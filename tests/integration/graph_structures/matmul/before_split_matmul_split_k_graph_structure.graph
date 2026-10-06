@@ -1,0 +1,154 @@
+[
+    {
+        "op_type": "kn_input_op",
+        "input_tensors": [],
+        "output_tensors": [
+            {
+                "num_dims": 2,
+                "dim": [
+                    4,
+                    12
+                ],
+                "guid": 10000006
+            }
+        ]
+    },
+    {
+        "op_type": "kn_input_op",
+        "input_tensors": [],
+        "output_tensors": [
+            {
+                "num_dims": 2,
+                "dim": [
+                    12,
+                    8
+                ],
+                "guid": 10000007
+            }
+        ]
+    },
+    {
+        "op_type": "kn_split_1_op",
+        "input_tensors": [
+            {
+                "num_dims": 2,
+                "dim": [
+                    4,
+                    12
+                ],
+                "guid": 10000006
+            }
+        ],
+        "output_tensors": [
+            {
+                "num_dims": 3,
+                "dim": [
+                    2,
+                    4,
+                    6
+                ],
+                "guid": 10000008
+            }
+        ]
+    },
+    {
+        "op_type": "kn_split_0_op",
+        "input_tensors": [
+            {
+                "num_dims": 2,
+                "dim": [
+                    12,
+                    8
+                ],
+                "guid": 10000007
+            }
+        ],
+        "output_tensors": [
+            {
+                "num_dims": 3,
+                "dim": [
+                    2,
+                    6,
+                    8
+                ],
+                "guid": 10000009
+            }
+        ]
+    },
+    {
+        "op_type": "kn_matmul_op",
+        "input_tensors": [
+            {
+                "num_dims": 3,
+                "dim": [
+                    2,
+                    4,
+                    6
+                ],
+                "guid": 10000008
+            },
+            {
+                "num_dims": 3,
+                "dim": [
+                    2,
+                    6,
+                    8
+                ],
+                "guid": 10000009
+            }
+        ],
+        "output_tensors": [
+            {
+                "num_dims": 3,
+                "dim": [
+                    2,
+                    4,
+                    8
+                ],
+                "guid": 10000010
+            }
+        ],
+        "trans_A": false,
+        "trans_B": false
+    },
+    {
+        "op_type": "kn_reduction_0_op",
+        "input_tensors": [
+            {
+                "num_dims": 3,
+                "dim": [
+                    2,
+                    4,
+                    8
+                ],
+                "guid": 10000010
+            }
+        ],
+        "output_tensors": [
+            {
+                "num_dims": 3,
+                "dim": [
+                    1,
+                    4,
+                    8
+                ],
+                "guid": 10000011
+            }
+        ]
+    },
+    {
+        "op_type": "kn_output_op",
+        "input_tensors": [
+            {
+                "num_dims": 3,
+                "dim": [
+                    1,
+                    4,
+                    8
+                ],
+                "guid": 10000011
+            }
+        ],
+        "output_tensors": []
+    }
+]

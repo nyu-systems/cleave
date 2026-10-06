@@ -1,0 +1,644 @@
+[
+    {
+        "input_map": {
+            "x": -1,
+            "y": -1,
+            "z": -1
+        },
+        "input_strides": [
+            12,
+            1
+        ],
+        "input_tensors": [],
+        "op_type": "kn_input_op",
+        "output_tensors": [
+            {
+                "can_reduce": [
+                    false,
+                    true,
+                    false,
+                    false,
+                    false
+                ],
+                "can_split": [
+                    false,
+                    true,
+                    false,
+                    false,
+                    false
+                ],
+                "data_type": 941,
+                "dim": [
+                    4,
+                    12,
+                    0,
+                    0,
+                    0
+                ],
+                "guid": 10009550,
+                "layout": "DmemRowMajor",
+                "num_dims": 2
+            }
+        ]
+    },
+    {
+        "input_map": {
+            "x": -1,
+            "y": -1,
+            "z": -1
+        },
+        "input_strides": [
+            8,
+            1
+        ],
+        "input_tensors": [],
+        "op_type": "kn_input_op",
+        "output_tensors": [
+            {
+                "can_reduce": [
+                    true,
+                    false,
+                    false,
+                    false,
+                    false
+                ],
+                "can_split": [
+                    true,
+                    false,
+                    false,
+                    false,
+                    false
+                ],
+                "data_type": 941,
+                "dim": [
+                    12,
+                    8,
+                    0,
+                    0,
+                    0
+                ],
+                "guid": 10009551,
+                "layout": "DmemRowMajor",
+                "num_dims": 2
+            }
+        ]
+    },
+    {
+        "input_tensors": [
+            {
+                "can_reduce": [
+                    false,
+                    true,
+                    false,
+                    false,
+                    false
+                ],
+                "can_split": [
+                    false,
+                    true,
+                    false,
+                    false,
+                    false
+                ],
+                "data_type": 941,
+                "dim": [
+                    4,
+                    12,
+                    0,
+                    0,
+                    0
+                ],
+                "guid": 10009550,
+                "layout": "DmemRowMajor",
+                "num_dims": 2
+            },
+            {
+                "can_reduce": [
+                    false,
+                    true,
+                    false,
+                    false,
+                    false
+                ],
+                "can_split": [
+                    false,
+                    true,
+                    false,
+                    false,
+                    false
+                ],
+                "data_type": 941,
+                "dim": [
+                    4,
+                    12,
+                    0,
+                    0,
+                    0
+                ],
+                "guid": 10009550,
+                "layout": "DmemRowMajor",
+                "num_dims": 2
+            }
+        ],
+        "op_type": "kn_mul_op",
+        "output_tensors": [
+            {
+                "can_reduce": [
+                    false,
+                    true,
+                    false,
+                    false,
+                    false
+                ],
+                "can_split": [
+                    false,
+                    true,
+                    false,
+                    false,
+                    false
+                ],
+                "data_type": 941,
+                "dim": [
+                    4,
+                    12,
+                    0,
+                    0,
+                    0
+                ],
+                "guid": 10009552,
+                "layout": "DmemRowMajor",
+                "num_dims": 2
+            }
+        ]
+    },
+    {
+        "input_tensors": [
+            {
+                "can_reduce": [
+                    false,
+                    true,
+                    false,
+                    false,
+                    false
+                ],
+                "can_split": [
+                    false,
+                    true,
+                    false,
+                    false,
+                    false
+                ],
+                "data_type": 941,
+                "dim": [
+                    4,
+                    12,
+                    0,
+                    0,
+                    0
+                ],
+                "guid": 10009550,
+                "layout": "DmemRowMajor",
+                "num_dims": 2
+            },
+            {
+                "can_reduce": [
+                    true,
+                    false,
+                    false,
+                    false,
+                    false
+                ],
+                "can_split": [
+                    true,
+                    false,
+                    false,
+                    false,
+                    false
+                ],
+                "data_type": 941,
+                "dim": [
+                    12,
+                    8,
+                    0,
+                    0,
+                    0
+                ],
+                "guid": 10009551,
+                "layout": "DmemRowMajor",
+                "num_dims": 2
+            }
+        ],
+        "op_type": "kn_matmul_op",
+        "output_tensors": [
+            {
+                "can_reduce": [
+                    false,
+                    false,
+                    false,
+                    false,
+                    false
+                ],
+                "can_split": [
+                    false,
+                    false,
+                    false,
+                    false,
+                    false
+                ],
+                "data_type": 941,
+                "dim": [
+                    4,
+                    8,
+                    0,
+                    0,
+                    0
+                ],
+                "guid": 10009553,
+                "layout": "DmemRowMajor",
+                "num_dims": 2
+            }
+        ],
+        "trans_A": false,
+        "trans_B": false
+    },
+    {
+        "input_tensors": [
+            {
+                "can_reduce": [
+                    false,
+                    true,
+                    false,
+                    false,
+                    false
+                ],
+                "can_split": [
+                    false,
+                    true,
+                    false,
+                    false,
+                    false
+                ],
+                "data_type": 941,
+                "dim": [
+                    4,
+                    12,
+                    0,
+                    0,
+                    0
+                ],
+                "guid": 10009552,
+                "layout": "DmemRowMajor",
+                "num_dims": 2
+            }
+        ],
+        "op_type": "kn_reduction_1_op",
+        "output_tensors": [
+            {
+                "can_reduce": [
+                    false,
+                    true,
+                    false,
+                    false,
+                    false
+                ],
+                "can_split": [
+                    false,
+                    true,
+                    false,
+                    false,
+                    false
+                ],
+                "data_type": 941,
+                "dim": [
+                    4,
+                    1,
+                    0,
+                    0,
+                    0
+                ],
+                "guid": 10009554,
+                "layout": "DmemRowMajor",
+                "num_dims": 2
+            }
+        ],
+        "reduction_dim_size": 1,
+        "squeeze_dim": false
+    },
+    {
+        "input_tensors": [
+            {
+                "can_reduce": [
+                    false,
+                    true,
+                    false,
+                    false,
+                    false
+                ],
+                "can_split": [
+                    false,
+                    true,
+                    false,
+                    false,
+                    false
+                ],
+                "data_type": 941,
+                "dim": [
+                    4,
+                    1,
+                    0,
+                    0,
+                    0
+                ],
+                "guid": 10009554,
+                "layout": "DmemRowMajor",
+                "num_dims": 2
+            }
+        ],
+        "op_type": "kn_div_op",
+        "output_tensors": [
+            {
+                "can_reduce": [
+                    false,
+                    true,
+                    false,
+                    false,
+                    false
+                ],
+                "can_split": [
+                    false,
+                    true,
+                    false,
+                    false,
+                    false
+                ],
+                "data_type": 941,
+                "dim": [
+                    4,
+                    1,
+                    0,
+                    0,
+                    0
+                ],
+                "guid": 10009555,
+                "layout": "DmemRowMajor",
+                "num_dims": 2
+            }
+        ],
+        "scalar": 4096.0,
+        "scalar_on_left": false
+    },
+    {
+        "input_tensors": [
+            {
+                "can_reduce": [
+                    false,
+                    true,
+                    false,
+                    false,
+                    false
+                ],
+                "can_split": [
+                    false,
+                    true,
+                    false,
+                    false,
+                    false
+                ],
+                "data_type": 941,
+                "dim": [
+                    4,
+                    1,
+                    0,
+                    0,
+                    0
+                ],
+                "guid": 10009555,
+                "layout": "DmemRowMajor",
+                "num_dims": 2
+            }
+        ],
+        "op_type": "kn_sqrt_op",
+        "output_tensors": [
+            {
+                "can_reduce": [
+                    false,
+                    true,
+                    false,
+                    false,
+                    false
+                ],
+                "can_split": [
+                    false,
+                    true,
+                    false,
+                    false,
+                    false
+                ],
+                "data_type": 941,
+                "dim": [
+                    4,
+                    1,
+                    0,
+                    0,
+                    0
+                ],
+                "guid": 10009556,
+                "layout": "DmemRowMajor",
+                "num_dims": 2
+            }
+        ]
+    },
+    {
+        "input_tensors": [
+            {
+                "can_reduce": [
+                    false,
+                    true,
+                    false,
+                    false,
+                    false
+                ],
+                "can_split": [
+                    false,
+                    true,
+                    false,
+                    false,
+                    false
+                ],
+                "data_type": 941,
+                "dim": [
+                    4,
+                    1,
+                    0,
+                    0,
+                    0
+                ],
+                "guid": 10009556,
+                "layout": "DmemRowMajor",
+                "num_dims": 2
+            }
+        ],
+        "op_type": "kn_div_op",
+        "output_tensors": [
+            {
+                "can_reduce": [
+                    false,
+                    true,
+                    false,
+                    false,
+                    false
+                ],
+                "can_split": [
+                    false,
+                    true,
+                    false,
+                    false,
+                    false
+                ],
+                "data_type": 941,
+                "dim": [
+                    4,
+                    1,
+                    0,
+                    0,
+                    0
+                ],
+                "guid": 10786983,
+                "layout": "DmemRowMajor",
+                "num_dims": 2
+            }
+        ],
+        "scalar": 1.0,
+        "scalar_on_left": true
+    },
+    {
+        "input_tensors": [
+            {
+                "can_reduce": [
+                    false,
+                    false,
+                    false,
+                    false,
+                    false
+                ],
+                "can_split": [
+                    false,
+                    false,
+                    false,
+                    false,
+                    false
+                ],
+                "data_type": 941,
+                "dim": [
+                    4,
+                    8,
+                    0,
+                    0,
+                    0
+                ],
+                "guid": 10009553,
+                "layout": "DmemRowMajor",
+                "num_dims": 2
+            },
+            {
+                "can_reduce": [
+                    false,
+                    true,
+                    false,
+                    false,
+                    false
+                ],
+                "can_split": [
+                    false,
+                    true,
+                    false,
+                    false,
+                    false
+                ],
+                "data_type": 941,
+                "dim": [
+                    4,
+                    1,
+                    0,
+                    0,
+                    0
+                ],
+                "guid": 10786983,
+                "layout": "DmemRowMajor",
+                "num_dims": 2
+            }
+        ],
+        "op_type": "kn_mul_op",
+        "output_tensors": [
+            {
+                "can_reduce": [
+                    false,
+                    false,
+                    false,
+                    false,
+                    false
+                ],
+                "can_split": [
+                    false,
+                    false,
+                    false,
+                    false,
+                    false
+                ],
+                "data_type": 941,
+                "dim": [
+                    4,
+                    8,
+                    0,
+                    0,
+                    0
+                ],
+                "guid": 10798472,
+                "layout": "DmemRowMajor",
+                "num_dims": 2
+            }
+        ]
+    },
+    {
+        "input_tensors": [
+            {
+                "can_reduce": [
+                    false,
+                    false,
+                    false,
+                    false,
+                    false
+                ],
+                "can_split": [
+                    false,
+                    false,
+                    false,
+                    false,
+                    false
+                ],
+                "data_type": 941,
+                "dim": [
+                    4,
+                    8,
+                    0,
+                    0,
+                    0
+                ],
+                "guid": 10798472,
+                "layout": "DmemRowMajor",
+                "num_dims": 2
+            }
+        ],
+        "op_type": "kn_output_op",
+        "output_map": {
+            "x": -1,
+            "y": -1,
+            "z": -1
+        },
+        "output_strides": [
+            8,
+            1
+        ],
+        "output_tensors": []
+    }
+]

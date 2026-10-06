@@ -1,0 +1,6 @@
+[submodule "3rdparty/tilelang"]
+	path = 3rdparty/tilelang
+	url = https://github.com/davidpissarra/tilelang/
+[submodule "3rdparty/json"]
+	path = 3rdparty/json
+	url = https://github.com/nlohmann/json

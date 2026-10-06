@@ -1,0 +1,191 @@
+import numpy as np
+
+from typing import Dict, List
+
+
+class Stride:
+    """
+    Manages stride information for a given axis of a tensor.
+    """
+
+    def __init__(self, stride: int = 1, ax: int = -1) -> None:
+        # which axis to put stride on
+        self._ax: int = int(ax)
+        # the stride size of the axis
+        self._stride: int = int(stride)
+
+    @property
+    def ax(self) -> int:
+        return self._ax
+
+    @property
+    def stride(self) -> int:
+        return self._stride
+
+    def compute_strides_from_shape(self, shape):
+        ndim = len(shape)
+        strides = [1 for _ in shape]
+        for i in range(ndim - 2, -1, -1):
+            if i == self.ax:
+                strides[i] = self.stride
+            else:
+                strides[i] = int(strides[i + 1] * shape[i + 1])
+        return strides
+
+    def compute_elements_from_shape(self, shape):
+        original_shape = np.prod(shape)
+        if not self.is_valid():
+            strided_elem = original_shape
+        else:
+            assert self.ax < len(shape)
+            strided_elem = np.prod(shape[0 : self.ax + 1]) * self.stride
+            assert strided_elem >= original_shape
+        return int(strided_elem)
+
+    def is_valid(self):
+        return self.ax >= 0
+
+    def __repr__(self):
+        return f"<Stride, {self._ax}, {self._stride}>"
+
+
+class TileDict:
+    def __init__(self, output_tile, rstep_map, flat_graph) -> None:
+        self.output_tile = output_tile
+        self.rstep_map = rstep_map
+        # schedule config
+        self.tile_map = {}
+        self.itile_map = {}
+        self.cached_tensors_map = {}
+        self.output_strides_map = {}
+        self.tensor_strides_map = {}
+
+        # analysis
+        self.traffic = -1
+        self.smem_cost = -1
+        self.block_per_SM = -1
+        self.num_wave = -1
+        self.grid_size = -1
+        self.valid = True
+        self.flat_graph = flat_graph
+
+    def get_tile(self, func) -> list[int]:
+        return self.tile_map[func]
+
+    def get_itile(self, func) -> list[int]:
+        return self.itile_map[func]
+
+    def get_rstep(self, node) -> dict[str, int]:
+        return self.rstep_map[node]
+
+    def __hash__(self) -> int:
+        return hash(tuple(self.output_tile))
+
+
+class Hint(object):
+    """
+    Central configuration class for managing various parameters of computational tasks.
+    """
+
+    def __init__(self) -> None:
+        self.arch = None
+        self.use_tc = None  # todo(lei): this should be renamed.
+
+        # Special axes tiling info
+        self.block = []
+        self.thread = []
+        # Special axes for MFMA
+        self.warp = []
+        # Reduce axes tiling info
+        self.rstep = []
+        self.reduce_thread = []
+        self.cached_tensors = []
+        self.output_strides = {}
+        self.schedule_stages = None
+        # Config for block reduction
+        self.block_reduction_depth = None  # type: int
+
+        # TL Specific
+        # Split-K factor for SM waste optimization
+        self.split_k_factor: int = 1
+
+        # Experimental
+        self._raxis_order = []
+        self._step = []
+        self.vectorize: Dict[str, int] = {}
+        self.pipeline_stage = 1
+        self.use_async = False
+        self.opt_shapes: Dict[str, int] = {}
+        self.shared_scope: str = "shared"
+        self.pass_context: Dict = {}
+
+    def to_dict(self) -> Dict:
+        dic = {}
+        dic["block"] = self.block
+        if self.use_tc:
+            dic["warp"] = self.warp
+        else:
+            dic["thread"] = self.thread
+        dic["rstep"] = self.rstep
+        if np.prod(self.reduce_thread) > 1:
+            dic["reduce_thread"] = self.reduce_thread
+        if self.use_tc:
+            dic["use_tc"] = self.use_tc
+        if self.output_strides:
+            dic["strides"] = {}
+            for k, stride in self.output_strides.items():
+                if stride.is_valid():
+                    dic["strides"][k] = stride
+            if len(dic["strides"]) == 0:
+                del dic["strides"]
+        if np.prod(self._step) > 1:
+            dic["step"] = self._step
+        if self._raxis_order != []:
+            dic["raxis_order"] = self._raxis_order
+        if self.vectorize != {}:
+            dic["vectorize"] = self.vectorize
+        if self.pipeline_stage != 1:
+            dic["pipeline_stage"] = self.pipeline_stage
+        if self.block_reduction_depth is not None:
+            dic["block_reduction_depth"] = self.block_reduction_depth
+        return dic
+
+    @classmethod
+    def from_dict(cls, dic: Dict) -> "Hint":
+        hint = cls()
+        for k, v in dic.items():
+            setattr(hint, k, v)
+        return hint
+
+    def tensorcore_legalization(self):
+        # only keep the last 2 axes for tensorcore
+        self.warp = self.warp[-2:]
+        self.block = self.block[-2:]
+        return self
+
+    @property
+    def raxis_order(self) -> List[int]:
+        if self._raxis_order != []:
+            return self._raxis_order
+        return list(range(len(self.rstep)))
+
+    @property
+    def step(self) -> List[int]:
+        if self._step != []:
+            return self._step
+        return [1 for _ in self.block]
+
+    def __repr__(self) -> str:
+        return str(self.to_dict())
+
+    def complete_config(self):
+        # analysis pass context, for int8 mma, we should merge static shared memory
+        merge_static_smem = False
+        # int32 and float32 accum may take too much shared memory
+        if self.use_tc and self.intrin_info.out_dtype in ["float32", "int32"]:
+            merge_static_smem = True
+        # Always merge dynamic shared memory
+        if self.shared_scope == "shared.dyn":
+            merge_static_smem = True
+        self.pass_context = {"tirx.merge_static_smem": merge_static_smem}
+        return self

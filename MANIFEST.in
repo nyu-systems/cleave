@@ -1,0 +1,11 @@
+recursive-include include *
+recursive-include src/superoptimizer *.cc
+recursive-include python/cleave/superoptimizer/_cython *.pyx *.pxd
+recursive-include 3rdparty/json/include *
+include 3rdparty/json/LICENSE.MIT
+recursive-include 3rdparty/tilelang *
+prune build
+prune python/cleave.egg-info
+prune 3rdparty/tilelang/build
+prune 3rdparty/tilelang/tilelang.egg-info
+global-exclude __pycache__ *.py[cod] .pytest_cache
