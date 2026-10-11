@@ -159,6 +159,22 @@ Issues, performance reports, and focused pull requests are welcome. Please keep
 changes scoped, include tests for behavioral changes, and note any CUDA or GPU
 assumptions needed to reproduce results.
 
+## Citation
+
+If you use Cleave in your research, please cite our paper:
+
+```bibtex
+@misc{pissarra2026cleave,
+  title         = {Cleave: Scaling Tensor Program Optimization via Decoupled Algebraic Search and Operator Scheduling},
+  author        = {David Pissarra and Jinkun Lin and Haitian Jiang and Aurojit Panda and Jinyang Li},
+  year          = {2026},
+  eprint        = {2610.07742},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.PL},
+  url           = {https://arxiv.org/abs/2610.07742}
+}
+```
+
 ## License
 
 Cleave is licensed under the [Apache-2.0](LICENSE) license.
