@@ -1,23 +1,19 @@
 from __future__ import annotations
 
-import ctypes
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
-import hashlib
-import json
 import multiprocessing as mp
 import os
 from pathlib import Path
 from queue import Empty
 import signal
 import shutil
-import subprocess
 import tempfile
 import time
+import warnings
 
 from .._cache_env import (
     configure_cache_env,
-    get_cleave_persistent_cache_root,
     get_cleave_runtime_root,
 )
 
@@ -241,430 +237,36 @@ def _restore_compile_error(result, label):
     return RuntimeError("\n".join(parts))
 
 
-def _current_cuda_stream() -> int:
-    import torch
+# How many launches one captured CUDA graph holds. Replaying the graph in batches
+# amortises the replay's own launch cost over many kernel launches.
+_BENCHMARK_GRAPH_BATCH = 100
 
-    if not torch.cuda.is_available():
-        return 0
+
+def _capture_launch_graph(kernel, inputs, batch):
+    """A CUDA graph of ``batch`` back-to-back ``kernel(*inputs)`` launches, or None.
+
+    Capturing ordinary Python calls works with any TileLang execution backend, and
+    replaying the graph keeps Python dispatch out of the timed region. Returns None
+    when the kernel cannot be captured, so the caller can fall back.
+    """
+    import torch
 
     try:
-        return torch._C._cuda_getCurrentRawStream(torch.cuda.current_device())
-    except Exception:
-        return torch.cuda.current_stream().cuda_stream
-
-
-_BATCHED_WRAPPER_LIBS: dict[str, ctypes.CDLL] = {}
-_BATCHED_WRAPPER_ROOT = get_cleave_persistent_cache_root() / "call_batched"
-
-
-def _scalar_dtype_to_c_type(dtype: str) -> str:
-    dtype_map = {
-        "bool": "bool",
-        "int8": "int8_t",
-        "uint8": "uint8_t",
-        "int16": "int16_t",
-        "uint16": "uint16_t",
-        "int32": "int32_t",
-        "uint32": "uint32_t",
-        "int64": "int64_t",
-        "uint64": "uint64_t",
-        "float": "float",
-        "float32": "float",
-        "float64": "double",
-        # Scalar fp16/bf16 arguments are rare in these benchmarks. Represent them as raw bits.
-        "float16": "uint16_t",
-        "bfloat16": "uint16_t",
-        "handle": "void*",
-    }
-    c_type = dtype_map.get(dtype)
-    if c_type is None:
-        raise ValueError(
-            f"Unsupported scalar argument dtype for batched wrapper: {dtype}"
-        )
-    return c_type
-
-
-def _scalar_arg_to_ctype(dtype, value):
-    import torch
-
-    dtype_to_ctype = {
-        torch.bfloat16: ctypes.c_uint16,
-        torch.float16: ctypes.c_uint16,
-        torch.float32: ctypes.c_float,
-        torch.float64: ctypes.c_double,
-        torch.int8: ctypes.c_int8,
-        torch.int16: ctypes.c_int16,
-        torch.int32: ctypes.c_int32,
-        torch.int64: ctypes.c_int64,
-        torch.uint8: ctypes.c_uint8,
-        torch.bool: ctypes.c_bool,
-        "bfloat16": ctypes.c_uint16,
-        "float16": ctypes.c_uint16,
-        "float32": ctypes.c_float,
-        "float64": ctypes.c_double,
-        "int8": ctypes.c_int8,
-        "int16": ctypes.c_int16,
-        "int32": ctypes.c_int32,
-        "int64": ctypes.c_int64,
-        "uint8": ctypes.c_uint8,
-        "bool": ctypes.c_bool,
-    }
-
-    ctype = dtype_to_ctype.get(dtype)
-    if ctype is None:
-        raise ValueError(f"Unsupported scalar parameter dtype: {dtype}")
-    return ctype(value)
-
-
-def _kernel_call_arg_types(kernel) -> list[str]:
-    from tvm import tirx as tir
-
-    adapter = kernel.adapter
-    prim_func = adapter.prim_func
-    buffer_map = prim_func.buffer_map
-    arg_types: list[str] = []
-    dynamic_symbolic_names: list[str] = []
-
-    for param in prim_func.params:
-        if param in buffer_map:
-            arg_types.append("void*")
-            buffer = buffer_map[param]
-            for dim in buffer.shape:
-                if isinstance(dim, tir.Var) and dim.name not in dynamic_symbolic_names:
-                    dynamic_symbolic_names.append(dim.name)
-        elif isinstance(param, tir.Var):
-            arg_types.append(_scalar_dtype_to_c_type(param.dtype))
-        else:
-            raise ValueError(f"Unsupported parameter type in PrimFunc: {type(param)}")
-
-    # TileLang appends dynamic symbols after the declared parameters.
-    for _ in dynamic_symbolic_names:
-        arg_types.append("int")
-
-    # TileLang's generated call(...) takes the stream as the final argument.
-    arg_types.append("void*")
-    return arg_types
-
-
-def _batched_wrapper_cache_key(kernel) -> str:
-    libpath = Path(kernel.adapter.libpath).resolve()
-    stat = libpath.stat()
-    payload = {
-        "libpath": str(libpath),
-        "mtime_ns": stat.st_mtime_ns,
-        "size": stat.st_size,
-        "arg_types": _kernel_call_arg_types(kernel),
-    }
-    return hashlib.sha256(
-        json.dumps(payload, sort_keys=True).encode("utf-8")
-    ).hexdigest()
-
-
-def _batched_wrapper_paths(key: str) -> tuple[Path, Path]:
-    _BATCHED_WRAPPER_ROOT.mkdir(parents=True, exist_ok=True)
-    wrapper_dir = _BATCHED_WRAPPER_ROOT / key
-    return wrapper_dir / "call_batched.cpp", wrapper_dir / "call_batched.so"
-
-
-def _batched_wrapper_source(kernel) -> str:
-    libpath = Path(kernel.adapter.libpath).resolve()
-    arg_types = _kernel_call_arg_types(kernel)
-    typed_args = ", ".join(f"{ctype} arg{idx}" for idx, ctype in enumerate(arg_types))
-    call_arg_names = ", ".join(f"arg{idx}" for idx in range(len(arg_types)))
-    fn_signature = ", ".join(arg_types)
-    lib_path_literal = json.dumps(str(libpath))
-
-    if not fn_signature:
-        fn_signature = "void"
-
-    return f"""#include <dlfcn.h>
-#include <stdbool.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <string.h>
-
-namespace {{
-constexpr int kErrorBufSize = 1024;
-char g_error_buf[kErrorBufSize];
-void* g_handle = nullptr;
-using init_fn_t = int (*)();
-using call_fn_t = int (*)({fn_signature});
-using get_last_error_fn_t = const char* (*)();
-init_fn_t g_init = nullptr;
-call_fn_t g_call = nullptr;
-get_last_error_fn_t g_get_last_error = nullptr;
-
-int set_error(const char* msg) {{
-  if (msg == nullptr) {{
-    g_error_buf[0] = '\\0';
-    return -1;
-  }}
-  snprintf(g_error_buf, kErrorBufSize, "%s", msg);
-  return -1;
-}}
-
-int ensure_loaded() {{
-  if (g_call != nullptr) {{
-    return 0;
-  }}
-
-  g_error_buf[0] = '\\0';
-  g_handle = dlopen({lib_path_literal}, RTLD_NOW | RTLD_LOCAL);
-  if (g_handle == nullptr) {{
-    return set_error(dlerror());
-  }}
-
-  g_init = reinterpret_cast<init_fn_t>(dlsym(g_handle, "init"));
-  g_call = reinterpret_cast<call_fn_t>(dlsym(g_handle, "call"));
-  g_get_last_error = reinterpret_cast<get_last_error_fn_t>(dlsym(g_handle, "get_last_error"));
-
-  if (g_call == nullptr) {{
-    return set_error(dlerror());
-  }}
-
-  if (g_init != nullptr) {{
-    int rc = g_init();
-    if (rc != 0) {{
-      if (g_get_last_error != nullptr) {{
-        const char* base_error = g_get_last_error();
-        if (base_error != nullptr) {{
-          return set_error(base_error);
-        }}
-      }}
-      return set_error("kernel init failed");
-    }}
-  }}
-  return 0;
-}}
-}}  // namespace
-
-extern "C" const char* get_last_error() {{
-  if (g_error_buf[0] != '\\0') {{
-    return g_error_buf;
-  }}
-  if (g_get_last_error != nullptr) {{
-    const char* base_error = g_get_last_error();
-    if (base_error != nullptr) {{
-      return base_error;
-    }}
-  }}
-  return g_error_buf;
-}}
-
-extern "C" int init() {{
-  g_error_buf[0] = '\\0';
-  return ensure_loaded();
-}}
-
-extern "C" int call_batched({typed_args}, int repeats) {{
-  g_error_buf[0] = '\\0';
-  if (repeats < 0) {{
-    return set_error("repeats must be >= 0");
-  }}
-  int rc = ensure_loaded();
-  if (rc != 0) {{
-    return rc;
-  }}
-  for (int repeat_idx = 0; repeat_idx < repeats; ++repeat_idx) {{
-    rc = g_call({call_arg_names});
-    if (rc != 0) {{
-      if (g_get_last_error != nullptr) {{
-        const char* base_error = g_get_last_error();
-        if (base_error != nullptr) {{
-          return set_error(base_error);
-        }}
-      }}
-      return set_error("kernel call failed");
-    }}
-  }}
-  return 0;
-}}
-"""
-
-
-def _compile_batched_wrapper(kernel) -> Path:
-    key = _batched_wrapper_cache_key(kernel)
-    src_path, so_path = _batched_wrapper_paths(key)
-    if so_path.is_file():
-        return so_path
-
-    compiler = shutil.which("c++") or shutil.which("g++")
-    if compiler is None:
-        raise RuntimeError(
-            "A C++ compiler is required to build Cleave's batched wrapper"
-        )
-
-    src_path.parent.mkdir(parents=True, exist_ok=True)
-    source = _batched_wrapper_source(kernel)
-    temp_src = src_path.with_suffix(".tmp.cpp")
-    temp_so = so_path.with_suffix(".tmp.so")
-    temp_src.write_text(source, encoding="utf-8")
-
-    command = [
-        compiler,
-        "-std=c++17",
-        "-O2",
-        "-shared",
-        "-fPIC",
-        str(temp_src),
-        "-ldl",
-        "-o",
-        str(temp_so),
-    ]
-    completed = subprocess.run(
-        command,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if completed.returncode != 0:
-        raise RuntimeError(
-            "Failed to compile Cleave batched wrapper:\n"
-            f"command: {' '.join(command)}\n"
-            f"stdout:\n{completed.stdout}\n"
-            f"stderr:\n{completed.stderr}"
-        )
-
-    temp_src.replace(src_path)
-    temp_so.replace(so_path)
-    return so_path
-
-
-def _load_batched_wrapper(kernel):
-    key = _batched_wrapper_cache_key(kernel)
-    cached = _BATCHED_WRAPPER_LIBS.get(key)
-    if cached is not None:
-        return cached
-
-    wrapper_path = _compile_batched_wrapper(kernel)
-    lib = ctypes.CDLL(str(wrapper_path))
-    lib.get_last_error.restype = ctypes.c_char_p
-    result = lib.init()
-    if result != 0:
-        error = lib.get_last_error()
-        message = error.decode("utf-8") if error else "unknown error"
-        raise RuntimeError(f"Failed to initialize Cleave batched wrapper: {message}")
-
-    _BATCHED_WRAPPER_LIBS[key] = lib
-    return lib
-
-
-def _prepare_benchmark_tensor_list(kernel, input_tensors):
-    import torch
-    from tvm import tirx as tir
-
-    adapter = kernel.adapter
-    inputs = list(input_tensors)
-    total_params = len(adapter.params)
-    total_results = len(adapter.result_idx)
-    result_idx = set(adapter.result_idx)
-    dynamic_symbolic_map = getattr(adapter, "dynamic_symbolic_map", {}) or {}
-
-    if total_params != len(inputs) + total_results:
-        raise ValueError(
-            f"Expected {total_params} parameters, got {len(inputs)} inputs and {total_results} outputs"
-        )
-
-    tensor_list = []
-    input_idx = 0
-    for param_idx, param in enumerate(adapter.params):
-        if param_idx in result_idx:
-            shape = []
-            for dim in param.shape:
-                if isinstance(dim, tir.Var):
-                    resolved = False
-                    for key, (buffer_idx, shape_idx) in dynamic_symbolic_map.items():
-                        if str(dim) != str(key):
-                            continue
-                        if buffer_idx >= len(tensor_list):
-                            raise ValueError(
-                                f"Dynamic dimension {dim} depends on parameter {buffer_idx} before it is available"
-                            )
-                        shape.append(int(tensor_list[buffer_idx].shape[shape_idx]))
-                        resolved = True
-                        break
-                    if not resolved:
-                        raise ValueError(f"Unable to resolve dynamic dimension {dim}")
-                elif isinstance(dim, tir.IntImm):
-                    shape.append(int(dim.value))
-                else:
-                    shape.append(int(dim))
-
-            if len(shape) == 0:
-                raise ValueError(
-                    f"Cannot allocate 0-dimensional output tensor for parameter index {param_idx}"
-                )
-
-            device = (
-                inputs[0].device
-                if inputs
-                else torch.device("cuda", torch.cuda.current_device())
-            )
-            tensor = torch.empty(tuple(shape), dtype=param.dtype, device=device)
-        else:
-            tensor = inputs[input_idx]
-            if isinstance(tensor, torch.Tensor) and not tensor.is_contiguous():
-                tensor = tensor.contiguous()
-            input_idx += 1
-        tensor_list.append(tensor)
-
-    return tensor_list
-
-
-def _prepare_benchmark_call(kernel, input_tensors):
-    import torch
-
-    adapter = kernel.adapter
-    lib = getattr(adapter, "lib", None)
-    if lib is None:
-        raise RuntimeError("Kernel adapter does not expose a compiled shared library")
-
-    tensor_list = _prepare_benchmark_tensor_list(kernel, input_tensors)
-    ptr_map = getattr(adapter, "ptr_map", {}) or {}
-    dynamic_symbolic_map = getattr(adapter, "dynamic_symbolic_map", {}) or {}
-
-    call_args = []
-    for param_idx, value in enumerate(tensor_list):
-        if isinstance(value, torch.Tensor):
-            if not value.is_contiguous():
-                raise ValueError(f"Tensor parameter {param_idx} must be contiguous")
-            call_args.append(ctypes.c_void_p(value.data_ptr()))
-        elif isinstance(value, (int, float, bool)):
-            if param_idx in ptr_map:
-                call_args.append(ctypes.c_void_p(int(value)))
-            else:
-                call_args.append(
-                    _scalar_arg_to_ctype(adapter.params[param_idx].dtype, value)
-                )
-        else:
-            raise ValueError(
-                f"Unsupported parameter type at index {param_idx}: {type(value)}"
-            )
-
-    for _, (buffer_idx, shape_idx) in dynamic_symbolic_map.items():
-        call_args.append(int(tensor_list[buffer_idx].shape[shape_idx]))
-
-    call_args.append(ctypes.c_void_p(_current_cuda_stream()))
-    return lib, tensor_list, call_args
-
-
-def _call_compiled_kernel(lib, func_name, call_args, repeats=None):
-    func = getattr(lib, func_name, None)
-    if func is None:
-        raise AttributeError(f"Compiled library does not export {func_name}")
-
-    args = list(call_args)
-    if repeats is not None:
-        args.append(ctypes.c_int(repeats))
-
-    result = func(*args)
-    if result != 0:
-        error = "unknown error"
-        if hasattr(lib, "get_last_error"):
-            raw_error = lib.get_last_error()
-            if raw_error:
-                error = raw_error.decode("utf-8")
-        raise RuntimeError(f"{func_name} failed: {error}")
+        graph = torch.cuda.CUDAGraph()
+        # Capture needs its own stream, and the kernel must have run once already so
+        # any lazy initialisation or allocation happens outside the capture.
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            kernel(*inputs)
+        torch.cuda.current_stream().wait_stream(stream)
+        torch.cuda.synchronize()
+        with torch.cuda.graph(graph):
+            for _ in range(batch):
+                kernel(*inputs)
+    except Exception:  # noqa: BLE001 - capture is an optimisation, not a requirement
+        return None
+    return graph
 
 
 def benchmark_compiled_kernel(
@@ -674,6 +276,14 @@ def benchmark_compiled_kernel(
     warmup_iters=0,
     profile_iters=1,
 ):
+    """Mean milliseconds per launch of ``kernel(*input_tensors)``.
+
+    Launches are captured into a CUDA graph and timed by replaying it, so the reading
+    is GPU time without per-call Python dispatch, whatever TileLang execution backend
+    compiled the kernel. If the kernel cannot be captured, this falls back to timing a
+    plain launch loop and warns, because that reading includes dispatch overhead and
+    is not comparable with graph-replay readings.
+    """
     if warmup_iters < 0:
         raise ValueError(f"warmup_iters must be >= 0, got {warmup_iters}")
     if profile_iters <= 0:
@@ -681,33 +291,44 @@ def benchmark_compiled_kernel(
 
     import torch
 
-    _, live_tensors, call_args = _prepare_benchmark_call(kernel, input_tensors)
-    batched_lib = _load_batched_wrapper(kernel)
-
+    inputs = list(input_tensors)
+    for _ in range(warmup_iters):
+        kernel(*inputs)
     torch.cuda.synchronize()
-    _call_compiled_kernel(
-        batched_lib,
-        "call_batched",
-        call_args,
-        repeats=warmup_iters,
-    )
 
-    torch.cuda.synchronize()
+    batch = min(profile_iters, _BENCHMARK_GRAPH_BATCH)
+    graph = _capture_launch_graph(kernel, inputs, batch)
+    if graph is not None:
+        replays = -(-profile_iters // batch)  # ceil: time at least profile_iters launches
+        launches = replays * batch
+        graph.replay()  # untimed: the first replay also uploads the graph
+        torch.cuda.synchronize()
+
+        def run():
+            for _ in range(replays):
+                graph.replay()
+
+    else:
+        warnings.warn(
+            "CUDA graph capture failed for this kernel; timing a plain launch loop, "
+            "which includes per-call Python dispatch overhead",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        launches = profile_iters
+
+        def run():
+            for _ in range(launches):
+                kernel(*inputs)
+
     starter = torch.cuda.Event(enable_timing=True)
     ender = torch.cuda.Event(enable_timing=True)
     starter.record()
-    _call_compiled_kernel(
-        batched_lib,
-        "call_batched",
-        call_args,
-        repeats=profile_iters,
-    )
+    run()
     ender.record()
     torch.cuda.synchronize()
 
-    latency_ms = starter.elapsed_time(ender) / profile_iters
-    del live_tensors
-    return latency_ms
+    return starter.elapsed_time(ender) / launches
 
 
 def _compile(prim_func, out_idx):
