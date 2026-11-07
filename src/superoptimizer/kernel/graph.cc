@@ -1,5 +1,4 @@
 #include "cleave/superoptimizer/kernel/graph.h"
-#include "cleave/superoptimizer/utils/hash_utils.h"
 
 // Symbolic graph construction
 #include "cleave/superoptimizer/symbolic/dimension_group.h"
@@ -25,13 +24,6 @@ Graph::~Graph() {
     delete operators.back();
     operators.pop_back();
   }
-}
-
-size_t Graph::pair_hash::operator()(std::pair<int, int> const &p) const {
-  size_t h1 = std::hash<int>{}(p.first);
-  size_t h2 = std::hash<int>{}(p.second);
-  hash_combine(h1, h2);
-  return h1;
 }
 
 int Graph::get_input_dtensors(DTensor **inputs) {

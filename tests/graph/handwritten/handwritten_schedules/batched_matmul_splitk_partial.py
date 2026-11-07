@@ -7,8 +7,6 @@ DTYPE = "float16"
 ACCUM_DTYPE = "float32"
 OUT_DTYPE = "float16"
 
-LOG = True
-
 
 def get_handwritten_scheduled_graph(dims):
     B, split_k, M, N, k_partial = dims

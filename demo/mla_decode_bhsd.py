@@ -52,7 +52,6 @@ def build_mla_decode_bhsd(
 
     optimized_graphs = symbolic_graph.search_tile_graph(checkpoint_file, False, True, config)
 
-    cleave_graph = None
     candidates = []
     for optimized_graph in optimized_graphs:
         graph_structure = optimized_graph.get_graph_structure()
@@ -63,8 +62,6 @@ def build_mla_decode_bhsd(
 
     error_graphs, errors = [], []
     success_info = []
-
-    # candidates = [cand for cand in candidates if cand.output_tile[-1] == HD and cand.rstep_map[cand.flat_graph.nodes[2]]['v2'] == HD]
 
     compile_and_run_candidates_parallel(
         candidates,
@@ -85,7 +82,7 @@ def build_mla_decode_bhsd(
         len(success_info) >= 1
     ), f"Expected at least 1 successful candidates for MLA, but got {len(success_info)}."
 
-    best_info, best_latency_ms, best_idx = benchmark_graphs(
+    _, best_latency_ms, best_idx = benchmark_graphs(
         success_info,
         "float16",
         warmup_iters=16,

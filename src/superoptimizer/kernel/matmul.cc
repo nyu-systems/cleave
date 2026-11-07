@@ -1,6 +1,5 @@
 #include "cleave/superoptimizer/kernel/matmul.h"
 #include "cleave/superoptimizer/kernel/graph.h"
-#include "cleave/superoptimizer/utils/hash_utils.h"
 #include <algorithm>
 #include <cassert>
 #include <iostream>
@@ -171,55 +170,5 @@ KNMatmulOp::operator json() const {
               {"trans_B", trans_B}};
 }
 
-void from_json(json const &j, KNMatmulOp &op) {
-  j.at("op_type").get_to(op.op_type);
-  j.at("input_tensors").get_to(op.input_tensors);
-  j.at("output_tensors").get_to(op.output_tensors);
-  if (j.contains("trans_A")) {
-    j.at("trans_A").get_to(op.trans_A);
-  } else {
-    op.trans_A = false;
-  }
-  if (j.contains("trans_B")) {
-    j.at("trans_B").get_to(op.trans_B);
-  } else {
-    op.trans_B = false;
-  }
-}
-
-MatmulKey::MatmulKey(DTensor const &A,
-                     DTensor const &B,
-                     bool trans_A_,
-                     bool trans_B_)
-    : operand_a(A), operand_b(B), trans_A(trans_A_), trans_B(trans_B_) {}
-
-bool MatmulKey::operator==(MatmulKey const &b) const {
-  if (b.operand_a != operand_a) {
-    return false;
-  }
-  if (b.operand_b != operand_b) {
-    return false;
-  }
-  if (b.trans_A != trans_A) {
-    return false;
-  }
-  if (b.trans_B != trans_B) {
-    return false;
-  }
-  return true;
-}
-
 } // namespace kernel
 } // namespace cleave_superoptimizer
-
-namespace std {
-size_t hash<cleave_superoptimizer::kernel::MatmulKey>::operator()(
-    cleave_superoptimizer::kernel::MatmulKey const &key) const {
-  size_t ret = 0;
-  hash_combine(ret, key.operand_a);
-  hash_combine(ret, key.operand_b);
-  hash_combine(ret, key.trans_A);
-  hash_combine(ret, key.trans_B);
-  return ret;
-}
-}; // namespace std

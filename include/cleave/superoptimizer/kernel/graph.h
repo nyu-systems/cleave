@@ -9,11 +9,6 @@ namespace cleave_superoptimizer {
 namespace kernel {
 
 class Graph {
-private:
-  struct pair_hash {
-    size_t operator()(std::pair<int, int> const &p) const;
-  };
-
 public:
   Graph();
   ~Graph();
@@ -146,7 +141,6 @@ private:
   // Helper methods for reducibility inference
   void propagate_reducibility_backward(KNOperator *op);
   void propagate_reduction_op(KNOperator *op);
-  void propagate_split_op(KNOperator *op);
   void propagate_matmul_op(KNOperator *op);
   void propagate_elementwise_unary_op(KNOperator *op);
   void propagate_elementwise_binary_op(KNOperator *op);

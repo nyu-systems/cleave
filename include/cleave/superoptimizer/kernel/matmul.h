@@ -34,24 +34,5 @@ public:
   bool trans_B;
 };
 
-void from_json(json const &j, KNMatmulOp &op);
-
-class MatmulKey {
-public:
-  MatmulKey(DTensor const &A, DTensor const &B, bool trans_A, bool trans_B);
-  bool operator==(MatmulKey const &b) const;
-  DTensor operand_a;
-  DTensor operand_b;
-  bool trans_A;
-  bool trans_B;
-};
-
 } // namespace kernel
 } // namespace cleave_superoptimizer
-
-namespace std {
-template <>
-struct hash<cleave_superoptimizer::kernel::MatmulKey> {
-  size_t operator()(cleave_superoptimizer::kernel::MatmulKey const &) const;
-};
-} // namespace std

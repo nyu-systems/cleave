@@ -77,7 +77,6 @@ struct alignas(16) DTensor {
     return num_elements() * fingerprint_type_size;
   }
 
-  // bool has_same_fingerprint(DTensor const &ref) const;
   bool has_same_fingerprint(
       cleave_superoptimizer::cpu::CTensor const &ref) const;
   cleave_superoptimizer::cpu::CTensor copy_fingerprint_to_ctensor() const;

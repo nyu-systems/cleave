@@ -14,11 +14,9 @@ from cleave.ops import (
     Log2,
     MaskedExp,
     Matmul,
-    PagedGather,
     Reduction,
     RowGather,
 )
-from cleave.ops.gather import BUFFER_BOUND
 from cleave.util import gather_all_nodes, lock_graph
 
 DTYPE = "bfloat16"

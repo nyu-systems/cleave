@@ -11,16 +11,9 @@ namespace search {
 using kernel::DTensor;
 using kernel::KNOperator;
 
-enum class VerifierType {
-  PROBABILISTIC_VERIFIER,
-  FORMAL_VERIFIER,
-};
-
 struct GeneratorConfig {
   size_t max_num_kernel_graph_op;
   size_t search_thread;
-
-  VerifierType verifier_type;
 
   std::vector<type::KNOperatorType> knop_to_explore;
   bool

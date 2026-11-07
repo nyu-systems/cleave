@@ -101,28 +101,11 @@ public:
   std::vector<int> get_symbolic_dims(type::GuidType tensor_guid,
                                      int num_dims) const;
 
-  int get_max_symbol() const {
-    return max_symbol_used;
-  }
-
-  /**
-   * @brief Get number of distinct groups (excluding broadcast)
-   *
-   * @return Number of non-broadcast dimension groups
-   */
-  int get_num_groups() const {
-    return num_groups;
-  }
-
 private:
   // Map from dimension to its symbolic value
   std::unordered_map<DimensionID, int, DimensionID::Hash> symbol_map;
 
   DimensionGrouper const &grouper;
-
-  int max_symbol_used;
-
-  int num_groups;
 
   static int next_prime(int n);
 };

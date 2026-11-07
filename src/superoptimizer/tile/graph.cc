@@ -183,7 +183,6 @@ cleave_superoptimizer::search::GeneratorConfig TileGraph::setup_search_config() 
             [](const cleave_superoptimizer::type::KNOperatorType &a, const cleave_superoptimizer::type::KNOperatorType &b) {
               return static_cast<int>(a) < static_cast<int>(b);
             });
-  config.verifier_type = cleave_superoptimizer::search::VerifierType::PROBABILISTIC_VERIFIER;
 
   return config;
 }

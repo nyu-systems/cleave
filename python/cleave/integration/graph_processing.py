@@ -1,6 +1,5 @@
 from copy import deepcopy
 from dataclasses import dataclass
-from itertools import zip_longest
 from typing import Dict, List, Optional, Tuple
 
 from .superoptimizer import graph_structure_to_cleave
@@ -252,10 +251,7 @@ def _augment_split_symbol_mapping(
             if len(raw_output_dims) != len(raw_input_dims) + 1:
                 continue
 
-            split_position = 0
             if not (0 <= split_axis < len(raw_input_dims)):
-                continue
-            if split_position < 0 or split_position >= len(raw_output_dims):
                 continue
 
             resolved_input_dims = [_resolve_dim(v, symbol_map) for v in raw_input_dims]

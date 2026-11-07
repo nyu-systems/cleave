@@ -14,7 +14,7 @@ from cleave.arch import get_arch
 from cleave.graph import OutputNode
 from cleave.ops import Matmul
 from cleave.policy.default import DefaultPolicy, TCPolicy
-from cleave.util import CompilerPassOptions, compile_and_run_candidates_parallel
+from cleave.util import compile_and_run_candidates_parallel
 
 
 DTYPE = "float16"

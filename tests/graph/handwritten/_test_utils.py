@@ -3,8 +3,6 @@ from __future__ import annotations
 import difflib
 from pathlib import Path
 
-import tilelang as tl
-
 from cleave.codegen import TilelangCodeGen
 from cleave.util import (
     DEFAULT_TOLERANCE,

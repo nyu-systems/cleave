@@ -13,7 +13,6 @@ from cleave.graph import (
 from cleave.ops import (
     CausalMaskedExp,
     ConstFill,
-    IndexGather,
     IndptrTileScan,
     MaskedDiv,
     MaskedLog2,

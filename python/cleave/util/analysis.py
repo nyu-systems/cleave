@@ -4,7 +4,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from tvm import tirx
 
-from ..graph import Graph, OutputNode
+from ..graph import OutputNode
 from ..ops import Add, Div, Exp, Matmul, Mul, RSqrt, Reduction, Silu, SplitView, Sqrt, Sub
 
 

@@ -1,5 +1,4 @@
 import tilelang.language as T
-import tilelang
 
 from tests._graphs import rmsnorm_matmul_graph
 from cleave.util import compile_and_run_prim_func

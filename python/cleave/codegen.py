@@ -945,9 +945,6 @@ class TilelangCodeGen:
             else:
                 raise NotImplementedError(f"Unknown node type: {node}")
 
-            # if isinstance(node.outputs[0].dst_node, OutputNode):
-            #     out_node = node.outputs[0].dst_node # so that it reuses the args buffer # TODO: enable this optimization
-
         iter_code += "\n"
         self.emit(iter_code)
 

@@ -54,7 +54,6 @@ def build_mla_prefill_bhsd(
 
     optimized_graphs = symbolic_graph.search_tile_graph(checkpoint_file, False, True, config)
 
-    cleave_graph = None
     candidates = []
     for optimized_graph in optimized_graphs:
         graph_structure = optimized_graph.get_graph_structure()

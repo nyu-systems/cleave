@@ -1,11 +1,4 @@
-import torch
-import torch.nn.functional as F
-import tilelang
-from tilelang.autotuner import *
 import tilelang.language as T
-import itertools
-import argparse
-from functools import partial
 
 from tests._graphs import mha_bhsd_graph
 from cleave.util import compile_and_run_prim_func

@@ -3,22 +3,18 @@ from .common import (
     coalesced_factor,
     get_all_round_factors,
     coalesced_tensor_shape,
-    factorize,
 )
 from .bestfit import BestFit
-from .hint import TileDict, Stride, Hint
-from ..graph import ComputeOpNode, ViewOpNode
+from .hint import TileDict, Stride
+from ..graph import ViewOpNode
 from ..util.analysis import (
     build_output_axis_provenance,
     build_reduction_axis_provenance,
 )
 
 import copy
-import math
-import functools
 import numpy as np
 from queue import Queue, PriorityQueue
-from typing import List
 
 
 DEFAULT_N_THREADS = 128
@@ -476,12 +472,6 @@ class DefaultPolicy:
             results[k_iter.var.name] = all_factors
         return results
 
-    def score_block_size(self, n):
-        num_wrap = (n + self.arch.warp_size - 1) // self.arch.warp_size
-        r1 = max(num_wrap / self.arch.sm_partition, self.arch.sm_partition / num_wrap)
-        r2 = (num_wrap * self.arch.warp_size - n) / n
-        return (r1, r2)
-
     def _assign_reduce_step(self, node):
         if node.reduction_block is None:
             return {}
@@ -801,190 +791,6 @@ class DefaultPolicy:
             np.ceil(td.grid_size / int(td.block_per_SM * self.arch.compute_max_core))
         )
         return td
-
-    def check_tile_shape_isvalid(self, td: TileDict) -> bool:
-        for node in self.ordered_nodes:
-            if np.prod(td.get_tile(node)) == 0:
-                return False
-            node_grid_size = np.prod(
-                [
-                    (y + x - 1) // x
-                    for x, y in zip(td.get_tile(node), node.get_space_dim())
-                ]
-            )
-            if node_grid_size != td.grid_size:
-                return False
-            if (
-                hasattr(node, "reduce_op")
-                and node.reduce_op is not None
-                and len(node.reduce_op.axis) == len(td.output_tile)
-            ):
-                for i, tile_extent in enumerate(td.output_tile):
-                    if node.reduce_op.axis[i].dom.extent % tile_extent:
-                        return False
-
-        return True
-
-    def recommend_block_size(self, td: TileDict) -> List[int]:
-        node_space_sizes = [
-            int(np.prod(td.get_tile(node))) for node in self.ordered_nodes
-        ]
-        max_block_size = functools.reduce(math.gcd, node_space_sizes)
-
-        if (
-            max_block_size < self.arch.warp_size * self.arch.sm_partition
-            and max_block_size == min(node_space_sizes)
-        ):
-            node_reduce_sizes = [
-                int(np.prod(list(td.get_rstep(node).values())))
-                for node in self.ordered_nodes
-            ]
-            total_sizes = [x * y for x, y in zip(node_space_sizes, node_reduce_sizes)]
-            max_possible_size = functools.reduce(math.gcd, total_sizes)
-            possible_block_sizes = list(
-                filter(
-                    lambda x: x % max_block_size == 0 and x <= 1024,
-                    get_all_round_factors(max_possible_size),
-                )
-            )
-            possible_block_sizes = list(
-                filter(  # either be a factor of space or cover fully cover the space
-                    lambda x: all([x % s == 0 or s % x == 0 for s in node_space_sizes]),
-                    possible_block_sizes,
-                )
-            )
-            factor_ordered = sorted(possible_block_sizes, key=self.score_block_size)
-            return factor_ordered
-        else:
-            possible_block_sizes = get_all_round_factors(max_block_size)
-            possible_block_sizes = list(
-                filter(lambda x: x <= 1024, possible_block_sizes)
-            )
-        factor_ordered = sorted(possible_block_sizes, key=self.score_block_size)
-        return factor_ordered
-
-    def assign_block_size(self, td: TileDict, topk=1):
-        block_size_ordered = self.recommend_block_size(td)
-        for block_size in block_size_ordered:
-            result = {}
-            failed = False
-            for node in self.ordered_nodes:
-                result[node] = self._assign_block_size(node, td, block_size)
-                if result[node] is None:
-                    failed = True
-                    break
-            if failed:
-                continue
-            else:
-                yield result
-                topk -= 1
-                if topk == 0:
-                    break
-
-    def _assign_block_size(self, node: ComputeOpNode, td: TileDict, block_size: int):
-        tile, rsteps = td.get_tile(node), td.get_rstep(node)
-        factors = factorize(block_size)
-        cur_threads = [1 for _ in tile]
-        reduce_thread = {k: 1 for k in rsteps}
-        ndim = len(tile)
-
-        def _score(node, thread):  # small is better
-            score = 0
-            block_tile = [int(np.ceil(tile[i] / thread[i])) for i in range(ndim)]
-            shape = self._propagate_inputs_full_rank(node, block_tile)
-            for i, _ in enumerate(node.input_buffers):
-                score += np.prod(shape[i]) / self.arch.bandwidth[1]
-            for buffer in node.output_buffers:
-                if node.is_output():  # TODO: check if this is correct
-                    score += (
-                        coalesced_tensor_shape(thread, buffer.shape, 8)
-                        / self.arch.bandwidth[0]
-                    )
-            return score
-
-        for factor in reversed(factors):
-            score_map = {}
-            for i in range(ndim):
-                if cur_threads[i] >= tile[i]:
-                    continue
-                if (tile[i] % (cur_threads[i] * factor)) != 0:
-                    continue
-                cur_threads[i] *= factor
-                score_map[i] = (_score(node, cur_threads), i)
-                cur_threads[i] //= factor
-            if len(score_map) > 0:
-                # assign to space axis
-                dim_order = sorted(score_map.keys(), key=lambda x: score_map[x])
-                cur_threads[dim_order[0]] *= factor
-            else:
-                # assign to reduce axis
-                target_ax = None
-                for ax, ax_len in reversed(list(rsteps.items())):
-                    if ax_len % (reduce_thread[ax] * factor) == 0:
-                        target_ax = ax
-                        break
-                assert target_ax
-                reduce_thread[target_ax] *= factor
-
-        codegen_dict = Hint()
-        codegen_dict.block = tile
-        codegen_dict.thread = cur_threads
-        codegen_dict.rstep = [rsteps[ax.var.name] for ax in node.raxis]
-        codegen_dict.reduce_thread = [reduce_thread[ax.var.name] for ax in node.raxis]
-        codegen_dict.cached_tensors = td.cached_tensors_map[node]
-
-        if (
-            node.get_dtype().bits == 16
-        ):  # set step=2 for 16bit case to ensure coalesced access
-            codegen_dict._step = [1 for _ in range(ndim)]
-            for i in reversed(range(ndim)):
-                if codegen_dict.block[i] // codegen_dict.thread[i] % 2 == 0:
-                    codegen_dict._step[i] = 2
-                    break
-        elif (
-            node.get_dtype().bits == 8
-        ):  # set step=4 for 8bit case to ensure coalesced access
-            codegen_dict._step = [1 for _ in range(ndim)]
-            for i in reversed(range(ndim)):
-                if codegen_dict.block[i] // codegen_dict.thread[i] % 4 == 0:
-                    codegen_dict._step[i] = 4
-                    break
-        # Plan vectorize
-        codegen_dict.vectorize = self._plan_vectorize(node, td, block_size)
-        codegen_dict.arch = self.arch
-        codegen_dict.opt_shapes = node.get_tag("opt_shapes")
-        return codegen_dict
-
-    def _plan_vectorize(self, node: ComputeOpNode, td: TileDict, block_size: int):
-        def is_cont(shape, vec):
-            if len(shape) == 0:
-                return vec == 1
-            last = shape[-1]
-            if last == 1:
-                return is_cont(shape[0:-1], vec // last)
-            else:
-                return last % vec == 0
-
-        def is_shape_aligned(shape, factor):
-            return int(np.prod(shape)) % factor == 0
-
-        def is_type_allowed(dtype, vec):
-            return dtype.bits * vec <= 128
-
-        vectorize_sizes = [16, 8, 4, 2]
-        dtypes = node.get_reduce_inputs_dtype()
-        shapes = node.propagate_reduction_inputs(td.get_tile(node), td.get_rstep(node))
-        vectorize_result = {}
-        for tensor, shape in shapes.items():
-            for v in vectorize_sizes:
-                if (
-                    is_shape_aligned(shape, block_size * v)
-                    and is_cont(shape, v)
-                    and is_type_allowed(dtypes[tensor], v)
-                ):
-                    vectorize_result[tensor] = v
-                    break
-        return vectorize_result
 
     def dfs_smem_tile(self, init_tile, rstep_map):
         visible_shape = self._get_visible_output_shape(self.canonical_output_node)

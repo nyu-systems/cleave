@@ -812,9 +812,6 @@ def apply_tiling(cand: List) -> List[Graph]:
             _normalize_inner_reduction_axes(graph_node, itile_map)
     lock_graph(graphs["main"])  # graph structure is fixed after this point
 
-    main_nodes = [
-        n for n in graphs["main"].nodes if not n.is_placeholder() and not n.is_output()
-    ]
     graphs["main"].nodes = find_topo_sort(main_output_nodes)
     canonical_output_binding = _get_output_binding_node(output_node)
     for node in graphs["main"].nodes:

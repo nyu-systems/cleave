@@ -5,7 +5,6 @@
 #include "cleave/superoptimizer/search/config.h"
 #include "cleave/superoptimizer/search/dim_strategy.h"
 #include "cleave/superoptimizer/search/op_utils.h"
-#include "cleave/superoptimizer/search/verification/formal_verifier.h"
 #include "cleave/superoptimizer/search/verification/probabilistic_verifier.h"
 #include "cleave/superoptimizer/type.h"
 #include "cleave/superoptimizer/utils/containers.h"
@@ -25,10 +24,9 @@ namespace search {
 KernelGraphGenerator::KernelGraphGenerator(
     kernel::Graph const &computation_graph,
     GeneratorConfig const &config,
-    char const *filename,
-    std::function<void(std::vector<SerializedSearchContext>)> call_back_on_valid_graph /* = nullptr*/)
+    char const *filename)
     : config(config), dim_strategy(DimStrategy(config)), filename(filename),
-      num_thread(config.search_thread), call_back_on_valid_graph(call_back_on_valid_graph),
+      num_thread(config.search_thread),
       num_total_random_tests(0), num_valid_kernel_graphs(0),
       num_total_states(0), num_tasks(0), max_depth(5) {
   preprocess(computation_graph);
@@ -91,7 +89,7 @@ std::vector<typename GraphType::TensorType>
   return output_tensors;
 }
 
-void KernelGraphGenerator::_on_valid_graph(std::vector<SerializedSearchContext> verified_graphs) const {  
+void KernelGraphGenerator::_on_valid_graph() const {  
   if (this->eager_save_viz_graphs) {
     std::vector<json> json_graphs = this->generated_graphs;
     std::string filename = this->filename;
@@ -106,9 +104,6 @@ void KernelGraphGenerator::_on_valid_graph(std::vector<SerializedSearchContext> 
       CSO_LOG(WARNING) << "Visualizer command failed with status " << status
                        << ": " << cmd;
     }
-  }
-  if (this->call_back_on_valid_graph) {
-    this->call_back_on_valid_graph(verified_graphs);
   }
 }
 
@@ -175,7 +170,6 @@ bool valid_split(cleave_superoptimizer::type::KNOperatorType op_type,
 void KernelGraphGenerator::generate_next_operator(
     SearchContext &c,
     std::function<bool(SearchContext const &)> const &verify,
-    std::vector<SerializedSearchContext> &verified,
     size_t depth) {
   int n_states = ++num_total_states;
   CSO_VLOG(1) << std::string(depth * 2, ' ')
@@ -186,8 +180,7 @@ void KernelGraphGenerator::generate_next_operator(
     show_statistics();
   }
   if (verify(c)) {
-    verified.push_back(SerializedSearchContext(c));
-    _on_valid_graph(verified);
+    _on_valid_graph();
     return;
   }
 
@@ -239,16 +232,14 @@ void KernelGraphGenerator::generate_next_operator(
 
       if (new_op) {
         c.kn_graph->operators.push_back(new_op);
-        // if (check_range(init_ranges, target_ranges, *c.kn_graph)) {
         if (depth < max_depth) {
           num_tasks++;
           SearchContext c_tmp = SerializedSearchContext(c).deserialize();
 #pragma omp task
-          { generate_next_operator(c_tmp, verify, verified, depth + 1); }
+          { generate_next_operator(c_tmp, verify, depth + 1); }
         } else {
-          generate_next_operator(c, verify, verified, depth + 1);
+          generate_next_operator(c, verify, depth + 1);
         }
-        // }
         delete c.kn_graph->operators.back();
         c.kn_graph->operators.pop_back();
       }
@@ -299,9 +290,9 @@ void KernelGraphGenerator::generate_next_operator(
             num_tasks++;
             SearchContext c_tmp = SerializedSearchContext(c).deserialize();
 #pragma omp task
-            { generate_next_operator(c_tmp, verify, verified, depth + 1); }
+            { generate_next_operator(c_tmp, verify, depth + 1); }
           } else {
-            generate_next_operator(c, verify, verified, depth + 1);
+            generate_next_operator(c, verify, depth + 1);
           }
           delete c.kn_graph->operators.back();
           c.kn_graph->operators.pop_back();
@@ -321,8 +312,6 @@ void KernelGraphGenerator::generate_kernel_graphs() {
     c.kn_graph->new_input(dim, can_reduce, can_split);
   }
 
-  std::vector<SerializedSearchContext> verified;
-
   CSO_LOG(INFO) << "[Search] Starting kernel graph generation with "
                 << num_thread << " threads";
 #pragma omp parallel num_threads(num_thread)
@@ -334,7 +323,6 @@ void KernelGraphGenerator::generate_kernel_graphs() {
           [this](SearchContext const &c) {
             return this->verify(*c.kn_graph);
           },
-          verified,
           0);
     }
   }
@@ -372,10 +360,6 @@ void KernelGraphGenerator::preprocess(kernel::Graph const &computation_graph) {
       computation_graph_patterns;
   abstract_expr_eval(computation_graph, computation_graph_patterns);
 
-  init_ranges = get_init_ranges(computation_graph);
-  target_ranges = get_interact_ranges(init_ranges, computation_graph);
-  assert(init_ranges.size() == target_ranges.size());
-
   for (kernel::KNOperator *op : computation_graph.operators) {
     if (op->op_type == type::KNOperatorType::KN_OUTPUT_OP) {
       computation_graph_output_patterns.push_back(
@@ -412,11 +396,7 @@ void KernelGraphGenerator::preprocess(kernel::Graph const &computation_graph) {
     }
   }
 
-  if (config.verifier_type == VerifierType::PROBABILISTIC_VERIFIER) {
-    this->verifier = std::make_shared<ProbabilisticVerifier>(computation_graph);
-  } else {
-    this->verifier = std::make_shared<FormalVerifier>(computation_graph);
-  }
+  this->verifier = std::make_shared<ProbabilisticVerifier>(computation_graph);
 }
 
 bool KernelGraphGenerator::check_pattern(
@@ -449,7 +429,7 @@ bool KernelGraphGenerator::verify(kernel::Graph &g) {
 #pragma omp critical
       { 
         generated_graphs.push_back(json(g)); 
-        _on_valid_graph({});
+        _on_valid_graph();
       }
     };
   char *env = std::getenv("CLEAVE_SUPEROPTIMIZER_DEBUG_SAVE");

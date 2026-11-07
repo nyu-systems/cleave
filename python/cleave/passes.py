@@ -111,9 +111,6 @@ def annotate_tinfo(graph: Graph, is_main: bool = False) -> Graph:
             }
             annotate_tinfo(node.graph, is_main=False)
 
-        # if isinstance(node.outputs[0].dst_node, OutputNode):
-        #     out_node = node.outputs[0].dst_node # so that it reuses the args buffer # TODO: enable this optimization
-
     return graph
 
 

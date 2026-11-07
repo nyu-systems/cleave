@@ -44,17 +44,3 @@ def coalesced_tensor_shape(
 
     # Compute the shape of the coalesced tensor
     return transaction_size * bytes / min(transaction_size, factor)
-
-
-def factorize(n: int) -> List[int]:
-    i = 2  # Start with the smallest prime number
-    result = []
-
-    # Iterate through numbers to find factors
-    while n > 1:
-        if n % i == 0:  # If i is a factor of n
-            n //= i  # Divide n by i and keep the integer part
-            result.append(i)
-        else:
-            i += 1  # Try the next number
-    return result

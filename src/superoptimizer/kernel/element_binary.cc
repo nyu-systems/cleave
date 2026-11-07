@@ -80,7 +80,6 @@ DTensor *Graph::elementbinary(DTensor const *input1,
 KNOperator *Graph::create_elementbinary_op(DTensor const &input1,
                                            DTensor const &input2,
                                            cleave_superoptimizer::type::KNOperatorType type) {
-  // DeviceMemoryManager *dmm = DeviceMemoryManager::get_instance();
   if (input1.num_dims != input2.num_dims) {
     return nullptr;
   }

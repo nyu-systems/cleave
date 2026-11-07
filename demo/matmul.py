@@ -12,8 +12,6 @@ from cleave.util import (
 
 
 DTYPE = "float16"
-ACCUM_DTYPE = "float32"
-OUT_DTYPE = "float16"
 
 
 def build_matmul(

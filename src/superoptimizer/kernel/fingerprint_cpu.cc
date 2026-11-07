@@ -706,14 +706,6 @@ cleave_superoptimizer::cpu::CTensor
 
 bool DTensor::has_same_fingerprint(
     cleave_superoptimizer::cpu::CTensor const &ref) const {
-  // if (num_dims != ref.num_dims) {
-  //   return false;
-  // }
-  // for (int i = 0; i < num_dims; i++) {
-  //   if (dim[i] != ref.dim[i]) {
-  //     return false;
-  //   }
-  // }
   if (num_elements() != ref.num_elements()) {
     return false;
   }

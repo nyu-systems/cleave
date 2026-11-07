@@ -4,7 +4,6 @@ from typing import Dict, List, Optional, Tuple
 
 import tilelang as tl
 import tvm
-from tilelang.carver.roller import Edge
 
 from ..graph import Graph, OutputNode, PlaceHolderNode
 from ..ops import (

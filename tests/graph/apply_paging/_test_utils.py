@@ -221,9 +221,3 @@ def operator_kernel_source(operator: str) -> str:
     spec, tiling = OPERATOR_CASES[operator]
     build = mla_paged_kernel_source if isinstance(spec, MLASpec) else paged_kernel_source
     return build(spec, **tiling)
-
-
-def build_operator_graph(operator: str):
-    spec, tiling = OPERATOR_CASES[operator]
-    build = build_mla_paged_graph if isinstance(spec, MLASpec) else build_paged_graph
-    return build(spec, **tiling)

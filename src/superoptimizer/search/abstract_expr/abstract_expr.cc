@@ -46,7 +46,6 @@ bool AbstractExpr::subpattern_to(AbstractExpr const &other) const {
   z3::params p(c);
   p.set("mbqi", true);
   p.set("rlimit", 80000u);
-  // p.set("timeout", 10u);
   s.set(p);
 
   z3::expr x = c.constant("x", P);
@@ -185,10 +184,6 @@ bool AbstractExpr::contains_subexpr(std::string const &other) const {
     return rec(n->input);
   }
   return false;
-}
-
-bool AbstractExpr::operator==(AbstractExpr const &other) const {
-  return subpattern_to(other) && other.subpattern_to(*this);
 }
 
 Var::Var(std::string const &name) : name(name) {}

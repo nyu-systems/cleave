@@ -21,7 +21,6 @@ public:
       to_z3(z3::context &c,
             std::unordered_set<std::string> &all_variables) const = 0;
   bool subpattern_to(AbstractExpr const &other) const;
-  bool operator==(AbstractExpr const &other) const;
   // True if `other` (a to_string()-serialized pattern) equals this expression
   // or any of its transitive sub-expressions. Used as a sound structural
   // fallback in subpattern_to when Z3 cannot decide within its resource limit.

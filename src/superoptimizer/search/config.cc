@@ -10,7 +10,6 @@ GeneratorConfig GeneratorConfig::get_default_config() {
   return {
       5 /* max_num_kernel_graph_op */,
       8 /* search_thread */,
-      VerifierType::PROBABILISTIC_VERIFIER,
       {
           type::KN_MATMUL_OP,
           type::KN_EXP_OP,
@@ -26,7 +25,6 @@ GeneratorConfig GeneratorConfig::get_default_config() {
           type::KN_ADD_OP,
           type::KN_MUL_OP,
           type::KN_DIV_OP,
-          // type::KN_REDUCTION_2_OP,
       } /* knop_to_explore */,
       false /* randomized_branches */,
       false /* enable_attention_specific_optimization */,

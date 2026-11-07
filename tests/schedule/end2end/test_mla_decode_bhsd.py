@@ -6,8 +6,6 @@ from tests.schedule.end2end._test_utils import run_end2end_candidates
 
 
 DTYPE = "float16"
-ACCUM_DTYPE = "float32"
-OUT_DTYPE = "float16"
 
 
 def test_mla_decode_bhsd():

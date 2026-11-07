@@ -12,8 +12,6 @@ from cleave.util import (
 
 
 DTYPE = "float16"
-ACCUM_DTYPE = "float32"
-OUT_DTYPE = "float16"
 
 
 def build_lora(
@@ -53,7 +51,6 @@ def build_lora(
 
     optimized_graphs = symbolic_graph.search_tile_graph(checkpoint_file, False, True, config)
 
-    cleave_graph = None
     candidates = []
     for optimized_graph in optimized_graphs:
         graph_structure = optimized_graph.get_graph_structure()

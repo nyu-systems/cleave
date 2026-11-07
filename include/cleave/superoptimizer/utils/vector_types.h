@@ -5,9 +5,3 @@ struct int3 {
   int y;
   int z;
 };
-
-struct dim3 {
-  unsigned int x;
-  unsigned int y;
-  unsigned int z;
-};

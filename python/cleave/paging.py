@@ -103,10 +103,6 @@ CAUSAL_KINDS = (PAGED_PREFILL_CAUSAL, RAGGED_PREFILL_CAUSAL)
 PAGED_KINDS = (PAGED_DECODE, PAGED_DECODE_SLAB, PAGED_PREFILL_CAUSAL)
 # The layers whose page table is indexed in pages rather than tokens.
 SLAB_KINDS = (PAGED_DECODE_SLAB,)
-# The layers split-KV is built for: one block per (request, kv head) with the whole KV
-# window to walk, which is where an extra grid axis over KV slices adds parallelism. Set
-# after the MLA kinds are declared below.
-SPLIT_KINDS = ()
 
 # Which `PagingSpec` fields each layer actually reads, for the fields that only some of
 # them do. Derived from the builders (including the tensor-map helpers they call) and used

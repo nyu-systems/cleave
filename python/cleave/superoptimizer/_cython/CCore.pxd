@@ -8,10 +8,6 @@ from libcpp cimport bool
 ctypedef unsigned long int size_t
 
 cdef extern from "cleave/superoptimizer/utils/vector_types.h":
-    ctypedef struct dim3:
-        unsigned int x
-        unsigned int y
-        unsigned int z
     ctypedef struct int3:
         int x
         int y
@@ -120,14 +116,9 @@ cdef extern from "cleave/superoptimizer/search/search_c.h" namespace "cleave_sup
                            const char * default_config)
 
 cdef extern from "cleave/superoptimizer/search/config.h" namespace "cleave_superoptimizer::search":
-    cdef enum VerifierType:
-        PROBABILISTIC_VERIFIER
-        FORMAL_VERIFIER
-
     cdef cppclass GeneratorConfig:
         size_t max_num_kernel_graph_op
         size_t search_thread
-        VerifierType verifier_type
         vector[KNOperatorType] knop_to_explore
         bool randomized_branches
         bool _enable_attention_specific_optimization
