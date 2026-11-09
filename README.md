@@ -48,82 +48,78 @@ package; nlohmann JSON headers come from `3rdparty/json`.
 
 ## Quickstart
 
-Run a small matmul search and benchmark:
+Search, compile and benchmark a matmul kernel:
 
 ```bash
-python demo/matmul.py --topk 100 --max_parallel 8
+python demo/matmul.py --preset fast --max-parallel 8
+python demo/matmul.py --split K:4,8,16     # also search split-K partial/combine plans
 ```
 
-Other demos cover fused RMSNorm+MatMul, SwiGLU, Split-K matmul, MHA, MQA, GQA,
-and MLA patterns:
+Every demo is a few lines: the operator written as a `@cleave.jit` function over
+`cleave.lang`, then `cleave.examples.main(...)` with its shapes, dtype, split and presets.
+All demos share the same flags (`python demo/<name>.py --help`):
 
-```bash
-ls demo
-```
+- one flag per dimension (`--M 256 --K 8192`), `--preset fast|default|exhaustive` (plus
+  demo-specific presets), `--topk`, `--split DIM:f1,f2` (`none` disables), `--max-ops`,
+  `--fusion auto|force|off`, `--max-parallel`, `--warmup/--iters`, `--no-cache`,
+  `--save DIR`, `-v`, `--json`.
 
-Use `--max_parallel` on demos to limit concurrent candidate compilation and GPU
-execution.
+| Demo | Operator |
+| --- | --- |
+| `matmul.py` | `X @ W`; `--split K:4,8,16` for split-K |
+| `rmsnorm_matmul.py` | `RMSNorm(X) @ W`; `--preset split-k` for the split-K shapes |
+| `swiglu.py`, `lora.py`, `matmul_rowsum.py` | SwiGLU, LoRA (`cleave.Program` builder), row-sum |
+| `matmul_matmul.py` | `(Q K^T) V`; `--preset split` for the split-KV decode shapes |
+| `{mha,gqa,mqa}_decode.py` | decode attention, split along `SKV` by default |
+| `mha_decode_exact.py` | decode attention with the exact `exp(s - max(s)) / sum` softmax |
+| `{mha,gqa,mqa,mla}_prefill.py`, `mla_decode.py`, `qknorm.py` | prefill / MLA / QK-norm attention |
+| `staged.py` | the pipeline one stage at a time (research view) |
+
+`demo/dynamic/` holds the paged-KV dynamic-shape demos.
 
 ## Search-to-Kernel Path
 
-Cleave follows a graph-first flow: describe a tensor graph, ask the
-superoptimizer for equivalent graph structures, convert them into Cleave graphs,
-search schedules, then compile and benchmark generated TileLang kernels.
+Cleave follows a graph-first flow: describe a tensor program, ask the superoptimizer for
+equivalent graph structures, search schedules for each, then compile, validate and
+benchmark the generated TileLang kernels. `cleave.compile` runs the whole pipeline; each
+stage is also a public function:
 
 ```python
-import cleave.superoptimizer as csopt
+import cleave
+import cleave.lang as cl
+from cleave.pipeline import schedule
 
-from cleave.integration import graph_structure_to_cleave
-from cleave.schedule import search_tiling
-from cleave.util import compile_and_run_candidates_parallel
 
-M, N, K = 128, 128, 4096
+@cleave.jit
+def matmul(x: cl.Tensor["M", "K"], w: cl.Tensor["K", "N"]):
+    return x @ w
 
-graph = csopt.new_tile_graph(split_enabled=[True, True])
-x = graph.create_tiled_input((M, K), (False, True))
-w = graph.create_tiled_input((K, N), (True, False))
-out = graph.matmul(x, w)
-graph.create_tiled_output(out)
 
-symbolic_graph, symbol_map = csopt.create_symbolic_tile_graph(graph)
-config = symbolic_graph.setup_search_config()
-config.search_thread = 16
+def main():
+    kernel = cleave.compile(matmul, shapes=dict(M=128, N=128, K=4096), dtype=cl.f16, preset="fast")
+    print(kernel.report.summary())
 
-optimized = symbolic_graph.search_tile_graph(
-    "checkpoint_matmul.json",
-    False,
-    True,
-    config,
-)
+    # The same compile, stage by stage.
+    prog = cleave.trace(matmul, dict(M=128, N=128, K=4096), cl.f16)
+    graphs = cleave.superoptimize(prog, cleave.SuperoptConfig(split=("K",)))
+    plans = schedule(graphs, cleave.ScheduleConfig(topk=100, split_k=(4, 8, 16)))
+    report = cleave.evaluate(cleave.build(plans, workers=8))
+    print(report.table(top=5, by="variant"))
+    print(report.best())
 
-candidates = []
-for opt_graph in optimized:
-    graph_structure = opt_graph.get_graph_structure()
-    cleave_graph = graph_structure_to_cleave(graph_structure, symbol_map=symbol_map)
-    candidates.extend(search_tiling(cleave_graph, topk=100))
 
-success_info, error_graphs, errors = [], [], []
-compile_and_run_candidates_parallel(
-    candidates,
-    [M, N, K],
-    "float16",
-    "matmul",
-    max_parallel=8,
-    success_info=success_info,
-    error_graphs=error_graphs,
-    errors=errors,
-)
+if __name__ == "__main__":  # candidate workers are spawned processes
+    main()
 ```
 
-See `demo/matmul.py` and `demo/rmsnorm_matmul.py` for complete runnable
-versions, including benchmarking.
+See `demo/staged.py` for a complete runnable version.
 
 ## Development
 
 Run the Python test suite:
 
 ```bash
-pip install pytest pytest-rerunfailures
+pip install pytest pytest-xdist
 pytest
 ```
 
@@ -133,7 +129,14 @@ targeted tests first:
 ```bash
 pytest tests/integration
 pytest tests/superoptimizer/python
+pytest -m "not gpu"   # markers: gpu, expected, search, slow
 ```
+
+Generated code is pinned two ways: `tests/graph/handwritten/expected_kernels`
+(hand-written schedules, checked by `test_expected_codegen.py`) and
+`tests/pipeline/snapshots` (hashes of every candidate from search through
+codegen). Regenerate them after an intended change with `--update-expected` or
+`--update-snapshots`, and review the diff.
 
 Useful environment variables:
 
@@ -145,8 +148,10 @@ Useful environment variables:
 
 ## Project Layout
 
-- `python/cleave/`: Python graph, scheduling, codegen, integration, and runtime
-  helpers.
+- `python/cleave/`: the Python package: `frontend`/`lang` (tracing), `ir` (graph, ops),
+  `lower` (superoptimizer graphs to IR), `schedule`, `codegen`, `runtime` (compile, validate,
+  time), `pipeline` (the staged API), `dynamic` (paged/ragged kernels) and `core` (settings,
+  target, `Session`).
 - `src/superoptimizer/`: C++ superoptimizer implementation.
 - `include/cleave/`: C++ public headers.
 - `demo/`: runnable search/codegen examples.

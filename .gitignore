@@ -288,3 +288,4 @@ tvm-site/
 # Logs
 log/
 log_viz/
+!tests/**/snapshots/*.json

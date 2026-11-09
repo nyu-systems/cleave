@@ -647,7 +647,7 @@
                 "num_dims": 4
             }
         ],
-        "op_type": "kn_reduction_3_op",
+        "op_type": "kn_reduce_sum_3_op",
         "output_tensors": [
             {
                 "can_reduce": [
@@ -710,7 +710,7 @@
                 "num_dims": 4
             }
         ],
-        "op_type": "kn_reduction_0_op",
+        "op_type": "kn_reduce_sum_0_op",
         "output_tensors": [
             {
                 "can_reduce": [

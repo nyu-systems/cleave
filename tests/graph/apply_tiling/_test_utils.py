@@ -11,10 +11,10 @@ from __future__ import annotations
 import pytest
 
 from cleave.arch import get_arch
-from cleave.graph import OutputNode
-from cleave.ops import Matmul
-from cleave.policy.default import DefaultPolicy, TCPolicy
-from cleave.util import compile_and_run_candidates_parallel
+from cleave.ir.graph import OutputNode
+from cleave.ir.ops import Matmul
+from cleave.schedule.policy.default import DefaultPolicy, TCPolicy
+from cleave.runtime.evaluate import run_candidates
 
 
 DTYPE = "float16"
@@ -61,18 +61,5 @@ def assert_candidate_compiles_and_runs(cand, *, compiler_pass_options=None):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required to compile and run candidates.")
 
-    success_info: list = []
-    error_graphs: list = []
-    errors: list = []
-    compile_and_run_candidates_parallel(
-        [cand],
-        DTYPE,
-        1,
-        success_info,
-        error_graphs,
-        errors,
-        compiler_pass_options=compiler_pass_options,
-    )
-
-    assert not errors, f"Candidate failed to compile/run: {errors[0]}"
-    assert len(success_info) == 1
+    (result,) = run_candidates([cand], DTYPE, max_parallel=1, compiler_pass_options=compiler_pass_options)
+    assert result.ok, f"Candidate failed to compile/run: {result.error}"

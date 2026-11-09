@@ -18,7 +18,7 @@ import pytest
 pytest.importorskip("tilelang")
 
 from tests.graph.apply_paging._test_utils import OPERATOR_CASES
-from cleave.paging import MLA_PAGED_PREFILL_CAUSAL, MLASpec
+from cleave.dynamic.paging import MLA_PAGED_PREFILL_CAUSAL, MLASpec
 
 # The shipped prefill tuning, as a base for the cases that need the prefill kind: its tiles
 # are one query block, too little work for the wide block a prefetch needs.
@@ -144,6 +144,6 @@ def test_accepts_the_shipped_specs(operator):
     """Both tuned MLA operators' specs must pass the gate they ship behind.
 
     Keyed off the operator registry rather than a second copy of the specs, so a tuning
-    change that trips a new assert fails here rather than in the golden test alone.
+    change that trips a new assert fails here rather than in the expected-kernel test alone.
     """
     OPERATOR_CASES[operator][0].validate()

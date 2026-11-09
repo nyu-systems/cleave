@@ -9,9 +9,12 @@
 #include "cleave/superoptimizer/kernel/element_binary.h"
 #include "cleave/superoptimizer/kernel/element_unary.h"
 #include "cleave/superoptimizer/kernel/matmul.h"
+#include "cleave/superoptimizer/kernel/reduction.h"
 #include "cleave/superoptimizer/kernel/rms_norm.h"
 
 #include <algorithm>
+#include <memory>
+#include <stdexcept>
 #include <iostream>
 
 namespace cleave_superoptimizer {
@@ -74,7 +77,7 @@ Graph *Graph::create_symbolic_graph(
   DimensionSymbolizer symbolizer(grouper, config);
 
   // Step 3: Create new symbolic graph
-  Graph *symbolic_graph = new Graph();
+  std::unique_ptr<Graph> symbolic_graph(new Graph());
 
   // Map from original tensor GUID to symbolic tensor
   std::unordered_map<size_t, DTensor> guid_to_symbolic_tensor;
@@ -102,7 +105,8 @@ Graph *Graph::create_symbolic_graph(
             orig_tensor.can_split + orig_tensor.num_dims);
 
         DTensor sym_tensor =
-            symbolic_graph->new_input(sym_dims, can_reduce_vec, can_split_vec);
+            symbolic_graph->new_input(sym_dims, can_reduce_vec, can_split_vec,
+                                      orig_tensor.dtype);
 
         // Store mapping
         guid_to_symbolic_tensor[orig_tensor.guid] = sym_tensor;
@@ -131,7 +135,8 @@ Graph *Graph::create_symbolic_graph(
 
       case KN_ADD_OP:
       case KN_MUL_OP:
-      case KN_DIV_OP: {
+      case KN_DIV_OP:
+      case KN_SUB_OP: {
         auto const *bin_op = dynamic_cast<KNElementBinaryOp const *>(op);
         if (bin_op && bin_op->has_scalar) {
           assert(op->input_tensors.size() == 1);
@@ -195,11 +200,11 @@ Graph *Graph::create_symbolic_graph(
         break;
       }
 
-      case KN_REDUCTION_0_OP:
-      case KN_REDUCTION_1_OP:
-      case KN_REDUCTION_2_OP:
-      case KN_REDUCTION_3_OP:
-      case KN_REDUCTION_4_OP: {
+      case KN_REDUCE_SUM_0_OP:
+      case KN_REDUCE_SUM_1_OP:
+      case KN_REDUCE_SUM_2_OP:
+      case KN_REDUCE_SUM_3_OP:
+      case KN_REDUCE_SUM_4_OP: {
         assert(op->input_tensors.size() == 1);
         DTensor const &input = op->input_tensors[0];
         DTensor const &output = op->output_tensors[0];
@@ -207,20 +212,34 @@ Graph *Graph::create_symbolic_graph(
         DTensor sym_input = guid_to_symbolic_tensor[input.guid];
 
         // Determine reduction dimension from operator type
-        int reduction_dim = op->op_type - KN_REDUCTION_0_OP;
+        int reduction_dim = op->op_type - KN_REDUCE_SUM_0_OP;
 
         // Get reduction size from output dimension
         int reduction_size = output.dim[reduction_dim];
 
         DTensor sym_output =
-            symbolic_graph->reduction(sym_input, reduction_dim, reduction_size);
+            symbolic_graph->reduce_sum(sym_input, reduction_dim, reduction_size);
 
         guid_to_symbolic_tensor[op->output_tensors[0].guid] = sym_output;
         break;
       }
 
+      case KN_REDUCE_MAX_0_OP:
+      case KN_REDUCE_MAX_1_OP:
+      case KN_REDUCE_MAX_2_OP:
+      case KN_REDUCE_MAX_3_OP:
+      case KN_REDUCE_MAX_4_OP: {
+        DTensor sym_input = guid_to_symbolic_tensor[op->input_tensors[0].guid];
+        guid_to_symbolic_tensor[op->output_tensors[0].guid] =
+            symbolic_graph->reduce_max(sym_input,
+                                          op->op_type - KN_REDUCE_MAX_0_OP);
+        break;
+      }
+
       case KN_RMS_NORM_OP: {
-        assert(false); // TODO: disable for safety because normalized_shape is not stored
+        // TODO: disabled because normalized_shape is not stored
+        CSO_THROW(std::runtime_error,
+                  "Symbolizing rms_norm is not supported");
         assert(op->input_tensors.size() >= 1);
         DTensor const &input = op->input_tensors[0];
         DTensor const &output = op->output_tensors[0];
@@ -286,7 +305,7 @@ Graph *Graph::create_symbolic_graph(
     }
   }
 
-  return symbolic_graph;
+  return symbolic_graph.release();
 }
 
 // Helper function to get actual input tensor (not the copy)
@@ -327,10 +346,12 @@ void Graph::infer_reducibility() {
           if (input_op->infer_can_split) {
             tensor.can_split[i] = tensor.can_reduce[i];
           } else if (tensor.can_split[i] && !tensor.can_reduce[i]) {
-            CSO_LOG(FATAL)
-                << "Input tensor " << tensor.guid << " dimension " << i
-                << " was marked can_split=true, but inferred can_reduce=false. "
-                   "Requested input split dimensions must be reducible.";
+            CSO_THROW(std::invalid_argument,
+                      "Input tensor "
+                          << tensor.guid << " dimension " << i
+                          << " was marked can_split=true, but inferred "
+                             "can_reduce=false. Requested input split "
+                             "dimensions must be reducible.");
           }
         }
       }
@@ -348,12 +369,12 @@ void Graph::propagate_reducibility_backward(KNOperator *op) {
       // Output dimensions remain false (not reduced in output)
       break;
 
-    case type::KN_REDUCTION_0_OP:
-    case type::KN_REDUCTION_1_OP:
-    case type::KN_REDUCTION_2_OP:
-    case type::KN_REDUCTION_3_OP:
-    case type::KN_REDUCTION_4_OP:
-      propagate_reduction_op(op);
+    case type::KN_REDUCE_SUM_0_OP:
+    case type::KN_REDUCE_SUM_1_OP:
+    case type::KN_REDUCE_SUM_2_OP:
+    case type::KN_REDUCE_SUM_3_OP:
+    case type::KN_REDUCE_SUM_4_OP:
+      propagate_reduce_sum_op(op);
       break;
 
     case type::KN_SPLIT_0_OP:
@@ -386,6 +407,7 @@ void Graph::propagate_reducibility_backward(KNOperator *op) {
     case type::KN_ADD_OP:
     case type::KN_MUL_OP:
     case type::KN_DIV_OP:
+    case type::KN_SUB_OP:
       if (auto *bin_op = dynamic_cast<KNElementBinaryOp *>(op);
           bin_op && bin_op->has_scalar) {
         propagate_elementwise_unary_op(op);
@@ -398,20 +420,28 @@ void Graph::propagate_reducibility_backward(KNOperator *op) {
       propagate_rms_norm_op(op);
       break;
 
+    case type::KN_REDUCE_MAX_0_OP:
+    case type::KN_REDUCE_MAX_1_OP:
+    case type::KN_REDUCE_MAX_2_OP:
+    case type::KN_REDUCE_MAX_3_OP:
+    case type::KN_REDUCE_MAX_4_OP:
+      propagate_reduce_max_op(op);
+      break;
+
     default:
       // Unknown operator - conservative: don't propagate
       break;
   }
 }
 
-void Graph::propagate_reduction_op(KNOperator *op) {
+void Graph::propagate_reduce_sum_op(KNOperator *op) {
   assert(op->input_tensors.size() == 1);
   assert(op->output_tensors.size() == 1);
 
   DTensor const &output = op->output_tensors[0];
   DTensor &input = get_input_tensor(op, 0);
 
-  int reduction_dim = op->op_type - type::KN_REDUCTION_0_OP;
+  int reduction_dim = op->op_type - type::KN_REDUCE_SUM_0_OP;
 
   // Rule 1: Mark the reduced dimension as can_reduce=true
   if (reduction_dim < input.num_dims) {
@@ -500,6 +530,19 @@ void Graph::propagate_elementwise_binary_op(KNOperator *op) {
   }
 }
 
+// Opaque max cannot be split-and-combined by sum, so the reduced dim is never
+// marked reducible; other dims map through unchanged.
+void Graph::propagate_reduce_max_op(KNOperator *op) {
+  DTensor const &output = op->output_tensors[0];
+  DTensor &input = get_input_tensor(op, 0);
+  int reduced = op->op_type - type::KN_REDUCE_MAX_0_OP;
+  for (int i = 0; i < output.num_dims; i++) {
+    if (i != reduced && output.can_reduce[i]) {
+      input.can_reduce[i] = true;
+    }
+  }
+}
+
 void Graph::propagate_rms_norm_op(KNOperator *op) {
   // RMS norm normalizes over certain dimensions
   // For now, treat like element-wise unary
@@ -512,145 +555,211 @@ void to_json(json &j, Graph const &g) {
   }
 }
 
-void from_json(json const &j, Graph &g) {
-  std::unordered_map<size_t, size_t>
-      guid_mapping; // from deseralized guid to json guid
+namespace {
 
-  auto get_tensor_from_guid = [&](size_t guid) {
-    for (auto const &op : g.operators) {
-      for (DTensor const &dtensor : op->output_tensors) {
-        if (guid_mapping.at(dtensor.guid) == guid) {
-          return dtensor;
-        }
+// Everything needed to re-create one operator; filled from JSON or from a
+// live operator so from_json and clone() share one construction path.
+struct OpSpec {
+  type::KNOperatorType op_type = type::KN_UNKOWN;
+  std::vector<DTensor> inputs;
+  std::vector<int> dims;
+  std::vector<bool> can_reduce, can_split;
+  type::DataType dtype = type::DT_UNKNOWN;
+  bool infer_can_split = false;
+  bool trans_A = false, trans_B = false;
+  bool has_scalar = false, scalar_on_left = false;
+  float scalar = 0.0f;
+  float min_val = 0.0f, max_val = 0.0f;
+  int reduction_size = 1;
+  int normalized_size = 0;
+};
+
+// Appends the op described by `s` to `g`; returns its output (nullptr for
+// output ops).
+DTensor const *append_op(Graph &g, OpSpec const &s) {
+  using type::OpCategory;
+  KNOperator *op = nullptr;
+  switch (type::op_category(s.op_type)) {
+    case OpCategory::INPUT:
+      op = g.create_input_op(s.dims, s.can_reduce, s.can_split, s.dtype);
+      static_cast<KNInputOp *>(op)->infer_can_split = s.infer_can_split;
+      break;
+    case OpCategory::OUTPUT:
+      g.mark_output(s.inputs.at(0), /*infer_output_reducibility=*/false);
+      return nullptr;
+    case OpCategory::MATMUL:
+      op = g.create_matmul_op(s.inputs.at(0), s.inputs.at(1), s.trans_A,
+                              s.trans_B);
+      break;
+    case OpCategory::UNARY:
+      op = g.create_elementunary_op(s.inputs.at(0), s.op_type);
+      break;
+    case OpCategory::CLAMP:
+      op = g.create_elementunary_clamp_op(s.inputs.at(0), s.min_val,
+                                          s.max_val);
+      break;
+    case OpCategory::BINARY:
+      op = s.has_scalar
+               ? g.create_elementbinary_op(s.inputs.at(0), s.scalar,
+                                           s.scalar_on_left, s.op_type)
+               : g.create_elementbinary_op(s.inputs.at(0), s.inputs.at(1),
+                                           s.op_type);
+      break;
+    case OpCategory::REDUCE_SUM:
+      op = g.create_reduce_sum_op(s.inputs.at(0),
+                                 s.op_type - type::KN_REDUCE_SUM_0_OP,
+                                 s.reduction_size);
+      break;
+    case OpCategory::REDUCE_MAX:
+      op = g.create_reduce_max_op(s.inputs.at(0),
+                                     s.op_type - type::KN_REDUCE_MAX_0_OP);
+      break;
+    case OpCategory::SPLIT:
+      op = g.create_split_op(s.inputs.at(0), s.op_type - type::KN_SPLIT_0_OP);
+      break;
+    case OpCategory::RMS_NORM: {
+      // Only normalized_size is stored: recover the trailing dims it spans.
+      DTensor const &in = s.inputs.at(0);
+      std::vector<int> shape;
+      int prod = 1;
+      for (int d = in.num_dims - 1; d >= 0 && prod < s.normalized_size; d--) {
+        prod *= in.dim[d];
+        shape.insert(shape.begin(), in.dim[d]);
       }
+      op = s.inputs.size() > 1
+               ? g.create_rms_norm_op(in, s.inputs[1], shape)
+               : g.create_rms_norm_op(in, shape);
+      break;
     }
-    assert(false);
+    default:
+      break;
+  }
+  CSO_REQUIRE(op != nullptr, std::runtime_error,
+              "Cannot rebuild operator type " << static_cast<int>(s.op_type));
+  g.operators.push_back(op);
+  return &op->output_tensors[0];
+}
+
+} // namespace
+
+Graph *Graph::clone() const {
+  std::unique_ptr<Graph> g(new Graph());
+  std::unordered_map<type::GuidType, DTensor> mapped;
+  for (KNOperator const *op : operators) {
+    OpSpec s;
+    s.op_type = op->op_type;
+    for (DTensor const &t : op->input_tensors) {
+      s.inputs.push_back(mapped.at(t.guid));
+    }
+    switch (type::op_category(op->op_type)) {
+      case type::OpCategory::INPUT: {
+        DTensor const &t = op->output_tensors[0];
+        s.dims.assign(t.dim, t.dim + t.num_dims);
+        s.can_reduce.assign(t.can_reduce, t.can_reduce + t.num_dims);
+        s.can_split.assign(t.can_split, t.can_split + t.num_dims);
+        s.dtype = t.dtype;
+        s.infer_can_split = static_cast<KNInputOp const *>(op)->infer_can_split;
+        break;
+      }
+      case type::OpCategory::MATMUL: {
+        auto const *m = static_cast<KNMatmulOp const *>(op);
+        s.trans_A = m->trans_A;
+        s.trans_B = m->trans_B;
+        break;
+      }
+      case type::OpCategory::CLAMP: {
+        auto const *c = static_cast<KNClampUnaryOp const *>(op);
+        s.min_val = c->min_val;
+        s.max_val = c->max_val;
+        break;
+      }
+      case type::OpCategory::BINARY: {
+        auto const *b = static_cast<KNElementBinaryOp const *>(op);
+        s.has_scalar = b->has_scalar;
+        s.scalar = b->scalar;
+        s.scalar_on_left = b->scalar_on_left;
+        break;
+      }
+      case type::OpCategory::REDUCE_SUM:
+        s.reduction_size =
+            static_cast<KNReduceSumOp const *>(op)->reduction_dim_size;
+        break;
+      case type::OpCategory::RMS_NORM:
+        s.normalized_size =
+            static_cast<KNRMSNormOp const *>(op)->normalized_size;
+        break;
+      default:
+        break;
+    }
+    DTensor const *out = append_op(*g, s);
+    if (out != nullptr) {
+      mapped[op->output_tensors[0].guid] = *out;
+    }
+  }
+  return g.release();
+}
+
+void from_json(json const &j, Graph &g) {
+  // json guid -> deserialized tensor
+  std::unordered_map<size_t, DTensor> mapped;
+  auto tensor_at = [&](json const &jt) {
+    size_t guid = jt.at("guid").get<size_t>();
+    auto it = mapped.find(guid);
+    CSO_REQUIRE(it != mapped.end(), std::runtime_error,
+                "Graph JSON references unknown tensor guid " << guid);
+    return it->second;
   };
 
   for (json const &jop : j) {
-    type::KNOperatorType op_type;
-    jop.at("op_type").get_to(op_type);
-    switch (op_type) {
-      case type::KNOperatorType::KN_INPUT_OP: {
-        int num_dim, dim[MAX_TENSOR_DIMS];
-        bool can_reduce_arr[MAX_TENSOR_DIMS];
-        bool can_split_arr[MAX_TENSOR_DIMS];
-        size_t guidO;
-        jop.at("output_tensors")[0].at("num_dims").get_to(num_dim);
-        jop.at("output_tensors")[0].at("dim").get_to(dim);
-        jop.at("output_tensors")[0].at("can_reduce").get_to(can_reduce_arr);
-        jop.at("output_tensors")[0].at("can_split").get_to(can_split_arr);
-        jop.at("output_tensors")[0].at("guid").get_to(guidO);
-        std::vector<int> dims = to_vector(num_dim, dim);
-        std::vector<bool> can_reduce = to_vector(num_dim, can_reduce_arr);
-        std::vector<bool> can_split = to_vector(num_dim, can_split_arr);
-        DTensor const &output = g.new_input(dims, can_reduce, can_split);
-        guid_mapping[output.guid] = guidO;
-        break;
+    OpSpec s;
+    jop.at("op_type").get_to(s.op_type);
+    CSO_REQUIRE(type::op_category(s.op_type) != type::OpCategory::META &&
+                    type::op_category(s.op_type) != type::OpCategory::CONCAT,
+                std::runtime_error,
+                "Cannot deserialize operator type "
+                    << static_cast<int>(s.op_type));
+    if (s.op_type == type::KN_INPUT_OP) {
+      json const &jout = jop.at("output_tensors")[0];
+      int num_dim = jout.at("num_dims").get<int>();
+      CSO_REQUIRE(num_dim <= MAX_TENSOR_DIMS, std::runtime_error,
+                  "Graph JSON input has more than " << MAX_TENSOR_DIMS
+                                                    << " dims");
+      int dim[MAX_TENSOR_DIMS];
+      bool can_reduce_arr[MAX_TENSOR_DIMS];
+      bool can_split_arr[MAX_TENSOR_DIMS];
+      jout.at("dim").get_to(dim);
+      jout.at("can_reduce").get_to(can_reduce_arr);
+      jout.at("can_split").get_to(can_split_arr);
+      s.dims = to_vector(num_dim, dim);
+      s.can_reduce = to_vector(num_dim, can_reduce_arr);
+      s.can_split = to_vector(num_dim, can_split_arr);
+      s.dtype = type::data_type_from_string(jout.value("dtype", std::string()));
+    } else {
+      // Scalar binary ops serialize their single tensor operand only.
+      size_t n = jop.contains("scalar") ? 1 : jop.at("input_tensors").size();
+      for (size_t i = 0; i < n; i++) {
+        s.inputs.push_back(tensor_at(jop.at("input_tensors")[i]));
       }
-      case type::KNOperatorType::KN_OUTPUT_OP: {
-        size_t guid;
-        jop.at("input_tensors")[0].at("guid").get_to(guid);
-        g.mark_output(get_tensor_from_guid(guid),
-                      /*infer_output_reducibility=*/false);
-        break;
-      }
-      case type::KNOperatorType::KN_MATMUL_OP: {
-        size_t guidA, guidB, guidO;
-        bool trans_A = false;
-        bool trans_B = false;
-        jop.at("input_tensors")[0].at("guid").get_to(guidA);
-        jop.at("input_tensors")[1].at("guid").get_to(guidB);
-        jop.at("output_tensors")[0].at("guid").get_to(guidO);
-        if (jop.contains("trans_A")) {
-          jop.at("trans_A").get_to(trans_A);
-        }
-        if (jop.contains("trans_B")) {
-          jop.at("trans_B").get_to(trans_B);
-        }
-        DTensor const &output =
-            g.matmul(get_tensor_from_guid(guidA),
-                     get_tensor_from_guid(guidB),
-                     trans_A,
-                     trans_B);
-        guid_mapping[output.guid] = guidO;
-        break;
-      }
-      case type::KNOperatorType::KN_EXP_OP:
-      case type::KNOperatorType::KN_SQUARE_OP:
-      case type::KNOperatorType::KN_SQRT_OP:
-      case type::KNOperatorType::KN_SILU_OP:
-      case type::KNOperatorType::KN_GELU_OP:
-      case type::KNOperatorType::KN_RELU_OP: {
-        size_t guid, guidO;
-        jop.at("input_tensors")[0].at("guid").get_to(guid);
-        jop.at("output_tensors")[0].at("guid").get_to(guidO);
-        DTensor const &output =
-            g.elementunary(get_tensor_from_guid(guid), op_type);
-        guid_mapping[output.guid] = guidO;
-        break;
-      }
-      case type::KNOperatorType::KN_CLAMP_OP: {
-        size_t guid, guidO;
-        jop.at("input_tensors")[0].at("guid").get_to(guid);
-        jop.at("output_tensors")[0].at("guid").get_to(guidO);
-        DTensor const &output =
-            g.elementunary_clamp(get_tensor_from_guid(guid), type::CLAMP_MIN_MAX["min_val"], type::CLAMP_MIN_MAX["max_val"]);
-        guid_mapping[output.guid] = guidO;
-        break;
-      }
-      case type::KNOperatorType::KN_DIV_OP:
-      case type::KNOperatorType::KN_ADD_OP:
-      case type::KNOperatorType::KN_MUL_OP: {
-        size_t guidA, guidO;
-        jop.at("input_tensors")[0].at("guid").get_to(guidA);
-        jop.at("output_tensors")[0].at("guid").get_to(guidO);
-        DTensor const &input = get_tensor_from_guid(guidA);
-        if (jop.contains("scalar")) {
-          float scalar = jop.at("scalar").get<float>();
-          bool scalar_on_left = jop.value("scalar_on_left", false);
-          DTensor const &output =
-              g.elementbinary(input, scalar, scalar_on_left, op_type);
-          guid_mapping[output.guid] = guidO;
-        } else {
-          size_t guidB;
-          jop.at("input_tensors")[1].at("guid").get_to(guidB);
-          DTensor const &output = g.elementbinary(
-              input, get_tensor_from_guid(guidB), op_type);
-          guid_mapping[output.guid] = guidO;
-        }
-        break;
-      }
-      case type::KNOperatorType::KN_REDUCTION_0_OP:
-      case type::KNOperatorType::KN_REDUCTION_1_OP:
-      case type::KNOperatorType::KN_REDUCTION_2_OP:
-      case type::KNOperatorType::KN_REDUCTION_3_OP:
-      case type::KNOperatorType::KN_REDUCTION_4_OP: {
-        size_t guid, guidO;
-        jop.at("input_tensors")[0].at("guid").get_to(guid);
-        jop.at("output_tensors")[0].at("guid").get_to(guidO);
-        DTensor const &output =
-            g.reduction(get_tensor_from_guid(guid),
-                        op_type - type::KNOperatorType::KN_REDUCTION_0_OP);
-        guid_mapping[output.guid] = guidO;
-        break;
-      }
-      case type::KNOperatorType::KN_SPLIT_0_OP:
-      case type::KNOperatorType::KN_SPLIT_1_OP:
-      case type::KNOperatorType::KN_SPLIT_2_OP:
-      case type::KNOperatorType::KN_SPLIT_3_OP:
-      case type::KNOperatorType::KN_SPLIT_4_OP: {
-        size_t guid, guidO;
-        jop.at("input_tensors")[0].at("guid").get_to(guid);
-        jop.at("output_tensors")[0].at("guid").get_to(guidO);
-        DTensor const &output =
-            g.split(get_tensor_from_guid(guid),
-                    op_type - type::KNOperatorType::KN_SPLIT_0_OP);
-        guid_mapping[output.guid] = guidO;
-        break;
-      }
-      default:
-        assert(false && "Cannot deserialize this operator");
+    }
+    s.trans_A = jop.value("trans_A", false);
+    s.trans_B = jop.value("trans_B", false);
+    if (jop.contains("scalar")) {
+      s.has_scalar = true;
+      s.scalar = jop.at("scalar").get<float>();
+      s.scalar_on_left = jop.value("scalar_on_left", false);
+    }
+    if (s.op_type == type::KN_CLAMP_OP) {
+      s.min_val = type::CLAMP_MIN_MAX["min_val"];
+      s.max_val = type::CLAMP_MIN_MAX["max_val"];
+    }
+    if (s.op_type == type::KN_RMS_NORM_OP) {
+      // Not serialized; assume the last dim (as create_symbolic_graph does).
+      DTensor const &in = s.inputs.at(0);
+      s.normalized_size = in.dim[in.num_dims - 1];
+    }
+    DTensor const *out = append_op(g, s);
+    if (out != nullptr) {
+      mapped[jop.at("output_tensors")[0].at("guid").get<size_t>()] = *out;
     }
   }
 }

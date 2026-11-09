@@ -30,7 +30,7 @@ def build_gqa_flash_decode():
     A = concrete_graph.div(A, (d**0.5))
     A = concrete_graph.add(A, -50 / (d**0.5))
     E = concrete_graph.exp(A)
-    S = concrete_graph.reduction(E, 3)
+    S = concrete_graph.reduce_sum(E, 3)
     D = concrete_graph.div(E, S)
     O = concrete_graph.matmul(D, V)
     concrete_graph.create_tiled_output(O)

@@ -37,7 +37,8 @@ DTensor Graph::matmul(DTensor const &A,
                       bool trans_A,
                       bool trans_B) {
   KNOperator *op = create_matmul_op(A, B, trans_A, trans_B);
-  assert(op != nullptr);
+  CSO_REQUIRE(op != nullptr, std::invalid_argument,
+              __func__ << ": incompatible operand shapes or attributes");
   operators.push_back(op);
   DTensor output = op->output_tensors[0];
   return output;
@@ -48,7 +49,8 @@ DTensor *Graph::matmul(DTensor const *A,
                        bool trans_A,
                        bool trans_B) {
   KNOperator *op = create_matmul_op(*A, *B, trans_A, trans_B);
-  assert(op != nullptr);
+  CSO_REQUIRE(op != nullptr, std::invalid_argument,
+              __func__ << ": incompatible operand shapes or attributes");
   operators.push_back(op);
   return &op->output_tensors[0];
 }
@@ -154,6 +156,7 @@ KNMatmulOp::KNMatmulOp(Graph *_kgraph,
   C.can_reduce[C.num_dims - 1] = B.can_reduce[dims.b_col_idx];
   C.can_split[C.num_dims - 1] = B.can_split[dims.b_col_idx];
   C.owner_op = this;
+  C.dtype = A.dtype;
   C.owner_ts_idx = 0;
   C.guid = DTensor::next_guid++;
   assert(output_tensors.size() == 0);

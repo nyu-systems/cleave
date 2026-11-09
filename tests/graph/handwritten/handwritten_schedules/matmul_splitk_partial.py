@@ -1,7 +1,7 @@
-from cleave import passes
-from cleave.graph import Graph, Iterator, GraphNode, OutputNode
-from cleave.ops import Matmul
-from cleave.util import gather_all_nodes, lock_graph
+from cleave.codegen import passes
+from cleave.ir.graph import Graph, Iterator, GraphNode, OutputNode
+from cleave.ir.ops import Matmul
+from cleave.ir.graph_utils import gather_all_nodes, lock_graph
 
 DTYPE = "float16"
 ACCUM_DTYPE = "float32"

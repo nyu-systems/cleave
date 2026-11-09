@@ -12,13 +12,11 @@ contribute zero tiles for it and still map every later request correctly.
 
 import pytest
 
-from tests.graph.handwritten import _paged_reference as ref
-from tests.graph.handwritten._test_utils import (
-    GATHER_TOLERANCE,
-    _load_main_kernel_from_code,
-    ensure_main_graph_threads,
-)
+from cleave.dynamic import GATHER_TOLERANCE
+from cleave.dynamic import reference as ref
+from cleave.runtime.compile import _load_main_kernel_from_code
 from tests.graph.handwritten.handwritten_schedules import (
+    ensure_main_graph_threads,
     gqa_paged_decode_h32_kv4_d128_ps1,
     gqa_paged_decode_h32_kv8_d128_ps1,
     gqa_paged_decode_h32_kv8_d128_ps64,
@@ -30,7 +28,7 @@ from tests.graph.handwritten.handwritten_schedules import (
     mla_paged_prefill_causal_h16_ckv512_kpe64_ps1,
 )
 from cleave.codegen import TilelangCodeGen
-from cleave.util.runtime import compile_and_run_prim_func
+from cleave.runtime.compile import compile_and_run_prim_func
 
 MLA_SM_SCALE = 0.1352337747812271
 

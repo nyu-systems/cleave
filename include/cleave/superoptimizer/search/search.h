@@ -1,7 +1,11 @@
 #pragma once
 
 #include <atomic>
+#include <exception>
 #include <functional>
+#include <mutex>
+#include <shared_mutex>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -43,7 +47,8 @@ private:
   std::vector<std::shared_ptr<AbstractExpr>> computation_graph_output_patterns;
   std::vector<std::tuple<std::vector<int>,
                          std::vector<bool>,
-                         std::vector<bool>>>
+                         std::vector<bool>,
+                         type::DataType>>
       computation_graph_input_attrs;
   std::vector<ScalarBinarySpec> scalar_binary_specs;
 
@@ -59,11 +64,19 @@ private:
   std::atomic<int> num_tasks;
   size_t max_depth;
 
-  //
+  // Shared across OpenMP tasks; guarded by seen_patterns_mutex.
   std::unordered_map<std::string, bool> seen_patterns;
+  std::shared_mutex seen_patterns_mutex;
 
   // Verifier
   std::shared_ptr<Verifier> verifier;
+
+  // First exception thrown inside an OpenMP region; rethrown after the
+  // region ends (an exception escaping a task/parallel region terminates).
+  std::exception_ptr search_error;
+  std::mutex search_error_mutex;
+  std::atomic<bool> search_failed{false};
+  void record_search_error(std::exception_ptr e);
 
   void generate_next_operator(
       SearchContext &c,

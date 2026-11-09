@@ -4,19 +4,13 @@ import difflib
 from pathlib import Path
 
 from cleave.codegen import TilelangCodeGen
-from cleave.util import (
-    DEFAULT_TOLERANCE,
-    Tolerance,
-    compile_and_run,
-    compile_and_run_prim_func,
-)
-from cleave.util.env import _gpu_exec_guard
-from cleave.util.graph_executor import build_inputs_and_reference, torch_dtype
-from cleave.util.runtime import (
-    _compile,
-    _load_main_kernel_from_code,
-    _validate_kernel_outputs,
-)
+from cleave.dynamic import EXPECTED_KERNELS_DIR
+from cleave.runtime.validate import DEFAULT_TOLERANCE, Tolerance
+from cleave.runtime.compile import check_code, compile_and_run_prim_func
+from cleave.runtime.gpu import _gpu_exec_guard
+from cleave.runtime.reference import build_inputs_and_reference, torch_dtype
+from cleave.runtime.compile import _compile, _load_main_kernel_from_code
+from cleave.runtime.validate import _validate_kernel_outputs
 
 from tests.graph.handwritten.handwritten_schedules import ensure_main_graph_threads
 
@@ -25,20 +19,19 @@ from tests.graph.handwritten.handwritten_schedules import ensure_main_graph_thre
 # but both name the SAME physical partial buffer (see codegen ``_get_partial_name``).
 _SCRATCH_SUFFIXES = ("_split", "_combine")
 
-EXPECTED_KERNELS_DIR = Path(__file__).resolve().parent / "expected_kernels"
-
-# The tolerance the paged/ragged gather kernels are held to. They reproduce the
-# SOL-ExecBench references far more tightly than the legacy loose bound (measured off-tree:
-# output cosine >= 0.99999, lse error <= 1e-5), so the 0.5 bound the older kernels
-# grandfather in would not be meaningful for them. ``equal_nan`` stays off: a causal row
-# with an empty KV window is defined to be 0 in the output and -inf in the lse, not NaN,
-# so a NaN anywhere is a real defect and must fail (SOL-ExecBench's own sanity check
-# rejects NaN unconditionally).
-GATHER_TOLERANCE = Tolerance(rtol=0.01, atol=0.01, equal_nan=False)
 
 
 def _expected_kernel_path(kernel_name: str) -> Path:
     return EXPECTED_KERNELS_DIR / f"{kernel_name}.py"
+
+
+def gen_handwritten_code(graph) -> str:
+    ensure_main_graph_threads(graph)
+    return TilelangCodeGen().gen(graph)
+
+
+def update_expected_tilelang_kernel(kernel_name: str, generated_code: str) -> None:
+    _expected_kernel_path(kernel_name).write_text(generated_code, encoding="utf-8")
 
 
 def assert_expected_tilelang_kernel(kernel_name: str, generated_code: str) -> None:
@@ -63,7 +56,7 @@ def assert_expected_tilelang_kernel(kernel_name: str, generated_code: str) -> No
 def _kernel_input_buffers(kernel):
     """The compiled kernel's input buffers, in parameter order.
 
-    Mirrors :func:`cleave.util.graph_executor.order_inputs_for_kernel`'s param walk,
+    Mirrors :func:`cleave.runtime.reference.order_inputs_for_kernel`'s param walk,
     but returns the buffers (not just names) so callers can size scratch tensors
     from the kernel's own declared shapes/dtypes rather than hand-coded dims.
     """
@@ -156,7 +149,7 @@ def run_handwritten_test(
 
     As a generic escape hatch, a caller may instead supply explicit
     ``make_inputs_fn`` / ``reference_fn`` closures plus ``out_idx`` (mirroring
-    ``cleave.util.compile_and_run_prim_func``). No in-tree test needs this today --
+    ``cleave.runtime.compile.compile_and_run_prim_func``). No in-tree test needs this today --
     every layout, including interior-head ``bshd`` attention (via ``PermuteView``),
     is expressible as a ``source_graph`` -- but the path is kept for one-off kernels
     whose reference has no cleave-graph equivalent.
@@ -165,8 +158,7 @@ def run_handwritten_test(
     it is checked against a sequence of workloads rather than a single one: ``workloads_fn``
     yields ``(inputs, reference)`` pairs and ``out_idx`` names the outputs.
     """
-    ensure_main_graph_threads(graph)
-    code_str = TilelangCodeGen().gen(graph)
+    code_str = gen_handwritten_code(graph)
     print("Generated Code:")
     print(code_str)
 
@@ -196,4 +188,4 @@ def run_handwritten_test(
         )
         return
 
-    compile_and_run(code_str, graph=source_graph, dtype=dtype, tolerance=tolerance)
+    check_code(code_str, graph=source_graph, dtype=dtype, tolerance=tolerance)

@@ -9,7 +9,8 @@ using namespace cleave_superoptimizer::type;
 
 DTensor Graph::split(DTensor const &input, int dim) {
   KNOperator *op = create_split_op(input, dim);
-  assert(op != nullptr);
+  CSO_REQUIRE(op != nullptr, std::invalid_argument,
+              __func__ << ": incompatible operand shapes or attributes");
   operators.push_back(op);
   assert(op->output_tensors.size() == 1);
   DTensor output = op->output_tensors[0];
@@ -18,7 +19,8 @@ DTensor Graph::split(DTensor const &input, int dim) {
 
 DTensor *Graph::split(DTensor const *input, int dim) {
   KNOperator *op = create_split_op(*input, dim);
-  assert(op != nullptr);
+  CSO_REQUIRE(op != nullptr, std::invalid_argument,
+              __func__ << ": incompatible operand shapes or attributes");
   operators.push_back(op);
   assert(op->output_tensors.size() == 1);
   return &op->output_tensors[0];

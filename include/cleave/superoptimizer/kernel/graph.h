@@ -2,6 +2,8 @@
 
 #include "cleave/superoptimizer/kernel/device_tensor.h"
 #include "cleave/superoptimizer/kernel/operator.h"
+#include "cleave/superoptimizer/utils/logging.h"
+#include <stdexcept>
 #include <unordered_map>
 #include <vector>
 
@@ -17,13 +19,16 @@ public:
   // input operator
   DTensor new_input(std::vector<int> const &dims,
                     std::vector<bool> const &can_reduce,
-                    std::vector<bool> const &can_split);
+                    std::vector<bool> const &can_split,
+                    type::DataType dtype = type::DT_UNKNOWN);
   DTensor *new_input_ptr(std::vector<int> const &dims,
                          std::vector<bool> const &can_reduce,
-                         std::vector<bool> const &can_split);
+                         std::vector<bool> const &can_split,
+                         type::DataType dtype = type::DT_UNKNOWN);
   KNOperator *create_input_op(std::vector<int> const &dims,
                               std::vector<bool> const &can_reduce,
-                              std::vector<bool> const &can_split);
+                              std::vector<bool> const &can_split,
+                              type::DataType dtype = type::DT_UNKNOWN);
   DTensor new_input(std::vector<int> const &dims);
   DTensor *new_input_ptr(std::vector<int> const &dims);
   // output operator
@@ -89,6 +94,10 @@ public:
   DTensor *add(DTensor const *input1, DTensor const *input2);
   DTensor *mul(DTensor const *input1, DTensor const *input2);
   DTensor *div(DTensor const *input1, DTensor const *input2);
+  DTensor sub(DTensor const &input1, DTensor const &input2);
+  DTensor sub(DTensor const &input, float scalar);  // add(input, -scalar)
+  DTensor sub(float scalar, DTensor const &input);  // add(mul(input, -1), scalar)
+  DTensor *sub(DTensor const *input1, DTensor const *input2);
   DTensor elementbinary(DTensor const &input1,
                         DTensor const &input2,
                         cleave_superoptimizer::type::KNOperatorType _type);
@@ -107,9 +116,13 @@ public:
                                       bool scalar_on_left,
                                       cleave_superoptimizer::type::KNOperatorType _type);
   // reduction operator
-  DTensor reduction(DTensor const &input, int dim, int size = 1);
-  DTensor *reduction(DTensor const *input, int dim, int size = 1);
-  KNOperator *create_reduction_op(DTensor const &input, int dim, int factor);
+  DTensor reduce_sum(DTensor const &input, int dim, int size = 1);
+  DTensor *reduce_sum(DTensor const *input, int dim, int size = 1);
+  KNOperator *create_reduce_sum_op(DTensor const &input, int dim, int factor);
+  // opaque max reduction over `dim` (keepdim, output size 1)
+  DTensor reduce_max(DTensor const &input, int dim);
+  DTensor *reduce_max(DTensor const *input, int dim);
+  KNOperator *create_reduce_max_op(DTensor const &input, int dim);
   // split operator
   DTensor split(DTensor const &input, int dim);
   DTensor *split(DTensor const *input, int dim);
@@ -140,13 +153,17 @@ public:
 private:
   // Helper methods for reducibility inference
   void propagate_reducibility_backward(KNOperator *op);
-  void propagate_reduction_op(KNOperator *op);
+  void propagate_reduce_sum_op(KNOperator *op);
   void propagate_matmul_op(KNOperator *op);
   void propagate_elementwise_unary_op(KNOperator *op);
   void propagate_elementwise_binary_op(KNOperator *op);
   void propagate_rms_norm_op(KNOperator *op);
+  void propagate_reduce_max_op(KNOperator *op);
 
 public:
+  // Deep copy with fresh guids; caller owns the result.
+  Graph *clone() const;
+
   Graph *create_symbolic_graph(
       std::unordered_map<size_t, std::vector<int>>
           *symbolic_dims_by_guid = nullptr) const;

@@ -27,7 +27,7 @@ def build_gqa_flash_decode():
     A = graph.div(A, (d**0.5))
     A = graph.add(A, -50 / (d**0.5))
     E = graph.exp(A)
-    S = graph.reduction(E, 3)
+    S = graph.reduce_sum(E, 3)
     D = graph.div(E, S)
     O = graph.matmul(D, V)
     graph.create_tiled_output(O)

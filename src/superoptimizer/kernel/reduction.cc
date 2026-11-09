@@ -8,41 +8,43 @@ namespace kernel {
 
 using namespace cleave_superoptimizer::type;
 
-DTensor Graph::reduction(DTensor const &input, int dim, int size) {
-  KNOperator *op = create_reduction_op(input, dim, size);
-  assert(op != nullptr);
+DTensor Graph::reduce_sum(DTensor const &input, int dim, int size) {
+  KNOperator *op = create_reduce_sum_op(input, dim, size);
+  CSO_REQUIRE(op != nullptr, std::invalid_argument,
+              __func__ << ": incompatible operand shapes or attributes");
   operators.push_back(op);
   assert(op->output_tensors.size() == 1);
   DTensor output = op->output_tensors[0];
   return output;
 }
 
-DTensor *Graph::reduction(DTensor const *input, int dim, int size) {
-  KNOperator *op = create_reduction_op(*input, dim, size);
-  assert(op != nullptr);
+DTensor *Graph::reduce_sum(DTensor const *input, int dim, int size) {
+  KNOperator *op = create_reduce_sum_op(*input, dim, size);
+  CSO_REQUIRE(op != nullptr, std::invalid_argument,
+              __func__ << ": incompatible operand shapes or attributes");
   operators.push_back(op);
   assert(op->output_tensors.size() == 1);
   return &op->output_tensors[0];
 }
 
 KNOperator *
-    Graph::create_reduction_op(DTensor const &input, int dim, int size) {
-  if (input.num_dims <= dim) {
+    Graph::create_reduce_sum_op(DTensor const &input, int dim, int size) {
+  if (dim < 0 || size <= 0 || input.num_dims <= dim) {
     return nullptr;
   }
   if (input.dim[dim] % size != 0) {
     return nullptr;
   }
 
-  KNReductionOp *op = new KNReductionOp(this, input, dim, size);
+  KNReduceSumOp *op = new KNReduceSumOp(this, input, dim, size);
   return op;
 }
 
-KNReductionOp::KNReductionOp(Graph *_kgraph,
+KNReduceSumOp::KNReduceSumOp(Graph *_kgraph,
                              DTensor const &input,
                              int dim,
                              int size)
-    : KNOperator(_kgraph, (KNOperatorType)(KN_REDUCTION_0_OP + dim), input),
+    : KNOperator(_kgraph, (KNOperatorType)(KN_REDUCE_SUM_0_OP + dim), input),
       reduction_dim_idx(dim), reduction_dim_size(size) {
   DTensor output = input;
   assert(dim < output.num_dims);
@@ -59,9 +61,51 @@ KNReductionOp::KNReductionOp(Graph *_kgraph,
   output_tensors.push_back(output);
 }
 
-KNReductionOp::~KNReductionOp() {}
+KNReduceSumOp::~KNReduceSumOp() {}
 
-KNReductionOp::operator json() const {
+KNReduceSumOp::operator json() const {
+  return json{{"op_type", op_type},
+              {"input_tensors", input_tensors},
+              {"output_tensors", output_tensors}};
+}
+
+DTensor Graph::reduce_max(DTensor const &input, int dim) {
+  KNOperator *op = create_reduce_max_op(input, dim);
+  CSO_REQUIRE(op != nullptr, std::invalid_argument,
+              __func__ << ": incompatible operand shapes or attributes");
+  operators.push_back(op);
+  return op->output_tensors[0];
+}
+
+DTensor *Graph::reduce_max(DTensor const *input, int dim) {
+  KNOperator *op = create_reduce_max_op(*input, dim);
+  CSO_REQUIRE(op != nullptr, std::invalid_argument,
+              __func__ << ": incompatible operand shapes or attributes");
+  operators.push_back(op);
+  return &op->output_tensors[0];
+}
+
+KNOperator *Graph::create_reduce_max_op(DTensor const &input, int dim) {
+  if (dim < 0 || dim >= input.num_dims || dim >= MAX_TENSOR_DIMS) {
+    return nullptr;
+  }
+  return new KNReduceMaxOp(this, input, dim);
+}
+
+KNReduceMaxOp::KNReduceMaxOp(Graph *_kgraph,
+                                   DTensor const &input,
+                                   int dim)
+    : KNOperator(_kgraph, (KNOperatorType)(KN_REDUCE_MAX_0_OP + dim), input),
+      reduction_dim_idx(dim) {
+  DTensor output = input;
+  output.dim[dim] = 1;
+  output.owner_op = this;
+  output.owner_ts_idx = 0;
+  output.guid = DTensor::next_guid++;
+  output_tensors.push_back(output);
+}
+
+KNReduceMaxOp::operator json() const {
   return json{{"op_type", op_type},
               {"input_tensors", input_tensors},
               {"output_tensors", output_tensors}};

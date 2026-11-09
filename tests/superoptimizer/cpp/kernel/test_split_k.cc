@@ -54,7 +54,7 @@ bool run_split_cpu_test(int split_dim_A, int split_dim_B) {
     return false;
   }
   auto CS = graph1.matmul(AS, BS);
-  auto C1 = graph1.reduction(CS, 0);
+  auto C1 = graph1.reduce_sum(CS, 0);
   graph1.mark_output(C1);
 
   eval_graph(graph0);
@@ -77,7 +77,7 @@ cleave_superoptimizer::kernel::DTensor
 
   auto A = graph.matmul(Q, K);
   auto E = graph.exp(A);
-  auto S = graph.reduction(E, 1);
+  auto S = graph.reduce_sum(E, 1);
   auto D = graph.div(E, S);
   auto O = graph.matmul(D, V);
   graph.mark_output(O);
@@ -101,9 +101,9 @@ bool run_attn_splitk_qk_test() {
     return false;
   }
   auto AS = graph_split.matmul(QS, KS);
-  auto A1 = graph_split.reduction(AS, 0);
+  auto A1 = graph_split.reduce_sum(AS, 0);
   auto E1 = graph_split.exp(A1);
-  auto S1 = graph_split.reduction(E1, 2);
+  auto S1 = graph_split.reduce_sum(E1, 2);
   auto D1 = graph_split.div(E1, S1);
   auto O1 = graph_split.matmul(D1, V1);
   graph_split.mark_output(O1);
@@ -129,7 +129,7 @@ bool run_attn_splitk_av_test() {
 
   auto A1 = graph_split.matmul(Q1, K1);
   auto E1 = graph_split.exp(A1);
-  auto S1 = graph_split.reduction(E1, 1);
+  auto S1 = graph_split.reduce_sum(E1, 1);
   auto D1 = graph_split.div(E1, S1);
   auto DS = graph_split.split(D1, 1);
   auto VS = graph_split.split(V1, 0);
@@ -137,7 +137,7 @@ bool run_attn_splitk_av_test() {
     return false;
   }
   auto OS = graph_split.matmul(DS, VS);
-  auto O1 = graph_split.reduction(OS, 0);
+  auto O1 = graph_split.reduce_sum(OS, 0);
   graph_split.mark_output(O1);
 
   eval_graph(graph_ref);
@@ -162,11 +162,11 @@ bool run_attn_splitk_flashdecode_test() {
   auto A1 = graph_split.matmul(Q1, K1);
   auto AS = graph_split.split(A1, 1);
   auto ES = graph_split.exp(AS);
-  auto SS = graph_split.reduction(ES, 2);
-  auto S1 = graph_split.reduction(SS, 0);
+  auto SS = graph_split.reduce_sum(ES, 2);
+  auto S1 = graph_split.reduce_sum(SS, 0);
   auto VS = graph_split.split(V1, 0);
   auto OS = graph_split.matmul(ES, VS);
-  auto O1 = graph_split.reduction(OS, 0);
+  auto O1 = graph_split.reduce_sum(OS, 0);
   auto OD = graph_split.div(O1, S1);
   graph_split.mark_output(OD);
 

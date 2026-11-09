@@ -1,7 +1,7 @@
 from tilelang.carver.roller import Edge
 
-from cleave import passes
-from cleave.graph import (
+from cleave.codegen import passes
+from cleave.ir.graph import (
     AccumEdge,
     Graph,
     GraphNode,
@@ -10,7 +10,7 @@ from cleave.graph import (
     PlaceHolderNode,
     ScalarScan,
 )
-from cleave.ops import (
+from cleave.ir.ops import (
     CausalMaskedExp,
     ConstFill,
     IndptrTileScan,
@@ -19,10 +19,10 @@ from cleave.ops import (
     Matmul,
     PagedGather,
     RangeGather,
-    Reduction,
+    ReduceSum,
 )
-from cleave.ops.gather import BUFFER_BOUND
-from cleave.util import gather_all_nodes, lock_graph
+from cleave.ir.ops.gather import BUFFER_BOUND
+from cleave.ir.graph_utils import gather_all_nodes, lock_graph
 
 DTYPE = "bfloat16"
 ACCUM_DTYPE = "float32"
@@ -125,7 +125,7 @@ def get_handwritten_scheduled_graph(dims):
         name="exp_0",
         n_batch_dims=0,
     )
-    rowsum_0 = Reduction(
+    rowsum_0 = ReduceSum(
         (BM, BN), axis=-1, dtype=ACCUM_DTYPE, out_dtype=ACCUM_DTYPE, name="rowsum_0"
     )
     gather_v = PagedGather(

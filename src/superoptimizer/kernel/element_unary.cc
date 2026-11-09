@@ -74,7 +74,8 @@ DTensor Graph::elementunary_clamp(DTensor const &input,
                                   float const &min_val, 
                                   float const &max_val) {
   KNOperator *op = create_elementunary_clamp_op(input, min_val, max_val);
-  assert(op != nullptr);
+  CSO_REQUIRE(op != nullptr, std::invalid_argument,
+              __func__ << ": incompatible operand shapes or attributes");
   operators.push_back(op);
   assert(op->output_tensors.size() == 1);
   DTensor output = op->output_tensors[0];
@@ -85,7 +86,8 @@ DTensor *Graph::elementunary_clamp(DTensor const *input,
                                    float const &min_val, 
                                    float const &max_val) {
   KNOperator *op = create_elementunary_clamp_op(*input, min_val, max_val);
-  assert(op != nullptr);
+  CSO_REQUIRE(op != nullptr, std::invalid_argument,
+              __func__ << ": incompatible operand shapes or attributes");
   operators.push_back(op);
   assert(op->output_tensors.size() == 1);
   return &op->output_tensors[0];
@@ -103,7 +105,8 @@ KNOperator *Graph::create_elementunary_clamp_op(DTensor const &input,
 DTensor Graph::elementunary(DTensor const &input,
                             cleave_superoptimizer::type::KNOperatorType type) {
   KNOperator *op = create_elementunary_op(input, type);
-  assert(op != nullptr);
+  CSO_REQUIRE(op != nullptr, std::invalid_argument,
+              __func__ << ": incompatible operand shapes or attributes");
   operators.push_back(op);
   assert(op->output_tensors.size() == 1);
   DTensor output = op->output_tensors[0];
@@ -113,7 +116,8 @@ DTensor Graph::elementunary(DTensor const &input,
 DTensor *Graph::elementunary(DTensor const *input,
                              cleave_superoptimizer::type::KNOperatorType type) {
   KNOperator *op = create_elementunary_op(*input, type);
-  assert(op != nullptr);
+  CSO_REQUIRE(op != nullptr, std::invalid_argument,
+              __func__ << ": incompatible operand shapes or attributes");
   operators.push_back(op);
   assert(op->output_tensors.size() == 1);
   return &op->output_tensors[0];

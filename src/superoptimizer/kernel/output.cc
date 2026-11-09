@@ -6,7 +6,8 @@ namespace kernel {
 
 void Graph::mark_output(DTensor const &A, bool infer_output_reducibility) {
   KNOperator *op = create_output_op(A);
-  assert(op != nullptr);
+  CSO_REQUIRE(op != nullptr, std::invalid_argument,
+              __func__ << ": incompatible operand shapes or attributes");
   operators.push_back(op);
   assert(op->output_tensors.size() == 0);
 

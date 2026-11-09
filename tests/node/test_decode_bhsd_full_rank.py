@@ -2,10 +2,10 @@ import pytest
 
 from tilelang.carver.roller import Edge  # noqa: F401 (ensures tilelang/tvm path setup)
 from cleave.arch import get_arch
-from cleave.graph import Graph, OutputNode
-from cleave.ops import Div, Matmul, Reduction
-from cleave.policy.default import TCPolicy
-from cleave.util import find_topo_sort, gather_all_nodes
+from cleave.ir.graph import Graph, OutputNode
+from cleave.ir.ops import Div, Matmul, ReduceSum
+from cleave.schedule.policy.default import TCPolicy
+from cleave.ir.graph_utils import find_topo_sort, gather_all_nodes
 
 
 def _build_policy_and_decode_nodes(b: int) -> tuple[TCPolicy, dict[str, object]]:
@@ -23,7 +23,7 @@ def _build_policy_and_decode_nodes(b: int) -> tuple[TCPolicy, dict[str, object]]
         name="mma_1",
         warp_policy="rows",
     )
-    node_5 = Reduction(
+    node_5 = ReduceSum(
         (b, h, s_kv),
         dtype=accum_dtype,
         out_dtype=accum_dtype,

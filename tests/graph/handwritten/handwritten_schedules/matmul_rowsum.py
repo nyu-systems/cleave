@@ -1,7 +1,7 @@
-from cleave import passes
-from cleave.graph import Graph, Iterator, GraphNode, OutputNode, AccumEdge
-from cleave.util import gather_all_nodes, lock_graph
-from cleave.ops import Matmul, Reduction
+from cleave.codegen import passes
+from cleave.ir.graph import Graph, Iterator, GraphNode, OutputNode, AccumEdge
+from cleave.ir.graph_utils import gather_all_nodes, lock_graph
+from cleave.ir.ops import Matmul, ReduceSum
 
 DTYPE = "float16"
 ACCUM_DTYPE = "float32"
@@ -26,7 +26,7 @@ def get_handwritten_scheduled_graph(dims):
     lock_graph(inner_inner_graph)
 
     inner_node_0 = GraphNode(name="GraphNode_0", graph=inner_inner_graph)
-    inner_node_1 = Reduction(
+    inner_node_1 = ReduceSum(
         (M, N), dtype=ACCUM_DTYPE, out_dtype=ACCUM_DTYPE, name="rowsum_0"
     )
 

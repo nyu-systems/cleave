@@ -82,7 +82,7 @@ void abstract_expr_eval(
             std::make_shared<Mul>(input_patterns[0], input_patterns[1]);
         std::shared_ptr<AbstractExpr> out_expr =
             reduction_size == 1 ? mul_expr
-                                : std::make_shared<Red>(reduction_size,
+                                : std::make_shared<Sum>(reduction_size,
                                                         mul_expr);
         patterns.insert({op->output_tensors[0].guid, out_expr});
       } else {

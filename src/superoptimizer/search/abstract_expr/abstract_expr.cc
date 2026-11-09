@@ -20,6 +20,74 @@ z3::expr_vector to_expr_vector(z3::context &c,
   return vec;
 }
 
+namespace {
+
+std::vector<std::shared_ptr<AbstractExpr>> children(AbstractExpr const &e) {
+  if (auto const *n = dynamic_cast<Add const *>(&e)) {
+    return {n->lhs, n->rhs};
+  }
+  if (auto const *n = dynamic_cast<Mul const *>(&e)) {
+    return {n->lhs, n->rhs};
+  }
+  if (auto const *n = dynamic_cast<Div const *>(&e)) {
+    return {n->lhs, n->rhs};
+  }
+  if (auto const *n = dynamic_cast<Sub const *>(&e)) {
+    return {n->lhs, n->rhs};
+  }
+  if (auto const *n = dynamic_cast<Exp const *>(&e)) {
+    return {n->exponent};
+  }
+  if (auto const *n = dynamic_cast<Sqrt const *>(&e)) {
+    return {n->a};
+  }
+  if (auto const *n = dynamic_cast<Silu const *>(&e)) {
+    return {n->a};
+  }
+  if (auto const *n = dynamic_cast<Gelu const *>(&e)) {
+    return {n->a};
+  }
+  if (auto const *n = dynamic_cast<Relu const *>(&e)) {
+    return {n->a};
+  }
+  if (auto const *n = dynamic_cast<Clamp const *>(&e)) {
+    return {n->elems};
+  }
+  if (auto const *n = dynamic_cast<RMS const *>(&e)) {
+    return {n->elems};
+  }
+  if (auto const *n = dynamic_cast<Sum const *>(&e)) {
+    return {n->summand};
+  }
+  if (auto const *n = dynamic_cast<Split const *>(&e)) {
+    return {n->input};
+  }
+  if (auto const *n = dynamic_cast<Opaque const *>(&e)) {
+    return n->args;
+  }
+  return {};
+}
+
+// Collects Sub/Opaque nodes so their axioms are added only when used: the
+// default search space must see the exact same solver queries as before.
+void collect_extensions(AbstractExpr const &e,
+                        bool &has_sub,
+                        std::unordered_map<std::string, size_t> &opaque) {
+  if (dynamic_cast<Sub const *>(&e)) {
+    has_sub = true;
+  }
+  if (auto const *n = dynamic_cast<Opaque const *>(&e)) {
+    opaque[n->name] = n->args.size();
+  }
+  for (auto const &child : children(e)) {
+    if (child) {
+      collect_extensions(*child, has_sub, opaque);
+    }
+  }
+}
+
+} // namespace
+
 bool AbstractExpr::subpattern_to(AbstractExpr const &other) const {
   z3::context c;
 
@@ -37,7 +105,7 @@ bool AbstractExpr::subpattern_to(AbstractExpr const &other) const {
   z3::func_decl relu = c.function("relu", P, P);
   z3::func_decl clamp = c.function("clamp", F, F, P, P);
   z3::func_decl rms = c.function("rms", I, P, P);
-  z3::func_decl red = c.function("red", I, P, P);
+  z3::func_decl sum = c.function("sum", I, P, P);
 
   z3::func_decl subpattern = c.function("subpattern", P, P, c.bool_sort());
 
@@ -99,19 +167,41 @@ bool AbstractExpr::subpattern_to(AbstractExpr const &other) const {
   s.add(forall(x, subpattern(x, relu(x))));
   s.add(forall(x, f, f1, subpattern(x, clamp(f, f1, x))));
   s.add(forall(x, i, subpattern(x, rms(i, x))));
-  s.add(forall(x, i, subpattern(x, red(i, x))));
+  s.add(forall(x, i, subpattern(x, sum(i, x))));
 
-  s.add(forall(x, x == red(c.int_val(0), x)));
-  s.add(forall(x, i1, i2, red(i1, red(i2, x)) == red(i1 + i2, x)));
+  s.add(forall(x, x == sum(c.int_val(0), x)));
+  s.add(forall(x, i1, i2, sum(i1, sum(i2, x)) == sum(i1 + i2, x)));
   s.add(forall(to_expr_vector(c, {x, y, i, i1, i2}),
-               red(i, add(red(i1, x), red(i2, y))) ==
-                   add(red(i + i1, x), red(i + i2, y))));
-  s.add(forall(x, y, i, red(i, mul(x, y)) == mul(red(i, x), y)));
-  s.add(forall(x, y, i, red(i, div(x, y)) == div(red(i, x), y)));
+               sum(i, add(sum(i1, x), sum(i2, y))) ==
+                   add(sum(i + i1, x), sum(i + i2, y))));
+  s.add(forall(x, y, i, sum(i, mul(x, y)) == mul(sum(i, x), y)));
+  s.add(forall(x, y, i, sum(i, div(x, y)) == div(sum(i, x), y)));
 
   // Lemmas
   s.add(
-      forall(x, i1, i2, implies(i1 <= i2, subpattern(red(i1, x), red(i2, x)))));
+      forall(x, i1, i2, implies(i1 <= i2, subpattern(sum(i1, x), sum(i2, x)))));
+
+  bool has_sub = false;
+  std::unordered_map<std::string, size_t> opaque;
+  collect_extensions(*this, has_sub, opaque);
+  collect_extensions(other, has_sub, opaque);
+  if (has_sub) {
+    z3::func_decl sub = c.function("sub", P, P, P);
+    s.add(forall(x, y, subpattern(x, sub(x, y))));
+    s.add(forall(x, y, subpattern(y, sub(x, y))));
+  }
+  for (auto const &[name, arity] : opaque) {
+    z3::sort_vector domain(c);
+    z3::expr_vector bound(c);
+    for (size_t k = 0; k < arity; k++) {
+      domain.push_back(P);
+      bound.push_back(c.constant(("a" + std::to_string(k)).c_str(), P));
+    }
+    z3::func_decl f = c.function(("opaque_" + name).c_str(), domain, P);
+    for (size_t k = 0; k < arity; k++) {
+      s.add(forall(bound, subpattern(bound[k], f(bound))));
+    }
+  }
 
   // Theorem to prove
   s.add(!subpattern(pattern1, pattern2));
@@ -142,46 +232,10 @@ bool AbstractExpr::contains_subexpr(std::string const &other) const {
   if (to_string() == other) {
     return true;
   }
-  // Recurse into the immediate operands. Enumerated by concrete type so no
-  // per-subclass virtual is needed; Var/leaf types have no children.
-  auto rec = [&other](std::shared_ptr<AbstractExpr> const &child) {
-    return child && child->contains_subexpr(other);
-  };
-  if (auto const *n = dynamic_cast<Add const *>(this)) {
-    return rec(n->lhs) || rec(n->rhs);
-  }
-  if (auto const *n = dynamic_cast<Mul const *>(this)) {
-    return rec(n->lhs) || rec(n->rhs);
-  }
-  if (auto const *n = dynamic_cast<Div const *>(this)) {
-    return rec(n->lhs) || rec(n->rhs);
-  }
-  if (auto const *n = dynamic_cast<Exp const *>(this)) {
-    return rec(n->exponent);
-  }
-  if (auto const *n = dynamic_cast<Sqrt const *>(this)) {
-    return rec(n->a);
-  }
-  if (auto const *n = dynamic_cast<Silu const *>(this)) {
-    return rec(n->a);
-  }
-  if (auto const *n = dynamic_cast<Gelu const *>(this)) {
-    return rec(n->a);
-  }
-  if (auto const *n = dynamic_cast<Relu const *>(this)) {
-    return rec(n->a);
-  }
-  if (auto const *n = dynamic_cast<Clamp const *>(this)) {
-    return rec(n->elems);
-  }
-  if (auto const *n = dynamic_cast<RMS const *>(this)) {
-    return rec(n->elems);
-  }
-  if (auto const *n = dynamic_cast<Red const *>(this)) {
-    return rec(n->summand);
-  }
-  if (auto const *n = dynamic_cast<Split const *>(this)) {
-    return rec(n->input);
+  for (auto const &child : children(*this)) {
+    if (child && child->contains_subexpr(other)) {
+      return true;
+    }
   }
   return false;
 }
@@ -357,21 +411,67 @@ std::string RMS::to_string() const {
   return "rms(" + std::to_string(red_deg) + ", " + elems->to_string() + ")";
 }
 
-Red::Red(int red_deg, std::shared_ptr<AbstractExpr> summand)
+Sum::Sum(int red_deg, std::shared_ptr<AbstractExpr> summand)
     : red_deg_log(std::ceil(std::log2(red_deg))), summand(summand) {
   assert(red_deg > 1);
   assert(summand);
 }
 
-z3::expr Red::to_z3(z3::context &c,
+z3::expr Sum::to_z3(z3::context &c,
                     std::unordered_set<std::string> &all_variables) const {
   z3::sort P = c.uninterpreted_sort("P");
-  z3::func_decl red = c.function("red", c.int_sort(), P, P);
-  return red(c.int_val(red_deg_log), summand->to_z3(c, all_variables));
+  z3::func_decl sum = c.function("sum", c.int_sort(), P, P);
+  return sum(c.int_val(red_deg_log), summand->to_z3(c, all_variables));
 }
 
-std::string Red::to_string() const {
-  return "r(" + std::to_string(red_deg_log) + ", " + summand->to_string() + ")";
+std::string Sum::to_string() const {
+  return "sum(" + std::to_string(red_deg_log) + ", " + summand->to_string() + ")";
+}
+
+Sub::Sub(std::shared_ptr<AbstractExpr> lhs, std::shared_ptr<AbstractExpr> rhs)
+    : lhs(lhs), rhs(rhs) {
+  assert(lhs);
+  assert(rhs);
+}
+
+z3::expr Sub::to_z3(z3::context &c,
+                    std::unordered_set<std::string> &all_variables) const {
+  z3::sort P = c.uninterpreted_sort("P");
+  z3::func_decl sub = c.function("sub", P, P, P);
+  return sub(lhs->to_z3(c, all_variables), rhs->to_z3(c, all_variables));
+}
+
+std::string Sub::to_string() const {
+  return "(" + lhs->to_string() + "-" + rhs->to_string() + ")";
+}
+
+Opaque::Opaque(std::string const &name,
+               std::vector<std::shared_ptr<AbstractExpr>> args)
+    : name(name), args(std::move(args)) {
+  for (auto const &a : this->args) {
+    assert(a);
+  }
+}
+
+z3::expr Opaque::to_z3(z3::context &c,
+                       std::unordered_set<std::string> &all_variables) const {
+  z3::sort P = c.uninterpreted_sort("P");
+  z3::sort_vector domain(c);
+  z3::expr_vector actual(c);
+  for (auto const &a : args) {
+    domain.push_back(P);
+    actual.push_back(a->to_z3(c, all_variables));
+  }
+  z3::func_decl f = c.function(("opaque_" + name).c_str(), domain, P);
+  return f(actual);
+}
+
+std::string Opaque::to_string() const {
+  std::string out = name + "(";
+  for (size_t k = 0; k < args.size(); k++) {
+    out += (k ? "," : "") + args[k]->to_string();
+  }
+  return out + ")";
 }
 
 Split::Split(int split_dim, std::shared_ptr<AbstractExpr> input)

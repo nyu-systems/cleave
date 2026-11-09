@@ -1,7 +1,7 @@
-from cleave.graph import OutputNode, Graph
-from cleave.ops import Matmul, SplitView, wire_input
+from cleave.ir.graph import OutputNode, Graph
+from cleave.ir.ops import Matmul, SplitView, wire_input
 from cleave.schedule import search_tiling
-from cleave.util import (
+from cleave.ir.graph_utils import (
     gather_all_nodes,
     find_topo_sort,
 )

@@ -17,15 +17,15 @@ pytest.importorskip("tilelang")
 torch = pytest.importorskip("torch")
 
 from tests.graph.apply_paging.test_split_decode import CASES, split_kernel_source
-from tests.graph.handwritten import _paged_reference as ref
-from tests.graph.handwritten._paged_workloads import OPERATORS, keyed_workloads
-from tests.graph.handwritten._test_utils import GATHER_TOLERANCE
+from cleave.dynamic import reference as ref
+from cleave.dynamic import OPERATORS, keyed_workloads
+from cleave.dynamic import GATHER_TOLERANCE
 from tests.graph.handwritten.test_empty_request import (
     DECODE_KV_LENS,
     MLA_SM_SCALE,
 )
-from cleave.util.autotune import _compiled
-from cleave.util.env import _gpu_exec_guard
+from cleave.runtime.autotune import _compiled
+from cleave.runtime.gpu import _gpu_exec_guard
 
 # How many captured workloads each pair is checked on: a stratified sample, so the tiny
 # batch-1 shapes, the batch-16 middle and the 50k-token batch-64 tail are all represented.
@@ -84,7 +84,7 @@ def test_split_pair_handles_an_empty_request(operator):
 
 def test_scratch_wrapper_reuses_one_allocation_per_shape():
     """The partials are allocated once per batch size and shared by the two names."""
-    from tests.graph.apply_paging._test_utils import operator_kernel_source
+    from cleave.dynamic.registry import operator_kernel_source
 
     kernel = _compiled(split_kernel_source("gqa_paged_decode_h32_kv8_d128_ps1"))
     params = kernel.scratch_params

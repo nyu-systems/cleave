@@ -3,7 +3,7 @@ import traceback
 import graphviz as gv
 from typing import List, Tuple, Optional
 
-from .graph import Graph, GraphNode, PlaceHolderNode, OutputNode, Iterator
+from .ir.graph import Graph, GraphNode, PlaceHolderNode, OutputNode, Iterator
 from tilelang.carver.roller import Edge
 from tilelang.carver.roller.node import Node
 

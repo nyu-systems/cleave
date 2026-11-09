@@ -1,8 +1,8 @@
 """What the paging pass builds for the ps1 paged decode layer, node by node.
 
-The emitted text is checked against the operator's golden in ``test_expected_kernels.py``,
+The emitted text is checked against the operator's expected in ``test_expected_kernels.py``,
 which is the assertion that carries the tuned performance over; this file is the structural
-half of that -- the graph the pass hands to codegen, including the parts of it a golden
+half of that -- the graph the pass hands to codegen, including the parts of it a expected
 cannot distinguish (the int32 page-table tile's layout label, which the pass has to
 overwrite after annotation without changing a byte of this operator's source).
 
@@ -17,16 +17,13 @@ import pytest
 
 pytest.importorskip("tilelang")
 
-from tests.graph.apply_paging._test_utils import (
-    OPERATOR_CASES,
-    build_paged_graph,
-    paged_kernel_source,
-)
-from cleave.graph import GraphNode, OutputNode, PlaceHolderNode
-from cleave.ops import Div, Log2, MaskedExp, Matmul, PagedGather, Reduction
+from tests.graph.apply_paging._test_utils import OPERATOR_CASES
+from cleave.dynamic.dense import build_paged_graph, paged_kernel_source
+from cleave.ir.graph import GraphNode, OutputNode, PlaceHolderNode
+from cleave.ir.ops import Div, Log2, MaskedExp, Matmul, PagedGather, ReduceSum
 
 # Read out of the operator registry rather than restated here, so this file cannot hold a
-# second copy of the specs that drifts from the one the goldens and the demos are built from.
+# second copy of the specs that drifts from the one the expected kernels and the demos are built from.
 CASES = {
     name: OPERATOR_CASES[name][0]
     for name in (
@@ -62,7 +59,7 @@ def test_access_layer_structure(operator):
     # The lse is one float per (request, query head), and a block owns one request and one
     # kv head's group of them -- so both the extent and the tile are named by the spec. A
     # weaker assertion (that the leading extent is *some* symbolic name) let a swap to the
-    # page pool's extent through, which only the goldens then caught.
+    # page pool's extent through, which only the expected kernels then caught.
     assert tuple(graph.tmap[outputs[1]].shape) == (spec.batch_dim, spec.num_qo_heads)
     assert tuple(graph.tmap[outputs[1]].tile_size) == (1, spec.group)
 
@@ -97,7 +94,7 @@ def test_access_layer_structure(operator):
     assert [n.name for n in inner.prefetch_nodes] == ["paged_gather_k", "paged_gather_v"]
     assert [n.name for n in inner.accum_nodes] == ["rowsum_0", "mma_1"]
     assert len([n for n in inner.nodes if isinstance(n, Matmul)]) == 2
-    assert isinstance(next(n for n in inner.nodes if n.name == "rowsum_0"), Reduction)
+    assert isinstance(next(n for n in inner.nodes if n.name == "rowsum_0"), ReduceSum)
 
     # The int32 page-table tile must not be labelled a tensor-core layout: it is read one
     # entry per row. `annotate_tc_layout` reaches it through the gathers and marks it, so
@@ -164,9 +161,8 @@ def test_honours_the_searched_query_tile(query_rows):
 
 
 def test_honours_the_schedules_thread_count():
-    from tests.graph.apply_paging._test_utils import tiled_dense_attention
-    from tests._graphs import flash_attention_sd_graph
-    from cleave.paging import apply_paging
+    from cleave.dynamic.dense import flash_attention_sd_graph, tiled_dense_attention
+    from cleave.dynamic.paging import apply_paging
 
     dense = flash_attention_sd_graph(16, 4096, 128, dtype="bfloat16", out_dtype="bfloat16")
     scheduled = tiled_dense_attention(dense, 16, 128, 64)

@@ -3,7 +3,7 @@
 ``apply_paging`` rebuilds the attention body from the spec and keeps nothing of the dense
 graph but its tiling, so a builder that writes the shipped operator's numbers instead of
 reading them emits a kernel the schedule never described -- and inherits a measurement that
-belongs to a different tile. Nothing else in this package notices: the goldens are compared
+belongs to a different tile. Nothing else in this package notices: the expected kernels are compared
 byte for byte at exactly the tuned tiling, which is the tiling a hardcode reproduces.
 
 So every layer is built twice, at the tiling its tuned schedule was measured at and at one
@@ -20,9 +20,9 @@ import pytest
 
 pytest.importorskip("tilelang")
 
-from tests.graph.apply_paging._test_utils import build_mla_paged_graph, build_paged_graph
-from cleave.graph import GraphNode, OutputNode
-from cleave.paging import (
+from cleave.dynamic.dense import build_mla_paged_graph, build_paged_graph
+from cleave.ir.graph import GraphNode, OutputNode
+from cleave.dynamic.paging import (
     MLA_PAGED_DECODE,
     MLA_PAGED_PREFILL_CAUSAL,
     PAGED_DECODE,

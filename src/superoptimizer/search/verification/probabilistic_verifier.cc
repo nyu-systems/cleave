@@ -1,12 +1,24 @@
 #include "cleave/superoptimizer/search/verification/probabilistic_verifier.h"
+#include "cleave/superoptimizer/kernel/fingerprint_cpu.h"
 #include "cleave/superoptimizer/search/op_utils.h"
+
+#include <cstdlib>
 
 namespace cleave_superoptimizer {
 namespace search {
 
-std::mutex ProbabilisticVerifier::fingerprint_mutex;
+namespace {
+// Fingerprints live in a thread-local store; drop them when a pass ends so
+// nothing outlives one verification.
+struct ThreadFingerprintScope {
+  ~ThreadFingerprintScope() {
+    kernel::clear_thread_fingerprints();
+  }
+};
+} // namespace
 
 ProbabilisticVerifier::ProbabilisticVerifier(kernel::Graph const &input_graph) {
+  ThreadFingerprintScope scope;
   int input_id = 0;
   for (auto const &op : input_graph.operators) {
     if (op->op_type == type::KNOperatorType::KN_INPUT_OP) {
@@ -24,8 +36,14 @@ ProbabilisticVerifier::ProbabilisticVerifier(kernel::Graph const &input_graph) {
   }
 }
 
+ProbabilisticVerifier::~ProbabilisticVerifier() {
+  for (auto &t : input_graph_fingerprints) {
+    free(t.fingerprint_ptr);
+  }
+}
+
 OutputMatch ProbabilisticVerifier::verify(kernel::Graph const &graph) {
-  std::lock_guard<std::mutex> lock(fingerprint_mutex);
+  ThreadFingerprintScope scope;
 
   std::vector<kernel::DTensor> fingerprints;
 

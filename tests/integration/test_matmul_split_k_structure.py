@@ -6,9 +6,10 @@ import pytest
 pytest.importorskip("tilelang")
 pytest.importorskip("tvm")
 
-from cleave.graph import Graph, OutputNode, PlaceHolderNode
-from cleave.integration.graph_processing import process_graphs, split_graph
-from cleave.ops import Matmul, Reduction, SplitView
+from cleave.ir.graph import Graph, OutputNode, PlaceHolderNode
+from cleave.lower.process import to_bundles
+from cleave.lower.split import split_graph
+from cleave.ir.ops import Matmul, ReduceSum, SplitView
 
 
 def _load_graph_structure(name: str):
@@ -54,7 +55,7 @@ def _assert_split_k_cleave_graph_pair(
 
     assert [type(node) for node in second_graph.nodes] == [
         PlaceHolderNode,
-        Reduction,
+        ReduceSum,
         OutputNode,
     ]
     assert [tuple(node.get_shape()) for node in second_graph.nodes] == [
@@ -85,7 +86,7 @@ def test_matmul_split_k_cleave_graph():
         "before_split_matmul_split_k_graph_structure.graph"
     )
 
-    cleave_graphs = process_graphs([before_graph])
+    cleave_graphs = to_bundles([before_graph])
 
     assert isinstance(cleave_graphs, list)
     assert len(cleave_graphs) == 1
@@ -114,7 +115,7 @@ def test_matmul_symbolic_split_k_cleave_graph_with_symbol_mapping():
         8: 1536,
     }
 
-    cleave_graphs = process_graphs(
+    cleave_graphs = to_bundles(
         [before_graph],
         symbol_map=symbol_map,
         split_factors=[4],
@@ -144,7 +145,7 @@ def test_matmul_symbolic_split_k_cleave_graph_with_multiple_split_factors():
         12: 4096,
     }
 
-    cleave_graphs = process_graphs(
+    cleave_graphs = to_bundles(
         [before_graph],
         symbol_map=symbol_map,
         split_factors=split_factors,

@@ -106,8 +106,10 @@ CpuFingerprintTables &get_tables() {
 
 using Store = CpuFingerprintEngine::Store;
 
+// Per-thread so concurrent verifications never share buffers or need a lock;
+// the verifier clears it after each use (see clear_thread_fingerprints).
 Store &get_store() {
-  static Store store;
+  static thread_local Store store;
   return store;
 }
 
@@ -116,6 +118,14 @@ inline FingerprintType fingerprint_add(FingerprintType a, FingerprintType b) {
   uint32_t y = b;
   return static_cast<FingerprintType>(
       (x + y) % cleave_superoptimizer::config::FINGERPRINT_PQ);
+}
+
+inline FingerprintType fingerprint_sub(FingerprintType a, FingerprintType b) {
+  uint32_t x = a % cleave_superoptimizer::config::FINGERPRINT_PQ;
+  uint32_t y = b % cleave_superoptimizer::config::FINGERPRINT_PQ;
+  return static_cast<FingerprintType>(
+      (x + cleave_superoptimizer::config::FINGERPRINT_PQ - y) %
+      cleave_superoptimizer::config::FINGERPRINT_PQ);
 }
 
 inline FingerprintType fingerprint_mul(FingerprintType a, FingerprintType b) {
@@ -448,6 +458,8 @@ void compute_elementbinary_fingerprint(
     FingerprintType y = input2_fingerprint_ptr[input2_idx];
     if (op_type == cleave_superoptimizer::type::KN_ADD_OP) {
       output_fingerprint_ptr[idx] = fingerprint_add(x, y);
+    } else if (op_type == cleave_superoptimizer::type::KN_SUB_OP) {
+      output_fingerprint_ptr[idx] = fingerprint_sub(x, y);
     } else if (op_type == cleave_superoptimizer::type::KN_MUL_OP) {
       output_fingerprint_ptr[idx] = fingerprint_mul(x, y);
     } else if (op_type == cleave_superoptimizer::type::KN_DIV_OP) {
@@ -485,7 +497,7 @@ void compute_elementbinary_fingerprint_scalar(
     }
   }
 }
-void compute_reduction_fingerprint(Store &store,
+void compute_reduce_sum_fingerprint(Store &store,
                                    DTensor const &input,
                                    DTensor const &output,
                                    int reduction_dim_idx) {
@@ -511,6 +523,32 @@ void compute_reduction_fingerprint(Store &store,
       result = fingerprint_add(result, value);
     }
     output_fingerprint_ptr[i] = result;
+  }
+}
+
+// Opaque: each output is a hash of its reduced input slice (max is not a ring
+// homomorphism, so only structurally identical subgraphs can match).
+void compute_reduce_max_fingerprint(Store &store,
+                                       DTensor const &input,
+                                       DTensor const &output,
+                                       int reduction_dim_idx) {
+  int inner = 1;
+  for (int i = reduction_dim_idx + 1; i < input.num_dims; i++) {
+    inner *= input.dim[i];
+  }
+  int len = input.dim[reduction_dim_idx];
+  int num_elements = output.num_elements();
+  FingerprintType *in = store.get_buffer(input);
+  FingerprintType *out = store.get_buffer(output);
+  for (int i = 0; i < num_elements; i++) {
+    int n = i / inner;
+    int m = i % inner;
+    uint32_t h = 0x6d6178u;
+    for (int k = 0; k < len; k++) {
+      h = fingerprint_rand(h ^ in[(n * len + k) * inner + m]);
+    }
+    out[i] = static_cast<FingerprintType>(
+        h % cleave_superoptimizer::config::FINGERPRINT_PQ);
   }
 }
 
@@ -578,6 +616,10 @@ void compute_rms_norm_fingerprint(Store &store,
 
 } // namespace
 
+void clear_thread_fingerprints() {
+  get_store().fingerprints.clear();
+}
+
 cleave_superoptimizer::type::FingerprintType *
     CpuFingerprintEngine::Store::get_buffer(DTensor const &tensor) {
   auto &buffer = fingerprints[tensor.guid];
@@ -625,7 +667,8 @@ void CpuFingerprintEngine::compute(KNOperator const *op) {
   }
   if (op->op_type == cleave_superoptimizer::type::KN_ADD_OP ||
       op->op_type == cleave_superoptimizer::type::KN_MUL_OP ||
-      op->op_type == cleave_superoptimizer::type::KN_DIV_OP) {
+      op->op_type == cleave_superoptimizer::type::KN_DIV_OP ||
+      op->op_type == cleave_superoptimizer::type::KN_SUB_OP) {
     auto const *bin_op = dynamic_cast<KNElementBinaryOp const *>(op);
     if (bin_op && bin_op->has_scalar) {
       compute_elementbinary_fingerprint_scalar(store_,
@@ -643,16 +686,22 @@ void CpuFingerprintEngine::compute(KNOperator const *op) {
     }
     return;
   }
-  if (op->op_type == cleave_superoptimizer::type::KN_REDUCTION_0_OP ||
-      op->op_type == cleave_superoptimizer::type::KN_REDUCTION_1_OP ||
-      op->op_type == cleave_superoptimizer::type::KN_REDUCTION_2_OP ||
-      op->op_type == cleave_superoptimizer::type::KN_REDUCTION_3_OP ||
-      op->op_type == cleave_superoptimizer::type::KN_REDUCTION_4_OP) {
-    auto const *red = static_cast<KNReductionOp const *>(op);
-    compute_reduction_fingerprint(store_,
+  if (op->op_type == cleave_superoptimizer::type::KN_REDUCE_SUM_0_OP ||
+      op->op_type == cleave_superoptimizer::type::KN_REDUCE_SUM_1_OP ||
+      op->op_type == cleave_superoptimizer::type::KN_REDUCE_SUM_2_OP ||
+      op->op_type == cleave_superoptimizer::type::KN_REDUCE_SUM_3_OP ||
+      op->op_type == cleave_superoptimizer::type::KN_REDUCE_SUM_4_OP) {
+    auto const *red = static_cast<KNReduceSumOp const *>(op);
+    compute_reduce_sum_fingerprint(store_,
                                   op->input_tensors[0],
                                   op->output_tensors[0],
                                   red->reduction_dim_idx);
+    return;
+  }
+  if (type::op_category(op->op_type) == type::OpCategory::REDUCE_MAX) {
+    compute_reduce_max_fingerprint(
+        store_, op->input_tensors[0], op->output_tensors[0],
+        static_cast<KNReduceMaxOp const *>(op)->reduction_dim_idx);
     return;
   }
   if (op->op_type >= cleave_superoptimizer::type::KN_SPLIT_FIRST_OP_ID &&
@@ -764,8 +813,14 @@ bool KNElementBinaryOp::fingerprint(void) {
   return true;
 }
 
-bool KNReductionOp::fingerprint(void) {
-  compute_reduction_fingerprint(
+bool KNReduceSumOp::fingerprint(void) {
+  compute_reduce_sum_fingerprint(
+      get_store(), input_tensors[0], output_tensors[0], reduction_dim_idx);
+  return true;
+}
+
+bool KNReduceMaxOp::fingerprint(void) {
+  compute_reduce_max_fingerprint(
       get_store(), input_tensors[0], output_tensors[0], reduction_dim_idx);
   return true;
 }

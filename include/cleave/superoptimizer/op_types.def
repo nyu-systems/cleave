@@ -1,0 +1,47 @@
+// Single source of truth for kernel operator types.
+// CSO_OP(enum name, value, serialized name, category)
+// Serialized names are the checkpoint format: renaming one invalidates saved checkpoints.
+// KN_UNKOWN must stay first (it is the fallback for unknown names/values).
+
+CSO_OP(KN_UNKOWN, 1000, "kn_unkown", META)
+CSO_OP(KN_INPUT_OP, 1001, "kn_input_op", INPUT)
+CSO_OP(KN_OUTPUT_OP, 1002, "kn_output_op", OUTPUT)
+CSO_OP(KN_MATMUL_OP, 1003, "kn_matmul_op", MATMUL)
+// ElementUnary
+CSO_OP(KN_EXP_OP, 1100, "kn_exp_op", UNARY)
+CSO_OP(KN_SQUARE_OP, 1101, "kn_square_op", UNARY)
+CSO_OP(KN_SQRT_OP, 1102, "kn_sqrt_op", UNARY)
+CSO_OP(KN_SILU_OP, 1104, "kn_silu_op", UNARY)
+CSO_OP(KN_SIGMOID_OP, 1105, "kn_sigmoid_op", UNARY)
+CSO_OP(KN_GELU_OP, 1106, "kn_gelu_op", UNARY)
+// non-lax elementunary ops
+CSO_OP(KN_RELU_OP, 1150, "kn_relu_op", UNARY)
+CSO_OP(KN_CLAMP_OP, 1151, "kn_clamp_op", CLAMP)
+CSO_OP(KN_LOG_OP, 1160, "kn_log_op", UNARY)
+// ElementBinary
+CSO_OP(KN_ADD_OP, 1200, "kn_add_op", BINARY)
+CSO_OP(KN_MUL_OP, 1201, "kn_mul_op", BINARY)
+CSO_OP(KN_DIV_OP, 1202, "kn_div_op", BINARY)
+CSO_OP(KN_SUB_OP, 1203, "kn_sub_op", BINARY)
+// Reduction & Normalization
+CSO_OP(KN_REDUCE_SUM_0_OP, 1300, "kn_reduce_sum_0_op", REDUCE_SUM)
+CSO_OP(KN_REDUCE_SUM_1_OP, 1301, "kn_reduce_sum_1_op", REDUCE_SUM)
+CSO_OP(KN_REDUCE_SUM_2_OP, 1302, "kn_reduce_sum_2_op", REDUCE_SUM)
+CSO_OP(KN_REDUCE_SUM_3_OP, 1303, "kn_reduce_sum_3_op", REDUCE_SUM)
+CSO_OP(KN_REDUCE_SUM_4_OP, 1304, "kn_reduce_sum_4_op", REDUCE_SUM)
+// Opaque max reduction (keepdim, size 1): never rewritten by the search.
+CSO_OP(KN_REDUCE_MAX_0_OP, 1310, "kn_reduce_max_0_op", REDUCE_MAX)
+CSO_OP(KN_REDUCE_MAX_1_OP, 1311, "kn_reduce_max_1_op", REDUCE_MAX)
+CSO_OP(KN_REDUCE_MAX_2_OP, 1312, "kn_reduce_max_2_op", REDUCE_MAX)
+CSO_OP(KN_REDUCE_MAX_3_OP, 1313, "kn_reduce_max_3_op", REDUCE_MAX)
+CSO_OP(KN_REDUCE_MAX_4_OP, 1314, "kn_reduce_max_4_op", REDUCE_MAX)
+CSO_OP(KN_RMS_NORM_OP, 1350, "kn_rms_norm_op", RMS_NORM)
+// Concat & Split
+CSO_OP(KN_CONCAT_0_OP, 1400, "kn_concat_0_op", CONCAT)
+CSO_OP(KN_CONCAT_1_OP, 1401, "kn_concat_1_op", CONCAT)
+CSO_OP(KN_CONCAT_2_OP, 1402, "kn_concat_2_op", CONCAT)
+CSO_OP(KN_SPLIT_0_OP, 1420, "kn_split_0_op", SPLIT)
+CSO_OP(KN_SPLIT_1_OP, 1421, "kn_split_1_op", SPLIT)
+CSO_OP(KN_SPLIT_2_OP, 1422, "kn_split_2_op", SPLIT)
+CSO_OP(KN_SPLIT_3_OP, 1423, "kn_split_3_op", SPLIT)
+CSO_OP(KN_SPLIT_4_OP, 1424, "kn_split_4_op", SPLIT)

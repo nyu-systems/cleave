@@ -11,6 +11,7 @@
 #include "cleave/superoptimizer/utils/json_utils.h"
 #include "cleave/superoptimizer/utils/logging.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstdint>
 #include <fstream>
@@ -25,7 +26,8 @@ KernelGraphGenerator::KernelGraphGenerator(
     kernel::Graph const &computation_graph,
     GeneratorConfig const &config,
     char const *filename)
-    : config(config), dim_strategy(DimStrategy(config)), filename(filename),
+    : config(config),
+      dim_strategy(DimStrategy(this->config)), filename(filename),
       num_thread(config.search_thread),
       num_total_random_tests(0), num_valid_kernel_graphs(0),
       num_total_states(0), num_tasks(0), max_depth(5) {
@@ -107,15 +109,15 @@ void KernelGraphGenerator::_on_valid_graph() const {
   }
 }
 
-bool valid_reduction(cleave_superoptimizer::type::KNOperatorType op_type,
+bool valid_reduce_sum(cleave_superoptimizer::type::KNOperatorType op_type,
                      std::vector<cleave_superoptimizer::kernel::DTensor> const &input_tensors) {
   assert(input_tensors.size() == 1);
   const auto &input = input_tensors[0];
-  if (op_type < type::KN_REDUCTION_0_OP ||
-      op_type > type::KN_REDUCTION_4_OP) {
+  if (op_type < type::KN_REDUCE_SUM_0_OP ||
+      op_type > type::KN_REDUCE_SUM_4_OP) {
     assert(false && "unreachable");
   }
-  int dim = op_type - type::KN_REDUCTION_0_OP;
+  int dim = op_type - type::KN_REDUCE_SUM_0_OP;
   if (input.num_dims <= dim || input.dim[dim] == 1) {
     return false;
   }
@@ -132,6 +134,13 @@ bool valid_reduction(cleave_superoptimizer::type::KNOperatorType op_type,
   }
 
   return true;
+}
+
+bool valid_reduce_max(type::KNOperatorType op_type,
+                         std::vector<kernel::DTensor> const &input_tensors) {
+  int dim = op_type - type::KN_REDUCE_MAX_0_OP;
+  auto const &input = input_tensors.at(0);
+  return dim < input.num_dims && input.dim[dim] > 1;
 }
 
 bool valid_split(cleave_superoptimizer::type::KNOperatorType op_type,
@@ -154,8 +163,8 @@ bool valid_split(cleave_superoptimizer::type::KNOperatorType op_type,
         op->op_type <= type::KN_SPLIT_LAST_OP_ID) {
       num_split_ops++;
     }
-    if (op->op_type >= type::KN_REDUCTION_0_OP &&
-        op->op_type <= type::KN_REDUCTION_4_OP) {
+    if (op->op_type >= type::KN_REDUCE_SUM_0_OP &&
+        op->op_type <= type::KN_REDUCE_SUM_4_OP) {
       num_reduction_ops++;
     }
   }
@@ -171,6 +180,9 @@ void KernelGraphGenerator::generate_next_operator(
     SearchContext &c,
     std::function<bool(SearchContext const &)> const &verify,
     size_t depth) {
+  if (search_failed.load(std::memory_order_relaxed)) {
+    return;
+  }
   int n_states = ++num_total_states;
   CSO_VLOG(1) << std::string(depth * 2, ' ')
               << "depth=" << depth
@@ -180,7 +192,9 @@ void KernelGraphGenerator::generate_next_operator(
     show_statistics();
   }
   if (verify(c)) {
-    _on_valid_graph();
+    // Reads generated_graphs, which other tasks append to under this lock.
+#pragma omp critical
+    { _on_valid_graph(); }
     return;
   }
 
@@ -204,9 +218,9 @@ void KernelGraphGenerator::generate_next_operator(
           get_tensors_from_idx(*c.kn_graph, input_idx);
 
       // reduction must reduce on a dim of length > 1
-      if (op_type >= type::KN_REDUCTION_0_OP &&
-          op_type <= type::KN_REDUCTION_4_OP) {
-        if (!valid_reduction(op_type, input_tensors)) {
+      if (op_type >= type::KN_REDUCE_SUM_0_OP &&
+          op_type <= type::KN_REDUCE_SUM_4_OP) {
+        if (!valid_reduce_sum(op_type, input_tensors)) {
           continue;
         }
       }
@@ -215,6 +229,10 @@ void KernelGraphGenerator::generate_next_operator(
         if (!valid_split(op_type, input_tensors, c, config)) {
           continue;
         }
+      }
+      if (type::op_category(op_type) == type::OpCategory::REDUCE_MAX &&
+          !valid_reduce_max(op_type, input_tensors)) {
+        continue;
       }
 
       std::vector<std::shared_ptr<AbstractExpr>> input_patterns;
@@ -234,9 +252,15 @@ void KernelGraphGenerator::generate_next_operator(
         c.kn_graph->operators.push_back(new_op);
         if (depth < max_depth) {
           num_tasks++;
-          SearchContext c_tmp = SerializedSearchContext(c).deserialize();
+          SearchContext c_tmp{std::shared_ptr<kernel::Graph>(c.kn_graph->clone())};
 #pragma omp task
-          { generate_next_operator(c_tmp, verify, depth + 1); }
+          {
+            try {
+              generate_next_operator(c_tmp, verify, depth + 1);
+            } catch (...) {
+              record_search_error(std::current_exception());
+            }
+          }
         } else {
           generate_next_operator(c, verify, depth + 1);
         }
@@ -288,9 +312,15 @@ void KernelGraphGenerator::generate_next_operator(
           c.kn_graph->operators.push_back(scalar_op);
           if (depth < max_depth) {
             num_tasks++;
-            SearchContext c_tmp = SerializedSearchContext(c).deserialize();
+            SearchContext c_tmp{std::shared_ptr<kernel::Graph>(c.kn_graph->clone())};
 #pragma omp task
-            { generate_next_operator(c_tmp, verify, depth + 1); }
+            {
+              try {
+                generate_next_operator(c_tmp, verify, depth + 1);
+              } catch (...) {
+                record_search_error(std::current_exception());
+              }
+            }
           } else {
             generate_next_operator(c, verify, depth + 1);
           }
@@ -302,14 +332,22 @@ void KernelGraphGenerator::generate_next_operator(
   }
 }
 
+void KernelGraphGenerator::record_search_error(std::exception_ptr e) {
+  std::lock_guard<std::mutex> lock(search_error_mutex);
+  if (!search_error) {
+    search_error = e;
+  }
+  search_failed.store(true, std::memory_order_relaxed);
+}
+
 void KernelGraphGenerator::generate_kernel_graphs() {
   start_time = std::chrono::steady_clock::now();
   SearchContext c;
   c.kn_graph = std::make_shared<kernel::Graph>();
 
   for (auto const &input_attr : computation_graph_input_attrs) {
-    auto [dim, can_reduce, can_split] = input_attr;
-    c.kn_graph->new_input(dim, can_reduce, can_split);
+    auto [dim, can_reduce, can_split, dtype] = input_attr;
+    c.kn_graph->new_input(dim, can_reduce, can_split, dtype);
   }
 
   CSO_LOG(INFO) << "[Search] Starting kernel graph generation with "
@@ -318,13 +356,20 @@ void KernelGraphGenerator::generate_kernel_graphs() {
   {
 #pragma omp single
     {
-      generate_next_operator(
-          c,
-          [this](SearchContext const &c) {
-            return this->verify(*c.kn_graph);
-          },
-          0);
+      try {
+        generate_next_operator(
+            c,
+            [this](SearchContext const &c) {
+              return this->verify(*c.kn_graph);
+            },
+            0);
+      } catch (...) {
+        record_search_error(std::current_exception());
+      }
     }
+  }
+  if (search_error) {
+    std::rethrow_exception(search_error);
   }
 
   CSO_LOG(INFO) << "[Search] Generated " << num_tasks.load() << " tasks";
@@ -352,7 +397,8 @@ void KernelGraphGenerator::preprocess(kernel::Graph const &computation_graph) {
            to_vector(op->output_tensors[0].num_dims,
                      op->output_tensors[0].can_reduce),
            to_vector(op->output_tensors[0].num_dims,
-                     op->output_tensors[0].can_split)});
+                     op->output_tensors[0].can_split),
+           op->output_tensors[0].dtype});
     }
   }
 
@@ -405,21 +451,25 @@ bool KernelGraphGenerator::check_pattern(
     return false;
   }
 
-  if (seen_patterns.find(pattern->to_string()) != seen_patterns.end()) {
-    return seen_patterns[pattern->to_string()];
-  }
-
-  for (auto const &final_pattern : computation_graph_output_patterns) {
-    if (pattern->subpattern_to(*final_pattern)) {
-
-#pragma omp critical
-      { seen_patterns[pattern->to_string()] = true; }
-      return true;
+  std::string key = pattern->to_string();
+  {
+    std::shared_lock<std::shared_mutex> lock(seen_patterns_mutex);
+    auto it = seen_patterns.find(key);
+    if (it != seen_patterns.end()) {
+      return it->second;
     }
   }
-#pragma omp critical
-  { seen_patterns[pattern->to_string()] = false; }
-  return false;
+
+  bool result = false;
+  for (auto const &final_pattern : computation_graph_output_patterns) {
+    if (pattern->subpattern_to(*final_pattern)) {
+      result = true;
+      break;
+    }
+  }
+  std::unique_lock<std::shared_mutex> lock(seen_patterns_mutex);
+  seen_patterns[key] = result;
+  return result;
 }
 
 bool KernelGraphGenerator::verify(kernel::Graph &g) {

@@ -5,16 +5,28 @@
 namespace cleave_superoptimizer {
 namespace kernel {
 
-class KNReductionOp : public cleave_superoptimizer::kernel::KNOperator {
+class KNReduceSumOp : public cleave_superoptimizer::kernel::KNOperator {
 public:
-  KNReductionOp(Graph *_graph, DTensor const &input, int dim, int size);
-  ~KNReductionOp();
+  KNReduceSumOp(Graph *_graph, DTensor const &input, int dim, int size);
+  ~KNReduceSumOp();
   bool fingerprint(void) override;
 
   operator json() const override;
 
 public:
   int reduction_dim_idx, reduction_dim_size;
+};
+
+// Opaque: fingerprinted by hashing each reduced slice, never rewritten.
+class KNReduceMaxOp : public cleave_superoptimizer::kernel::KNOperator {
+public:
+  KNReduceMaxOp(Graph *_graph, DTensor const &input, int dim);
+  bool fingerprint(void) override;
+
+  operator json() const override;
+
+public:
+  int reduction_dim_idx;
 };
 
 } // namespace kernel

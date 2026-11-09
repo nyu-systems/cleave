@@ -11,7 +11,8 @@ using namespace cleave_superoptimizer::type;
 DTensor Graph::rms_norm(DTensor const &input,
                         std::vector<int> const &normalized_shape) {
   KNOperator *op = create_rms_norm_op(input, normalized_shape);
-  assert(op != nullptr);
+  CSO_REQUIRE(op != nullptr, std::invalid_argument,
+              __func__ << ": incompatible operand shapes or attributes");
   operators.push_back(op);
   assert(op->output_tensors.size() == 1);
   DTensor output = op->output_tensors[0];
@@ -21,7 +22,8 @@ DTensor Graph::rms_norm(DTensor const &input,
 DTensor *Graph::rms_norm(DTensor const *input,
                          std::vector<int> const &normalized_shape) {
   KNOperator *op = create_rms_norm_op(*input, normalized_shape);
-  assert(op != nullptr);
+  CSO_REQUIRE(op != nullptr, std::invalid_argument,
+              __func__ << ": incompatible operand shapes or attributes");
   operators.push_back(op);
   assert(op->output_tensors.size() == 1);
   return &op->output_tensors[0];
@@ -32,7 +34,8 @@ DTensor Graph::rms_norm(DTensor const &input,
                         std::vector<int> const &normalized_shape) {
   KNOperator *op =
       create_rms_norm_op(input, elementwise_affine, normalized_shape);
-  assert(op != nullptr);
+  CSO_REQUIRE(op != nullptr, std::invalid_argument,
+              __func__ << ": incompatible operand shapes or attributes");
   operators.push_back(op);
   assert(op->output_tensors.size() == 1);
   DTensor output = op->output_tensors[0];
@@ -44,7 +47,8 @@ DTensor *Graph::rms_norm(DTensor const *input,
                          std::vector<int> const &normalized_shape) {
   KNOperator *op =
       create_rms_norm_op(*input, *elementwise_affine, normalized_shape);
-  assert(op != nullptr);
+  CSO_REQUIRE(op != nullptr, std::invalid_argument,
+              __func__ << ": incompatible operand shapes or attributes");
   operators.push_back(op);
   assert(op->output_tensors.size() == 1);
   return &op->output_tensors[0];
@@ -72,7 +76,8 @@ KNOperator *
                               DTensor const &elementwise_affine,
                               std::vector<int> const &normalized_shape) {
   // We currently only allow normalizing the last dimension
-  assert(false && "To be implemented");
+  CSO_THROW(std::runtime_error,
+            "rms_norm with elementwise_affine is not implemented");
 }
 
 KNRMSNormOp::KNRMSNormOp(Graph *_kgraph,

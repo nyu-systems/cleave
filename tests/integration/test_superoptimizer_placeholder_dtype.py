@@ -3,10 +3,10 @@ import pytest
 pytest.importorskip("tilelang")
 tvm = pytest.importorskip("tvm")
 
-from cleave.graph import PlaceHolderNode
-from cleave.integration import graph_structure_to_cleave
-from cleave.ops import Exp, Reduction
-from cleave.ops import wire_input
+from cleave.ir.graph import PlaceHolderNode
+from cleave.lower import to_ir
+from cleave.ir.ops import Exp, ReduceSum
+from cleave.ir.ops import wire_input
 
 
 def test_wire_input_keeps_placeholder_dtype_on_consumer_mismatch():
@@ -14,13 +14,13 @@ def test_wire_input_keeps_placeholder_dtype_on_consumer_mismatch():
     src.set_shape((4, 8))
     src.set_dtype(tvm.DataType("float16"))
 
-    rowsum = Reduction((4, 8), dtype="float32", out_dtype="float32", name="rowsum")
+    rowsum = ReduceSum((4, 8), dtype="float32", out_dtype="float32", name="rowsum")
     wire_input(src, rowsum, dst_id=0, src_id=0)
 
     assert src.get_dtype(0) == tvm.DataType("float16")
 
 
-def test_graph_structure_to_cleave_uses_superoptimizer_dtype_metadata():
+def test_to_ir_uses_superoptimizer_dtype_metadata():
     graph_structure = [
         {
             "op_type": "kn_input_op",
@@ -47,7 +47,7 @@ def test_graph_structure_to_cleave_uses_superoptimizer_dtype_metadata():
         },
     ]
 
-    graph = graph_structure_to_cleave(graph_structure)
+    graph = to_ir(graph_structure)
 
     placeholder = next(node for node in graph.nodes if isinstance(node, PlaceHolderNode))
     exp = next(node for node in graph.nodes if isinstance(node, Exp))

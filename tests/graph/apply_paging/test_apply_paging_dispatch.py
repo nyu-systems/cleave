@@ -17,12 +17,8 @@ import pytest
 
 pytest.importorskip("tilelang")
 
-from tests.graph.apply_paging._test_utils import (
-    build_mla_paged_graph,
-    build_paged_graph,
-    paged_kernel_source,
-)
-from cleave.paging import (
+from cleave.dynamic.dense import build_mla_paged_graph, build_paged_graph, paged_kernel_source
+from cleave.dynamic.paging import (
     MLA_PAGED_DECODE,
     MLA_PAGED_PREFILL_CAUSAL,
     PAGED_DECODE_SLAB,

@@ -39,8 +39,8 @@ class KNGraph:
     ) -> DTensor:
         return self.cygraph.matmul(A, B, trans_A, trans_B)
 
-    def reduction(self, A: DTensor, dim: int):
-        return self.cygraph.reduction(A, dim)
+    def reduce_sum(self, A: DTensor, dim: int):
+        return self.cygraph.reduce_sum(A, dim)
 
     def exp(self, A: DTensor):
         return self.cygraph.exp(A)
@@ -65,6 +65,12 @@ class KNGraph:
 
     def div(self, A: DTensor, B: DTensor):
         return self.cygraph.div(A, B)
+
+    def sub(self, A: DTensor, B: DTensor):
+        return self.cygraph.sub(A, B)
+
+    def reduce_max(self, A: DTensor, dim: int):
+        return self.cygraph.reduce_max(A, dim)
 
     def rms_norm(self, A: DTensor, normalized_shape: tuple):
         return self.cygraph.rms_norm(A, normalized_shape)

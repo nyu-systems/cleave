@@ -1,10 +1,9 @@
 """Guard the generated kernels' latency against this GPU's recorded baseline.
 
-Cleave against itself: the kernel under test is the checked-in golden TileLang in
+Cleave against itself: the kernel under test is the checked-in expected TileLang in
 ``tests/graph/handwritten/expected_kernels/``, compiled and run directly, and the
 reference is a recorded run of the same harness on the same GPU model. Nothing here
-compares against another library -- for that, see
-``bench/bench_dynamic.py``.
+compares against another library.
 
 Baselines are per GPU model (``tests/perf/baselines/<model>.json``) and only H100 is
 recorded today, so the test skips on any other device rather than comparing latencies
@@ -41,6 +40,7 @@ import pytest
 # skipping on a machine that cannot time anything.
 pytest.importorskip("torch")
 
+from cleave.runtime.autotune import geomean  # noqa: E402
 from tests.perf import _bench  # noqa: E402
 
 THRESHOLD = float(os.environ.get("CLEAVE_PERF_THRESHOLD", "1.25"))
@@ -82,7 +82,7 @@ def test_expected_kernel_latency(operator, baseline):
         pytest.skip(f"{operator} is absent from the baseline record")
 
     measured = _bench.time_operator(operator, max_workloads=MAX_WORKLOADS)
-    current = _bench.geomean(measured.values())
+    current = geomean(measured.values())
     ratio = current / recorded["geomean_us"]
 
     # Per-workload detail, so a failure names the workload that moved rather than only

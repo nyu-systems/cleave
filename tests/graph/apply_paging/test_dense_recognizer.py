@@ -18,22 +18,19 @@ import pytest
 
 pytest.importorskip("tilelang")
 
-from tests._graphs import (
-    _connect,
-    _finalize,
-    flash_attention_sd_graph,
-    mla_attention_sd_graph,
-)
-from tests.graph.apply_paging._test_utils import (
+from tests._graphs import _connect, _finalize
+from cleave.dynamic.dense import (
     ACCUM_DTYPE,
     DTYPE,
     KV_PROXY,
     build_paged_graph,
+    flash_attention_sd_graph,
+    mla_attention_sd_graph,
     tiled_dense_attention,
 )
-from cleave.graph import OutputNode
-from cleave.ops import Add, Div, Exp, Matmul, Mul, Reduction, Sub
-from cleave.paging import (
+from cleave.ir.graph import OutputNode
+from cleave.ir.ops import Add, Div, Exp, Matmul, Mul, ReduceSum, Sub
+from cleave.dynamic.paging import (
     DenseAttention,
     DenseMLA,
     MLASpec,
@@ -93,7 +90,7 @@ def _dense(**overrides):
         warp_policy="rows",
         transpose_B=overrides.get("value_transpose", False),
     )
-    rowsum_0 = Reduction(
+    rowsum_0 = ReduceSum(
         (MQ, KV_PROXY), dtype=ACCUM_DTYPE, out_dtype=ACCUM_DTYPE, name="rowsum_0"
     )
     div_0 = Div(
@@ -323,7 +320,7 @@ def _dense_mla(**overrides):
         warp_policy="rows",
         transpose_B=overrides.get("value_transpose", False),
     )
-    rowsum_0 = Reduction(
+    rowsum_0 = ReduceSum(
         (s_q, KV_PROXY), dtype=ACCUM_DTYPE, out_dtype=ACCUM_DTYPE, name="rowsum_0"
     )
     div_0 = Div(

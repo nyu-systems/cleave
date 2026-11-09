@@ -1,9 +1,9 @@
 from tilelang.carver.roller import Edge
 
-from cleave import passes
-from cleave.graph import Graph, Iterator, OutputNode, GraphNode, AccumEdge
-from cleave.util import gather_all_nodes, lock_graph
-from cleave.ops import Matmul, Silu, Mul
+from cleave.codegen import passes
+from cleave.ir.graph import Graph, Iterator, OutputNode, GraphNode, AccumEdge
+from cleave.ir.graph_utils import gather_all_nodes, lock_graph
+from cleave.ir.ops import Matmul, Silu, Mul
 
 DTYPE = "float16"
 ACCUM_DTYPE = "float32"

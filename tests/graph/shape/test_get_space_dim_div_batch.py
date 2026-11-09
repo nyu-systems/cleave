@@ -3,7 +3,7 @@ import pytest
 pytest.importorskip("tilelang")
 pytest.importorskip("tvm")
 
-from cleave.ops import Div
+from cleave.ir.ops import Div
 
 
 @pytest.mark.parametrize(

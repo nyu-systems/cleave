@@ -3,7 +3,7 @@ import pytest
 pytest.importorskip("tilelang")
 pytest.importorskip("tvm")
 
-from cleave.graph import GraphNode
+from cleave.ir.graph import GraphNode
 from cleave.schedule import apply_tiling
 
 from tests._graphs import gqa_bhsd_graph

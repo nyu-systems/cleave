@@ -46,11 +46,28 @@ DTensor *Graph::div(DTensor const *input1, DTensor const *input2) {
   return elementbinary(input1, input2, cleave_superoptimizer::type::KN_DIV_OP);
 }
 
+DTensor Graph::sub(DTensor const &input1, DTensor const &input2) {
+  return elementbinary(input1, input2, cleave_superoptimizer::type::KN_SUB_OP);
+}
+
+DTensor Graph::sub(DTensor const &input, float scalar) {
+  return add(input, -scalar);
+}
+
+DTensor Graph::sub(float scalar, DTensor const &input) {
+  return add(mul(input, -1.0f), scalar);
+}
+
+DTensor *Graph::sub(DTensor const *input1, DTensor const *input2) {
+  return elementbinary(input1, input2, cleave_superoptimizer::type::KN_SUB_OP);
+}
+
 DTensor Graph::elementbinary(DTensor const &input1,
                              DTensor const &input2,
                              cleave_superoptimizer::type::KNOperatorType type) {
   KNOperator *op = create_elementbinary_op(input1, input2, type);
-  assert(op != nullptr);
+  CSO_REQUIRE(op != nullptr, std::invalid_argument,
+              __func__ << ": incompatible operand shapes or attributes");
   operators.push_back(op);
   assert(op->output_tensors.size() == 1);
   DTensor output = op->output_tensors[0];
@@ -63,7 +80,8 @@ DTensor Graph::elementbinary(DTensor const &input,
                              cleave_superoptimizer::type::KNOperatorType type) {
   KNOperator *op =
       create_elementbinary_op(input, scalar, scalar_on_left, type);
-  assert(op != nullptr);
+  CSO_REQUIRE(op != nullptr, std::invalid_argument,
+              __func__ << ": incompatible operand shapes or attributes");
   operators.push_back(op);
   assert(op->output_tensors.size() == 1);
   DTensor output = op->output_tensors[0];

@@ -28,7 +28,7 @@ def build_gqa_prefill_bhsd():
     A = graph.div(A, norm_factor)
     A = graph.add(A, -50 / norm_factor)
     E = graph.exp(A)
-    S = graph.reduction(E, 2)
+    S = graph.reduce_sum(E, 2)
     D = graph.div(E, S)
     O = graph.matmul(D, V)
     graph.create_tiled_output(O)

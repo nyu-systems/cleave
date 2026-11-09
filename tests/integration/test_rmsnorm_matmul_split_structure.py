@@ -10,9 +10,10 @@ from tests._graphs import (
     rmsnorm_matmul_split_combine_graph,
     rmsnorm_matmul_split_partial_graph,
 )
-from cleave.graph import Graph, OutputNode, PlaceHolderNode
-from cleave.integration.graph_processing import process_graphs, split_graph
-from cleave.ops import Div, Matmul, Mul, Reduction, SplitView, Sqrt
+from cleave.ir.graph import Graph, OutputNode, PlaceHolderNode
+from cleave.lower.process import to_bundles
+from cleave.lower.split import split_graph
+from cleave.ir.ops import Div, Matmul, Mul, ReduceSum, SplitView, Sqrt
 
 
 _CASES_WITH_SYMBOLIC_SPLIT_FACTOR = set()
@@ -28,7 +29,7 @@ def _node_attrs(node):
         return ()
     if isinstance(node, SplitView):
         return (("axis", node.axis), ("factor", node.factor))
-    if isinstance(node, Reduction):
+    if isinstance(node, ReduceSum):
         return (("axis", node.axis),)
     if isinstance(node, Matmul):
         return (
@@ -191,7 +192,7 @@ def test_rmsnorm_matmul_symbolic_split_k_cleave_graph_with_symbol_mapping():
         12: 4096,
     }
 
-    cleave_graphs = process_graphs(
+    cleave_graphs = to_bundles(
         [before_graph],
         symbol_map=symbol_map,
         split_factors=[4],
@@ -229,7 +230,7 @@ def test_rmsnorm_matmul_split_cleave_graph_matches_apply_tiling_references():
         "before_split_rmsnorm_matmul_graph_structure_valid_2.graph"
     )
 
-    cleave_graphs = process_graphs(
+    cleave_graphs = to_bundles(
         [before_graph],
         symbol_map={
             4: 1024,

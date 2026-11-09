@@ -5,6 +5,7 @@
 #include <iostream>
 #include <mutex>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -188,6 +189,11 @@ class LogMessage {
   std::ostringstream stream_;
 };
 
+template <typename E>
+[[noreturn]] inline void ThrowError(std::string const &message) {
+  throw E(message);
+}
+
 class LogMessageVoidify {
  public:
   void operator&(std::ostream &) {}
@@ -237,3 +243,18 @@ class LogMessageVoidify {
 
 #define CSO_CHECK(condition)                                                  \
   CSO_LOG_IF(FATAL, !(condition)) << "Check failed: " #condition ". "
+
+// Throw a C++ exception (surfaced to Python via `except +`) for user errors.
+#define CSO_THROW(exc, msg)                                                   \
+  do {                                                                        \
+    std::ostringstream _cso_os;                                               \
+    _cso_os << msg;                                                           \
+    ::cleave_superoptimizer::logging::ThrowError<exc>(_cso_os.str());         \
+  } while (0)
+
+#define CSO_REQUIRE(condition, exc, msg)                                      \
+  do {                                                                        \
+    if (!(condition)) {                                                       \
+      CSO_THROW(exc, msg);                                                    \
+    }                                                                         \
+  } while (0)
