@@ -18,7 +18,7 @@ import pytest
 pytest.importorskip("tilelang")
 
 from tests.graph.apply_paging._test_utils import OPERATOR_CASES
-from cleave.paging import (
+from cleave.dynamic.paging import (
     PAGED_DECODE_SLAB,
     PAGED_PREFILL_CAUSAL,
     RAGGED_PREFILL_CAUSAL,
@@ -194,7 +194,7 @@ def test_accepts_the_shipped_specs(operator):
     """Every tuned GQA operator's spec must pass the gate it ships behind.
 
     Keyed off the operator registry rather than a second copy of the specs, so a new assert
-    that a shipped spec would trip fails here rather than only in the golden test.
+    that a shipped spec would trip fails here rather than only in the expected-kernel test.
     """
     OPERATOR_CASES[operator][0].validate()
 

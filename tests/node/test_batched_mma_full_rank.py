@@ -2,9 +2,9 @@ import pytest
 
 from tilelang.carver.roller import Edge  # noqa: F401 (ensures tilelang/tvm path setup)
 from cleave.arch import get_arch
-from cleave.graph import OutputNode
-from cleave.ops import Matmul
-from cleave.policy.default import TCPolicy
+from cleave.ir.graph import OutputNode
+from cleave.ir.ops import Matmul
+from cleave.schedule.policy.default import TCPolicy
 
 
 def _build_batched_mma_with_broadcast_batch() -> Matmul:

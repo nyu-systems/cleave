@@ -33,5 +33,9 @@ private:
   Store store_;
 };
 
+// Drops the calling thread's fingerprint buffers (filled by
+// KNOperator::fingerprint()).
+void clear_thread_fingerprints();
+
 } // namespace kernel
 } // namespace cleave_superoptimizer

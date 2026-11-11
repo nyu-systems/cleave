@@ -10,9 +10,9 @@ after cloning, producing a matmul with mismatched contraction dims.
 
 from tilelang.carver.roller.node import Edge
 
-from cleave.graph import OutputNode, Graph
-from cleave.ops import Matmul, Mul
-from cleave.util import gather_all_nodes, find_topo_sort, clone_graph
+from cleave.ir.graph import OutputNode, Graph
+from cleave.ir.ops import Matmul, Mul
+from cleave.ir.graph_utils import gather_all_nodes, find_topo_sort, clone_graph
 
 
 def _connect(src, dst, src_id, dst_id):

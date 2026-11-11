@@ -1,9 +1,9 @@
 import torch
 
-from tests.graph.handwritten._test_utils import GATHER_TOLERANCE
+from cleave.dynamic import GATHER_TOLERANCE
 
-import cleave.util.runtime as runtime
-from cleave.util.env import _gpu_exec_guard
+from cleave.runtime import validate
+from cleave.runtime.gpu import _gpu_exec_guard
 
 
 class FakeKernel:
@@ -27,11 +27,11 @@ def _captured_tolerance(monkeypatch, **kwargs):
     monkeypatch.setattr(torch.testing, "assert_close", fake_assert_close)
     with _gpu_exec_guard():
         tensor = torch.zeros(4, device="cuda")
-        runtime._validate_kernel_outputs(FakeKernel(tensor), (), [tensor], **kwargs)
+        validate._validate_kernel_outputs(FakeKernel(tensor), (), [tensor], **kwargs)
     return seen
 
 
-def test_validate_kernel_outputs_keeps_the_legacy_bound_by_default(monkeypatch):
+def test_validate_kernel_outputs_uses_the_loose_bound_by_default(monkeypatch):
     assert _captured_tolerance(monkeypatch) == {
         "rtol": 0.5,
         "atol": 0.5,

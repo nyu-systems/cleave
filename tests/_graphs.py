@@ -2,7 +2,7 @@
 
 Reference and handwritten kernels are hand-written TileLang, but their numeric
 reference is derived by executing an equivalent cleave source graph (see
-``cleave.util.graph_executor``). The builders here construct those source graphs
+``cleave.runtime.reference``). The builders here construct those source graphs
 so the graph executor produces inputs (in the kernel's parameter order) and the
 matching reference outputs. Each builder's placeholder order must equal the
 hand-written kernel's parameter order.
@@ -12,20 +12,20 @@ from __future__ import annotations
 
 from tilelang.carver.roller import Edge
 
-from cleave.graph import Graph, OutputNode
-from cleave.ops import (
+from cleave.ir.graph import Graph, OutputNode
+from cleave.ir.ops import (
     Add,
     Div,
     Exp,
     Matmul,
     Mul,
     PermuteView,
-    Reduction,
+    ReduceSum,
     SplitView,
     Sub,
     wire_input,
 )
-from cleave.util import find_topo_sort, gather_all_nodes
+from cleave.ir.graph_utils import find_topo_sort, gather_all_nodes
 
 
 DTYPE = "float16"
@@ -152,7 +152,7 @@ def matmul_rowsum_graph(M, N, K):
     mma = Matmul(
         (M, N, K), dtype=DTYPE, out_dtype=ACCUM_DTYPE, name="mma_0", warp_policy="rows"
     )
-    rowsum = Reduction(
+    rowsum = ReduceSum(
         (M, N), axis=-1, dtype=ACCUM_DTYPE, out_dtype=ACCUM_DTYPE, name="rowsum_0"
     )
     _connect(mma, rowsum, 0, 0)
@@ -167,10 +167,10 @@ def rmsnorm_matmul_graph(M, N, K):
     (``rowsum_0``), matmul A@B (``mma_0``), ``Div(const=K)`` (``div_0``) -> RSqrt
     (``rsqrt_0``) -> broadcast Mul of the matmul output (``mul_1``, out fp16).
     """
-    from cleave.ops import RSqrt
+    from cleave.ir.ops import RSqrt
 
     square = Mul((M, K), dtype=DTYPE, out_dtype=ACCUM_DTYPE, name="mul_0")
-    rowsum = Reduction(
+    rowsum = ReduceSum(
         (M, K), dtype=ACCUM_DTYPE, out_dtype=ACCUM_DTYPE, name="rowsum_0"
     )
     mma = Matmul(
@@ -226,7 +226,7 @@ def mha_bhsd_graph(B, H, S_Q, S_KV, D):
         name="mma_1",
         warp_policy="rows",
     )
-    rowsum_0 = Reduction(
+    rowsum_0 = ReduceSum(
         (BH, S_Q, S_KV), dtype=ACCUM_DTYPE, out_dtype=ACCUM_DTYPE, name="rowsum_0"
     )
     div_0 = Div(
@@ -299,7 +299,7 @@ def mha_bshd_graph(B, S_Q, S_KV, H, D):
         name="mma_1",
         warp_policy="rows",
     )
-    rowsum_0 = Reduction(
+    rowsum_0 = ReduceSum(
         (B, H, S_Q, S_KV), dtype=ACCUM_DTYPE, out_dtype=ACCUM_DTYPE, name="rowsum_0"
     )
     div_0 = Div(
@@ -332,7 +332,7 @@ def matmul_splitk_partial_graph(SPLIT_K, M, N, K_PARTIAL):
     """Split-K partial matmul. Kernel params: A (M,K), B (K,N) with K=SPLIT_K*K_PARTIAL.
 
     Output is the per-split product stacked on a leading split axis: (SPLIT_K, M, N).
-    Mirrors ``tests/schedule/end2end/test_matmul_splitk_partial.py``.
+    Mirrors the ``matmul_splitk_partial`` case of ``tests/schedule/end2end/test_end2end.py``.
     """
     K = SPLIT_K * K_PARTIAL
     split_a = SplitView((M, K), axis=1, factor=SPLIT_K, dtype=DTYPE, name="split_a")
@@ -353,9 +353,9 @@ def matmul_splitk_partial_graph(SPLIT_K, M, N, K_PARTIAL):
 def matmul_splitk_combine_graph(SPLIT_K, M, N):
     """Split-K combine: sum the per-split partials. Kernel param: A (SPLIT_K, M, N).
 
-    Mirrors ``tests/schedule/end2end/test_matmul_splitk_combine.py``.
+    Mirrors the ``matmul_splitk_combine`` case of ``tests/schedule/end2end/test_end2end.py``.
     """
-    reduction = Reduction(
+    reduction = ReduceSum(
         (SPLIT_K, M, N), axis=0, dtype=DTYPE, out_dtype=ACCUM_DTYPE, name="reduction_0"
     )
     OutputNode(reduction, dtype=OUT_DTYPE)
@@ -366,7 +366,7 @@ def batched_matmul_splitk_partial_graph(B, SPLIT_K, M, N, K_PARTIAL):
     """Batched split-K partial matmul. Kernel params: A (B,M,K), B (B,K,N).
 
     Output: (B, SPLIT_K, M, N). Mirrors
-    ``tests/schedule/end2end/test_batched_matmul_splitk_partial.py``.
+    the ``batched_matmul_splitk_partial`` case of ``tests/schedule/end2end/test_end2end.py``.
     """
     K = SPLIT_K * K_PARTIAL
     split_a = SplitView((B, M, K), axis=2, factor=SPLIT_K, dtype=DTYPE, name="split_a")
@@ -387,9 +387,9 @@ def batched_matmul_splitk_partial_graph(B, SPLIT_K, M, N, K_PARTIAL):
 def batched_matmul_splitk_combine_graph(B, SPLIT_K, M, N):
     """Batched split-K combine. Kernel param: A (B, SPLIT_K, M, N) -> (B, M, N).
 
-    Mirrors ``tests/schedule/end2end/test_batched_matmul_splitk_combine.py``.
+    Mirrors the ``batched_matmul_splitk_combine`` case of ``tests/schedule/end2end/test_end2end.py``.
     """
-    reduction = Reduction(
+    reduction = ReduceSum(
         (B, SPLIT_K, M, N),
         axis=-3,
         dtype=DTYPE,
@@ -410,7 +410,7 @@ def swiglu_graph(M, N, K):
     ``PlaceHolder_C``. Placeholder names are assigned explicitly below because the
     shared ``A`` input makes the automatic topo-order naming ambiguous.
     """
-    from cleave.ops import Silu
+    from cleave.ir.ops import Silu
 
     mma_up = Matmul(
         (M, N, K), dtype=DTYPE, out_dtype=ACCUM_DTYPE, name="mma_up", warp_policy="rows"
@@ -479,7 +479,7 @@ def gqa_bhsd_graph(B, H_Q, H_KV, S_Q, S_KV, D):
 
     Q carries the full query-head batch (``B*H_Q``) while K/V carry the KV-head
     batch (``B*H_KV``); the ``input_batch_dims_A/B`` on both matmuls encode the
-    grouped broadcast. Mirrors ``tests/schedule/end2end/test_gqa_bhsd.py``.
+    grouped broadcast. Mirrors the ``gqa_bhsd`` case of ``tests/schedule/end2end/test_end2end.py``.
     """
     scale = 1 / (D**0.5)
     mma_0 = Matmul(
@@ -518,7 +518,7 @@ def gqa_bhsd_graph(B, H_Q, H_KV, S_Q, S_KV, D):
         name="mma_1",
         warp_policy="rows",
     )
-    rowsum_0 = Reduction(
+    rowsum_0 = ReduceSum(
         (B * H_Q, S_Q, S_KV), dtype=ACCUM_DTYPE, out_dtype=ACCUM_DTYPE, name="rowsum_0"
     )
     div_0 = Div(
@@ -566,7 +566,7 @@ def qknorm_graph(B, H_Q, H_KV, S_Q, S_KV, HD, eps=1e-6):
     ``Mul`` are wired to the SAME placeholder node so the executor treats it as a
     genuine square (positivity stops at the self-square, keeping Q/K general).
     """
-    from cleave.ops import RSqrt
+    from cleave.ir.ops import RSqrt
 
     def _rmsnorm(x_node, batch, seq, name):
         # x_node: the placeholder feeding this RMSNorm branch.
@@ -574,7 +574,7 @@ def qknorm_graph(B, H_Q, H_KV, S_Q, S_KV, HD, eps=1e-6):
         # Wire x into BOTH operands of the square (shared node -> genuine x*x).
         _connect(x_node, sq, 0, 0)
         _connect(x_node, sq, 0, 1)
-        rowsum = Reduction(
+        rowsum = ReduceSum(
             (batch, seq, HD), dtype=ACCUM_DTYPE, out_dtype=ACCUM_DTYPE, name=f"{name}_rowsum"
         )
         # mean and eps_add operate on the rank-2 (batch, seq) reduction output whose
@@ -652,7 +652,7 @@ def qknorm_graph(B, H_Q, H_KV, S_Q, S_KV, HD, eps=1e-6):
     )
     v_node = mma_1.inputs[1].src_node
     v_node.name = "PlaceHolder_C"
-    rowsum_0 = Reduction(
+    rowsum_0 = ReduceSum(
         (B * H_Q, S_Q, S_KV), dtype=ACCUM_DTYPE, out_dtype=ACCUM_DTYPE, name="rowsum_0"
     )
     div_0 = Div(
@@ -676,7 +676,7 @@ def mqa_bhsd_graph(B, H_Q, H_KV, S_Q, S_KV, D):
     K (B*H_KV,S_KV,D), V (B*H_KV,S_KV,D).
 
     Structurally identical to ``gqa_bhsd_graph``; MQA is the ``H_KV == 1`` case.
-    Mirrors ``tests/schedule/end2end/test_mqa_bhsd.py``.
+    Mirrors the ``mqa_bhsd`` case of ``tests/schedule/end2end/test_end2end.py``.
     """
     scale = 1 / (D**0.5)
     mma_0 = Matmul(
@@ -715,7 +715,7 @@ def mqa_bhsd_graph(B, H_Q, H_KV, S_Q, S_KV, D):
         name="mma_1",
         warp_policy="rows",
     )
-    rowsum_0 = Reduction(
+    rowsum_0 = ReduceSum(
         (B * H_Q, S_Q, S_KV), dtype=ACCUM_DTYPE, out_dtype=ACCUM_DTYPE, name="rowsum_0"
     )
     div_0 = Div(
@@ -769,7 +769,7 @@ def matmul_softmax_graph(B, H, S_Q, S_KV, D):
     exp_0 = Exp(
         (B * H, S_Q, S_KV), dtype=ACCUM_DTYPE, out_dtype=ACCUM_DTYPE, name="exp_0"
     )
-    rowsum_0 = Reduction(
+    rowsum_0 = ReduceSum(
         (B * H, S_Q, S_KV), dtype=ACCUM_DTYPE, out_dtype=ACCUM_DTYPE, name="rowsum_0"
     )
     div_0 = Div(
@@ -789,160 +789,6 @@ def matmul_softmax_graph(B, H, S_Q, S_KV, D):
     return _finalize(mma_0, mul_0, sub_0, exp_0, rowsum_0, div_0)
 
 
-def flash_attention_sd_graph(
-    S_Q, S_KV, D, *, dtype=DTYPE, accum_dtype=ACCUM_DTYPE, out_dtype=OUT_DTYPE
-):
-    """Single-head flash-attention (safe-exp). Kernel params: Q,K,V (S,D).
-
-    Same op chain as ``mha_bhsd_graph`` but with no batch dimension (rank-2/3
-    tensors). Mirrors ``tests/schedule/end2end/test_flash_attention_sd.py``.
-
-    The dtypes are arguments because this is also the dense body a paged attention
-    operator is built from, and those operators are bfloat16.
-    """
-    scale = 1 / (D**0.5)
-    node_0 = Matmul(
-        (S_Q, S_KV, D),
-        dtype=dtype,
-        out_dtype=accum_dtype,
-        name="mma_0",
-        transpose_B=True,
-        warp_policy="rows",
-    )
-    node_1 = Mul(
-        (S_Q, S_KV),
-        const=scale,
-        dtype=accum_dtype,
-        out_dtype=accum_dtype,
-        name="mul_0",
-    )
-    node_2 = Sub(
-        (S_Q, S_KV),
-        const=(50.0 * scale),
-        dtype=accum_dtype,
-        out_dtype=accum_dtype,
-        name="sub_0",
-    )
-    node_3 = Exp((S_Q, S_KV), dtype=accum_dtype, out_dtype=accum_dtype, name="exp_0")
-    node_4 = Matmul(
-        (S_Q, D, S_KV),
-        dtype=dtype,
-        out_dtype=accum_dtype,
-        name="mma_1",
-        warp_policy="rows",
-    )
-    node_5 = Reduction(
-        (S_Q, S_KV), dtype=accum_dtype, out_dtype=accum_dtype, name="rowsum_0"
-    )
-    node_6 = Div(
-        (S_Q, D),
-        broadcast=0,
-        dtype=accum_dtype,
-        out_dtype=accum_dtype,
-        name="div_0",
-    )
-    _connect(node_0, node_1, 0, 0)
-    _connect(node_1, node_2, 0, 0)
-    _connect(node_2, node_3, 0, 0)
-    _connect(node_3, node_4, 0, 0)
-    _connect(node_3, node_5, 0, 0)
-    _connect(node_4, node_6, 0, 0)
-    _connect(node_5, node_6, 0, 1)
-    OutputNode(node_6, dtype=out_dtype)
-    return _finalize(node_0, node_1, node_2, node_3, node_4, node_5, node_6)
-
-
-def mla_attention_sd_graph(
-    S_Q, S_KV, HD, PE, *, dtype=DTYPE, accum_dtype=ACCUM_DTYPE, out_dtype=OUT_DTYPE
-):
-    """Single-head MLA attention (safe-exp) with RoPE positional scores, no batch dim.
-
-    Kernel params (by placeholder role): Q ``PlaceHolder_A`` (S_Q,HD), KV
-    ``PlaceHolder_B`` (S_KV,HD), Q_pe ``PlaceHolder_C`` (S_Q,PE), K_pe
-    ``PlaceHolder_D`` (S_KV,PE). The score is ``(Q @ KV^T) + (Q_pe @ K_pe^T)``, then
-    softmax, then a value matmul that reuses KV -- MLA has no separate V, which is why
-    the placeholders are named by role.
-
-    The rank-2 counterpart of ``mla_decode_bhsd_graph``: this is the dense body the paged
-    MLA operators are built from, and those have no batch axis to tile (their batch is a
-    ragged request list resolved at runtime) and are bfloat16.
-    """
-    scale = 1 / (HD**0.5)
-    node_0 = Matmul(
-        (S_Q, S_KV, HD),
-        dtype=dtype,
-        out_dtype=accum_dtype,
-        name="mma_0",
-        transpose_B=True,
-        warp_policy="rows",
-    )
-    q = node_0.inputs[0].src_node
-    q.name = "PlaceHolder_A"
-    kv = node_0.inputs[1].src_node
-    kv.name = "PlaceHolder_B"
-
-    node_pe = Matmul(
-        (S_Q, S_KV, PE),
-        dtype=dtype,
-        out_dtype=accum_dtype,
-        name="mma_pe",
-        transpose_B=True,
-        warp_policy="rows",
-    )
-    node_pe.inputs[0].src_node.name = "PlaceHolder_C"
-    node_pe.inputs[1].src_node.name = "PlaceHolder_D"
-
-    node_add = Add(
-        (S_Q, S_KV), dtype=accum_dtype, out_dtype=accum_dtype, name="add_0"
-    )
-    node_1 = Mul(
-        (S_Q, S_KV),
-        const=scale,
-        dtype=accum_dtype,
-        out_dtype=accum_dtype,
-        name="mul_0",
-    )
-    node_2 = Sub(
-        (S_Q, S_KV),
-        const=(50.0 * scale),
-        dtype=accum_dtype,
-        out_dtype=accum_dtype,
-        name="sub_0",
-    )
-    node_3 = Exp((S_Q, S_KV), dtype=accum_dtype, out_dtype=accum_dtype, name="exp_0")
-    node_4 = Matmul(
-        (S_Q, HD, S_KV),
-        dtype=dtype,
-        out_dtype=accum_dtype,
-        name="mma_1",
-        warp_policy="rows",
-    )
-    node_5 = Reduction(
-        (S_Q, S_KV), dtype=accum_dtype, out_dtype=accum_dtype, name="rowsum_0"
-    )
-    node_6 = Div(
-        (S_Q, HD),
-        broadcast=0,
-        dtype=accum_dtype,
-        out_dtype=accum_dtype,
-        name="div_0",
-    )
-    _connect(node_0, node_add, 0, 0)
-    _connect(node_pe, node_add, 0, 1)
-    _connect(node_add, node_1, 0, 0)
-    _connect(node_1, node_2, 0, 0)
-    _connect(node_2, node_3, 0, 0)
-    _connect(node_3, node_4, 0, 0)
-    _connect(kv, node_4, 0, 1)
-    _connect(node_3, node_5, 0, 0)
-    _connect(node_4, node_6, 0, 0)
-    _connect(node_5, node_6, 0, 1)
-    OutputNode(node_6, dtype=out_dtype)
-    return _finalize(
-        node_0, node_pe, node_add, node_1, node_2, node_3, node_4, node_5, node_6
-    )
-
-
 def mla_prefill_bhsd_graph(B, H, S_Q, S_KV, HD_IN, HD_OUT):
     """MLA-prefill flash-attention (safe-exp). Kernel params: Q (B*H,S_Q,HD_IN),
     KV (B*H,S_KV,HD_IN) for the score matmul and V (B*H,S_KV,HD_OUT) for the
@@ -950,7 +796,7 @@ def mla_prefill_bhsd_graph(B, H, S_Q, S_KV, HD_IN, HD_OUT):
 
     Same op chain as ``mha_bhsd_graph`` but with distinct input/output head dims
     (``HD_IN`` for the QK score, ``HD_OUT`` for the value projection). Mirrors
-    ``tests/schedule/end2end/test_mla_prefill_bhsd.py``.
+    the ``mla_prefill_bhsd`` case of ``tests/schedule/end2end/test_end2end.py``.
     """
     scale = 1 / (HD_IN**0.5)
     node_0 = Matmul(
@@ -985,7 +831,7 @@ def mla_prefill_bhsd_graph(B, H, S_Q, S_KV, HD_IN, HD_OUT):
         name="mma_1",
         warp_policy="rows",
     )
-    node_5 = Reduction(
+    node_5 = ReduceSum(
         (B * H, S_Q, S_KV), dtype=ACCUM_DTYPE, out_dtype=ACCUM_DTYPE, name="rowsum_0"
     )
     node_6 = Div(
@@ -1014,7 +860,7 @@ def mla_decode_bhsd_graph(B, H, S_KV, HD, PE):
     ``PlaceHolder_D`` (B,S_KV,PE). The score is ``(Q @ KV^T) + (Q_pe @ K_pe^T)``
     then softmax and value matmul reusing KV. Placeholder names are set by role
     because ``KV`` is shared between the score matmul and the value matmul.
-    Mirrors ``tests/schedule/end2end/test_mla_decode_bhsd.py``.
+    Mirrors the ``mla_decode_bhsd`` case of ``tests/schedule/end2end/test_end2end.py``.
     """
     scale = 1 / (HD**0.5)
     node_0 = Matmul(
@@ -1082,7 +928,7 @@ def mla_decode_bhsd_graph(B, H, S_KV, HD, PE):
         name="mma_1",
         warp_policy="rows",
     )
-    node_5 = Reduction(
+    node_5 = ReduceSum(
         (B, H, S_KV),
         dtype=ACCUM_DTYPE,
         out_dtype=ACCUM_DTYPE,
@@ -1189,7 +1035,7 @@ def gqa_split_partial_graph(B, H_Q, H_KV, SPLIT_K, S_Q, S_KV_PARTIAL, D):
         out_dtype=ACCUM_DTYPE,
         name="exp_0",
     )
-    rowsum_0 = Reduction(
+    rowsum_0 = ReduceSum(
         (B * H_Q, SPLIT_K, S_Q, S_KV_PARTIAL),
         axis=-1,
         dtype=ACCUM_DTYPE,
@@ -1228,7 +1074,7 @@ def mha_split_partial_graph(B, H, SPLIT_K, S_Q, S_KV_PARTIAL, D):
     Thin wrapper over :func:`gqa_split_partial_graph` with ``H_Q == H_KV == H`` (no
     head grouping). TWO outputs: ``OutputNode_0`` (rowsum, (SPLIT_K,B*H,S_Q,1)) and
     ``OutputNode_1`` (value partial, (SPLIT_K,B*H,S_Q,D)); order and names preserved.
-    Mirrors ``tests/schedule/end2end/test_mha_split_partial.py``.
+    Mirrors the ``mha_split_partial`` case of ``tests/schedule/end2end/test_end2end.py``.
     """
     return gqa_split_partial_graph(B, H, H, SPLIT_K, S_Q, S_KV_PARTIAL, D)
 
@@ -1240,16 +1086,16 @@ def mha_split_combine_graph(H_Q, SPLIT_K, S_Q, D):
 
     Sums the per-split rowsum and value partials over the split axis, then divides
     the combined value by the combined rowsum. Mirrors
-    ``tests/schedule/end2end/test_mha_split_combine.py``.
+    the ``mha_split_combine`` case of ``tests/schedule/end2end/test_end2end.py``.
     """
-    rowsum_combine_0 = Reduction(
+    rowsum_combine_0 = ReduceSum(
         (H_Q, SPLIT_K, S_Q),
         axis=1,
         dtype=DTYPE,
         out_dtype=ACCUM_DTYPE,
         name="rowsum_combine_0",
     )
-    value_combine_0 = Reduction(
+    value_combine_0 = ReduceSum(
         (H_Q, SPLIT_K, S_Q, D),
         axis=1,
         dtype=DTYPE,
@@ -1277,7 +1123,7 @@ def rmsnorm_matmul_split_partial_graph(SPLIT_K, M, N, K_PARTIAL):
     per-split sum-of-squares (for the RMS norm) and a per-split matmul partial.
     TWO outputs: ``OutputNode_0`` (rowsum, (SPLIT_K,M,1)) and ``OutputNode_1``
     (matmul partial, (SPLIT_K,M,N)); order and names are preserved. Mirrors
-    ``tests/schedule/end2end/test_rmsnorm_matmul_split_partial.py``.
+    the ``rmsnorm_matmul_split_partial`` case of ``tests/schedule/end2end/test_end2end.py``.
     """
     K = SPLIT_K * K_PARTIAL
 
@@ -1304,7 +1150,7 @@ def rmsnorm_matmul_split_partial_graph(SPLIT_K, M, N, K_PARTIAL):
         out_dtype=ACCUM_DTYPE,
         name="mul_0",
     )
-    rowsum_0 = Reduction(
+    rowsum_0 = ReduceSum(
         (SPLIT_K, M, K_PARTIAL),
         axis=-1,
         dtype=ACCUM_DTYPE,
@@ -1339,18 +1185,18 @@ def rmsnorm_matmul_split_combine_graph(SPLIT_K, M, N, K):
 
     Combines the per-split sum-of-squares and matmul partials over the split axis,
     forms ``inv_rms = 1 / sqrt(sum_sq / K)`` and post-multiplies the combined
-    matmul by it. Mirrors ``tests/schedule/end2end/test_rmsnorm_matmul_split_combine.py``.
+    matmul by it. Mirrors the ``rmsnorm_matmul_split_combine`` case of ``tests/schedule/end2end/test_end2end.py``.
     """
-    from cleave.ops import Sqrt
+    from cleave.ir.ops import Sqrt
 
-    rowsum_combine_0 = Reduction(
+    rowsum_combine_0 = ReduceSum(
         (SPLIT_K, M),
         axis=0,
         dtype=DTYPE,
         out_dtype=ACCUM_DTYPE,
         name="rowsum_combine_0",
     )
-    mma_combine_0 = Reduction(
+    mma_combine_0 = ReduceSum(
         (SPLIT_K, M, N),
         axis=0,
         dtype=DTYPE,
@@ -1391,9 +1237,9 @@ def rmsnorm_matmul_split_combine_graph(SPLIT_K, M, N, K):
 
 def rowsum_graph(M, N):
     """Row-sum reduction over the last axis: A.sum(dim=-1) -> (M,). Kernel param:
-    A (M, N). Mirrors ``tests/schedule/end2end/test_rowsum.py``.
+    A (M, N). Mirrors the ``rowsum`` case of ``tests/schedule/end2end/test_end2end.py``.
     """
-    node_0 = Reduction(
+    node_0 = ReduceSum(
         (M, N),
         dtype=DTYPE,
         out_dtype=ACCUM_DTYPE,
@@ -1408,10 +1254,10 @@ def rowsum_div_graph(S_Q, S_KV):
     A (S_Q, S_KV).
 
     The single input ``A`` feeds both the row-sum (denominator) and the numerator
-    of the broadcast divide. Reduction and Div run entirely in ``DTYPE`` (no
-    float32 accumulation), matching ``tests/schedule/end2end/test_rowsum_div.py``.
+    of the broadcast divide. ReduceSum and Div run entirely in ``DTYPE`` (no
+    float32 accumulation), matching the ``rowsum_div`` case of ``tests/schedule/end2end/test_end2end.py``.
     """
-    node_0 = Reduction((S_Q, S_KV), dtype=DTYPE, out_dtype=DTYPE, name="rowsum_0")
+    node_0 = ReduceSum((S_Q, S_KV), dtype=DTYPE, out_dtype=DTYPE, name="rowsum_0")
     node_1 = Div(
         (S_Q, S_KV),
         broadcast=0,

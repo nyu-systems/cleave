@@ -1,3 +1,5 @@
+import tilelang  # noqa: F401 - puts its bundled tvm on sys.path
+
 from .arch_base import Arch
 from .cuda import CUDA
 from typing import Union
@@ -5,7 +7,15 @@ from tvm.target import Target
 
 
 def get_arch(target: Union[str, Target] = "cuda") -> Arch:
-    if isinstance(target, str):
+    if target == "cuda":
+        import os
+
+        from ..core.target import no_cuda_device
+
+        if no_cuda_device():  # describe one (see cleave.core.target)
+            arch = os.environ.get("CLEAVE_TARGET_ARCH", "sm_90a").rstrip("a")
+            target = {"kind": "cuda", "arch": arch, "max_num_threads": 1024, "thread_warp_size": 32}
+    if isinstance(target, (str, dict)):
         target = Target(target)
 
     if target.kind.name == "cuda":

@@ -13,17 +13,18 @@ bool is_binary(type::KNOperatorType op) {
       type::KNOperatorType::KN_MUL_OP,
       type::KNOperatorType::KN_MATMUL_OP,
       type::KNOperatorType::KN_DIV_OP,
+      type::KNOperatorType::KN_SUB_OP,
   };
   return contains(true_values, op);
 }
 
 bool is_unary(type::KNOperatorType op) {
   std::unordered_set<type::KNOperatorType> true_values{
-      type::KNOperatorType::KN_REDUCTION_0_OP,
-      type::KNOperatorType::KN_REDUCTION_1_OP,
-      type::KNOperatorType::KN_REDUCTION_2_OP,
-      type::KNOperatorType::KN_REDUCTION_3_OP,
-      type::KNOperatorType::KN_REDUCTION_4_OP,
+      type::KNOperatorType::KN_REDUCE_SUM_0_OP,
+      type::KNOperatorType::KN_REDUCE_SUM_1_OP,
+      type::KNOperatorType::KN_REDUCE_SUM_2_OP,
+      type::KNOperatorType::KN_REDUCE_SUM_3_OP,
+      type::KNOperatorType::KN_REDUCE_SUM_4_OP,
       type::KNOperatorType::KN_SPLIT_0_OP,
       type::KNOperatorType::KN_SPLIT_1_OP,
       type::KNOperatorType::KN_SPLIT_2_OP,
@@ -37,6 +38,11 @@ bool is_unary(type::KNOperatorType op) {
       type::KNOperatorType::KN_CLAMP_OP,
       type::KNOperatorType::KN_RMS_NORM_OP,
       type::KNOperatorType::KN_OUTPUT_OP,
+      type::KNOperatorType::KN_REDUCE_MAX_0_OP,
+      type::KNOperatorType::KN_REDUCE_MAX_1_OP,
+      type::KNOperatorType::KN_REDUCE_MAX_2_OP,
+      type::KNOperatorType::KN_REDUCE_MAX_3_OP,
+      type::KNOperatorType::KN_REDUCE_MAX_4_OP,
   };
   return contains(true_values, op);
 }
@@ -62,24 +68,36 @@ int get_input_number(type::KNOperatorType op) {
 }
 
 std::shared_ptr<AbstractExpr>
-    make_reduction_pattern(int dim, std::shared_ptr<AbstractExpr> opd) {
+    make_reduce_sum_pattern(int dim, std::shared_ptr<AbstractExpr> opd) {
   if (dim == 1) {
     return opd;
   }
-  return std::make_shared<Red>(dim, opd);
+  return std::make_shared<Sum>(dim, opd);
 }
 
 std::shared_ptr<AbstractExpr> get_pattern(type::KNOperatorType op,
                                           DTensor const &tensor,
                                           std::shared_ptr<AbstractExpr> opd) {
   assert(opd != nullptr);
-  if (op >= type::KNOperatorType::KN_REDUCTION_0_OP &&
-      op <= type::KNOperatorType::KN_REDUCTION_4_OP) {
-    int dim = op - type::KNOperatorType::KN_REDUCTION_0_OP;
+  if (op >= type::KNOperatorType::KN_REDUCE_SUM_0_OP &&
+      op <= type::KNOperatorType::KN_REDUCE_SUM_4_OP) {
+    int dim = op - type::KNOperatorType::KN_REDUCE_SUM_0_OP;
     if (tensor.num_dims <= dim) {
       return nullptr;
     }
-    return make_reduction_pattern(tensor.dim[dim], opd);
+    return make_reduce_sum_pattern(tensor.dim[dim], opd);
+  }
+  if (type::op_category(op) == type::OpCategory::REDUCE_MAX) {
+    int dim = op - type::KNOperatorType::KN_REDUCE_MAX_0_OP;
+    if (tensor.num_dims <= dim) {
+      return nullptr;
+    }
+    if (tensor.dim[dim] == 1) {
+      return opd;
+    }
+    return std::make_shared<Opaque>(
+        "max" + std::to_string(tensor.dim[dim]),
+        std::vector<std::shared_ptr<AbstractExpr>>{opd});
   }
   switch (op) {
     case type::KNOperatorType::KN_SPLIT_0_OP:
@@ -178,7 +196,7 @@ std::shared_ptr<AbstractExpr> get_pattern(type::KNOperatorType op,
         } else {
           return nullptr;
         }
-        return make_reduction_pattern(reduction_dim,
+        return make_reduce_sum_pattern(reduction_dim,
                                       std::make_shared<Mul>(lhs, rhs));
       }
     case type::KNOperatorType::KN_ADD_OP:
@@ -187,6 +205,8 @@ std::shared_ptr<AbstractExpr> get_pattern(type::KNOperatorType op,
       return std::make_shared<Div>(lhs, rhs);
     case type::KNOperatorType::KN_MUL_OP:
       return std::make_shared<Mul>(lhs, rhs);
+    case type::KNOperatorType::KN_SUB_OP:
+      return std::make_shared<Sub>(lhs, rhs);
     default:
       CSO_LOG(FATAL) << "Unsupported KNOperatorType "
                      << static_cast<int>(op);
@@ -217,10 +237,14 @@ std::shared_ptr<AbstractExpr>
 KNOperator *create_op(kernel::Graph &g,
                       type::KNOperatorType type,
                       DTensor const &input) {
-  if (type >= type::KNOperatorType::KN_REDUCTION_0_OP &&
-      type <= type::KNOperatorType::KN_REDUCTION_4_OP) {
-    return g.create_reduction_op(
-        input, type - type::KNOperatorType::KN_REDUCTION_0_OP, 1);
+  if (type >= type::KNOperatorType::KN_REDUCE_SUM_0_OP &&
+      type <= type::KNOperatorType::KN_REDUCE_SUM_4_OP) {
+    return g.create_reduce_sum_op(
+        input, type - type::KNOperatorType::KN_REDUCE_SUM_0_OP, 1);
+  }
+  if (type::op_category(type) == type::OpCategory::REDUCE_MAX) {
+    return g.create_reduce_max_op(
+        input, type - type::KNOperatorType::KN_REDUCE_MAX_0_OP);
   }
   switch (type) {
     case type::KNOperatorType::KN_SPLIT_0_OP:
@@ -268,6 +292,7 @@ KNOperator *create_op(kernel::Graph &g,
     case type::KNOperatorType::KN_DIV_OP:
     case type::KNOperatorType::KN_ADD_OP:
     case type::KNOperatorType::KN_MUL_OP:
+    case type::KNOperatorType::KN_SUB_OP:
       return g.create_elementbinary_op(input1, input2, type);
     default:
       CSO_LOG(FATAL) << "Unsupported KNOperatorType "
@@ -286,16 +311,6 @@ KNOperator *create_op(kernel::Graph &g,
     return create_op(g, type, inputs[0], inputs[1]);
   }
   return nullptr;
-}
-
-size_t count_op_of_type(type::KNOperatorType op_type, kernel::Graph const &g) {
-  int counter = 0;
-  for (auto const &op : g.operators) {
-    if (op->op_type == op_type) {
-      ++counter;
-    }
-  }
-  return counter;
 }
 
 } // namespace search

@@ -1,15 +1,13 @@
 from tilelang.carver.roller import Edge
 
-from cleave import passes
-from cleave.graph import Graph, Iterator, GraphNode, OutputNode, AccumEdge
-from cleave.util import gather_all_nodes, lock_graph
-from cleave.ops import Matmul, Reduction, Mul, Div, RSqrt
+from cleave.codegen import passes
+from cleave.ir.graph import Graph, Iterator, GraphNode, OutputNode, AccumEdge
+from cleave.ir.graph_utils import gather_all_nodes, lock_graph
+from cleave.ir.ops import Matmul, ReduceSum, Mul, Div, RSqrt
 
 DTYPE = "float16"
 ACCUM_DTYPE = "float32"
 OUT_DTYPE = "float16"
-
-LOG = True
 
 
 def get_handwritten_scheduled_graph(dims):
@@ -17,7 +15,7 @@ def get_handwritten_scheduled_graph(dims):
     PM, PN, PK = 128, 128, 4096
     IM, IN, IK = 128, 128, 32
     inner_node_0 = Mul((M, K), dtype=DTYPE, out_dtype=ACCUM_DTYPE, name="mul_0")
-    inner_node_1 = Reduction(
+    inner_node_1 = ReduceSum(
         (M, K), dtype=ACCUM_DTYPE, out_dtype=ACCUM_DTYPE, name="rowsum_0"
     )
     inner_node_2 = Matmul(

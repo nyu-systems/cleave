@@ -56,15 +56,21 @@ void GroupingRules::apply_grouping(kernel::KNOperator const *op,
     case KN_ADD_OP:
     case KN_MUL_OP:
     case KN_DIV_OP:
+    case KN_SUB_OP:
       group_element_binary(op, grouper);
       break;
 
     // Reduction operators
-    case KN_REDUCTION_0_OP:
-    case KN_REDUCTION_1_OP:
-    case KN_REDUCTION_2_OP:
-    case KN_REDUCTION_3_OP:
-    case KN_REDUCTION_4_OP:
+    case KN_REDUCE_SUM_0_OP:
+    case KN_REDUCE_SUM_1_OP:
+    case KN_REDUCE_SUM_2_OP:
+    case KN_REDUCE_SUM_3_OP:
+    case KN_REDUCE_SUM_4_OP:
+    case KN_REDUCE_MAX_0_OP:
+    case KN_REDUCE_MAX_1_OP:
+    case KN_REDUCE_MAX_2_OP:
+    case KN_REDUCE_MAX_3_OP:
+    case KN_REDUCE_MAX_4_OP:
       group_reduction(op, grouper);
       break;
 
@@ -246,7 +252,11 @@ void GroupingRules::group_reduction(kernel::KNOperator const *op,
   assert(input.num_dims == output.num_dims);
 
   // Determine reduction dimension from operator type
-  int reduction_dim = op->op_type - type::KN_REDUCTION_0_OP;
+  int reduction_dim =
+      op->op_type - (type::op_category(op->op_type) ==
+                             type::OpCategory::REDUCE_MAX
+                         ? type::KN_REDUCE_MAX_0_OP
+                         : type::KN_REDUCE_SUM_0_OP);
   assert(reduction_dim >= 0 && reduction_dim <= 4 && "Invalid reduction operator type");
 
   assert(reduction_dim >= 0 && reduction_dim < input.num_dims);

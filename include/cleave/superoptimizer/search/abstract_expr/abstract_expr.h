@@ -8,6 +8,7 @@
 #include <shared_mutex>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace cleave_superoptimizer {
 namespace search {
@@ -21,7 +22,6 @@ public:
       to_z3(z3::context &c,
             std::unordered_set<std::string> &all_variables) const = 0;
   bool subpattern_to(AbstractExpr const &other) const;
-  bool operator==(AbstractExpr const &other) const;
   // True if `other` (a to_string()-serialized pattern) equals this expression
   // or any of its transitive sub-expressions. Used as a sound structural
   // fallback in subpattern_to when Z3 cannot decide within its resource limit.
@@ -121,6 +121,28 @@ class Clamp : public AbstractExpr {
     std::shared_ptr<AbstractExpr> elems;
   };
 
+class Sub : public AbstractExpr {
+public:
+  Sub(std::shared_ptr<AbstractExpr> lhs, std::shared_ptr<AbstractExpr> rhs);
+  z3::expr to_z3(z3::context &c,
+                 std::unordered_set<std::string> &all_variables) const override;
+  std::string to_string() const override;
+  std::shared_ptr<AbstractExpr> lhs, rhs;
+};
+
+// Uninterpreted function `name(args...)`: no rewrite axioms, only that each
+// argument is a subpattern of the result.
+class Opaque : public AbstractExpr {
+public:
+  Opaque(std::string const &name,
+         std::vector<std::shared_ptr<AbstractExpr>> args);
+  z3::expr to_z3(z3::context &c,
+                 std::unordered_set<std::string> &all_variables) const override;
+  std::string to_string() const override;
+  std::string name;
+  std::vector<std::shared_ptr<AbstractExpr>> args;
+};
+
 // Note(@Mengdi): Replace it with Sqr and Sqrt once we have related algebraic
 // transformation
 class RMS : public AbstractExpr {
@@ -133,9 +155,9 @@ public:
   std::shared_ptr<AbstractExpr> elems;
 };
 
-class Red : public AbstractExpr {
+class Sum : public AbstractExpr {
 public:
-  Red(int red_deg, std::shared_ptr<AbstractExpr> summand);
+  Sum(int red_deg, std::shared_ptr<AbstractExpr> summand);
   z3::expr to_z3(z3::context &c,
                  std::unordered_set<std::string> &all_variables) const override;
   std::string to_string() const override;

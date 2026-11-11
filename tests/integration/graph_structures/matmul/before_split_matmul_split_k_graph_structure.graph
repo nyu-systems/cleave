@@ -112,7 +112,7 @@
         "trans_B": false
     },
     {
-        "op_type": "kn_reduction_0_op",
+        "op_type": "kn_reduce_sum_0_op",
         "input_tensors": [
             {
                 "num_dims": 3,

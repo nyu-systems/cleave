@@ -227,7 +227,7 @@ bool run_reduction_test(int dim) {
   auto input = graph.new_input(dims,
                                make_all_false_flags(dims.size()),
                                make_all_false_flags(dims.size()));
-  auto output = graph.reduction(input, dim, 1);
+  auto output = graph.reduce_sum(input, dim, 1);
   graph.mark_output(output);
   return compare_fingerprints(graph, {output});
 }

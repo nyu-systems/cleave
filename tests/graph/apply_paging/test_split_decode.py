@@ -1,4 +1,4 @@
-"""What the paging pass builds for split-KV decode: the pair, its structure, its goldens.
+"""What the paging pass builds for split-KV decode: the pair, its structure, its expected kernels.
 
 Split-KV is the decode layers' answer to a grid of fewer blocks than the GPU has SMs: the
 KV window of one (request, kv head) is dealt out over ``split`` blocks that each store a
@@ -9,7 +9,7 @@ of two kernels sharing the partial tensors.
 
 Three kinds of assertion here. The structural half pins the graph the pass hands to
 codegen -- the extra grid axis, the two ``Copy`` stores, the combine's grid and its two
-reductions. The goldens pin the emitted text, which is what the measured numbers belong to
+reductions. The expected kernels pin the emitted text, which is what the measured numbers belong to
 (``tests/graph/handwritten/test_splitkv_decode.py`` runs them). The arithmetic half checks
 the tile-range formulas the partial kernel is built on by evaluating the emitted expressions
 in Python: every KV tile of every request must be owned by exactly one split.
@@ -24,9 +24,9 @@ pytest.importorskip("tilelang")
 from tests.graph.apply_paging._test_utils import OPERATOR_CASES
 from tests.graph.handwritten._test_utils import assert_expected_tilelang_kernel
 from cleave.codegen import TilelangCodeGen
-from cleave.graph import GraphNode, OutputNode, PlaceHolderNode
-from cleave.ops import Accumulate, Copy, Div, Log2, Reduction
-from cleave.paging import (
+from cleave.ir.graph import GraphNode, OutputNode, PlaceHolderNode
+from cleave.ir.ops import Accumulate, Copy, Div, Log2, ReduceSum
+from cleave.dynamic.paging import (
     PARTIAL_ROWSUM,
     PARTIAL_VALUE,
     SPLIT_KINDS,
@@ -34,9 +34,9 @@ from cleave.paging import (
     DenseAttention,
     DenseMLA,
     MLASpec,
-    _split_range_scalars,
     build_split_decode,
 )
+from cleave.dynamic.paging.stages import _split_range_scalars
 
 # The four decode operators, at their tuned partial tiling and the combine tiling the
 # searches rank first (one partial per step, the head dim in 128-wide column blocks).
@@ -209,7 +209,7 @@ def test_combine_with_a_wider_step_reduces():
     _, combine = build("gqa_paged_decode_h32_kv8_d128_ps1", step=2)
     inner = next(n for n in combine.nodes if isinstance(n, GraphNode)).graph
     assert inner.extent == SPLIT // 2
-    assert {type(n) for n in inner.accum_nodes} == {Reduction}
+    assert {type(n) for n in inner.accum_nodes} == {ReduceSum}
     assert all(n.axis == 0 for n in inner.accum_nodes)
 
 

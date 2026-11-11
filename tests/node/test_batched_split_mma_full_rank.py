@@ -1,10 +1,10 @@
 import pytest
 
 from cleave.arch import get_arch
-from cleave.graph import Graph, OutputNode
-from cleave.ops import Matmul, SplitView, wire_input
-from cleave.policy.default import TCPolicy
-from cleave.util import find_topo_sort, gather_all_nodes
+from cleave.ir.graph import Graph, OutputNode
+from cleave.ir.ops import Matmul, SplitView, wire_input
+from cleave.schedule.policy.default import TCPolicy
+from cleave.ir.graph_utils import find_topo_sort, gather_all_nodes
 
 
 def _build_policy_and_split_mma_nodes(b: int) -> tuple[TCPolicy, dict[str, object]]:

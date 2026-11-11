@@ -76,7 +76,7 @@ bool test_matmul_with_reduction() {
   auto C = graph.matmul(A, B);
 
   // Reduce over dimension 0 (M dimension)
-  auto D = graph.reduction(C, 0);
+  auto D = graph.reduce_sum(C, 0);
 
   // Mark output
   graph.mark_output(D);
@@ -146,7 +146,7 @@ bool test_direct_reduction() {
   auto A = graph.new_input({128, 64, 32});
 
   // Reduce over dimension 1
-  auto B = graph.reduction(A, 1);
+  auto B = graph.reduce_sum(A, 1);
 
   graph.mark_output(B);
 
@@ -187,7 +187,7 @@ bool test_elementwise_then_reduction() {
 
   // Reduce over dimension 1
   // D [128, 64, 32] -> E [128, 32]
-  auto E = graph.reduction(D, 1);
+  auto E = graph.reduce_sum(D, 1);
 
   graph.mark_output(E);
 
@@ -351,7 +351,7 @@ bool test_scalar_elementwise_then_reduction() {
   auto A = graph.new_input({128, 64, 32});
   auto B = graph.div(A, 2.0f);
   auto C = graph.add(B, -3.0f);
-  auto D = graph.reduction(C, 1);
+  auto D = graph.reduce_sum(C, 1);
 
   graph.mark_output(D);
 
@@ -384,7 +384,7 @@ bool test_scalar_left_div_then_reduction() {
 
   auto A = graph.new_input({128, 64, 32});
   auto B = graph.div(2.0f, A);
-  auto C = graph.reduction(B, 2);
+  auto C = graph.reduce_sum(B, 2);
 
   graph.mark_output(C);
 

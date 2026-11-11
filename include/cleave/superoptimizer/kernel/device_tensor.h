@@ -77,7 +77,6 @@ struct alignas(16) DTensor {
     return num_elements() * fingerprint_type_size;
   }
 
-  // bool has_same_fingerprint(DTensor const &ref) const;
   bool has_same_fingerprint(
       cleave_superoptimizer::cpu::CTensor const &ref) const;
   cleave_superoptimizer::cpu::CTensor copy_fingerprint_to_ctensor() const;
@@ -91,11 +90,13 @@ public:
   //  DTensor fields
   KNOperator *owner_op;
   int owner_ts_idx;
+  // Metadata only: not part of operator==/!= or std::hash.
+  type::DataType dtype;
   static std::atomic<int64_t> next_guid;
 };
 
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
-    DTensor, num_dims, dim, can_reduce, can_split, guid)
+void to_json(json &j, DTensor const &t);
+void from_json(json const &j, DTensor &t);
 
 } // namespace kernel
 } // namespace cleave_superoptimizer

@@ -29,7 +29,7 @@ auto run_search() {
 
     DTensor A = concrete_tile_graph.matmul(Q, K);
     DTensor E = concrete_tile_graph.exp(A);
-    DTensor S = concrete_tile_graph.reduction(E, 3);
+    DTensor S = concrete_tile_graph.reduce_sum(E, 3);
     DTensor D = concrete_tile_graph.div(E, S);
     DTensor O = concrete_tile_graph.matmul(D, V);
     concrete_tile_graph.create_tiled_output(O);

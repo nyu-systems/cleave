@@ -1,6 +1,5 @@
 #include "cleave/superoptimizer/symbolic/dimension_group.h"
 
-#include <algorithm>
 #include <cassert>
 #include <numeric>
 
@@ -126,7 +125,7 @@ int DimensionSymbolizer::next_prime(int n) {
 DimensionSymbolizer::DimensionSymbolizer(
     DimensionGrouper const &grouper,
     SymbolicGraphConfig const &config)
-    : grouper(grouper), max_symbol_used(1), num_groups(0) {
+    : grouper(grouper) {
 
   int next_symbol = config.use_prime_numbers ? 2 * config.symbol_increment : config.base_symbol;
 
@@ -169,8 +168,6 @@ DimensionSymbolizer::DimensionSymbolizer(
     } else {
       next_symbol += config.symbol_increment;
     }
-
-    num_groups++;
   }
 
   // Step 3: Preserve known non-equal divisibility constraints, such as GQA
@@ -221,7 +218,6 @@ DimensionSymbolizer::DimensionSymbolizer(
     for (auto const &dim : group) {
       symbol_map[dim] = symbol;
     }
-    max_symbol_used = std::max(max_symbol_used, symbol);
   }
 }
 

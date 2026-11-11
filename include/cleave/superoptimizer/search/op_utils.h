@@ -2,27 +2,9 @@
 
 #include "cleave/superoptimizer/search/abstract_expr/abstract_expr.h"
 #include "cleave/superoptimizer/search/config.h"
-#include "cleave/superoptimizer/utils/hash_utils.h"
 
 namespace cleave_superoptimizer {
 namespace search {
-
-template <typename Op, typename OpType>
-size_t get_operator_hash(Op i, OpType op) {
-  size_t h = 0;
-  hash_combine(h, i);
-  hash_combine(h, op);
-  return h;
-}
-
-template <typename Op, typename OpType>
-size_t get_operator_hash(Op i, Op j, OpType op) {
-  size_t h = 0;
-  hash_combine(h, i);
-  hash_combine(h, j);
-  hash_combine(h, op);
-  return h;
-}
 
 template <typename GraphType>
 int get_num_consumers(GraphType const &g,
@@ -73,7 +55,6 @@ KNOperator *create_op(kernel::Graph &g,
 KNOperator *create_op(kernel::Graph &g,
                       type::KNOperatorType type,
                       std::vector<DTensor> const &inputs);
-size_t count_op_of_type(type::KNOperatorType op_type, kernel::Graph const &g);
 
 } // namespace search
 } // namespace cleave_superoptimizer

@@ -1,13 +1,11 @@
-from cleave import passes
-from cleave.graph import Graph, Iterator, GraphNode, OutputNode, AccumEdge
-from cleave.ops import Div, Reduction
-from cleave.util import gather_all_nodes, lock_graph
+from cleave.codegen import passes
+from cleave.ir.graph import Graph, Iterator, GraphNode, OutputNode, AccumEdge
+from cleave.ir.ops import Div, ReduceSum
+from cleave.ir.graph_utils import gather_all_nodes, lock_graph
 
 DTYPE = "float16"
 ACCUM_DTYPE = "float32"
 OUT_DTYPE = "float16"
-
-LOG = True
 
 
 def get_handwritten_scheduled_graph(dims):
@@ -20,14 +18,14 @@ def get_handwritten_scheduled_graph(dims):
     assert S_Q == 4096, S_Q
     assert D == PD, D
 
-    combine_rowsum = Reduction(
+    combine_rowsum = ReduceSum(
         (split_k, S_Q),
         axis=0,
         dtype=DTYPE,
         out_dtype=ACCUM_DTYPE,
         name="rowsum_combine_0",
     )
-    combine_value = Reduction(
+    combine_value = ReduceSum(
         (split_k, S_Q, D),
         axis=0,
         dtype=DTYPE,

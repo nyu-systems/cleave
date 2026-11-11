@@ -43,9 +43,11 @@ public:
       cleave_superoptimizer::kernel::Graph const &concrete_graph,
       std::unordered_map<int, int> *symbol_map = nullptr);
 
-  DTensor create_tiled_input(std::vector<int> const &dims);
   DTensor create_tiled_input(std::vector<int> const &dims,
-                             std::vector<int> const &can_split);
+                             type::DataType dtype = type::DT_UNKNOWN);
+  DTensor create_tiled_input(std::vector<int> const &dims,
+                             std::vector<int> const &can_split,
+                             type::DataType dtype = type::DT_UNKNOWN);
   void create_tiled_output(DTensor const &O);
   std::unique_ptr<cleave_superoptimizer::search::KernelGraphGenerator> search_tile_graph(std::string const &checkpoint_file_name = "checkpoint.json",
                          bool const &enable_concat_matmul_transformation = false,
@@ -57,6 +59,14 @@ public:
                         cleave_superoptimizer::search::GeneratorConfig* external_config,
                         int max_num_graphs,
                         cleave_superoptimizer::kernel::Graph **new_graphs);
+  // Caller owns the returned graphs. The checkpoint file is read only when
+  // load_checkpoint is true; it is (re)written after a fresh search.
+  std::vector<cleave_superoptimizer::kernel::Graph *> search_graphs(
+      std::string const &checkpoint_file_name,
+      bool enable_concat_matmul_transformation,
+      bool show_config,
+      cleave_superoptimizer::search::GeneratorConfig const *external_config,
+      bool load_checkpoint);
   cleave_superoptimizer::search::GeneratorConfig setup_search_config();
                          
   // ops
@@ -66,6 +76,9 @@ public:
                  bool trans_B = false);
   DTensor add(DTensor const &A, DTensor const &B);
   DTensor add(DTensor const &A, float scalar);
+  DTensor sub(DTensor const &A, DTensor const &B);
+  DTensor sub(DTensor const &A, float scalar);  // add(A, -scalar)
+  DTensor sub(float scalar, DTensor const &A);  // add(mul(A, -1), scalar)
   DTensor mul(DTensor const &A, DTensor const &B);
   DTensor mul(DTensor const &A, float scalar);
   DTensor div(DTensor const &A, DTensor const &B);
@@ -74,7 +87,8 @@ public:
   DTensor exp(DTensor const &I);
   DTensor silu(DTensor const &I);
   DTensor sqrt(DTensor const &I);
-  DTensor reduction(DTensor const &I, int const &dim);
+  DTensor reduce_sum(DTensor const &I, int const &dim);
+  DTensor reduce_max(DTensor const &I, int dim);
 
 public:
   cleave_superoptimizer::kernel::Graph tile_graph;

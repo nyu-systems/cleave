@@ -4,7 +4,6 @@
 #include "cleave/superoptimizer/kernel/device_tensor.h"
 
 #include <unordered_set>
-// #include <cstddef>
 #include <vector>
 
 namespace cleave_superoptimizer {

@@ -6,7 +6,7 @@ import pytest
 pytest.importorskip("tilelang")
 pytest.importorskip("tvm")
 
-from cleave.integration.graph_processing import split_graph
+from cleave.lower.split import split_graph
 
 
 _CASES_WITH_SYMBOLIC_SPLIT_FACTOR = {f"valid_{i}" for i in range(1, 6)}

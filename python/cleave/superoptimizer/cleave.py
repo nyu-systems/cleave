@@ -42,24 +42,41 @@ class TileGraph:
     def silu(self, A: DTensor) -> DTensor:
         return self.cygraph.silu(A)
 
-    def reduction(self, A: DTensor, dim: int) -> DTensor:
-        return self.cygraph.reduction(A, dim)
+    def reduce_sum(self, A: DTensor, dim: int) -> DTensor:
+        return self.cygraph.reduce_sum(A, dim)
+
+    def sub(self, A, B) -> DTensor:
+        """Elementwise A - B (either side may be a scalar)."""
+        return self.cygraph.sub(A, B)
+
+    def reduce_max(self, A: DTensor, dim: int) -> DTensor:
+        """Max over ``dim`` (keepdim)."""
+        return self.cygraph.reduce_max(A, dim)
+
+    def get_graph_structure(self):
+        return self.cygraph.get_graph_structure()
 
     def setup_search_config(self):
         return self.cygraph.setup_search_config()
 
     def search_tile_graph(
         self,
-        checkpoint_file_name: str = "checkpoint.json",
+        checkpoint_file_name: str = "",
         enable_concat_matmul_transformation: bool = False,
         show_config: bool = False,
         config=None,
     ):
+        """No checkpoint by default; one is reused only if its ``<path>.key`` sidecar matches."""
         return self.cygraph.search_tile_graph(
             checkpoint_file_name,
-            enable_concat_matmul_transformation,
-            show_config,
-            config,
+            enable_concat_matmul_transformation=bool(enable_concat_matmul_transformation),
+            show_config=bool(show_config),
+            external_config=config,
+        )
+
+    def checkpoint_key(self, enable_concat_matmul_transformation: bool = False, config=None) -> str:
+        return self.cygraph.checkpoint_key(
+            bool(enable_concat_matmul_transformation), config
         )
 
 

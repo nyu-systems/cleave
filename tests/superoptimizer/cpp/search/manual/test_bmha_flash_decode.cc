@@ -29,7 +29,7 @@ auto run_search() {
 
     DTensor A = input_graph.matmul(Q, K);
     DTensor E = input_graph.exp(A);
-    DTensor S = input_graph.reduction(E, 3);
+    DTensor S = input_graph.reduce_sum(E, 3);
     DTensor D = input_graph.div(E, S);
     DTensor O = input_graph.matmul(D, V);
 

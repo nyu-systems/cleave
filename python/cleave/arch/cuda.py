@@ -3,6 +3,7 @@ from tvm.target import Target
 from .arch_base import Arch
 from typing import List, Union
 from .driver import cuda_driver
+from ..core.target import no_cuda_device
 
 
 def _target_attr(target: Target, name: str):
@@ -117,6 +118,12 @@ class TensorInstruction(object):
         self.shape: List[int] = shape
 
 
+# Limits used when no GPU is visible (CPU-only scheduling/codegen, e.g. expected-kernel tests).
+OFFLINE_DEVICES = {
+    90: {"name": "offline sm_90 (H100 limits)", "sms": 132, "l2": 50 * 2**20},
+}
+
+
 class CUDA(Arch):
 
     def __init__(self, target: Union[Target, str]):
@@ -125,18 +132,25 @@ class CUDA(Arch):
         self.target = target
         self.sm_version = check_sm_version(_target_attr(self.target, "arch"))
         device = tvm.runtime.cuda(0)
-        if not device.exist:
-            raise RuntimeError("Cannot find cuda device 0.")
-        self.name = cuda_driver.get_device_name()
+        offline = None
+        if not device.exist and no_cuda_device():
+            offline = OFFLINE_DEVICES.get(self.sm_version)
+            if offline is None:
+                raise RuntimeError("Cannot find cuda device 0.")
+        self.name = offline["name"] if offline else cuda_driver.get_device_name()
         self.device: tvm.runtime.Device = device
         self.platform: str = "CUDA"
         # TODO (david): maybe static shared memory, can be improved in future
         # cuda driver API to get dynamic shared memory size?
         # self.smem_cap = cuda_driver.get_shared_memory_per_block()
         self.smem_cap: int = 164 * 2**10  # 164KB for A100
-        self.compute_max_core = device.multi_processor_count
-        self.warp_size = device.warp_size
-        self.compute_capability = device.compute_version.replace(".", "")
+        if offline:
+            self.compute_max_core, self.warp_size = offline["sms"], 32
+            self.compute_capability = str(self.sm_version)
+        else:
+            self.compute_max_core = device.multi_processor_count
+            self.warp_size = device.warp_size
+            self.compute_capability = device.compute_version.replace(".", "")
         self.reg_cap: int = 65536
         self.max_smem_usage: int = 2 * self.smem_cap
         self.sm_partition: int = 4
@@ -145,6 +159,8 @@ class CUDA(Arch):
         # cudaDeviceProp layout no longer matches the installed CUDA's struct, so reading
         # `l2CacheSize` out of it returns garbage (measured: 1 byte on an H100).
         l2 = _target_attr(target, "l2_cache_size_bytes")
+        if l2 is None and offline:
+            l2 = offline["l2"]
         if l2 is None:
             l2 = getattr(device, "l2_cache_size_bytes", None)
         self.l2_cache_size_bytes: int = int(l2) if l2 else 0

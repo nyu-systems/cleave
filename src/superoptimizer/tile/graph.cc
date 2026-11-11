@@ -5,7 +5,10 @@
 #include "cleave/superoptimizer/utils/logging.h"
 
 #include <cassert>
+#include <algorithm>
 #include <fstream>
+#include <memory>
+#include <stdexcept>
 #include <sstream>
 
 namespace cleave_superoptimizer {
@@ -56,12 +59,11 @@ void log_symbolic_input_mapping(
 }
 
 void require_symbolized_search_graph(bool symbolic) {
-  if (!symbolic) {
-    CSO_LOG(FATAL)
-        << "TileGraph search requires a symbolized graph. "
-        << "Use TileGraph::create_symbolic(...) before search instead of "
-        << "searching a concrete TileGraph constructed with symbolic=false.";
-  }
+  CSO_REQUIRE(symbolic, std::runtime_error,
+              "TileGraph search requires a symbolized graph. Use "
+              "TileGraph::create_symbolic(...) before search instead of "
+              "searching a concrete TileGraph constructed with "
+              "symbolic=false.");
 }
 
 void record_symbol_mapping_entry(
@@ -121,29 +123,26 @@ TileGraph::TileGraph(
 
 TileGraph::~TileGraph() {}
 
-DTensor TileGraph::create_tiled_input(std::vector<int> const &dims) {
-  tile_config.update_config(cleave_superoptimizer::type::KN_INPUT_OP);
-
-  std::vector<int> can_split(dims.size(), tile_config.split_enabled ? 1 : 0);
+DTensor TileGraph::create_tiled_input(std::vector<int> const &dims,
+                                      type::DataType dtype) {
   std::vector<bool> can_reduce_b(dims.size(), false);
-  std::vector<bool> can_split_b(can_split.size(), false);
-  for (size_t i = 0; i < can_split.size(); ++i) {
-    can_split_b[i] = (can_split[i] != 0);
-  }
+  std::vector<bool> can_split_b(dims.size(), tile_config.split_enabled);
 
-  DTensor output = tile_graph.new_input(dims, can_reduce_b, can_split_b);
+  DTensor output = tile_graph.new_input(dims, can_reduce_b, can_split_b, dtype);
   auto *input_op =
       dynamic_cast<cleave_superoptimizer::kernel::KNInputOp *>(
           tile_graph.operators.back());
   assert(input_op != nullptr);
   input_op->infer_can_split = true;
+  tile_config.update_config(cleave_superoptimizer::type::KN_INPUT_OP);
   return output;
 }
 
 DTensor TileGraph::create_tiled_input(std::vector<int> const &dims,
-                                      std::vector<int> const &can_split) {
-  tile_config.update_config(cleave_superoptimizer::type::KN_INPUT_OP);
-
+                                      std::vector<int> const &can_split,
+                                      type::DataType dtype) {
+  CSO_REQUIRE(can_split.size() == dims.size(), std::invalid_argument,
+              "can_split must match dims length");
   bool has_split_dim = false;
   for (int split_flag : can_split) {
     if (split_flag != 0) {
@@ -151,10 +150,11 @@ DTensor TileGraph::create_tiled_input(std::vector<int> const &dims,
       break;
     }
   }
-  assert((tile_config.split_enabled || !has_split_dim) &&
-         "TileGraph::create_tiled_input: can_split must be all false when "
-         "split_enabled=false. Either set all can_split entries to 0/false, "
-         "or create TileGraph with split_enabled=true.");
+  CSO_REQUIRE(tile_config.split_enabled || !has_split_dim,
+              std::invalid_argument,
+              "create_tiled_input: can_split must be all false when "
+              "split_enabled=false. Either set all can_split entries to "
+              "0/false, or create TileGraph with split_enabled=true.");
 
   std::vector<bool> can_reduce_b(dims.size(), false);
   std::vector<bool> can_split_b(can_split.size(), false);
@@ -162,12 +162,14 @@ DTensor TileGraph::create_tiled_input(std::vector<int> const &dims,
     can_split_b[i] = (can_split[i] != 0);
   }
 
-  return tile_graph.new_input(dims, can_reduce_b, can_split_b);
+  DTensor output = tile_graph.new_input(dims, can_reduce_b, can_split_b, dtype);
+  tile_config.update_config(cleave_superoptimizer::type::KN_INPUT_OP);
+  return output;
 }
 
 void TileGraph::create_tiled_output(DTensor const &O) {
-  tile_config.update_config(cleave_superoptimizer::type::KN_OUTPUT_OP);
   tile_graph.mark_output(O);
+  tile_config.update_config(cleave_superoptimizer::type::KN_OUTPUT_OP);
 }
 
 cleave_superoptimizer::search::GeneratorConfig TileGraph::setup_search_config() {
@@ -183,7 +185,6 @@ cleave_superoptimizer::search::GeneratorConfig TileGraph::setup_search_config() 
             [](const cleave_superoptimizer::type::KNOperatorType &a, const cleave_superoptimizer::type::KNOperatorType &b) {
               return static_cast<int>(a) < static_cast<int>(b);
             });
-  config.verifier_type = cleave_superoptimizer::search::VerifierType::PROBABILISTIC_VERIFIER;
 
   return config;
 }
@@ -213,15 +214,17 @@ std::unique_ptr<cleave_superoptimizer::search::KernelGraphGenerator> TileGraph::
   return gen;
 }
 
-int TileGraph::search_tile_graph(std::string const &checkpoint_file_name,
-                                 bool const &enable_concat_matmul_transformation,
-                                 bool const &show_config,
-                                 cleave_superoptimizer::search::GeneratorConfig* external_config,
-                                 int max_num_graphs,
-                                 cleave_superoptimizer::kernel::Graph **new_graphs) {
+std::vector<cleave_superoptimizer::kernel::Graph *> TileGraph::search_graphs(
+    std::string const &checkpoint_file_name,
+    bool enable_concat_matmul_transformation,
+    bool show_config,
+    cleave_superoptimizer::search::GeneratorConfig const *external_config,
+    bool load_checkpoint) {
   require_symbolized_search_graph(symbolic);
 
-  if (!checkpoint_file_name.empty()) {
+  std::vector<json> graphs_json;
+  bool loaded = false;
+  if (load_checkpoint && !checkpoint_file_name.empty()) {
     std::ifstream generated_graphs_file(checkpoint_file_name,
                                         std::ifstream::binary);
     if (generated_graphs_file) {
@@ -229,44 +232,64 @@ int TileGraph::search_tile_graph(std::string const &checkpoint_file_name,
                     << checkpoint_file_name;
       json j;
       generated_graphs_file >> j;
-      int num = 0;
       for (json const &graph : j) {
-        assert(num < max_num_graphs);
-        new_graphs[num] = new cleave_superoptimizer::kernel::Graph();
-        from_json(graph, *new_graphs[num]);
-        num++;
+        graphs_json.push_back(graph);
       }
-      return num;
+      loaded = true;
     }
   }
 
-  cleave_superoptimizer::search::GeneratorConfig config;
-  if (!external_config) {
-    config = setup_search_config();
-  } else {
-    config = *external_config;
+  if (!loaded) {
+    cleave_superoptimizer::search::GeneratorConfig config =
+        external_config ? *external_config : setup_search_config();
+    if (enable_concat_matmul_transformation) {
+      config.enable_concat_matmul_transformation();
+    }
+    if (show_config) {
+      config.show();
+    }
+    cleave_superoptimizer::search::KernelGraphGenerator gen(
+        tile_graph, config, checkpoint_file_name.data());
+    gen.generate_kernel_graphs();
+    graphs_json = std::move(gen.generated_graphs);
   }
 
-  if (enable_concat_matmul_transformation) {
-    config.enable_concat_matmul_transformation();
+  std::vector<std::unique_ptr<cleave_superoptimizer::kernel::Graph>> owned;
+  for (json const &j : graphs_json) {
+    owned.emplace_back(new cleave_superoptimizer::kernel::Graph());
+    from_json(j, *owned.back());
   }
-
-  if (show_config) {
-    config.show();
+  std::vector<cleave_superoptimizer::kernel::Graph *> result;
+  for (auto &g : owned) {
+    result.push_back(g.release());
   }
-  cleave_superoptimizer::search::KernelGraphGenerator gen(
-      tile_graph, config, checkpoint_file_name.data());
-  gen.generate_kernel_graphs();
-  int num = 0;
-  for (json const &j : gen.generated_graphs) {
-    assert(num < max_num_graphs);
-    new_graphs[num] = new cleave_superoptimizer::kernel::Graph();
-    from_json(j, *new_graphs[num]);
-    num++;
-  }
-  return num;
+  return result;
 }
 
+int TileGraph::search_tile_graph(std::string const &checkpoint_file_name,
+                                 bool const &enable_concat_matmul_transformation,
+                                 bool const &show_config,
+                                 cleave_superoptimizer::search::GeneratorConfig* external_config,
+                                 int max_num_graphs,
+                                 cleave_superoptimizer::kernel::Graph **new_graphs) {
+  std::vector<cleave_superoptimizer::kernel::Graph *> graphs =
+      search_graphs(checkpoint_file_name,
+                    enable_concat_matmul_transformation,
+                    show_config,
+                    external_config,
+                    /*load_checkpoint=*/true);
+  if (static_cast<int>(graphs.size()) > max_num_graphs) {
+    for (auto *g : graphs) {
+      delete g;
+    }
+    CSO_THROW(std::runtime_error,
+              "Search produced " << graphs.size()
+                                 << " graphs, more than max_num_graphs="
+                                 << max_num_graphs);
+  }
+  std::copy(graphs.begin(), graphs.end(), new_graphs);
+  return static_cast<int>(graphs.size());
+}
 
 TileGraph *TileGraph::create_symbolic(
     cleave_superoptimizer::kernel::Graph const &concrete_graph,

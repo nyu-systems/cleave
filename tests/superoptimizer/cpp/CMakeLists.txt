@@ -48,3 +48,9 @@ add_cleave_superoptimizer_search_test(manual sha_flash_decode)
 add_cleave_superoptimizer_search_test(symbolic gated_mlp)
 add_cleave_superoptimizer_search_test(symbolic gqa_flash_decode)
 add_cleave_superoptimizer_search_test(symbolic matmul)
+add_cleave_superoptimizer_search_test(symbolic sub_max)
+
+add_executable(test_sub_max_ops
+  kernel/test_sub_max_ops.cc)
+target_link_libraries(test_sub_max_ops cleave_superoptimizer)
+add_test(NAME test_sub_max_ops COMMAND test_sub_max_ops)

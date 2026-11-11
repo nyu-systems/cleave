@@ -1,6 +1,6 @@
 """The candidate-selection rules, without a GPU.
 
-``cleave.util.autotune`` decides which of several correct kernels an operator ships. The
+``cleave.runtime.autotune`` decides which of several correct kernels an operator ships. The
 timing itself needs hardware and is covered by ``tests/perf``; what is unit-testable is the
 part that turns latencies into a decision, and that part is where a wrong answer is silent:
 a ranking that quietly prefers the wrong candidate still prints a winner.
@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from cleave.util.autotune import (
+from cleave.runtime.autotune import (
     TIE_BAND,
     WorkloadCandidate,
     format_ranking,

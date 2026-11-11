@@ -25,11 +25,11 @@ import pytest
 
 pytest.importorskip("tilelang")
 
-from tests.graph.apply_paging._test_utils import build_mla_paged_graph, build_paged_graph
+from cleave.dynamic.dense import build_mla_paged_graph, build_paged_graph
 from cleave.codegen import TilelangCodeGen
-from cleave.graph import OutputNode, PlaceHolderNode
-from cleave.ops import Log2, MaskedLog2
-from cleave.paging import (
+from cleave.ir.graph import OutputNode, PlaceHolderNode
+from cleave.ir.ops import Log2, MaskedLog2
+from cleave.dynamic.paging import (
     MLA_PAGED_DECODE,
     MLA_PAGED_PREFILL_CAUSAL,
     PAGED_DECODE,

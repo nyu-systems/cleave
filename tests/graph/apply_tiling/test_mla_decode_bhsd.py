@@ -3,12 +3,12 @@ import pytest
 pytest.importorskip("tilelang")
 pytest.importorskip("tvm")
 
-from cleave import passes
+from cleave.codegen import passes
 from cleave.codegen import TilelangCodeGen
-from cleave.graph import GraphNode
+from cleave.ir.graph import GraphNode
 from cleave.schedule import apply_tiling
-from cleave.util import CompilerPassOptions
-from cleave.util.runtime import Tolerance, compile_and_run
+from cleave.runtime.compile import CompilerPassOptions, check_code
+from cleave.runtime.validate import Tolerance
 
 from tests._graphs import mla_decode_bhsd_graph
 from tests.graph.apply_tiling._test_utils import (
@@ -110,7 +110,7 @@ def test_apply_tiling_mla_decode_bhsd(
     graph = passes.annotate_tinfo(graph, is_main=True)
     graph = passes.annotate_fragment_layout_conflicts(graph)
     graph = passes.annotate_mla_accumulation_layout_conflict(graph)
-    compile_and_run(
+    check_code(
         TilelangCodeGen().gen(graph),
         graph=mla_decode_bhsd_graph(2, 128, 4096, 128, 64),
         dtype=DTYPE,

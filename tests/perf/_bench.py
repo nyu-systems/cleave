@@ -1,15 +1,14 @@
 """Time the checked-in expected kernels, one workload at a time.
 
-This measures **codegen output only**. The kernel under test is the golden TileLang
+This measures **codegen output only**. The kernel under test is the expected TileLang
 module in ``tests/graph/handwritten/expected_kernels/``, compiled and run directly --
 no schedule, no tiling search, no superoptimizer. That is deliberate: a regression
-here can only come from the emitted kernel changing, which is what the golden files
+here can only come from the emitted kernel changing, which is what the expected-kernel files
 pin and what a reviewer can diff.
 
 The numbers are wall clock over a warmed kernel, not SOL/CUPTI time, so they are
 comparable only against another run of this same harness on the same GPU. They are
-not the operator's speedup against FlashInfer and must not be quoted as one; see
-``bench/bench_dynamic.py`` for that.
+not the operator's speedup against FlashInfer and must not be quoted as one.
 
 Outputs are allocated once, outside the timing loop, and passed in. A kernel compiled
 with ``out_idx`` allocates them on every call instead, which costs more than these
@@ -23,28 +22,19 @@ from pathlib import Path
 
 import torch
 
-# The operator table and its workloads both come from the numeric tests' own module: this
-# harness times the same kernels on the same axes, and a second copy of the list here is a
-# copy to drift from. At module scope because `parametrize` in
-# test_kernel_perf_regression.py needs the keys at collection time -- which costs this
-# module its import-lightness, since that module reaches torch, so the test file guards
-# with `importorskip("torch")` before importing this one.
-from tests.graph.handwritten._paged_workloads import OPERATORS, keyed_workloads
-# Moved into the library so the dynamic autotune loop and this gate share one timing
-# implementation. Not one configuration: this gate passes `budget_us=inf` to keep the
-# recorded baselines' exact settings, while the autotune loop caps the work per
-# measurement, so above ~100us they use a different `iters`. Measured, the readings still
-# agree to <0.05%. `geomean` is re-exported because the perf test reads it off this module.
-from cleave.util.autotune import geomean, ramp, time_kernel  # noqa: F401
-
-EXPECTED_KERNELS = (
-    Path(__file__).resolve().parents[1] / "graph" / "handwritten" / "expected_kernels"
-)
+# The operator table and its workloads are the same ones the numeric tests and the dynamic
+# demo use. At module scope because `parametrize` in test_kernel_perf_regression.py needs
+# the keys at collection time.
+from cleave.dynamic.registry import EXPECTED_KERNELS_DIR as EXPECTED_KERNELS
+from cleave.dynamic.registry import OPERATORS, keyed_workloads
+# Shared with the dynamic autotune loop; this gate passes `budget_us=inf` to keep the
+# recorded baselines' exact settings (the autotune loop caps the work per measurement).
+from cleave.runtime.autotune import geomean, ramp, time_kernel
 
 
 def _compiled_expected_kernel(operator: str):
-    """The golden kernel for ``operator``, compiled with the pass configs it declares."""
-    from cleave.util.runtime import _compile, _load_main_kernel_from_code
+    """The expected kernel for ``operator``, compiled with the pass configs it declares."""
+    from cleave.runtime.compile import _compile, _load_main_kernel_from_code
 
     source = (EXPECTED_KERNELS / f"{operator}.py").read_text(encoding="utf-8")
     # out_idx=None: every output is already a declared parameter of these kernels, so

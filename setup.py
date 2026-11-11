@@ -54,7 +54,7 @@ def _install_requires():
         "graphviz",
         "numpy",
         "tqdm",
-        "z3-solver",
+        "z3-solver==4.15.4",
         f"tilelang @ {tilelang_dir.as_uri()}",
     ]
 
