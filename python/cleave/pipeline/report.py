@@ -28,13 +28,16 @@ def tolerance_dicts(tolerance) -> list | None:
 
 
 def worst_measured(measurements) -> list | None:
-    """Per output, ``{"rel", "abs"}``: the largest of each over ``measurements``."""
+    """Per output index, ``{"rel", "abs"}``: the largest of each over ``measurements``.
+
+    As long as the longest measurement: a split partial has more outputs than a solo plan.
+    """
     out = None
     for measured in measurements:
         if measured is None:
             continue
-        if out is None:
-            out = [{"rel": 0.0, "abs": 0.0} for _ in measured]
+        out = out or []
+        out += [{"rel": 0.0, "abs": 0.0} for _ in range(len(measured) - len(out))]
         for worst, m in zip(out, measured):
             worst["rel"], worst["abs"] = max(worst["rel"], m.rel), max(worst["abs"], m.abs)
     return out
@@ -42,7 +45,8 @@ def worst_measured(measurements) -> list | None:
 
 def format_measured(worst, tolerance=None) -> str:
     """``rel 6.1e-04 of rtol 0.005`` per output, for the stage report: the measured error
-    beside the bound that governs it (both errors when the tolerance is not known)."""
+    beside the bound that governs it. Both errors when the tolerance is not known, and when
+    it has both terms: neither error alone is then a fraction of its term."""
     if not worst:
         return ""
     bounds = tolerance_dicts(tolerance) or [None] * len(worst)
@@ -50,12 +54,17 @@ def format_measured(worst, tolerance=None) -> str:
         bounds = bounds * len(worst)
     parts = []
     for i, (w, bound) in enumerate(zip(worst, bounds)):
+        both = f"rel {w['rel']:.1e} abs {w['abs']:.1e}"
         if bound is None:
-            text = f"rel {w['rel']:.1e} abs {w['abs']:.1e}"
+            text = both
+        elif bound["rtol"] and bound["atol"]:
+            text = f"{both} of rtol {bound['rtol']:g} * rowmax + atol {bound['atol']:g}"
+        elif bound["rtol"]:
+            text = f"rel {w['rel']:.1e} of rtol {bound['rtol']:g}"
+        elif bound["atol"]:
+            text = f"abs {w['abs']:.1e} of atol {bound['atol']:g}"
         else:
-            terms = [f"rel {w['rel']:.1e} of rtol {bound['rtol']:g}"] * bool(bound["rtol"])
-            terms += [f"abs {w['abs']:.1e} of atol {bound['atol']:g}"] * bool(bound["atol"])
-            text = ", ".join(terms) or f"rel {w['rel']:.1e} abs {w['abs']:.1e} of an exact bound"
+            text = f"{both} of an exact bound"
         parts.append((f"out{i} " if len(worst) > 1 else "") + text)
     return "; ".join(parts)
 

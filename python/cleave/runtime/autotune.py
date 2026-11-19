@@ -85,7 +85,9 @@ class WorkloadCandidate:
     kernel: object = None
     checked: int = 0
     failure: str | None = None  # first wrong/failed workload; set means excluded
-    # validate.MeasuredError per output: the worst over the workloads it was checked on.
+    # validate.MeasuredError per output. A correct candidate: the worst over its workloads.
+    # A failed one: that with the failing comparison folded in, or None when the failing
+    # comparison measured nothing (as CandidateResult.measured: only a mismatch has values).
     measured: tuple | None = None
     latency_us: dict = field(default_factory=dict)
     used_replay: bool = True
@@ -278,7 +280,8 @@ def compile_and_validate_over_workloads(
     ``success_info`` gets the candidates correct everywhere, ``errors`` ``(label, exception)``
     (an ``OutputMismatch``, ``NonFiniteOutput`` or ``LaunchCrash`` for a validation failure).
     ``tolerance`` is the operator's declared bound, one ``Tolerance`` or one per output; it
-    has no default. Each candidate keeps the worst error it measured (``measured``).
+    has no default. Each candidate keeps the worst error it measured (``measured``); for a
+    failed one that includes the comparison that failed it.
     """
     import torch
 
@@ -325,6 +328,11 @@ def compile_and_validate_over_workloads(
                         + (f": {first[0][:160]}" if first else "")
                     )
                     errors.append((candidate.label, error))
+                    # What a failed candidate reports is the comparison that failed it,
+                    # not the workloads it passed first; a launch crash, a wrong shape or a
+                    # NaN measured nothing.
+                    failed = getattr(error, "measured", None)
+                    candidate.measured = failed and worst(candidate.measured, failed)
                     # A poisoned context would blame every later candidate: stop.
                     _assert_context_survived(candidate.label, error)
                 else:

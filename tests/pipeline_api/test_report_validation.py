@@ -18,7 +18,14 @@ from cleave.core.errors import (
     ValidationError,
 )
 from cleave.pipeline.dynamic import DynamicReport
-from cleave.pipeline.report import Report, Result, format_measured, validation_kind
+from cleave.pipeline.report import (
+    Report,
+    Result,
+    format_measured,
+    validation_kind,
+    worst_measured,
+)
+from cleave.runtime import autotune
 from cleave.runtime.autotune import WorkloadCandidate
 from cleave.runtime.evaluate import CandidateResult
 from cleave.runtime.validate import MeasuredError, Tolerance
@@ -84,8 +91,14 @@ def test_format_measured_names_the_governing_bound_per_output():
     tolerance = (Tolerance(rtol=5e-2), Tolerance(rtol=0.0, atol=1e-5))
     assert format_measured(worst, tolerance) == (
         "out0 rel 7.8e-03 of rtol 0.05; out1 abs 1.9e-06 of atol 1e-05")
-    assert format_measured(worst[:1], Tolerance(rtol=1e-3, atol=1e-6)) == (
-        "rel 7.8e-03 of rtol 0.001, abs 1.6e-02 of atol 1e-06")
+    # A bound with both terms (the paged lse): the abs error is not a fraction of the atol
+    # (here it is larger than it and well inside the bound), so both are shown against both.
+    paged = (Tolerance(rtol=2e-2), Tolerance(rtol=2e-6, atol=1e-6))
+    assert format_measured(worst, paged) == (
+        "out0 rel 7.8e-03 of rtol 0.02; "
+        "out1 rel 2.7e-07 abs 1.9e-06 of rtol 2e-06 * rowmax + atol 1e-06")
+    assert format_measured(worst[:1], Tolerance(rtol=0.0)) == (
+        "rel 7.8e-03 abs 1.6e-02 of an exact bound")
     assert format_measured(worst[:1]) == "rel 7.8e-03 abs 1.6e-02"
     assert format_measured(None) == "" and format_measured([]) == ""
 
@@ -105,8 +118,9 @@ def test_dynamic_report_carries_measured_errors_and_failure_kinds():
                              measured=(MeasuredError(7.8e-3, 0.02), MeasuredError(1e-7, 2e-6)))
     better = WorkloadCandidate(label="better", source="", checked=3,
                                measured=(MeasuredError(3.9e-3, 0.01), MeasuredError(1e-7, 4e-6)))
+    # a failed candidate carries the measurement that failed it, like a static one does
     wrong = WorkloadCandidate(label="wrong", source="", checked=1, failure="wl_1: OutputMismatch",
-                              measured=(MeasuredError(7.0e-3, 0.02), MeasuredError(1e-7, 1e-6)))
+                              measured=(MeasuredError(0.4, 0.9), MeasuredError(1e-7, 1e-6)))
     nan = WorkloadCandidate(label="nan", source="", failure="wl_0: NonFiniteOutput")
     broken = WorkloadCandidate(label="broken", source="", failure="compile: InternalError")
     errors = [("wrong", OutputMismatch("output 0: ...")), ("nan", NonFiniteOutput("output 1: ...")),
@@ -119,6 +133,77 @@ def test_dynamic_report_carries_measured_errors_and_failure_kinds():
     validation = json.loads(json.dumps(report.to_dict()))["validation"]
     assert validation["tolerance"] == [{"rtol": 5e-2, "atol": 0.0}, {"rtol": 0.0, "atol": 1e-5}]
     assert validation["failures"] == {"mismatch": 1, "non_finite": 1}
-    assert [(m["plan"], m["ok"], m["workloads"]) for m in validation["measured"]] == [
-        ("good", True, 3), ("better", True, 3), ("wrong", False, 1)]
+    assert [(m["plan"], m["ok"], m["workloads"], m["rel"][0]) for m in validation["measured"]] == [
+        ("good", True, 3, 7.8e-3), ("better", True, 3, 3.9e-3), ("wrong", False, 1, 0.4)]
     assert validation["max_error"][1]["abs"] == pytest.approx(4e-6)
+
+
+def test_a_paged_candidate_keeps_the_measurement_that_failed_it(monkeypatch):
+    """``compile_and_validate_over_workloads``: what a failed candidate reports as measured
+    is the error that excluded it, not only the workloads it passed before."""
+    import torch
+
+    tolerance = (Tolerance(rtol=2e-2), Tolerance(rtol=2e-6, atol=1e-6))
+    out = torch.tensor([[1.0, -4.0, 2.0]])
+    lse = torch.tensor([[8.0, -3.0]])
+
+    def kernel(out_error, lse_error, wrong_from=0):
+        calls = []
+
+        def run(scale, got_out, got_lse):
+            calls.append(None)
+            wrong = len(calls) > wrong_from
+            got_out.copy_(scale * (out + (out_error if wrong else 0.0)))
+            got_lse.copy_(scale * (lse + (lse_error if wrong else 0.0)))
+
+        return run
+
+    kernels = {
+        "good": kernel(0.02, 4e-6),                 # 0.5% of the row max 4; half an lse bound
+        "wrong": kernel(1.2, 4e-6, wrong_from=1),   # right on the first workload, 30% off after
+        "nan": kernel(float("nan"), 0.0),
+        "late_nan": kernel(float("nan"), 0.0, wrong_from=2),  # right on the first two workloads
+    }
+    monkeypatch.setattr(autotune, "_compiled", lambda source: kernels[source])
+    monkeypatch.setattr(autotune, "_assert_context_survived", lambda label, cause: None)
+    candidates = [WorkloadCandidate(label=name, source=name) for name in kernels]
+
+    def workloads():
+        for i, scale in enumerate((1.0, 2.0, 3.0)):
+            yield f"wl_{i}", (torch.tensor(scale),), [scale * out, scale * lse]
+
+    success, errors = [], []
+    autotune.compile_and_validate_over_workloads(candidates, workloads, success, errors,
+                                                 tolerance=tolerance)
+    good, wrong, nan, late_nan = candidates
+    assert success == [good] and good.checked == 3
+    assert good.measured[0].rel == pytest.approx(0.005) and good.measured[1].abs < 2e-5
+    assert [(label, type(e)) for label, e in errors] == [
+        ("nan", NonFiniteOutput), ("wrong", OutputMismatch), ("late_nan", NonFiniteOutput)]
+    # exact on wl_0, 30% off on wl_1: the comparison that failed it is what it reports
+    assert wrong.checked == 1 and wrong.failure.startswith("wl_1: OutputMismatch")
+    assert wrong.measured[0].rel == pytest.approx(0.3)
+    assert wrong.measured[0].rel > tolerance[0].rtol
+    # A NaN measures nothing, so those candidates report nothing: not even the (exact)
+    # workloads one of them passed first, which would read as a failure within tolerance.
+    assert nan.checked == 0 and nan.measured is None
+    assert late_nan.checked == 2 and late_nan.failure.startswith("wl_2: NonFiniteOutput")
+    assert late_nan.measured is None
+
+    report = DynamicReport(SimpleNamespace(refused=[]), candidates, errors, workloads=3,
+                           timings={}, tolerance=tolerance)
+    measured = {m["plan"]: m for m in report.to_dict()["validation"]["measured"]}
+    assert set(measured) == {"good", "wrong"}
+    assert not measured["wrong"]["ok"] and measured["wrong"]["rel"][0] == pytest.approx(0.3)
+    # the report's worst error is over the candidates that passed, as before
+    assert report.measured_error()[0]["rel"] == pytest.approx(0.005)
+
+
+def test_worst_measured_keeps_every_output_when_plans_differ_in_output_count():
+    # a solo plan has one output, a split partial two: neither order may drop the second
+    solo = (MeasuredError(9e-4, 0.01),)
+    partial = (MeasuredError(8e-4, 0.02), MeasuredError(1.6e-3, 0.03))
+    want = [{"rel": 9e-4, "abs": 0.02}, {"rel": 1.6e-3, "abs": 0.03}]
+    assert worst_measured([solo, partial]) == want
+    assert worst_measured([partial, None, solo]) == want
+    assert worst_measured([None]) is None and worst_measured([]) is None
