@@ -129,11 +129,21 @@ def paging_accept(spec):
     """A ``search_tiling(accept=...)`` filter: tile the candidate, then ``can_page`` it.
 
     Anything ``apply_tiling`` raises counts as a refusal too, as it would downstream.
+
+    A candidate that steps an absorbed reduction below its extent (a score matmul over
+    part of the head dim, inside the KV loop) is refused as well. ``apply_tiling``
+    schedules that reduction whole, so the candidate is the kernel of the one that steps
+    it whole, which the search proposes too; accepted, it would only take a second
+    top-k slot for the same kernel.
     """
     from ...schedule import apply_tiling
+    from ...schedule.tiling import absorbed_reductions
 
     def accept(cand) -> bool:
+        ops = [n for n in cand.flat_graph.nodes if not n.is_placeholder() and not n.is_output()]
         try:
+            if absorbed_reductions(ops, cand.rstep_map):
+                return False
             tiled = apply_tiling(cand)
         except Exception:  # noqa: BLE001 - a filter answers, it does not stop the search
             return False

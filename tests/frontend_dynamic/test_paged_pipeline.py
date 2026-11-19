@@ -56,6 +56,30 @@ def test_searched_plans_reproduce_expected(preset):
     assert len({p.source for p in plans}) == len(plans)
 
 
+@pytest.mark.search
+@pytest.mark.expected
+@pytest.mark.parametrize("preset", sorted(CASES))
+def test_filtered_top_k_slots_are_distinct_kernels(preset):
+    """With the paging filter ahead of the cut, each of four slots is a different kernel.
+
+    A score matmul stepped below the head dim is scheduled over all of it, which makes that
+    tiling the kernel of the one that steps the head dim whole. The filter refuses it rather
+    than let it take that one's slot, so ``topk=4`` -- what ``test_compile_end_to_end``
+    searches -- still reaches the 64-token KV tile the expected kernel is tuned at.
+    """
+    from cleave.pipeline import ScheduleConfig, SuperoptConfig, superoptimize
+    from cleave.pipeline.dynamic import schedule_paged
+
+    att = _attention(preset)
+    graphs = superoptimize(att.dense_body(), SuperoptConfig())
+    plans = schedule_paged(graphs, att.paging_spec(), ScheduleConfig(topk=4),
+                           filter_before_topk=True)
+    tilings = [(p.dense.kv_tile, p.dense.query_rows, p.dense.n_threads) for p in plans]
+    assert tilings == [(32, 16, 128), (32, 16, 256), (64, 16, 128), (64, 16, 256)], plans.summary()
+    expected = OPERATORS[CASES[preset]].expected_kernel_path.read_text(encoding="utf-8")
+    assert [p.source == expected for p in plans].count(True) == 1
+
+
 @pytest.mark.gpu
 @pytest.mark.search
 @pytest.mark.slow

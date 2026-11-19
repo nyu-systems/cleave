@@ -24,6 +24,7 @@ from cleave.dynamic.dense import (
     DTYPE,
     KV_PROXY,
     build_paged_graph,
+    build_tiled_candidate,
     flash_attention_sd_graph,
     mla_attention_sd_graph,
     tiled_dense_attention,
@@ -36,6 +37,7 @@ from cleave.dynamic.paging import (
     MLASpec,
     PagingSpec,
     apply_paging,
+    paging_accept,
     read_dense_attention,
     read_dense_mla,
 )
@@ -247,6 +249,33 @@ def test_schedules_a_partial_score_step_over_the_whole_head_dim():
     assert read_dense_attention(
         tiled_dense_attention(_shipped_dense(), MQ, D, BN, steps=steps)
     ) == read_dense_attention(tiled_dense_attention(_shipped_dense(), MQ, D, BN))
+
+
+def _searched(dense, width, steps, n_threads=None):
+    """The candidate the tiling search hands its filter for ``steps`` (cf. ``tiled_dense_attention``)."""
+    rstep = {
+        node.name: steps.get(node.name, {})
+        for node in dense.nodes
+        if not node.is_placeholder() and not node.is_output()
+    }
+    cand = build_tiled_candidate(dense, [MQ, width], rstep)
+    if n_threads is not None:
+        cand.n_threads = n_threads
+    return cand
+
+
+def test_the_search_filter_refuses_a_partial_score_step():
+    """The filter ahead of the top-k cut passes one candidate per kernel.
+
+    The partial step is scheduled over the whole head dim, which makes it the whole step's
+    kernel: accepted, it would hold a second top-k slot for that kernel and push a different
+    one out.
+    """
+    whole = {"mma_0": {"v2": D}, "mma_1": {"v2": BN}, "rowsum_0": {"v1": BN}}
+    partial = {**whole, "mma_0": {"v2": D // 2}}
+    accept = paging_accept(SPEC)
+    assert accept(_searched(_shipped_dense(), D, whole))
+    assert not accept(_searched(_shipped_dense(), D, partial))
 
 
 def test_rejects_a_dense_schedule_that_still_has_a_grid():
@@ -514,6 +543,16 @@ def test_schedules_a_partial_latent_score_step_over_its_whole_width(matmul, widt
     assert read_dense_mla(_tiled_mla(_shipped_mla(), steps=steps)) == read_dense_mla(
         _tiled_mla(_shipped_mla())
     )
+
+
+@pytest.mark.parametrize("matmul, width", [("mma_0", CKV), ("mma_pe", KPE)])
+def test_the_search_filter_refuses_a_partial_latent_score_step(matmul, width):
+    """As for the dense attention body, for each of the two score matmuls."""
+    partial = _mla_steps(CKV, KPE)
+    partial[matmul] = {"v2": width // 2}
+    accept = paging_accept(MLA_SPEC)
+    assert accept(_searched(_shipped_mla(), CKV, _mla_steps(CKV, KPE), n_threads=256))
+    assert not accept(_searched(_shipped_mla(), CKV, partial, n_threads=256))
 
 
 def test_rejects_a_latent_schedule_that_still_has_a_grid():
