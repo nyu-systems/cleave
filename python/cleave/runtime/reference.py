@@ -310,8 +310,13 @@ def _eval_node(node, args):
     raise TypeError(f"graph_executor has no torch reference for node type {name}")
 
 
-def make_inputs(graph, dtype, *, seed=None, device="cuda"):
-    """Sample the graph's placeholder inputs (in kernel argument order)."""
+def make_inputs(graph, dtype, *, seed=None, device="cuda", distribution="normal"):
+    """Sample the graph's placeholder inputs (in kernel argument order).
+
+    ``distribution`` is ``"normal"`` (iid N(0,1), or U(0.5,1.5) where positivity is needed)
+    or one of the adversarial softmax cases of :mod:`cleave.runtime.inputs`, which rewrite
+    the normal sample afterwards: the normal stream is the same whatever is requested.
+    """
     import torch
 
     if seed is None:
@@ -331,6 +336,10 @@ def make_inputs(graph, dtype, *, seed=None, device="cuda"):
         else:
             tensor = torch.randn(shape, device=device)
         inputs.append(tensor.to(dt))
+    if distribution != "normal":
+        from .inputs import apply_distribution
+
+        return apply_distribution(graph, tuple(inputs), distribution)
     return tuple(inputs)
 
 
@@ -428,7 +437,8 @@ def reconcile_output_layout(reference, actual_shape):
     return squeezed.reshape(actual_shape)
 
 
-def build_inputs_and_reference(graph, dtype, *, seed=None, device="cuda"):
+def build_inputs_and_reference(graph, dtype, *, seed=None, device="cuda",
+                               distribution="normal"):
     """Return ``(inputs_by_name, reference, out_idx)`` for a cleave graph.
 
     ``inputs_by_name`` maps each placeholder name to its tensor. Scheduling can
@@ -439,7 +449,7 @@ def build_inputs_and_reference(graph, dtype, *, seed=None, device="cuda"):
     ``tl.compile`` index.
     """
     placeholders = placeholder_order(graph)
-    tensors = make_inputs(graph, dtype, seed=seed, device=device)
+    tensors = make_inputs(graph, dtype, seed=seed, device=device, distribution=distribution)
     inputs_by_name = {ph.name: t for ph, t in zip(placeholders, tensors)}
     reference = execute(graph, tensors)
     return inputs_by_name, reference, graph_out_indices(graph)

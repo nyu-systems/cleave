@@ -326,6 +326,25 @@ WORKLOADS = {
 }
 
 
+def _spread(axes, keep=3):
+    """``keep`` of the captured ``axes``: the smallest, the largest and those evenly between."""
+    if len(axes) <= keep:
+        return tuple(axes)
+    return tuple(axes[round(i * (len(axes) - 1) / (keep - 1))] for i in range(keep))
+
+
+# Adversarial softmax workloads, apart from the captured ``WORKLOADS``: ``(distribution, axes)``
+# per operator, the axes drawn from its captured ones (see ``reference.apply_distribution``).
+# Nothing validates on these by default; ask for them (``keyed_workloads(adversarial=True)``,
+# ``cleave.compile(fn, adversarial=True)``) once an operator's softmax is stabilized.
+ADVERSARIAL_DISTRIBUTIONS = ("large_logits", "increasing")
+ADVERSARIAL_WORKLOADS = {
+    name: tuple((distribution, axes) for distribution in ADVERSARIAL_DISTRIBUTIONS
+                for axes in _spread(captured))
+    for name, captured in WORKLOADS.items()
+}
+
+
 def _rng(operator, axes):
     return random.Random(zlib.crc32(repr((operator, axes)).encode()))
 
@@ -378,8 +397,12 @@ def _prefill_lengths(operator, axes):
     return batch, q_lens, kv_lens
 
 
-def case(operator, axes, dims, page_size=1, scale=None):
-    """(inputs, expected outputs) for one captured workload ``axes`` of ``operator``."""
+def case(operator, axes, dims, page_size=1, scale=None, distribution="normal"):
+    """(inputs, expected outputs) for one captured workload ``axes`` of ``operator``.
+
+    ``distribution`` other than ``"normal"`` rewrites the inputs to an adversarial softmax
+    case (``reference.apply_distribution``); the reference is computed from what results.
+    """
     from . import reference  # torch, so only when a workload is actually built
 
     if operator.startswith("mla_paged_decode"):
@@ -423,6 +446,7 @@ def case(operator, axes, dims, page_size=1, scale=None):
             expected = reference.gqa_paged_prefill_reference(
                 wl, q_lens, kv_lens
             )
+    inputs = reference.apply_distribution(operator, inputs, distribution)
     return inputs, expected(*inputs)
 
 

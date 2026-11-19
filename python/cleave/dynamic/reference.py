@@ -15,6 +15,10 @@ from __future__ import annotations
 
 import torch
 
+from ..core.errors import SpecError
+from ..core.settings import Settings
+from ..runtime.inputs import INCREASING_SPAN, LARGE_LOGIT_FACTOR, check_distributions
+
 SEED = 0
 BF16 = torch.bfloat16
 NEG_INF = float("-inf")
@@ -37,7 +41,8 @@ def _randn(*shape, dtype=BF16, device="cuda", gen=None):
 
 def _generator(device="cuda"):
     gen = torch.Generator(device=device)
-    gen.manual_seed(SEED)
+    override = Settings.from_env().test_seed  # CLEAVE_TEST_SEED, as for the dense references
+    gen.manual_seed(SEED if override is None else override)
     return gen
 
 
@@ -363,3 +368,69 @@ def mla_paged_prefill_reference(dims, q_lens, kv_lens):
         return [out, lse]
 
     return reference
+
+
+# ------------------------------------------------------------ adversarial distributions
+# Per operator family: the (query, key) input positions of each score term, then the positions
+# of kv_indptr and of kv_indices (None: ragged keys, addressed by token). The softmax scale is
+# always the last input.
+_SCORE_INPUTS = {
+    "gqa_paged_decode": (((0, 1),), 3, 4),
+    "gqa_paged_prefill": (((0, 1),), 4, 5),
+    "gqa_ragged_prefill": (((0, 1),), 4, None),
+    "mla_paged_decode": (((0, 2), (1, 3)), 4, 5),
+    "mla_paged_prefill": (((0, 2), (1, 3)), 5, 6),
+}
+
+
+def apply_distribution(operator, inputs, distribution):
+    """One workload's ``inputs`` rewritten to an adversarial softmax distribution.
+
+    The dynamic counterpart of :func:`cleave.runtime.inputs.apply_distribution`, applied
+    after the normal inputs are built so their random stream never shifts:
+
+    ``large_logits``  every query tensor times 100;
+    ``increasing``    logits ``a * 128 * j / (n - 1)`` at token ``j`` of each request's ``n``
+                      keys, in the order the page table lists them (``a >= 0.5`` per query
+                      row and head), so the running max changes at every KV tile.
+    """
+    (distribution,) = check_distributions(distribution)
+    if distribution == "normal":
+        return inputs
+    family = next((f for f in _SCORE_INPUTS if operator.startswith(f)), None)
+    if family is None:
+        raise SpecError(f"no adversarial inputs are defined for operator {operator!r}")
+    terms, indptr_at, indices_at = _SCORE_INPUTS[family]
+    inputs = list(inputs)
+    if distribution == "large_logits":
+        for query_at, _ in terms:
+            query = inputs[query_at]
+            inputs[query_at] = (query.float() * LARGE_LOGIT_FACTOR).to(query.dtype)
+        return inputs
+
+    scale = float(inputs[-1])
+    indptr = [int(i) for i in inputs[indptr_at].tolist()]
+    for query_at, key_at in terms:
+        query, keys = inputs[query_at], inputs[key_at].clone()
+        width = query.shape[-1]
+        magnitude = query[..., :1].float().abs() + 0.5
+        inputs[query_at] = (magnitude / width**0.5).expand_as(query).to(query.dtype).contiguous()
+        # scale * sum_terms(q . k) = magnitude * INCREASING_SPAN * ramp
+        top = INCREASING_SPAN / (len(terms) * scale * width**0.5)
+        paged = indices_at is not None
+        page_size = keys.shape[1] if paged else 1
+        rows = keys.reshape(-1, *keys.shape[2:]) if paged else keys  # one row per token slot
+        for lo, hi in zip(indptr, indptr[1:]):
+            if hi <= lo:
+                continue
+            if paged:
+                pages = inputs[indices_at][lo:hi].long()
+                slots = torch.arange(page_size, device=pages.device)
+                tokens = (pages[:, None] * page_size + slots[None, :]).reshape(-1)
+            else:
+                tokens = torch.arange(lo, hi, device=keys.device)
+            n = tokens.numel()
+            ramp = torch.arange(n, device=keys.device, dtype=torch.float32) / max(n - 1, 1)
+            rows[tokens] = (top * ramp).reshape(n, *[1] * (rows.dim() - 1)).to(keys.dtype)
+        inputs[key_at] = keys
+    return inputs
