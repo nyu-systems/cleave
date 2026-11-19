@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from math import prod
 from typing import Dict, List, Optional, Set
 from tilelang.carver.roller.node import Edge
+from ..core.errors import ScheduleRejected
 from ..ir.graph import (
     Graph,
     OutputNode,
@@ -592,30 +593,46 @@ def _normalize_inner_reduction_axes(graph_node: GraphNode, itile_map: dict):
         node.axis_arg = visible_axis
 
 
-def _pin_absorbed_reduction_axes(ordered_nodes, rstep_map, tile_map, itile_map):
-    """Iteration tiles with every absorbed reduction axis kept at its block extent.
+def _iterative_reductions(nodes, rstep_map):
+    """The reductions of ``nodes`` that are stepped below their extent."""
+    return [
+        n
+        for n in nodes
+        if len(n.raxis) > 0
+        and n in rstep_map
+        and _get_rstep_for_axis(n, rstep_map[n]) < n.raxis[0].dom.extent
+    ]
+
+
+def absorbed_reductions(nodes, rstep_map):
+    """The reductions of ``nodes`` that ``apply_tiling`` schedules inside another's loop.
 
     A reduction that iterates (step < extent) while one of its descendant reductions
     also iterates is absorbed into that descendant's loop (see the merge in
     ``apply_tiling``). The loop has a single counter, which advances the loop's own
-    axis; it cannot also advance the absorbed reduction's axis. The absorbed reduction
-    is therefore computed over its whole axis in every iteration: each tensor dim that
-    carries that axis keeps its block tile, so ``assign_tensor_map`` does not slice it.
+    axis; it cannot also advance the absorbed reduction's axis. An absorbed reduction
+    is therefore computed over its whole axis in every iteration, whatever its step:
+    the tiling is the kernel of the one that steps it at its extent.
     """
-
-    def iterative(node):
-        return (
-            len(node.raxis) > 0
-            and node in rstep_map
-            and _get_rstep_for_axis(node, rstep_map[node]) < node.raxis[0].dom.extent
-        )
-
-    active = [n for n in ordered_nodes if iterative(n)]
-    absorbed = [
+    active = _iterative_reductions(nodes, rstep_map)
+    return [
         a
         for a in active
         if any(r is not a and a in get_op_ancestors(r) for r in active)
     ]
+
+
+def _pin_absorbed_reduction_axes(ordered_nodes, rstep_map, tile_map, itile_map):
+    """Iteration tiles with every absorbed reduction axis kept at its block extent.
+
+    Each tensor dim that carries the axis of an absorbed reduction (see
+    ``absorbed_reductions``) keeps its block tile, so ``assign_tensor_map`` does not
+    slice it with the counter of the loop the reduction was absorbed into.
+
+    Raises ``ScheduleRejected`` for a tiling in which another reduction steps that same
+    axis: its loop would have to advance an axis that has to stay whole.
+    """
+    absorbed = absorbed_reductions(ordered_nodes, rstep_map)
     if not absorbed:
         return itile_map
 
@@ -626,20 +643,24 @@ def _pin_absorbed_reduction_axes(ordered_nodes, rstep_map, tile_map, itile_map):
         tokens = red_tokens.get(node)
         return tokens[0] if tokens else set()
 
+    # These are refusals, not asserts: without them the tiling would be scheduled into
+    # a kernel that reads the wrong slices, and ``python -O`` drops an assert.
     pinned = set()
     for node in absorbed:
         tokens = axis_tokens(node)
-        assert tokens, (
-            f"No axis provenance for the reduction axis of {node.name}; cannot tell "
-            "which tensor dims it runs over."
-        )
+        if not tokens:
+            raise ScheduleRejected(
+                f"No axis provenance for the reduction axis of {node.name}; cannot tell "
+                "which tensor dims it runs over."
+            )
         pinned |= tokens
-    for node in active:
+    for node in _iterative_reductions(ordered_nodes, rstep_map):
         # Keeping a loop's own axis at block extent would stop the loop from advancing.
-        assert node in absorbed or not (pinned & axis_tokens(node)), (
-            f"Reduction axis of {node.name} is shared with an absorbed ancestor "
-            "reduction; one loop cannot both advance it and hold it whole."
-        )
+        if node not in absorbed and pinned & axis_tokens(node):
+            raise ScheduleRejected(
+                f"Reduction axis of {node.name} is shared with an absorbed ancestor "
+                "reduction; one loop cannot both advance it and hold it whole."
+            )
 
     itile_map = dict(itile_map)
     for (node, out_id), dim_tokens in out_tokens.items():

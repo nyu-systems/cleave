@@ -9,8 +9,8 @@ contracted one ``D`` block per ``S_KV`` step and read past the tile.
 
 import pytest
 
-pytest.importorskip("tilelang")
-
+from cleave import codegen
+from cleave.core.errors import ScheduleRejected
 from cleave.core.target import current_target
 from cleave.dynamic.dense import flash_attention_sd_graph
 from cleave.ir.graph import GraphNode, OutputNode
@@ -79,8 +79,18 @@ def _mis_sliced(scheduled):
     return bad
 
 
+@pytest.fixture
+def unformatted(monkeypatch):
+    """Kernel sources as codegen emits them, without the ``black`` pass over the result.
+
+    Formatting is nine tenths of the time it takes to build a source and no part of what is
+    compared: two sources that are equal before it are equal after it.
+    """
+    monkeypatch.setattr(codegen, "format_source", lambda debug, *sections: "".join(sections))
+
+
 @pytest.mark.parametrize("name", sorted(CASES))
-def test_absorbed_reduction_keeps_its_whole_axis(name):
+def test_absorbed_reduction_keeps_its_whole_axis(name, unformatted):
     build, dims, options = CASES[name]
     policy = _policy(build(*dims), options.get("force_fusion", False))
     candidates = policy.emit_config(options.get("topk", 1000))
@@ -112,3 +122,29 @@ def test_absorbed_reduction_keeps_its_whole_axis(name):
         assert build_candidate_code(cand) == siblings[key], label
 
     assert n_absorbed, f"{name}: no candidate with an absorbed reduction; the case tests nothing"
+
+
+def test_refuses_to_step_an_axis_that_an_absorbed_reduction_holds_whole():
+    """LoRA ``X @ W + (X @ A) @ B`` with all three matmuls stepped below their extents.
+
+    ``X @ A`` is absorbed into the loop of ``(X @ A) @ B``, which walks the rank, so it needs
+    the whole ``K`` of ``X`` in every iteration. ``X @ W`` steps that same ``K`` of the same
+    ``X``. No tile of ``X`` serves both, so the tiling is refused -- with a typed error, which
+    ``python -O`` cannot strip -- rather than scheduled into a kernel that slices ``X`` wrong.
+    """
+    # Rank 128: at the end2end case's rank of 16 the up projection never iterates.
+    candidates = _policy(g.lora_graph(16, 4096, 4096, 128), False).emit_config(1000)
+
+    n_refused = 0
+    for cand in candidates:
+        label = f"tile={list(cand.output_tile)} rstep={cand.rstep_map}"
+        absorbed = [node.name for node in _absorbed(cand)]
+        if not absorbed:
+            apply_tiling(cand)  # nothing is held whole, so nothing is refused
+            continue
+        assert absorbed == ["mma_down"], label
+        with pytest.raises(ScheduleRejected, match="mma_base is shared with an absorbed"):
+            apply_tiling(cand)
+        n_refused += 1
+
+    assert n_refused, "no candidate steps all three matmuls; the case tests nothing"
