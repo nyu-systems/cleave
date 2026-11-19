@@ -28,7 +28,7 @@ from cleave.dynamic.dense import (
     mla_attention_sd_graph,
     tiled_dense_attention,
 )
-from cleave.ir.graph import OutputNode
+from cleave.ir.graph import GraphNode, Iterator, OutputNode
 from cleave.ir.ops import Add, Div, Exp, Matmul, Mul, ReduceSum, Sub
 from cleave.dynamic.paging import (
     DenseAttention,
@@ -209,6 +209,21 @@ def test_rejects_a_split_head_dim():
         apply_paging(tiled_dense_attention(_shipped_dense(), MQ, D // 2, BN), SPEC)
 
 
+def _cut_query_tile(tiled, matmul, width):
+    """``tiled`` with the query operand of score matmul ``matmul`` cut to ``width`` columns.
+
+    ``apply_tiling`` does not schedule this: a score matmul stepped below its width is
+    absorbed into the KV loop, which has one counter and walks KV with it, so the score
+    reduction is kept whole (the ``test_schedules_a_partial_*`` cases). A schedule from
+    anywhere else still has to be refused, so the loop tier's tile is cut by hand.
+    """
+    (loop,) = [n for n in tiled.nodes if isinstance(n, GraphNode)]
+    operand = next(n for n in loop.graph.nodes if n.name == matmul).inputs[0].src_node
+    whole = loop.graph.tmap[operand]
+    loop.graph.tmap[operand] = Iterator(whole.offset, whole.shape, (whole.tile_size[0], width))
+    return tiled
+
+
 def test_rejects_a_partial_reduction_over_the_head_dim():
     """A score matmul that reduces over half the head dim computes half a score.
 
@@ -217,9 +232,21 @@ def test_rejects_a_partial_reduction_over_the_head_dim():
     layer rebuilds the matmul against the operator's full width either way, so the split
     would be dropped and the kernel would attend on the wrong reduction.
     """
-    steps = {"mma_0": {"v2": D // 2}, "mma_1": {"v2": BN}, "rowsum_0": {"v1": BN}}
+    tiled = _cut_query_tile(tiled_dense_attention(_shipped_dense(), MQ, D, BN), "mma_0", D // 2)
     with pytest.raises(AssertionError, match="part of the head dim"):
-        apply_paging(tiled_dense_attention(_shipped_dense(), MQ, D, BN, steps=steps), SPEC)
+        apply_paging(tiled, SPEC)
+
+
+def test_schedules_a_partial_score_step_over_the_whole_head_dim():
+    """A score matmul stepped below the head dim is scheduled over all of it.
+
+    The layer is handed the tiling it would get for the whole step, so there is nothing for
+    it to misrepresent.
+    """
+    steps = {"mma_0": {"v2": D // 2}, "mma_1": {"v2": BN}, "rowsum_0": {"v1": BN}}
+    assert read_dense_attention(
+        tiled_dense_attention(_shipped_dense(), MQ, D, BN, steps=steps)
+    ) == read_dense_attention(tiled_dense_attention(_shipped_dense(), MQ, D, BN))
 
 
 def test_rejects_a_dense_schedule_that_still_has_a_grid():
@@ -474,10 +501,19 @@ def test_rejects_a_partial_reduction_over_a_head_dim(matmul, width, expected):
     The layer rebuilds both matmuls against the operator's full widths, so the split would
     be dropped and the kernel would silently attend on the wrong reduction.
     """
+    tiled = _cut_query_tile(_tiled_mla(_shipped_mla()), matmul, width // 2)
+    with pytest.raises(AssertionError, match=expected):
+        apply_paging(tiled, MLA_SPEC)
+
+
+@pytest.mark.parametrize("matmul, width", [("mma_0", CKV), ("mma_pe", KPE)])
+def test_schedules_a_partial_latent_score_step_over_its_whole_width(matmul, width):
+    """As for the dense attention body, for each of the two score matmuls."""
     steps = _mla_steps(CKV, KPE)
     steps[matmul] = {"v2": width // 2}
-    with pytest.raises(AssertionError, match=expected):
-        apply_paging(_tiled_mla(_shipped_mla(), steps=steps), MLA_SPEC)
+    assert read_dense_mla(_tiled_mla(_shipped_mla(), steps=steps)) == read_dense_mla(
+        _tiled_mla(_shipped_mla())
+    )
 
 
 def test_rejects_a_latent_schedule_that_still_has_a_grid():

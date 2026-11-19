@@ -14,6 +14,8 @@ from ..ir.graph import (
 from ..ir.ops import ReduceSum
 from ..ir.offsets import OffsetTerm, TileOffset, get_offset_lambda
 from ..ir.analysis import (
+    build_output_axis_provenance,
+    build_reduction_axis_provenance,
     infer_output_axis_dependencies,
 )
 from ..ir.graph_utils import (
@@ -590,6 +592,69 @@ def _normalize_inner_reduction_axes(graph_node: GraphNode, itile_map: dict):
         node.axis_arg = visible_axis
 
 
+def _pin_absorbed_reduction_axes(ordered_nodes, rstep_map, tile_map, itile_map):
+    """Iteration tiles with every absorbed reduction axis kept at its block extent.
+
+    A reduction that iterates (step < extent) while one of its descendant reductions
+    also iterates is absorbed into that descendant's loop (see the merge in
+    ``apply_tiling``). The loop has a single counter, which advances the loop's own
+    axis; it cannot also advance the absorbed reduction's axis. The absorbed reduction
+    is therefore computed over its whole axis in every iteration: each tensor dim that
+    carries that axis keeps its block tile, so ``assign_tensor_map`` does not slice it.
+    """
+
+    def iterative(node):
+        return (
+            len(node.raxis) > 0
+            and node in rstep_map
+            and _get_rstep_for_axis(node, rstep_map[node]) < node.raxis[0].dom.extent
+        )
+
+    active = [n for n in ordered_nodes if iterative(n)]
+    absorbed = [
+        a
+        for a in active
+        if any(r is not a and a in get_op_ancestors(r) for r in active)
+    ]
+    if not absorbed:
+        return itile_map
+
+    out_tokens = build_output_axis_provenance(ordered_nodes)
+    red_tokens = build_reduction_axis_provenance(ordered_nodes, out_tokens)
+
+    def axis_tokens(node):
+        tokens = red_tokens.get(node)
+        return tokens[0] if tokens else set()
+
+    pinned = set()
+    for node in absorbed:
+        tokens = axis_tokens(node)
+        assert tokens, (
+            f"No axis provenance for the reduction axis of {node.name}; cannot tell "
+            "which tensor dims it runs over."
+        )
+        pinned |= tokens
+    for node in active:
+        # Keeping a loop's own axis at block extent would stop the loop from advancing.
+        assert node in absorbed or not (pinned & axis_tokens(node)), (
+            f"Reduction axis of {node.name} is shared with an absorbed ancestor "
+            "reduction; one loop cannot both advance it and hold it whole."
+        )
+
+    itile_map = dict(itile_map)
+    for (node, out_id), dim_tokens in out_tokens.items():
+        if out_id != 0 or node.name not in itile_map:
+            continue
+        tile, itile = tile_map[node.name], list(itile_map[node.name])
+        if len(dim_tokens) != len(itile) or len(tile) != len(itile):
+            continue
+        for dim, tokens in enumerate(dim_tokens):
+            if tokens & pinned:
+                itile[dim] = tile[dim]
+        itile_map[node.name] = itile
+    return itile_map
+
+
 def apply_tiling(cand: List) -> List[Graph]:
     output_nodes = [n for n in cand.flat_graph.nodes if n.is_output()]
     output_node = _select_canonical_output_node(output_nodes)
@@ -624,6 +689,9 @@ def apply_tiling(cand: List) -> List[Graph]:
     # serialization (avoid mutation node issues)
     tile_map = {k.name: v for k, v in cand.tile_map.items()}
     itile_map = {k.name: v for k, v in cand.itile_map.items()}
+    itile_map = _pin_absorbed_reduction_axes(
+        ordered_nodes, cand.rstep_map, tile_map, itile_map
+    )
 
     # set top level threadblock extent and tmap based on the
     # candidate tile and reduction step choices
@@ -671,8 +739,9 @@ def apply_tiling(cand: List) -> List[Graph]:
                     # merge node and its ancestors into an existing graph when
                     # they already share inner nodes/placeholders, even if the
                     # reduction-step choice differs. In that case the existing
-                    # inner graph extent wins and the incompatible candidate
-                    # choice is ignored instead of failing the whole schedule.
+                    # inner graph extent wins. An ancestor of the loop's
+                    # reductions that is merged this way does not iterate at
+                    # all: _pin_absorbed_reduction_axes kept its axis whole.
                     lock_graph(gnode.graph)
                     new_nodes = gather_all_nodes(node, descending=False)
                     unlock_graph(gnode.graph)
