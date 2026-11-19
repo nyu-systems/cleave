@@ -309,7 +309,10 @@ class PlaceHolderNode(Node):
         return "placeholder"
 
     def __hash__(self):
-        return hash((self.name, tuple(e.dst_node for e in self.outputs)))
+        # The name only, not the consumers ``__eq__`` also compares: a placeholder is a
+        # key of ``Graph.tmap`` while ``apply_tiling`` is still giving it consumers, and
+        # a key whose hash moves can no longer be found in the dict it is in.
+        return hash(self.name)
 
     def __eq__(self, other):
         if not isinstance(other, PlaceHolderNode):
