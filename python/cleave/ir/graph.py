@@ -211,6 +211,24 @@ class Graph:
         # implicit __syncthreads(); (b) the union of active slots must cover every
         # declared output element -- nothing else checks that.
     )
+    lag_nodes: List[Node] = field(
+        default_factory=list
+    )  # nodes of an iterative graph that snapshot an accumulator of the same loop (their
+    # single input) BEFORE this iteration updates it. A lag node is an ordinary compute
+    # node of the dataflow -- a `Copy` -- except for where it is emitted: an edge orders a
+    # reader after its producer, and this reader has to see the value the previous
+    # iteration left. So the emitter ignores a lag node's own input edge when ordering and
+    # makes the lag node a dependency of the accumulator it reads instead. Its consumers
+    # keep ordinary edges. Used by the rolling (online) softmax: `m_prev = lag(m)`.
+    accum_scale: dict[Node, Node] = field(
+        default_factory=dict
+    )  # accumulator -> factor node. Right before the accumulator's own macro runs, its
+    # buffer is multiplied in place by the factor (indexed by the accumulator's leading
+    # axes): `acc *= factor; acc += update`. The factor is an ordinary node of this graph,
+    # ordered before the accumulator although no edge joins them. Used by the rolling
+    # softmax: every accumulator downstream of `exp(s - m)` is rescaled by
+    # `alpha = exp(m_prev - m)` when the running max moves. With both fields empty the
+    # emitted text is exactly what it is without them.
 
     def clone(self) -> "Graph":
         """Copy every field, node and edge (nested graphs included).
@@ -941,6 +959,13 @@ class GraphNode(Node):
             ):
                 if node in self.graph.accum_nodes:
                     continue
+                # A rescale factor has no dataflow consumer (it is read through
+                # `accum_scale`), and neither has an unused lag node; both are
+                # per-iteration temporaries, not state carried across iterations.
+                if any(node is f for f in self.graph.accum_scale.values()):
+                    continue
+                if any(node is n for n in self.graph.lag_nodes):
+                    continue
 
                 self.graph.accum_nodes.append(node)
                 output_id = len(self.graph.accum_nodes) - 1
@@ -965,6 +990,36 @@ class GraphNode(Node):
                 assert (
                     len(node.outputs) == 0
                 ), f"All outputs of accum_node {node.name} should be removed after assigning AccumEdge."
+
+    def carry(self, node) -> int:
+        """Register ``node`` as an accumulator although the loop also reads it; its index.
+
+        ``_assign_accum_nodes`` only takes nodes without a consumer inside the loop: a sum
+        that is read in the loop it accumulates in is a partial sum, which nothing wants.
+        A running max is the exception -- its partial value is exactly what the rolling
+        softmax subtracts -- so it is declared, not inferred. Appended, never inserted:
+        accumulator order is positional (macro signatures, ``_resolve_output_binding``).
+        Consumers outside the loop, if any, are rewired to ``AccumEdge``s; consumers
+        inside keep reading the carried buffer through their ordinary edges. A node that
+        already is an accumulator is left as it is.
+        """
+        inner = self.graph
+        assert any(node is n for n in inner.nodes), f"{node.name} is not a node of {self.name}."
+        assert isinstance(node, ComputeOpNode), f"{node.name} is not a compute node."
+        for index, accum in enumerate(inner.accum_nodes):
+            if accum is node:
+                return index
+        inner.accum_nodes.append(node)
+        output_id = len(inner.accum_nodes) - 1
+        self.set_shape(node.get_shape(0), id=output_id, overwrite=True)
+        self.set_dtype(node.get_dtype(0), id=output_id)
+        for edge in list(node.outputs):
+            if any(edge.dst_node is n for n in inner.nodes):
+                continue
+            new_edge = AccumEdge(self, edge.dst_node, output_id, edge.dst_id, accum_node=node)
+            self.outputs.append(new_edge), node.outputs.remove(edge)
+            edge.dst_node.set_inputs(new_edge.dst_id, new_edge)
+        return output_id
 
     def _resolve_output_binding(self, output_id: int):
         if output_id < len(self.graph.accum_nodes):

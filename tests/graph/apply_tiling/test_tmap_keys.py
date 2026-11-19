@@ -14,7 +14,7 @@ import pytest
 pytest.importorskip("tilelang")
 pytest.importorskip("tvm")
 
-from cleave.ir.graph import GraphNode
+from cleave.ir.graph_utils import graph_tiers
 from cleave.schedule import apply_tiling
 
 from tests._graphs import mha_bhsd_graph, mla_decode_bhsd_graph
@@ -30,14 +30,6 @@ _MHA_RSTEP = {
 }
 
 
-def _tiers(graph):
-    """``graph`` and every loop tier nested in it, as ``(tier, owning GraphNode or None)``."""
-    tiers = [(graph, None)]
-    for tier, _ in tiers:
-        tiers.extend((n.graph, n) for n in tier.nodes if isinstance(n, GraphNode))
-    return tiers
-
-
 @pytest.mark.parametrize(
     ("build", "tile", "rstep"),
     [
@@ -48,7 +40,7 @@ def _tiers(graph):
 )
 def test_tmap_holds_each_node_once(build, tile, rstep):
     tiled = apply_tiling(build_tiled_candidate(build(), tile, rstep))
-    tiers = _tiers(tiled)
+    tiers = graph_tiers(tiled)
     assert len(tiers) > 1, "the candidate built no loop; the case tests nothing"
     merged = False
     for tier, owner in tiers:
