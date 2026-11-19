@@ -79,9 +79,10 @@ def compile(fn_or_program, *, shapes: dict | None = None, dtype=None, preset="de
     """Compile a traced function or ``Program`` to its fastest validated kernel.
 
     ``tolerance``: the bound every candidate is validated at, a ``cl.Tolerance`` or one per
-    output (also ``@cleave.jit(tolerance=...)`` or ``EvalConfig.tolerance``). There is no
-    default: a dense program must declare one; a paged program without one uses its registry
-    operator's.
+    output (also ``@cleave.jit(tolerance=...)`` or ``EvalConfig.tolerance``). One per output
+    needs every plan to have that many outputs, so a program with split plans declares a
+    single one. There is no default: a dense program must declare one; a paged program
+    without one uses its registry operator's.
     ``split``: dim name / ``cl.Split`` / tuple; ``None``: the Program's own, ``False``: off.
     ``cache_kernels`` (default ``superopt.cache``) reuses a saved kernel. Paged programs go to
     ``pipeline.dynamic.compile_dynamic`` (``hints``, ``workloads``, ...).

@@ -158,10 +158,15 @@ def resolve_workloads(attention, workloads=None, tolerance=None, adversarial=Fal
     The tolerance is the one given, else the one the registry operator of this name and
     shape declares; there is no generic fallback. ``adversarial`` asks for the registry
     operator's adversarial softmax workloads on top of its captured ones (validation only).
+    Nothing here touches a GPU: ``compile_dynamic`` calls it before it searches, so a program
+    that cannot be validated is refused first.
     """
     from ..frontend.paged import workloads as wl
 
     op = _registry_op(attention)
+    if workloads is None and op is None and (attention.is_mla or attention.is_prefill):
+        raise SpecError(f"{attention.program.name}: no captured {attention.kind} workloads; "
+                        "pass workloads=")
     tol = tolerance if tolerance is not None else getattr(op, "tolerance", None)
     if tol is None:
         raise SpecError(f"{attention.program.name}: no validation tolerance declared and no "
@@ -175,9 +180,6 @@ def resolve_workloads(attention, workloads=None, tolerance=None, adversarial=Fal
                         "registry operators' captured workloads only; give a cl.workloads "
                         "spec its own distribution= instead")
     if workloads is None:
-        if attention.is_mla or attention.is_prefill:
-            raise SpecError(f"{attention.program.name}: no captured {attention.kind} workloads; "
-                            "pass workloads=")
         workloads = wl.paged_decode()
     if hasattr(workloads, "factory"):
         return (lambda keep=0, adversarial=False: workloads.factory(attention, keep=keep)), tol
@@ -492,6 +494,10 @@ def compile_dynamic(fn, *, dtype=None, preset="default", superopt=None, schedule
                                  eval=eval, split=split)
     if split is False:
         sc = sc.replace(split_k=())
+    # Before the search: a program with no declared tolerance (or no workloads) cannot be
+    # validated, and that is known now.
+    factory, tol = resolve_workloads(
+        attention, workloads, tolerance if tolerance is not None else ev.tolerance, adversarial)
     t0 = time.perf_counter()
     graphs = superoptimize(body, so.replace(split=()))
     split_graphs = superoptimize(body, so).filter(lambda g: g.is_split) if so.split else ()
@@ -503,8 +509,6 @@ def compile_dynamic(fn, *, dtype=None, preset="default", superopt=None, schedule
     if not plans:
         raise CleaveError(f"{program.name}: the access layer refused every tiling\n{plans.summary()}")
     t2 = time.perf_counter()
-    factory, tol = resolve_workloads(
-        attention, workloads, tolerance if tolerance is not None else ev.tolerance, adversarial)
     by_cand = {}
     for p in plans:
         c = WorkloadCandidate(label=p.label, source=p.source, origin=p.origin, tiling=p.dense,

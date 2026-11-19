@@ -149,12 +149,44 @@ def _program_dtype(plans) -> str:
     return str(getattr(program, "dtype", None) or "float16")
 
 
+def _check_tolerance_fits(plan_list, tolerance) -> None:
+    """Refuse a per-output ``tolerance`` that does not fit every plan, before any runs.
+
+    One ``Tolerance`` covers every output of every plan. A sequence is one per output, and
+    the plans of one program need not have the same outputs: a split partial has more than
+    its combine and than the solo plans. All candidates share the declaration, so a sequence
+    is only valid when every plan has exactly that many outputs.
+    """
+    from ..runtime import reference
+    from ..runtime.validate import Tolerance, tolerances_for
+
+    if not plan_list or isinstance(tolerance, Tolerance):
+        return  # nothing to validate, or one bound for every output
+    try:
+        declared = len(tuple(tolerance))
+    except TypeError:
+        declared = 1
+    tolerances_for(tolerance, declared)  # a SpecError unless these are Tolerances
+    counted = {}  # id(flat graph) -> number of outputs
+    for plan in plan_list:
+        graph = plan.tile.flat_graph
+        if id(graph) not in counted:
+            counted[id(graph)] = len(reference.output_order(graph))
+        if counted[id(graph)] != declared:
+            raise SpecError(
+                f"build(): {declared} tolerances were declared, but plan {plan.label!r} "
+                f"({plan.role}) has {counted[id(graph)]} output(s). A per-output tolerance "
+                "must fit every plan, and a split partial has more outputs than its combine "
+                "and the solo plans; declare one Tolerance for all outputs")
+
+
 def build(plans: PlanSet | Sequence[Plan], workers: int | None = None, *,
           config: EvalConfig | None = None, compiler_pass_options=None) -> BuildSet:
     """Compile, validate and time every plan in its own worker (a crash fails one candidate).
 
     Parallelism: ``workers``, else the active ``Session.max_parallel``, else ``config``.
-    ``config.tolerance`` is required as soon as there is a plan to validate.
+    ``config.tolerance`` is required as soon as there is a plan to validate: one
+    ``Tolerance`` for every output, or one per output when every plan has that many.
     """
     from ..core.session import current_session
     from ..runtime.inputs import check_distributions
@@ -172,6 +204,7 @@ def build(plans: PlanSet | Sequence[Plan], workers: int | None = None, *,
                         "Pass config=EvalConfig(tolerance=cl.Tolerance(rtol=...))")
     reference_fn = functools.partial(publish_reference,
                                      distributions=check_distributions(config.distributions))
+    _check_tolerance_fits(plan_list, config.tolerance)
     t0 = time.perf_counter()
     runs = run_candidates([p.tile for p in plan_list], _program_dtype(plans),
                           max_parallel=workers or session.max_parallel or config.max_parallel,

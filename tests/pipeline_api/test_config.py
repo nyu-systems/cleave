@@ -202,6 +202,49 @@ def test_compile_and_build_require_a_declared_tolerance(monkeypatch):
     assert len(build_mod.build([])) == 0  # nothing to validate, nothing to declare
 
 
+def test_a_per_output_tolerance_must_fit_every_plan(monkeypatch):
+    """A split partial has more outputs than its combine and the solo plans, and all
+    candidates share one declaration: a sequence that cannot fit them all is refused by
+    ``build()`` before any candidate runs, not by every mismatching candidate at validate."""
+    import cleave.runtime.evaluate as evaluate_mod
+    import cleave.runtime.reference as reference_mod
+
+    one, two = object(), object()
+    outputs = {id(one): ["o"], id(two): ["l", "o"]}
+    monkeypatch.setattr(reference_mod, "output_order", lambda graph: outputs[id(graph)])
+    ran = []
+    monkeypatch.setattr(evaluate_mod, "run_candidates",
+                        lambda tiles, dtype, **kw: ran.append(kw["tolerance"]) or
+                        [types.SimpleNamespace(code=None) for _ in tiles])
+
+    def plan(graph, role):
+        return types.SimpleNamespace(tile=types.SimpleNamespace(flat_graph=graph), role=role,
+                                     label=f"g0 {role}", program=None)
+
+    solo, partial, combine = plan(one, "main"), plan(two, "partial"), plan(one, "combine")
+    t = cl.Tolerance(rtol=5e-3)
+
+    def build(plans, tolerance):
+        return build_mod.build(plans, config=EvalConfig(tolerance=tolerance))
+
+    # one Tolerance covers every output of every plan
+    assert len(build([solo, partial, combine], t)) == 3
+    # one per output is fine while every plan has that many
+    assert len(build([partial], (t, t))) == 1 and len(build([solo, combine], [t])) == 2
+    assert ran == [t, (t, t), [t]]
+    for plans, tolerance, message in (
+            ([solo, partial, combine], (t, t),
+             r"2 tolerances were declared, but plan 'g0 main' \(main\) has 1 output"),
+            ([partial, combine], (t,),
+             r"1 tolerances were declared, but plan 'g0 partial' \(partial\) has 2 output"),
+            ([partial, solo], [t, t], "A per-output tolerance must fit every plan"),
+            ([solo], (t, 1e-3), "must be a Tolerance or a sequence of them"),
+            ([solo], 1e-3, "must be a Tolerance or a sequence of them")):
+        with pytest.raises(SpecError, match=message):
+            build(plans, tolerance)
+    assert len(ran) == 3  # nothing ran for the refused declarations
+
+
 def test_compile_takes_the_tolerance_from_jit_options_or_the_keyword(monkeypatch):
     import cleave
 

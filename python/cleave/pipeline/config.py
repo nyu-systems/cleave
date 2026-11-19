@@ -63,8 +63,10 @@ class ScheduleConfig(_Replace):
 class EvalConfig(_Replace):
     warmup: int = 16
     iters: int = 1000
-    # The operator's declared bound: a cleave.lang.Tolerance, or one per output. There is no
-    # default; building kernels without one is an error.
+    # The operator's declared bound: a cleave.lang.Tolerance for every output, or one per
+    # output when every plan has that many (a split partial has more outputs than its combine
+    # and the solo plans, so a split program declares one). There is no default; building
+    # kernels without one is an error.
     tolerance: Any = None
     max_parallel: int = 8
     timeout_s: float | None = None  # None -> Settings.compile_timeout_secs
