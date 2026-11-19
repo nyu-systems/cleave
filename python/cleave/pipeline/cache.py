@@ -7,7 +7,10 @@ import hashlib
 import json
 from pathlib import Path
 
-SCHEMA = 1
+# In every key. Bump it when the layout changes, or when the same program and configs would
+# now build a different kernel: a kernel-cache hit returns the saved one as it is.
+# 2: a reduction absorbed into another's loop is scheduled over its whole axis.
+SCHEMA = 2
 
 
 @functools.lru_cache(maxsize=None)

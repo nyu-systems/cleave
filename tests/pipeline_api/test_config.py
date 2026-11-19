@@ -87,6 +87,21 @@ def test_superopt_cache_key_is_stable_and_content_addressed(monkeypatch, tmp_pat
     assert str(path).startswith(str(tmp_path / "persistent" / "superopt")) and key in str(path)
 
 
+def test_cache_schema_retires_kernels_built_before_a_scheduler_fix(monkeypatch):
+    """A kernel-cache hit returns the saved kernel as it is, so a fix that changes what the
+    same program and configs build has to move the key: the schema is in every one."""
+    from cleave.pipeline.compile import _kernel_key
+
+    prog = trace(P.matmul, dict(M=128, N=128, K=4096), cl.f16)
+    cfgs = resolve_configs(prog)
+    # 1: a reduction absorbed into another's loop was sliced with that loop's counter, and
+    # demo/mha_prefill.py's saved winner was such a kernel.
+    assert cache.SCHEMA >= 2
+    key = _kernel_key(prog, *cfgs)
+    monkeypatch.setattr(cache, "SCHEMA", 1)
+    assert _kernel_key(prog, *cfgs) != key
+
+
 def test_resolve_configs_split():
     prog = trace(P.matmul, dict(M=128, N=128, K=4096), cl.f16)
     so, sc, _ = resolve_configs(prog, split=cl.Split("K", (4, 8)))
