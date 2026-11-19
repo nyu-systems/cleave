@@ -182,6 +182,9 @@ cscope*
 *.onnx
 
 !tests/perf/baselines/*.json
+# The measurement every declared validation tolerance is pinned to
+# (python -m tests._measure_tolerances --pin); the tests read it.
+!tests/measured_errors.json
 # The benchmark's inputs: SOL-ExecBench definitions (which carry the reference
 # implementations its correctness gate uses) and the shipped FlashInfer baseline solutions.
 # The blanket *.json above would otherwise hide them, which is how they went untracked.

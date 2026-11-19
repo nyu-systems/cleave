@@ -2,6 +2,7 @@
 
     python -m tests._measure_tolerances --gpus 4,5,6,7 --out DIR    # measure, then report
     python -m tests._measure_tolerances --report DIR                # the table again
+    python -m tests._measure_tolerances --report DIR --pin          # ... and pin it in-tree
 
 Run from the repo root on an otherwise idle set of GPUs. Every run sets
 ``CLEAVE_VALIDATION_LOG``, so each validated kernel appends the error the comparator measured
@@ -16,10 +17,15 @@ unset) it runs
             pytest run and fail where a declared tolerance is exceeded -- that is a finding,
             the measurement itself is in the log either way.
 
-The table has one row per operator and output: a histogram of the measured errors, the
-largest error of the candidates that are clearly valid, and the tolerance that follows from
-it by the rule in ``recommend``. Declare that value (``demo/<name>.py``,
+The table has one row per operator and output: a histogram of the measured row-relative
+errors, the largest error of the candidates that are clearly valid, and the tolerance that
+follows from it by the rule in ``recommend``. Declare that value (``demo/<name>.py``,
 ``cleave.dynamic.registry``, ``tests/_tolerances.py``); never one chosen to make a kernel pass.
+
+``--pin`` writes the measurement to ``tests/measured_errors.json``.
+``tests/test_tolerance_declarations.py`` and ``tests/demo/test_demos.py`` hold every
+declaration to what the rule gives for that file, so after re-measuring the failing tests
+list exactly the declarations to change.
 """
 
 from __future__ import annotations
@@ -37,16 +43,36 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
-from tests._tolerances import CEILING  # no operator may declare a looser bound
+from cleave.runtime.validate import Tolerance
+from tests._tolerances import CEILING, FP32_CEILING  # no operator may declare a looser bound
 
 ROOT = Path(__file__).resolve().parents[1]
+MEASURED = ROOT / "tests" / "measured_errors.json"  # what the declarations are pinned to
 SAFETY = 4.0  # declared tolerance >= SAFETY x the largest valid error
-# Errors are bimodal (valid kernels near one ulp, wrong ones above 1e-1). An error is
-# "clearly valid" when SAFETY x it still fits under the ceiling; anything between that and
-# WRONG is reported as ambiguous and has to be looked at by a person.
-VALID = CEILING / SAFETY
+# ... except for bf16. It has 8 significand bits, so one ulp is 7.8e-3 of the row max, and
+# that is what a valid kernel measures (7.8e-3 .. 9.4e-3). 4x it is the ceiling itself, which
+# for any row whose max is above 0.25 is looser than the elementwise 0.01 + 0.01|ref| the
+# paged operators were held to before. 2x gives 2e-2, i.e. 2.56 ulps.
+COARSE_SAFETY = {"bfloat16": 2.0}
 WRONG = 1e-1
 ULP = {"float16": 2.0**-10, "bfloat16": 2.0**-7, "float32": 2.0**-23}
+
+
+def ceiling(dtype: str) -> float:
+    """The loosest rtol an output of ``dtype`` may declare."""
+    return FP32_CEILING if dtype == "float32" else CEILING
+
+
+def safety(dtype: str) -> float:
+    return COARSE_SAFETY.get(dtype, SAFETY)
+
+
+def valid_limit(dtype: str) -> float:
+    """The largest error that counts as "clearly valid": ``safety`` x it still fits under the
+    ceiling. Errors are bimodal (valid kernels within a few ulp, wrong ones above WRONG);
+    anything between this and WRONG is reported as ambiguous, for a person to look at."""
+    return ceiling(dtype) / safety(dtype)
+
 
 # demo -> the runs that cover its plans (fast settings; lora and qknorm keep the fast
 # preset's topk because few of their tilings survive, and mla_decode needs its whole
@@ -92,14 +118,40 @@ def step125(x: float) -> float:
     raise AssertionError(x)
 
 
-def recommend(largest_valid: float, dtype: str, relative: bool) -> float:
-    """The 1-2-5 step at or above ``SAFETY`` x the largest clearly-valid error.
+def recommend(largest_valid: float, dtype: str) -> float:
+    """The rtol for an output: the 1-2-5 step at or above ``safety(dtype)`` x its largest
+    clearly-valid row-relative error.
 
-    A row-relative bound is also never below one ulp of the output dtype: two correct
-    results may differ by one ulp of the row max, whatever a few seeds happened to measure.
+    Never below one ulp of the output dtype (two correct results may differ by one ulp of
+    the row max, whatever a few seeds happened to measure) and never above its ceiling.
     """
-    floor = ULP.get(dtype, 0.0) if relative else 0.0
-    return min(CEILING, step125(max(SAFETY * largest_valid, floor)))
+    return min(ceiling(dtype), step125(max(safety(dtype) * largest_valid, ULP.get(dtype, 0.0))))
+
+
+# The absolute part of a bound that has one (the paged lse, an fp32 log2-sum-exp): what an
+# lse of exactly 0 can be off by, SAFETY fp32 ulps of a sum of 1 in log2 units. It is fixed,
+# never measured: the lse error is proportional to |lse| (2 .. 25 on the captured workloads,
+# hundreds at x100 logits, where one fp32 ulp alone is 3e-5), so an absolute bound sized on
+# one logit scale is wrong on every other. The measured part of the bound is its rtol.
+ATOL_FLOOR = step125(SAFETY * ULP["float32"] / math.log(2))  # 1e-6
+
+
+def expected_tolerances(outputs) -> list:
+    """Per measured output (an entry of ``measured_errors.json``), the ``Tolerance`` the rule
+    gives, or None for an output no valid kernel was measured on."""
+    return [
+        None if o["rel"] is None else
+        Tolerance(rtol=recommend(o["rel"], o["dtype"]), atol=ATOL_FLOOR if o["absolute"] else 0.0)
+        for o in outputs
+    ]
+
+
+def expected_tolerance(outputs) -> Tolerance:
+    """The single ``Tolerance`` an operator declares for all its outputs: the loosest of what
+    the rule gives each (a dense program's plans do not all have the same outputs)."""
+    rtols = [t.rtol for t in expected_tolerances(outputs) if t is not None]
+    assert rtols and not any(o["absolute"] for o in outputs), outputs
+    return Tolerance(rtol=max(rtols))
 
 
 # ----------------------------------------------------------------------------- running
@@ -201,7 +253,7 @@ def _test_operators():
 
 
 def load(out: Path) -> dict:
-    """operator -> output index -> list of (dtype, relative?, value | None, kind, seed)."""
+    """operator -> output index -> list of (dtype, absolute part?, rel, abs, kind, seed)."""
     operator_of = _test_operators()
     table = defaultdict(lambda: defaultdict(list))
     for path in sorted((out / "validation").glob("*.jsonl")):
@@ -218,13 +270,16 @@ def load(out: Path) -> dict:
                 context = "test:" + operator_of(node)
                 context = context.replace("test:dynamic:", "dynamic:")
             for i, o in enumerate(record["outputs"]):
-                relative = not (o["rtol"] == 0 and o["atol"] > 0)
-                value = o["rel"] if relative else o["abs"]
-                table[context][i].append((o["dtype"], relative, value, o["kind"], seed))
+                # Every output is judged by its row-relative error, whatever bound it was
+                # validated at when this was logged; "absolute" only records that the
+                # operator declares an absolute part as well (ATOL_FLOOR).
+                table[context][i].append(
+                    (o["dtype"], o["atol"] > 0, o["rel"], o["abs"], o["kind"], seed))
     return table
 
 
-BUCKETS = ["0", "<1e-4", "<1e-3", "<1e-2", "<1e-1", ">=1e-1", "non-finite", "layout"]
+_DECADES = [(f"<1e-{k}", 10.0**-k) for k in (6, 5, 4, 3, 2, 1)]
+BUCKETS = ["0", *(name for name, _ in _DECADES), ">=1e-1", "non-finite", "layout"]
 
 
 def _bucket(value, kind):
@@ -234,45 +289,64 @@ def _bucket(value, kind):
         return "layout"  # wrong shape or dtype: nothing was measured
     if value == 0:
         return "0"
-    return next((b for b, hi in zip(BUCKETS[1:5], (1e-4, 1e-3, 1e-2, 1e-1)) if value < hi), ">=1e-1")
+    return next((name for name, hi in _DECADES if value < hi), ">=1e-1")
 
 
 def rows(table):
     for context in sorted(table, key=lambda c: (c.split(":")[0] != "demo", c)):
         for i, entries in sorted(table[context].items()):
-            dtype, relative = entries[0][0], entries[0][1]
+            dtype = entries[0][0]
+            absolute = any(e[1] for e in entries)
             counts = defaultdict(int)
-            for _, _, value, kind, _ in entries:
-                counts[_bucket(value, kind)] += 1
-            values = [v for _, _, v, kind, _ in entries if v is not None and kind != "non_finite"]
-            valid = [v for v in values if v <= VALID]
-            ambiguous = sorted(v for v in values if VALID < v < WRONG)
-            largest = max(valid, default=None)
+            for _, _, rel, _, kind, _ in entries:
+                counts[_bucket(rel, kind)] += 1
+            measured = [(rel, abs_) for _, _, rel, abs_, kind, _ in entries
+                        if rel is not None and kind != "non_finite"]
+            limit = valid_limit(dtype)
+            valid = [(rel, abs_) for rel, abs_ in measured if rel <= limit]
+            largest = max((rel for rel, _ in valid), default=None)
             yield {
-                "operator": context, "output": i, "dtype": dtype,
-                "bound": "rtol" if relative else "atol",
-                "seeds": sorted({e[4] for e in entries}), "n": len(entries),
+                "operator": context, "output": i, "dtype": dtype, "absolute": absolute,
+                "seeds": sorted({e[5] for e in entries}), "n": len(entries),
                 "histogram": {b: counts[b] for b in BUCKETS if counts[b]},
-                "largest_valid": largest, "ambiguous": ambiguous,
-                "tolerance": None if largest is None else recommend(largest, dtype, relative),
+                "largest_valid": largest,
+                "largest_valid_abs": max((abs_ for _, abs_ in valid), default=None),
+                "ambiguous": sorted(rel for rel, _ in measured if limit < rel < WRONG),
+                "rtol": None if largest is None else recommend(largest, dtype),
+                "atol": ATOL_FLOOR if absolute else 0.0,
             }
+
+
+def measured_errors(table) -> dict:
+    """operator -> per output ``{dtype, rel, abs, absolute, seeds, validated}``: the largest
+    clearly-valid error of each output, which is all the rule needs (``MEASURED``)."""
+    out = defaultdict(list)
+    for r in rows(table):
+        assert r["output"] == len(out[r["operator"]]), r
+        out[r["operator"]].append({
+            "dtype": r["dtype"], "rel": r["largest_valid"], "abs": r["largest_valid_abs"],
+            "absolute": r["absolute"], "seeds": len(r["seeds"]), "validated": r["n"],
+        })
+    return dict(out)
 
 
 def markdown(table) -> str:
     lines = [
-        "| operator | out | dtype | bound | seeds | validated | error histogram | largest valid "
-        "| tolerance |",
+        "| operator | out | dtype | seeds | validated | row-relative error histogram "
+        "| largest valid | largest valid abs | tolerance |",
         "|---|---|---|---|---|---|---|---|---|",
     ]
     for r in rows(table):
         hist = ", ".join(f"{k}: {v}" for k, v in r["histogram"].items())
         largest = "-" if r["largest_valid"] is None else f"{r['largest_valid']:.2e}"
-        tol = "-" if r["tolerance"] is None else f"{r['bound']}={r['tolerance']:g}"
+        largest_abs = "-" if r["largest_valid_abs"] is None else f"{r['largest_valid_abs']:.2e}"
+        tol = "-" if r["rtol"] is None else f"rtol={r['rtol']:g}" + (
+            f", atol={r['atol']:g}" if r["atol"] else "")
         if r["ambiguous"]:
-            tol += f" (AMBIGUOUS: {len(r['ambiguous'])} in ({VALID:g}, {WRONG:g}), " \
-                   f"max {r['ambiguous'][-1]:.2e})"
-        lines.append(f"| {r['operator']} | {r['output']} | {r['dtype']} | {r['bound']} | "
-                     f"{len(r['seeds'])} | {r['n']} | {hist} | {largest} | {tol} |")
+            tol += f" (AMBIGUOUS: {len(r['ambiguous'])} in ({valid_limit(r['dtype']):g}, " \
+                   f"{WRONG:g}), max {r['ambiguous'][-1]:.2e})"
+        lines.append(f"| {r['operator']} | {r['output']} | {r['dtype']} | {len(r['seeds'])} | "
+                     f"{r['n']} | {hist} | {largest} | {largest_abs} | {tol} |")
     return "\n".join(lines)
 
 
@@ -286,6 +360,9 @@ def main(argv=None):
     ap.add_argument("--only", default="demos,dynamic,tests")
     ap.add_argument("--names", default=None,
                     help="comma-separated demos / dynamic operators to restrict the runs to")
+    ap.add_argument("--pin", action="store_true",
+                    help=f"also write the measurement to {MEASURED.relative_to(ROOT)}, which "
+                         "the declaration tests hold every declared tolerance to")
     args = ap.parse_args(argv)
     out = args.report or args.out
     if out is None:
@@ -293,8 +370,13 @@ def main(argv=None):
     if args.report is None:
         measure(out, args.gpus.split(","), args.seeds.split(","), args.only.split(","),
                 args.names.split(",") if args.names else None)
-    text = markdown(load(out))
+    table = load(out)
+    text = markdown(table)
     (out / "tolerances.md").write_text(text + "\n")
+    pinned = json.dumps(measured_errors(table), indent=1, sort_keys=True) + "\n"
+    (out / MEASURED.name).write_text(pinned)
+    if args.pin:
+        MEASURED.write_text(pinned)
     print(text)
 
 

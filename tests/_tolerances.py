@@ -11,6 +11,10 @@ operator's valid candidates over three seeds, and never below one fp16 ulp of th
 few ulp (<= 1.6e-3, 3.9e-3 for the quotient ``rowsum_div``), wrong ones above 1e-1 -- so a
 candidate that needs more than its operator's value is wrong, not unlucky. Never raise a
 value to make a kernel pass.
+
+The measurement itself is checked in as ``tests/measured_errors.json`` and
+``tests/test_tolerance_declarations.py`` holds every entry here to what the rule gives for
+it, so a value cannot be edited by hand in either direction: re-measure and ``--pin``.
 """
 
 from __future__ import annotations
@@ -18,6 +22,10 @@ from __future__ import annotations
 from cleave.runtime.validate import Tolerance
 
 CEILING = 5e-2  # no operator may declare a looser rtol than this
+# ... and an fp32 output (the paged lse) none looser than this. Valid kernels measure
+# 2e-7 .. 1.6e-6 of the row max; a kernel that loses one key in 8192 is 1.4e-5 off, which
+# this ceiling keeps out of the "clearly valid" range (a quarter of it) when re-measuring.
+FP32_CEILING = 2e-5
 
 TOLERANCES = {
     # ---- tests/_graphs.py

@@ -65,32 +65,36 @@ def test_an_all_zeros_output_no_longer_passes_for_small_outputs():
 
 
 def test_validate_kernel_outputs_honors_a_per_operator_tolerance():
-    """``out`` is held to its row and ``lse`` absolutely, each at the operator's own bound."""
+    """Each output is held to its own row at the operator's own bound: ``out`` with no
+    absolute part, ``lse`` with the fixed floor on top of its (much tighter) relative part."""
     out_tol, lse_tol = OPERATORS["gqa_paged_decode_h32_kv8_d128_ps1"].tolerance
-    assert out_tol.rtol > 0 and lse_tol.atol > 0
+    assert out_tol.rtol > 0 and out_tol.atol == 0
+    assert 0 < lse_tol.rtol < 1e-3 * out_tol.rtol and lse_tol.atol > 0
     out = torch.randn(4, 32, 128, device="cuda")
     lse = 10 * torch.randn(4, 32, device="cuda")
     lse[1, 3] = float("-inf")  # an empty request: defined, and to be reproduced exactly
-    lse[0, 0] = 0.0  # the perturbed entry: a few 1e-6 are not representable next to a 10
+    lse[0, 0] = 0.0  # the perturbed entry: a few 1e-5 are not representable next to a 10
     scale = out.abs().amax(dim=-1, keepdim=True)
+    lse_bound = lse_tol.rtol * float(lse[0].abs().max()) + lse_tol.atol  # of row 0
 
     def run(out_error, lse_error):
         """Kernel outputs off by that many tolerances at one entry of each output."""
         got_out, got_lse = out.clone(), lse.clone()
         got_out[2, 5, 7] += out_error * out_tol.rtol * scale[2, 5, 0]
-        got_lse[0, 0] += lse_error * lse_tol.atol
+        got_lse[0, 0] += lse_error * lse_bound
         return _validate([got_out, got_lse], [out, lse], tolerance=(out_tol, lse_tol))
 
     measured_out, measured_lse = run(0.5, 0.5)
     assert measured_out.rel == pytest.approx(0.5 * out_tol.rtol, rel=1e-3)
-    assert measured_lse.abs == pytest.approx(0.5 * lse_tol.atol, rel=1e-3)
+    assert measured_lse.abs == pytest.approx(0.5 * lse_bound, rel=1e-3)
     with pytest.raises(OutputMismatch, match="output 0"):
         run(2.0, 0.5)
     with pytest.raises(OutputMismatch, match="output 1"):
         run(0.5, 2.0)
-    # The outputs do not lend each other slack: the lse gets no relative bound and the
-    # output no absolute one.
-    assert lse_tol.rtol == 0 and out_tol.atol == 0
+    # The outputs do not lend each other slack: an lse error that the output's relative
+    # bound would allow is far outside its own.
+    with pytest.raises(OutputMismatch, match="output 1"):
+        run(0.5, 0.5 * out_tol.rtol * float(lse[0].abs().max()) / lse_bound)
     # A declaration for the wrong number of outputs is an error, not a silent broadcast.
     with pytest.raises(SpecError, match="3 tolerances were declared for 2 outputs"):
         _validate([out, lse], [out, lse], tolerance=(out_tol, lse_tol, lse_tol))

@@ -4,6 +4,7 @@
 Each demo runs as ``__main__`` with ``cleave.examples``' compile stubbed (no search, no GPU).
 """
 
+import json
 import runpy
 import subprocess
 import sys
@@ -15,6 +16,7 @@ import pytest
 import cleave.examples as examples
 from cleave.runtime.validate import Tolerance
 
+from .._measure_tolerances import MEASURED, expected_tolerance
 from .._tolerances import CEILING
 from ..frontend.test_trace_equivalence import normalized, spy
 from ._snapshot import SNAPSHOT, record, updating
@@ -89,11 +91,13 @@ def test_every_demo_has_a_case():
     assert {c[0] for c in CASES} == set(SNAPSHOT["demos"])
 
 
-def _assert_declared(config):
+def _assert_declared(config, name):
     """One measured bound for the operator, within the ceiling; normal inputs only."""
     tolerance = config.tolerance
     assert isinstance(tolerance, Tolerance), "the demo declares no tolerance"
     assert 0 < tolerance.rtol <= CEILING and tolerance.atol == 0
+    # ... and exactly the one the rule gives for the pinned measurement of this demo
+    assert tolerance == expected_tolerance(json.loads(MEASURED.read_text())[f"demo:{name}"])
     # the adversarial input distributions exist but are not switched on for any operator yet
     assert config.distributions == ("normal",)
 
@@ -101,7 +105,7 @@ def _assert_declared(config):
 @pytest.mark.parametrize("name", [d for d in DEMOS if d != "staged"])
 def test_demo_declares_its_own_tolerance(monkeypatch, name):
     # There is no default bound to fall back to: a demo without one cannot validate.
-    _assert_declared(run_demo(monkeypatch, name, [])["ev"])
+    _assert_declared(run_demo(monkeypatch, name, [])["ev"], name)
 
 
 def test_staged_demo_declares_its_own_tolerance(monkeypatch):
@@ -121,7 +125,7 @@ def test_staged_demo_declares_its_own_tolerance(monkeypatch):
     monkeypatch.syspath_prepend(str(DEMO))
     with pytest.raises(_Stop):
         runpy.run_path(str(DEMO / "staged.py"), run_name="__main__")
-    _assert_declared(seen["config"])
+    _assert_declared(seen["config"], "staged")
     assert (seen["config"].warmup, seen["config"].iters) == (16, 1000)
 
 
