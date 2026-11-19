@@ -19,6 +19,9 @@ from ..core.errors import (
     CleaveError,
     CodegenError,
     CompileError,
+    LaunchCrash,
+    NonFiniteOutput,
+    OutputMismatch,
     SmemExceeded,
     ValidationError,
     WorkerCrash,
@@ -33,7 +36,7 @@ from .compile import (
 )
 from .gpu import _create_parallel_env, _gpu_exec_guard
 from .reference import graph_out_indices, make_inputs, order_inputs_for_kernel
-from .validate import BenchOptions, Tolerance, benchmark_compiled_kernel, publish_reference
+from .validate import BenchOptions, benchmark_compiled_kernel, publish_reference
 from .workers import WorkerPool
 
 
@@ -87,6 +90,9 @@ class CandidateResult:
     cuda_src: str | None = None
     latency_ms: float | None = None
     label: str = ""
+    # cleave.runtime.validate.MeasuredError per output, when the comparison ran to the end:
+    # for every ok candidate, and for one that failed as an OutputMismatch.
+    measured: tuple | None = None
 
     @property
     def ok(self) -> bool:
@@ -94,6 +100,9 @@ class CandidateResult:
 
 
 _SMEM_MARKER = "Failed to set the allowed dynamic shared memory size"
+# How a kernel failed validation, by the name of what the worker raised; anything else at
+# the validate stage (a reference or layout problem) stays a plain ValidationError.
+_VALIDATION_KINDS = {c.__name__: c for c in (OutputMismatch, NonFiniteOutput, LaunchCrash)}
 _TRACEBACK_LINES = 20
 
 
@@ -120,9 +129,10 @@ def _restore_compile_error(result, label):
     stage = result.get("stage") or "compile"
     if _SMEM_MARKER in error_message or _SMEM_MARKER in traceback_str:
         return "compile", SmemExceeded(text)
-    error_cls = {"validate": ValidationError, "bench": BenchmarkError}.get(
-        stage, CompileError
-    )
+    if stage == "validate":
+        error_cls = _VALIDATION_KINDS.get(error_type, ValidationError)
+    else:
+        error_cls = BenchmarkError if stage == "bench" else CompileError
     return stage, error_cls(text)
 
 
@@ -138,7 +148,7 @@ def run_candidates(
     dtype,
     *,
     max_parallel: int = 8,
-    tolerance: Tolerance | None = None,
+    tolerance=None,
     timeout_s: float | None = None,
     compiler_pass_options: CompilerPassOptions | None = None,
     benchmark: BenchOptions | None = None,
@@ -152,6 +162,9 @@ def run_candidates(
     Compile/validate (and ``benchmark`` timing) run on up to ``max_parallel`` persistent
     workers; codegen stays in the parent (TileDicts can't be pickled). Injectable stages:
     ``build_fn`` (parent), ``check_fn`` (worker, picklable), ``reference_fn``, ``pool``.
+
+    ``tolerance`` is the operator's declared bound (a ``Tolerance`` or one per output),
+    handed to ``check_fn``; the default ``check_code`` fails a candidate without one.
     """
     if not candidates:
         return []
@@ -222,11 +235,12 @@ def run_candidates(
         results[job["idx"] - 1] = result
         pbar.update(1)
 
-    def fail(job, stage, error, pbar, code=None):
+    def fail(job, stage, error, pbar, code=None, measured=None):
         finish(
             job,
             CandidateResult(
-                job["candidate"], "failed", stage, error, code=code, label=job["label"]
+                job["candidate"], "failed", stage, error, code=code, label=job["label"],
+                measured=measured,
             ),
             pbar,
         )
@@ -277,12 +291,13 @@ def run_candidates(
                 CandidateResult(
                     job["candidate"], "ok", None, None, job["code_str"],
                     result["cuda_src"], result.get("latency_ms"), job["label"],
+                    result.get("measured"),
                 ),
                 pbar,
             )
         else:
             stage, error = _restore_compile_error(result, job["label"])
-            fail(job, stage, error, pbar, job["code_str"])
+            fail(job, stage, error, pbar, job["code_str"], result.get("measured"))
 
     def collect(pbar):
         # A worker's result is read before its death is noticed, so a worker that

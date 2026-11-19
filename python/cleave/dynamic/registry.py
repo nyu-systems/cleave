@@ -23,10 +23,16 @@ from .paging import (
 from ..runtime.validate import Tolerance
 from . import workloads as _wl
 
-# The paged/ragged gather kernels reproduce the SOL-ExecBench references far more tightly
-# than the default loose bound (output cosine >= 0.99999, lse error <= 1e-5). ``equal_nan``
-# stays off: an empty causal row is defined as 0 / -inf, so a NaN is a real defect.
-GATHER_TOLERANCE = Tolerance(rtol=0.01, atol=0.01, equal_nan=False)
+
+def _tolerance(out_rtol, lse_atol):
+    """``(out, lse)`` bounds of one operator, each set from its measured error.
+
+    The bf16 output is held relative to its row (the head_dim vector of one query row and
+    head); the fp32 lse is a logarithm, with no row scale, so it is held absolutely. Neither
+    gets the other's slack: an empty causal row is defined as exactly 0 / -inf.
+    """
+    return (Tolerance(rtol=out_rtol), Tolerance(rtol=0.0, atol=lse_atol))
+
 
 # The expected kernels are a test contract and stay in the source tree; only a checkout has them.
 EXPECTED_KERNELS_DIR = (
@@ -45,7 +51,10 @@ class DynamicOperator:
     workloads: tuple
     # axes -> (inputs, expected outputs) for one workload.
     reference: Callable = field(repr=False)
-    tolerance: Tolerance = GATHER_TOLERANCE
+    # The declared (out, lse) validation bounds; every operator states its own.
+    tolerance: tuple
+    # (distribution, axes) adversarial workloads; validated on only when asked for.
+    adversarial: tuple = ()
     page_size: int = 1
     scale: float | None = None
 
@@ -57,8 +66,8 @@ class DynamicOperator:
         """(inputs, expected outputs) for every captured workload, built one at a time."""
         return (self.reference(axes) for axes in self.workloads)
 
-    def keyed_workloads(self, *, keep: int = 0):
-        return keyed_workloads(self.name, keep=keep)
+    def keyed_workloads(self, *, keep: int = 0, adversarial: bool = False):
+        return keyed_workloads(self.name, keep=keep, adversarial=adversarial)
 
     def kernel_source(self) -> str:
         """The TileLang the pipeline emits for this operator at its tuned tiling."""
@@ -72,7 +81,7 @@ class DynamicOperator:
         return EXPECTED_KERNELS_DIR / f"{self.name}.py"
 
 
-def _operator(name, spec, tuned_tiling, dims, page_size=1, scale=None) -> DynamicOperator:
+def _operator(name, spec, tuned_tiling, dims, tolerance, page_size=1, scale=None) -> DynamicOperator:
     return DynamicOperator(
         name=name,
         spec=spec,
@@ -80,6 +89,8 @@ def _operator(name, spec, tuned_tiling, dims, page_size=1, scale=None) -> Dynami
         dims=dims,
         workloads=_wl.WORKLOADS[name],
         reference=partial(_wl.case, name, dims=dims, page_size=page_size, scale=scale),
+        tolerance=tolerance,
+        adversarial=_wl.ADVERSARIAL_WORKLOADS[name],
         page_size=page_size,
         scale=scale,
     )
@@ -96,6 +107,7 @@ OPERATORS: dict[str, DynamicOperator] = {
             PagingSpec(num_qo_heads=32, num_kv_heads=8),
             _GQA,
             (32, 8, 128),
+            _tolerance(out_rtol=1e-2, lse_atol=1e-2),
         ),
         _operator(
             "gqa_paged_decode_h32_kv4_d128_ps1",
@@ -103,6 +115,7 @@ OPERATORS: dict[str, DynamicOperator] = {
             PagingSpec(num_qo_heads=32, num_kv_heads=4, grid_order=("head", "batch")),
             _GQA,
             (32, 4, 128),
+            _tolerance(out_rtol=1e-2, lse_atol=1e-2),
         ),
         _operator(
             "gqa_paged_decode_h32_kv8_d128_ps64",
@@ -119,6 +132,7 @@ OPERATORS: dict[str, DynamicOperator] = {
             ),
             _GQA,
             (32, 8, 128, 64),
+            _tolerance(out_rtol=1e-2, lse_atol=1e-2),
             page_size=64,
         ),
         _operator(
@@ -128,12 +142,14 @@ OPERATORS: dict[str, DynamicOperator] = {
             # measured -- the captured requests' causal windows are a handful of tokens.
             _GQA_PREFILL,
             (32, 8, 128),
+            _tolerance(out_rtol=1e-2, lse_atol=1e-2),
         ),
         _operator(
             "gqa_paged_prefill_causal_h32_kv4_d128_ps1",
             PagingSpec(num_qo_heads=32, num_kv_heads=4, kind=PAGED_PREFILL_CAUSAL, causal=True),
             _GQA_PREFILL,
             (32, 4, 128),
+            _tolerance(out_rtol=1e-2, lse_atol=1e-2),
         ),
         _operator(
             "gqa_ragged_prefill_causal_h32_kv8_d128",
@@ -150,6 +166,7 @@ OPERATORS: dict[str, DynamicOperator] = {
             ),
             dict(query_rows=64, kv_tile=64, head_dim=128),
             (32, 8, 128),
+            _tolerance(out_rtol=1e-2, lse_atol=1e-2),
         ),
         _operator(
             "gqa_ragged_prefill_causal_h32_kv4_d128",
@@ -163,6 +180,7 @@ OPERATORS: dict[str, DynamicOperator] = {
             ),
             dict(query_rows=64, kv_tile=64, head_dim=128),
             (32, 4, 128),
+            _tolerance(out_rtol=1e-2, lse_atol=1e-2),
         ),
         _operator(
             "mla_paged_decode_h16_ckv512_kpe64_ps1",
@@ -171,6 +189,7 @@ OPERATORS: dict[str, DynamicOperator] = {
             MLASpec(num_qo_heads=16),
             dict(query_rows=16, kv_tile=64, n_threads=256, ckv=512, kpe=64),
             (16, 512, 64),
+            _tolerance(out_rtol=1e-2, lse_atol=1e-2),
             scale=_wl.MLA_SM_SCALE,
         ),
         _operator(
@@ -190,6 +209,7 @@ OPERATORS: dict[str, DynamicOperator] = {
             ),
             dict(query_rows=16, kv_tile=64, n_threads=128, ckv=512, kpe=64),
             (16, 512, 64),
+            _tolerance(out_rtol=1e-2, lse_atol=1e-2),
             scale=_wl.MLA_SM_SCALE,
         ),
     )
@@ -212,11 +232,13 @@ def workloads(operator):
     return OPERATORS[operator].cases()
 
 
-def keyed_workloads(operator, *, keep: int = 0):
+def keyed_workloads(operator, *, keep: int = 0, adversarial: bool = False):
     """A zero-arg factory yielding ``(workload_key, inputs, reference)``.
 
     ``keep=0`` is every captured workload; ``keep>0`` a stratified sample of that many (a
     prefix would sample only the degenerate shapes, since ``WORKLOADS`` is smallest-first).
+    ``adversarial`` appends the operator's adversarial softmax workloads
+    (``workloads.ADVERSARIAL_WORKLOADS``), keyed ``<workload>@<distribution>``.
     """
     from ..runtime.autotune import sampled, workload_key
 
@@ -227,5 +249,9 @@ def keyed_workloads(operator, *, keep: int = 0):
     def factory():
         for axes in wanted:
             yield (workload_key(axes), *op.reference(axes))
+        if adversarial:
+            for distribution, axes in op.adversarial:
+                yield (f"{workload_key(axes)}@{distribution}",
+                       *op.reference(axes, distribution=distribution))
 
     return factory

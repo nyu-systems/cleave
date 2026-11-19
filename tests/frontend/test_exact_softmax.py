@@ -12,6 +12,7 @@ import cleave.lang as cl
 from cleave import pipeline as P
 from cleave.core.errors import SpecError
 from cleave.frontend import Program, trace
+from tests._tolerances import tolerance_for
 
 
 def softmax(x: cl.Tensor["R", "C"]):
@@ -106,7 +107,8 @@ def test_search_max_row_limit_reason(tmp_path, monkeypatch):
     assert {str(r.error) for r in plans.refused} == {MAX_ROW_LIMIT}
     with pytest.raises(CleaveError, match="online softmax") as e:
         P.compile(attention, shapes=shapes, dtype=cl.f16, split=False, preset="fast",
-                  superopt=P.SuperoptConfig(max_ops=14), schedule=P.ScheduleConfig(topk=2))
+                  superopt=P.SuperoptConfig(max_ops=14), schedule=P.ScheduleConfig(topk=2),
+                  tolerance=tolerance_for("exact_attention"))
     assert MAX_ROW_LIMIT in e.value.report.summary()
 
 
@@ -129,7 +131,8 @@ def _gpu():
 
 def test_gpu_exact_softmax_standalone(cache_root):
     _gpu()
-    kernel = P.compile(softmax, shapes={"R": 64, "C": 1024}, dtype=cl.f16, split=False, **FAST)
+    kernel = P.compile(softmax, shapes={"R": 64, "C": 1024}, dtype=cl.f16, split=False,
+                       tolerance=tolerance_for("softmax"), **FAST)
     assert len(kernel.report.correct) >= 1
     x = (torch.randn(64, 1024) * 30).to("cuda", torch.float16)  # exp(x + c) would overflow
     torch.testing.assert_close(kernel(x).float(), torch.softmax(x.float(), -1),
@@ -140,7 +143,8 @@ def test_gpu_exact_softmax_attention(cache_root):
     _gpu()
     shapes = dict(H=32, SQ=64, SKV=256, D=64)
     kernel = P.compile(attention, shapes=shapes, dtype=cl.f16, split=False,
-                       superopt=P.SuperoptConfig(max_ops=14), **FAST)
+                       superopt=P.SuperoptConfig(max_ops=14),
+                       tolerance=tolerance_for("exact_attention"), **FAST)
     assert kernel.variant == "solo" and len(kernel.report.correct) >= 1
     g = torch.Generator().manual_seed(0)
     q, k, v = (torch.randn(s, generator=g).to("cuda", torch.float16)

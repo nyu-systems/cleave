@@ -9,4 +9,9 @@ def matmul_rowsum(x: cl.Tensor["M", "K"], w: cl.Tensor["K", "N"]):
 
 
 if __name__ == "__main__":
-    cleave.examples.main(matmul_rowsum, shapes=dict(M=4096, N=4096, K=64), dtype=cl.f16)
+    cleave.examples.main(
+        matmul_rowsum,
+        shapes=dict(M=4096, N=4096, K=64),
+        dtype=cl.f16,
+        tolerance=cl.Tolerance(rtol=1e-2),
+    )

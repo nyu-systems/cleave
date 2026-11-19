@@ -24,4 +24,5 @@ if __name__ == "__main__":
         dtype=cl.f16,
         split=False,
         max_ops=14,
+        tolerance=cl.Tolerance(rtol=1e-2),
     )

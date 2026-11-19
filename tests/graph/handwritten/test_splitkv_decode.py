@@ -3,8 +3,9 @@
 The emitted text is pinned by ``tests/graph/apply_paging/test_split_decode.py``; this is
 the numeric half. Each pair is compiled through ``autotune._compiled`` -- which is what the
 demos and the benchmark use, and what hides the fp32 partial buffers behind the operator's
-own signature -- and checked at 1e-2 on a stratified sample of the captured workloads plus
-a hand-built one with an empty request in the middle. The empty request is the case the
+own signature -- and checked, with the comparator and the tolerance every other validation
+of the operator uses, on a stratified sample of the captured workloads plus a hand-built one
+with an empty request in the middle. The empty request is the case the
 split arithmetic has to get right with no work at all: every split runs zero tiles, stores
 zero partials, and the combine has to turn 0/0 into the operator's defined 0 and -inf.
 """
@@ -19,31 +20,24 @@ torch = pytest.importorskip("torch")
 from tests.graph.apply_paging.test_split_decode import CASES, split_kernel_source
 from cleave.dynamic import reference as ref
 from cleave.dynamic import OPERATORS, keyed_workloads
-from cleave.dynamic import GATHER_TOLERANCE
 from tests.graph.handwritten.test_empty_request import (
     DECODE_KV_LENS,
     MLA_SM_SCALE,
 )
 from cleave.runtime.autotune import _compiled
 from cleave.runtime.gpu import _gpu_exec_guard
+from cleave.runtime.validate import compare_outputs
 
 # How many captured workloads each pair is checked on: a stratified sample, so the tiny
 # batch-1 shapes, the batch-16 middle and the 50k-token batch-64 tail are all represented.
 KEEP = 6
 
 
-def _check(kernel, inputs, reference):
+def _check(operator, kernel, inputs, reference):
     outputs = [torch.full_like(t, float("nan")) for t in reference]
     kernel(*inputs, *outputs)
     torch.cuda.synchronize()
-    for got, want in zip(outputs, reference):
-        torch.testing.assert_close(
-            got.float(),
-            want.float(),
-            rtol=GATHER_TOLERANCE.rtol,
-            atol=GATHER_TOLERANCE.atol,
-            equal_nan=GATHER_TOLERANCE.equal_nan,
-        )
+    compare_outputs(outputs, reference, OPERATORS[operator].tolerance)
 
 
 @pytest.mark.parametrize("operator", sorted(CASES))
@@ -53,7 +47,7 @@ def test_split_pair_matches_the_reference(operator):
     seen = 0
     for _key, inputs, reference in keyed_workloads(operator, keep=KEEP)():
         with _gpu_exec_guard():
-            _check(kernel, inputs, reference)
+            _check(operator, kernel, inputs, reference)
         seen += 1
         del inputs, reference
         torch.cuda.empty_cache()
@@ -79,7 +73,7 @@ def test_split_pair_handles_an_empty_request(operator):
     with _gpu_exec_guard():
         inputs, reference = _empty_request_workload(operator)
         assert torch.isneginf(reference[1]).any(), "the workload must contain an empty request"
-        _check(kernel, inputs, reference)
+        _check(operator, kernel, inputs, reference)
 
 
 def test_scratch_wrapper_reuses_one_allocation_per_shape():

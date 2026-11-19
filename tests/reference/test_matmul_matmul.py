@@ -2,6 +2,7 @@ import tilelang.language as T
 
 from tests._graphs import matmul_matmul_graph
 from cleave.runtime.compile import compile_and_run_prim_func
+from tests._tolerances import tolerance_for
 
 DTYPE = "float16"
 
@@ -67,7 +68,8 @@ def test_matmul_matmul_small_k():
     M, N, K = 4096, 4096, 32
     func = matmul_matmul(M=M, N=N, K=K, block_M=64, block_N=64, num_stages=3, threads=128)
     compile_and_run_prim_func(
-        func, graph=matmul_matmul_graph(M, N, K), dtype=DTYPE
+        func, graph=matmul_matmul_graph(M, N, K), dtype=DTYPE,
+        tolerance=tolerance_for(matmul_matmul_graph),
     )
 
 
@@ -75,5 +77,6 @@ def test_matmul_matmul_small_n():
     M, N, K = 1024, 64, 64
     func = matmul_matmul(M=M, N=N, K=K, block_M=64, block_N=64, num_stages=3, threads=128)
     compile_and_run_prim_func(
-        func, graph=matmul_matmul_graph(M, N, K), dtype=DTYPE
+        func, graph=matmul_matmul_graph(M, N, K), dtype=DTYPE,
+        tolerance=tolerance_for(matmul_matmul_graph),
     )

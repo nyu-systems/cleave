@@ -7,6 +7,7 @@ import pytest
 import cleave.lang as cl
 from cleave.frontend import trace
 from cleave import pipeline as P
+from tests._tolerances import tolerance_for
 from tests.frontend import _programs as programs
 
 torch = pytest.importorskip("torch")
@@ -16,7 +17,9 @@ pytestmark = [
 ]
 
 SHAPES = dict(M=128, N=128, K=256)
-FAST = dict(schedule=P.ScheduleConfig(topk=3), eval=P.EvalConfig(warmup=2, iters=20, max_parallel=4))
+TOLERANCE = tolerance_for("matmul")
+FAST = dict(schedule=P.ScheduleConfig(topk=3),
+            eval=P.EvalConfig(warmup=2, iters=20, max_parallel=4, tolerance=TOLERANCE))
 
 
 @pytest.fixture
@@ -36,6 +39,14 @@ def test_compile_matmul_end_to_end(cache_root, tmp_path):
     assert len(report.correct) >= 1 and set(report.timings) >= {"superoptimize", "schedule", "build"}
     assert "def main_kernel" in kernel.source or "main_kernel" in kernel.source
     assert "superoptimize" in report.summary() and "benchmark" in report.summary()
+    # every validated candidate carries the error it measured, within the declared bound
+    assert report.tolerance == TOLERANCE
+    assert all(0 <= r.measured[0].rel <= TOLERANCE.rtol for r in report.correct)
+    validation = report.to_dict()["validation"]
+    assert validation["tolerance"] == [{"rtol": TOLERANCE.rtol, "atol": TOLERANCE.atol}]
+    assert 0 < validation["max_error"][0]["rel"] <= TOLERANCE.rtol
+    assert len(validation["measured"]) >= len(report.correct)
+    assert "max error rel" in report.summary()
 
     prog = trace(programs.matmul, SHAPES, cl.f16)
     x, w = prog.random_inputs(seed=1)
@@ -72,7 +83,8 @@ def test_split_k_schedule_and_chained_kernel(cache_root):
 
     # Build and time only split-k=4, then run partial -> combine as one Kernel.
     split4 = plans.filter(lambda p: p.variant == "split-k=4")
-    report = P.evaluate(split4, P.EvalConfig(warmup=2, iters=20, max_parallel=4))
+    report = P.evaluate(split4, P.EvalConfig(warmup=2, iters=20, max_parallel=4,
+                                             tolerance=TOLERANCE))
     kernel = report.best("split-k=4")
     assert [s.role for s in kernel.stages] == ["partial", "combine"]
     parts = report.variants()["split-k=4"].members

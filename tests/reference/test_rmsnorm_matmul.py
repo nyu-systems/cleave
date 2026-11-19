@@ -2,6 +2,7 @@ import tilelang.language as T
 
 from tests._graphs import rmsnorm_matmul_graph
 from cleave.runtime.compile import compile_and_run_prim_func
+from tests._tolerances import tolerance_for
 
 DTYPE = "float16"
 
@@ -74,5 +75,6 @@ def test_rmsnorm_matmul():
         threads=128,
     )
     compile_and_run_prim_func(
-        func, graph=rmsnorm_matmul_graph(M, N, K), dtype=DTYPE
+        func, graph=rmsnorm_matmul_graph(M, N, K), dtype=DTYPE,
+        tolerance=tolerance_for(rmsnorm_matmul_graph),
     )

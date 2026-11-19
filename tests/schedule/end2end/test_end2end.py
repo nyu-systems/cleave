@@ -5,6 +5,7 @@ from cleave.schedule import search_tiling
 from cleave.runtime.compile import CompilerPassOptions
 
 from tests import _graphs as g
+from tests._tolerances import tolerance_for
 from tests.schedule.end2end._test_utils import run_end2end_candidates
 
 DTYPE = "float16"
@@ -50,6 +51,6 @@ def test_end2end(name):
     pass_options = options.pop("compiler_pass_options", None)
     candidates = search_tiling(build(*dims), **{"topk": 1000, **options})
     run_end2end_candidates(
-        name, candidates, DTYPE, min_success=min_success,
+        name, candidates, DTYPE, min_success=min_success, tolerance=tolerance_for(build),
         compiler_pass_options=pass_options,
     )

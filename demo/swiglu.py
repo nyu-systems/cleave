@@ -10,4 +10,9 @@ def swiglu(x: cl.Tensor["M", "K"], w0: cl.Tensor["K", "N"], w1: cl.Tensor["K", "
 
 
 if __name__ == "__main__":
-    cleave.examples.main(swiglu, shapes=dict(M=4096, N=14336, K=4096), dtype=cl.f16)
+    cleave.examples.main(
+        swiglu,
+        shapes=dict(M=4096, N=14336, K=4096),
+        dtype=cl.f16,
+        tolerance=cl.Tolerance(rtol=1e-2),
+    )

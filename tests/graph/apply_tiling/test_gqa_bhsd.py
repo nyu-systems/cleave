@@ -7,6 +7,7 @@ from cleave.ir.graph import GraphNode
 from cleave.schedule import apply_tiling
 
 from tests._graphs import gqa_bhsd_graph
+from tests._tolerances import tolerance_for
 from tests.graph.apply_tiling._test_utils import (
     assert_candidate_compiles_and_runs,
     build_tiled_candidate,
@@ -117,4 +118,4 @@ def test_apply_tiling_gqa_bhsd(
         actual_offset = scheduled_graph.tmap[node].offset(*vars_)
         assert actual_offset == expected_offset
 
-    assert_candidate_compiles_and_runs(cand)
+    assert_candidate_compiles_and_runs(cand, tolerance_for(gqa_bhsd_graph))

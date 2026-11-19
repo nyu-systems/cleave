@@ -10,14 +10,13 @@ import tilelang as tl
 from .gpu import _create_parallel_env, _gpu_exec_guard
 from .reference import graph_out_indices
 from .validate import (
-    DEFAULT_TOLERANCE,
     BenchOptions,
-    Tolerance,
     _as_list,
     _check_kernel,
     _run_and_validate_kernel,
     _stage,
     _validate_kernel_outputs,
+    require_tolerance,
 )
 
 
@@ -68,7 +67,7 @@ def compile_and_run_prim_func(
     make_inputs_fn=None,
     workloads_fn=None,
     reference_cache_dir=None,
-    tolerance: Tolerance = DEFAULT_TOLERANCE,
+    tolerance=None,
 ):
     """Compile a hand-written prim func and validate it against a reference.
 
@@ -81,7 +80,11 @@ def compile_and_run_prim_func(
     ``workloads_fn`` validates such a kernel over a sequence of them: it yields
     ``(inputs, reference)`` pairs, one built and freed at a time, because a single
     workload's tensors can run to several GiB.
+
+    ``tolerance`` is the operator's declared bound (a ``Tolerance``, or one per output);
+    there is no default, so leaving it out is an error.
     """
+    require_tolerance(tolerance, "this prim func")
     _create_parallel_env()
 
     if workloads_fn is not None:
@@ -150,13 +153,18 @@ def build_candidate_code(cand, options: CompilerPassOptions | None = None):
 
 def check_code(
     code_str, *, graph=None, dtype=None, out_idx=None, reference_cache_dir=None,
-    tolerance: Tolerance | None = None, benchmark: BenchOptions | None = None,
+    tolerance=None, benchmark: BenchOptions | None = None,
 ):
-    """``(cuda_src, latency_ms | None)``: compile, validate and optionally time one kernel.
+    """``(cuda_src, latency_ms | None, measured)``: compile, validate and optionally time
+    one kernel; ``measured`` is the error per output the comparison found.
 
     Workers (the default ``check_fn``) pass ``out_idx`` + ``reference_cache_dir`` (the
     parent built the reference); standalone callers pass ``graph`` + ``dtype``.
+    ``tolerance`` is the operator's declared bound and has no default: a kernel nobody
+    declared a tolerance for fails here, before it is compiled.
     """
+    with _stage("validate"):
+        require_tolerance(tolerance)
     _create_parallel_env()
     if out_idx is None:
         if graph is None:
@@ -166,8 +174,8 @@ def check_code(
     with _stage("compile"):
         kernel = _compile(_load_main_kernel_from_code(code_str), out_idx)
 
-    latency_ms = _check_kernel(
+    measured, latency_ms = _check_kernel(
         kernel, graph=graph, dtype=dtype, reference_cache_dir=reference_cache_dir,
-        tolerance=tolerance or DEFAULT_TOLERANCE, benchmark=benchmark,
+        tolerance=tolerance, benchmark=benchmark,
     )
-    return kernel.get_kernel_source(), latency_ms
+    return kernel.get_kernel_source(), latency_ms, measured

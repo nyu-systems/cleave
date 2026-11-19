@@ -38,15 +38,19 @@ class Settings:
     progress_log: bool = False
     test_seed: Optional[int] = None
     cache_root: Optional[Path] = None
+    # Append one JSON line per validated kernel (its measured error) to this file.
+    validation_log: Optional[Path] = None
 
     @classmethod
     def from_env(cls, env: Optional[Mapping[str, str]] = None) -> "Settings":
         env = os.environ if env is None else env
         seed = env.get("CLEAVE_TEST_SEED")
+        log = env.get("CLEAVE_VALIDATION_LOG")
         return cls(
             compile_timeout_secs=_positive_float(env, "CLEAVE_COMPILE_AND_RUN_TIMEOUT_SECS", 300.0),
             heartbeat_secs=_positive_float(env, "CLEAVE_COMPILE_PROGRESS_HEARTBEAT_SECS", 15.0),
             progress_log=_bool(env, "COMPILATION_PROGRESS_LOG"),
             test_seed=None if seed is None else int(seed) & 0xFFFFFFFF,
             cache_root=get_cleave_cache_root(env),
+            validation_log=Path(log).expanduser() if log else None,
         )

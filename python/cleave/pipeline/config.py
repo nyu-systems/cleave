@@ -63,9 +63,19 @@ class ScheduleConfig(_Replace):
 class EvalConfig(_Replace):
     warmup: int = 16
     iters: int = 1000
-    tolerance: Any = None  # cleave.runtime.validate.Tolerance; None -> runtime default
+    # The operator's declared bound: a cleave.lang.Tolerance, or one per output. There is no
+    # default; building kernels without one is an error.
+    tolerance: Any = None
     max_parallel: int = 8
     timeout_s: float | None = None  # None -> Settings.compile_timeout_secs
+    # Input distributions every candidate is validated on (cleave.runtime.inputs.DISTRIBUTIONS);
+    # it is timed on the first.
+    distributions: tuple[str, ...] = ("normal",)
+
+    def __post_init__(self):
+        names = self.distributions
+        object.__setattr__(self, "distributions",
+                           (names,) if isinstance(names, str) else tuple(names))
 
 
 @dataclass(frozen=True)

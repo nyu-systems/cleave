@@ -1,9 +1,11 @@
 """The validation input distributions (CPU): ``normal`` and the adversarial softmax cases.
 
 ``large_logits`` and ``increasing`` are generators only for now: no operator validates on
-them until its softmax is stabilized (today's fixed-shift references are NaN there).
+them until its softmax is stabilized (today's fixed-shift references are NaN there), which
+``test_no_operator_validates_on_adversarial_inputs_yet`` pins.
 """
 
+import inspect
 import math
 
 import pytest
@@ -12,12 +14,13 @@ torch = pytest.importorskip("torch")
 
 import cleave.lang as cl
 from cleave.core.errors import SpecError
-from cleave.dynamic import OPERATORS
+from cleave.dynamic import OPERATORS, keyed_workloads
 from cleave.dynamic import reference as dyn
 from cleave.dynamic.workloads import ADVERSARIAL_WORKLOADS, MLA_SM_SCALE, WORKLOADS
 from cleave.ir.graph import OutputNode, PlaceHolderNode
 from cleave.ir.graph_utils import find_topo_sort
 from cleave.ir.ops import Exp
+from cleave.pipeline import EvalConfig
 from cleave.runtime import inputs as rt_inputs
 from cleave.runtime import reference as rt
 from cleave.runtime.inputs import DISTRIBUTIONS, INCREASING_SPAN, LARGE_LOGIT_FACTOR
@@ -168,6 +171,19 @@ def test_adversarial_inputs_need_softmax_scores_and_a_known_name():
         rt_inputs.check_distributions(())
 
 
+def test_no_operator_validates_on_adversarial_inputs_yet():
+    """The generators exist; switching one on is a deliberate, per-operator change."""
+    assert EvalConfig().distributions == ("normal",)
+    assert EvalConfig(distributions="increasing").distributions == ("increasing",)
+    assert inspect.signature(rt.make_inputs).parameters["distribution"].default == "normal"
+    assert inspect.signature(keyed_workloads).parameters["adversarial"].default is False
+    from cleave.pipeline.dynamic import compile_dynamic, resolve_workloads
+
+    assert inspect.signature(compile_dynamic).parameters["adversarial"].default is False
+    assert inspect.signature(resolve_workloads).parameters["adversarial"].default is False
+    assert cl.workloads.paged_decode().distribution == "normal"
+
+
 # ----------------------------------------------------------------------------- dynamic
 def test_adversarial_workloads_are_a_table_of_their_own():
     assert set(ADVERSARIAL_WORKLOADS) == set(WORKLOADS) == set(OPERATORS)
@@ -179,6 +195,7 @@ def test_adversarial_workloads_are_a_table_of_their_own():
             # the smallest, a middle and the largest captured shape (long KV included)
             assert axes[0] == captured[0] and axes[-1] == captured[-1] and len(axes) == 3
             assert set(axes) <= set(captured)
+        assert OPERATORS[name].adversarial == cases
         assert not any(isinstance(w[0], str) for w in captured)  # WORKLOADS itself is unchanged
 
 

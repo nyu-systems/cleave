@@ -12,9 +12,10 @@ from cleave.dynamic.dense import (
     mla_attention_sd_graph,
     tiled_dense_attention,
 )
-from cleave.dynamic.workloads import WORKLOADS
+from cleave.dynamic.workloads import ADVERSARIAL_WORKLOADS, WORKLOADS
 from cleave.dynamic.paging import MLASpec, PagingRefusal, PagingSpec, apply_paging, can_page
 from cleave.schedule import apply_tiling, search_tiling
+from tests._tolerances import CEILING
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -44,7 +45,14 @@ def test_every_operator_is_complete(name):
     assert op.workloads == WORKLOADS[name] and op.workloads
     assert callable(op.reference)
     assert op.expected_kernel_path.is_file()
-    assert op.tolerance.rtol > 0
+    # Its own declared bound per output, never a shared default: the bf16 output relative
+    # to its row, the fp32 lse (a log) absolutely, both within the ceiling.
+    out, lse = op.tolerance
+    assert 0 < out.rtol <= CEILING and out.atol == 0
+    assert lse.rtol == 0 and 0 < lse.atol <= CEILING
+    # The adversarial softmax workloads live apart from the captured ones.
+    assert op.adversarial == ADVERSARIAL_WORKLOADS[name]
+    assert {axes for _, axes in op.adversarial} <= set(op.workloads)
     if op.is_mla:
         assert op.scale is not None
 

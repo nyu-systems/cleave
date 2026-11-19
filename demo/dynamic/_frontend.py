@@ -19,6 +19,7 @@ def add_args(ap) -> None:
     ap.add_argument("--dump-best", default=None, metavar="DIR",
                     help="write the winner to DIR/<op>.py (with --split also .split/.nosplit/.hybrid.json)")
     ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("--json", action="store_true", help="print the report as JSON")
 
 
 def main(doc, presets, build, argv, default, **run_kw):
@@ -34,8 +35,10 @@ def main(doc, presets, build, argv, default, **run_kw):
     return run(fn, args, hints=hints, **run_kw)
 
 
-def run(fn, args, *, hints=None, tolerance=None, synthetic=None):
-    """``synthetic``: the ``cl.workloads`` spec ``--synthetic`` selects (default: captured)."""
+def run(fn, args, *, hints=None, synthetic=None):
+    """``synthetic``: the ``cl.workloads`` spec ``--synthetic`` selects (default: captured).
+
+    Candidates are validated at the tolerance the operator declares in the registry."""
     import cleave
     import cleave.lang as cl
     from cleave.frontend.paged import trace_paged
@@ -68,7 +71,7 @@ def run(fn, args, *, hints=None, tolerance=None, synthetic=None):
         raise SystemExit(f"{program.name}: this family has no synthetic workloads")
     workloads = synthetic if args.synthetic else None
     kernel = cleave.compile(fn, schedule=schedule, split=split, hints=hints, workloads=workloads,
-                            tolerance=tolerance, max_workloads=args.max_workloads,
+                            max_workloads=args.max_workloads,
                             filter_before_topk=args.filter_before_topk, progress=progress)
     report = kernel.report
     print(report.summary())
@@ -90,4 +93,8 @@ def run(fn, args, *, hints=None, tolerance=None, synthetic=None):
             (out / name).write_text(text, encoding="utf-8")
             print(f"  wrote {out / name}")
     print(f"elapsed {time.perf_counter() - t0:.1f}s\n")
+    if args.json:
+        print(json.dumps({"name": program.name, "label": kernel.label,
+                          "latency_us": kernel.latency_us, "report": report.to_dict()},
+                         indent=1, default=str))
     return kernel

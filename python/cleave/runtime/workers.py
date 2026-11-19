@@ -56,14 +56,19 @@ def _terminate_process_tree(process):
 
 
 def _run_task(task):
-    """One candidate in a worker: ``check_fn``'s result, or the failure, as a plain dict."""
+    """One candidate in a worker: ``check_fn``'s result, or the failure, as a plain dict.
+
+    ``check_fn`` returns ``(cuda_src, latency_ms)``, optionally followed by the measured
+    error per output; a validation failure may carry one too (``exc.measured``).
+    """
     try:
-        cuda_src, latency_ms = task["check_fn"](
+        cuda_src, latency_ms, *rest = task["check_fn"](
             task["code_str"], out_idx=task["out_idx"],
             reference_cache_dir=task["reference_cache_dir"],
             tolerance=task["tolerance"], benchmark=task["benchmark"],
         )
-        return {"ok": True, "cuda_src": cuda_src, "latency_ms": latency_ms}
+        return {"ok": True, "cuda_src": cuda_src, "latency_ms": latency_ms,
+                "measured": rest[0] if rest else None}
     except BaseException as exc:
         stage = getattr(exc, "_cleave_stage", None)
         if stage is None:
@@ -74,6 +79,7 @@ def _run_task(task):
             "error_type": type(exc).__name__,
             "error_message": str(exc),
             "traceback": traceback.format_exc(),
+            "measured": getattr(exc, "measured", None),
         }
 
 

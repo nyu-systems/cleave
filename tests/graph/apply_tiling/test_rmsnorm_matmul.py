@@ -7,6 +7,7 @@ from cleave.ir.graph import GraphNode
 from cleave.schedule import apply_tiling
 
 from tests._graphs import rmsnorm_matmul_graph
+from tests._tolerances import tolerance_for
 from tests.graph.apply_tiling._test_utils import (
     assert_candidate_compiles_and_runs,
     build_tiled_candidate,
@@ -72,4 +73,4 @@ def test_apply_tiling_rmsnorm_matmul(
             continue
         assert iterator.offset(*vars_) == expected_offsets[node.name]
 
-    assert_candidate_compiles_and_runs(cand)
+    assert_candidate_compiles_and_runs(cand, tolerance_for(rmsnorm_matmul_graph))

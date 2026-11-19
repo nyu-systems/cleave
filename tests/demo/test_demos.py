@@ -7,12 +7,15 @@ Each demo runs as ``__main__`` with ``cleave.examples``' compile stubbed (no sea
 import runpy
 import subprocess
 import sys
+import types
 from pathlib import Path
 
 import pytest
 
 import cleave.examples as examples
+from cleave.runtime.validate import Tolerance
 
+from .._tolerances import CEILING
 from ..frontend.test_trace_equivalence import normalized, spy
 from ._snapshot import SNAPSHOT, record, updating
 
@@ -84,6 +87,42 @@ def test_every_demo_has_a_case():
     covered = {c[1] for c in CASES}
     assert set(DEMOS) - covered == {"staged", "mha_decode_exact"}
     assert {c[0] for c in CASES} == set(SNAPSHOT["demos"])
+
+
+def _assert_declared(config):
+    """One measured bound for the operator, within the ceiling; normal inputs only."""
+    tolerance = config.tolerance
+    assert isinstance(tolerance, Tolerance), "the demo declares no tolerance"
+    assert 0 < tolerance.rtol <= CEILING and tolerance.atol == 0
+    # the adversarial input distributions exist but are not switched on for any operator yet
+    assert config.distributions == ("normal",)
+
+
+@pytest.mark.parametrize("name", [d for d in DEMOS if d != "staged"])
+def test_demo_declares_its_own_tolerance(monkeypatch, name):
+    # There is no default bound to fall back to: a demo without one cannot validate.
+    _assert_declared(run_demo(monkeypatch, name, [])["ev"])
+
+
+def test_staged_demo_declares_its_own_tolerance(monkeypatch):
+    import cleave.pipeline as pipeline
+
+    seen = {}
+
+    def fake_build(plans, workers=None, *, config=None):
+        seen["config"] = config
+        raise _Stop
+
+    monkeypatch.setattr(pipeline, "superoptimize", lambda program, config=None: "graphs")
+    monkeypatch.setattr(pipeline, "schedule",
+                        lambda graphs, config=None: types.SimpleNamespace(summary=lambda: ""))
+    monkeypatch.setattr(pipeline, "build", fake_build)
+    monkeypatch.setattr(sys, "argv", [str(DEMO / "staged.py")])
+    monkeypatch.syspath_prepend(str(DEMO))
+    with pytest.raises(_Stop):
+        runpy.run_path(str(DEMO / "staged.py"), run_name="__main__")
+    _assert_declared(seen["config"])
+    assert (seen["config"].warmup, seen["config"].iters) == (16, 1000)
 
 
 def test_mha_decode_exact_config(monkeypatch):

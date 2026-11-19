@@ -1,6 +1,8 @@
 """CPU-only: configs, presets, the max_ops="auto" rule, cache keys, CLI parsing."""
 
 import dataclasses
+import importlib
+import types
 
 import pytest
 
@@ -19,6 +21,10 @@ from cleave.pipeline import (
 )
 from cleave.pipeline import cache
 from tests.frontend import _programs as P
+
+# the package exports the functions build() and compile() under the modules' names
+build_mod = importlib.import_module("cleave.pipeline.build")
+compile_mod = importlib.import_module("cleave.pipeline.compile")
 
 
 def test_presets_are_frozen_and_listed():
@@ -145,6 +151,81 @@ def test_kernel_cache_key_covers_io_names():
     cfgs = resolve_configs(prog("x", "w"))
     assert prog("x", "w").fingerprint() == prog("a", "b").fingerprint()
     assert _kernel_key(prog("x", "w"), *cfgs) != _kernel_key(prog("a", "b"), *cfgs)
+
+
+def test_kernel_cache_key_covers_validation():
+    """A saved kernel is returned without validating, so everything that decides what
+    "validated" means is in its key: the tolerance, the input distributions, and the
+    comparator's own version."""
+    from cleave.pipeline.compile import _kernel_key
+
+    prog = trace(P.matmul, dict(M=16, N=8, K=32), cl.f16)
+    so, sc, ev = resolve_configs(prog)
+
+    def key(config):
+        return _kernel_key(prog, so, sc, config)
+
+    declared = ev.replace(tolerance=cl.Tolerance(rtol=1e-3))
+    assert key(declared) == key(ev.replace(tolerance=cl.Tolerance(rtol=1e-3)))
+    assert key(declared) != key(ev.replace(tolerance=cl.Tolerance(rtol=2e-3)))
+    assert key(declared) != key(ev.replace(tolerance=cl.Tolerance(rtol=1e-3, atol=1e-6)))
+    assert key(declared) != key(declared.replace(distributions=("normal", "large_logits")))
+    assert key(declared) == key(declared.replace(max_parallel=2, timeout_s=5.0))
+    assert cache.VALIDATION >= 2  # 1: elementwise assert_close with a 0.5/0.5 default
+    before = key(declared)
+    cache.VALIDATION += 1
+    try:
+        assert key(declared) != before
+    finally:
+        cache.VALIDATION -= 1
+
+
+def test_compile_and_build_require_a_declared_tolerance(monkeypatch):
+    """There is no default bound: a dense program without one is refused before the search."""
+    import cleave
+
+    prog = trace(P.matmul, dict(M=16, N=8, K=32), cl.f16)
+    monkeypatch.setattr(compile_mod, "superoptimize",
+                        lambda *a, **k: pytest.fail("searched without a tolerance"))
+    with pytest.raises(SpecError, match="no validation tolerance declared"):
+        cleave.compile(prog, preset="fast")
+    with pytest.raises(SpecError, match="no validation tolerance declared"):
+        cleave.compile(prog, eval=EvalConfig(warmup=1, iters=1))
+    assert EvalConfig().tolerance is None and EvalConfig().distributions == ("normal",)
+
+    plan = types.SimpleNamespace(tile=None, program=prog)
+    with pytest.raises(SpecError, match="no validation tolerance declared"):
+        build_mod.build([plan])
+    with pytest.raises(SpecError, match="input distributions must be drawn from"):
+        build_mod.build([plan], config=EvalConfig(tolerance=cl.Tolerance(rtol=1e-3),
+                                                  distributions=("normal", "bogus")))
+    assert len(build_mod.build([])) == 0  # nothing to validate, nothing to declare
+
+
+def test_compile_takes_the_tolerance_from_jit_options_or_the_keyword(monkeypatch):
+    import cleave
+
+    seen = []
+
+    def stop(program, so, sc, ev):
+        seen.append(ev.tolerance)
+        raise RuntimeError("stop")
+
+    monkeypatch.setattr(compile_mod, "_kernel_key", stop)
+
+    @cleave.jit(tolerance=cl.Tolerance(rtol=1e-3))
+    def mm(x: cl.Tensor["M", "K"], w: cl.Tensor["K", "N"]):
+        return x @ w
+
+    shapes = dict(M=16, N=16, K=64)
+    for call in (lambda: cleave.compile(mm, shapes=shapes),
+                 lambda: mm.compile(**shapes),
+                 lambda: cleave.compile(mm, shapes=shapes, tolerance=cl.Tolerance(rtol=5e-3)),
+                 lambda: cleave.compile(mm.fn, shapes=shapes, preset="fast",
+                                        tolerance=cl.Tolerance(rtol=2e-3))):
+        with pytest.raises(RuntimeError, match="stop"):
+            call()
+    assert [t.rtol for t in seen] == [1e-3, 1e-3, 5e-3, 2e-3]
 
 
 def test_compile_rejects_dtype_for_a_program():

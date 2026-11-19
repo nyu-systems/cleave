@@ -14,7 +14,7 @@ import statistics
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, Sequence
 
-from .validate import DEFAULT_TOLERANCE, Tolerance
+from .validate import compare_outputs, launch, require_tolerance, worst
 from .gpu import _gpu_exec_guard
 from .timer import capture_launch_graph, launch_rounds, replay_rounds
 
@@ -85,6 +85,8 @@ class WorkloadCandidate:
     kernel: object = None
     checked: int = 0
     failure: str | None = None  # first wrong/failed workload; set means excluded
+    # validate.MeasuredError per output: the worst over the workloads it was checked on.
+    measured: tuple | None = None
     latency_us: dict = field(default_factory=dict)
     used_replay: bool = True
 
@@ -269,14 +271,18 @@ def compile_and_validate_over_workloads(
     success_info: list,
     errors: list,
     *,
-    tolerance: Tolerance = DEFAULT_TOLERANCE,
+    tolerance=None,
 ) -> None:
     """Compile every candidate and check it on every workload; never raises per candidate.
 
-    ``success_info`` gets the candidates correct everywhere, ``errors`` ``(label, exception)``.
+    ``success_info`` gets the candidates correct everywhere, ``errors`` ``(label, exception)``
+    (an ``OutputMismatch``, ``NonFiniteOutput`` or ``LaunchCrash`` for a validation failure).
+    ``tolerance`` is the operator's declared bound, one ``Tolerance`` or one per output; it
+    has no default. Each candidate keeps the worst error it measured (``measured``).
     """
     import torch
 
+    require_tolerance(tolerance, "these workloads")
     seen_workloads = 0
     live = []
     for candidate in candidates:
@@ -310,27 +316,20 @@ def compile_and_validate_over_workloads(
                 for tensor in outputs:
                     tensor.fill_(float("nan"))
                 try:
-                    candidate.kernel(*inputs, *outputs)
-                    torch.cuda.synchronize()
-                    for got, want in zip(outputs, reference):
-                        torch.testing.assert_close(
-                            got.float(),
-                            want.float(),
-                            rtol=tolerance.rtol,
-                            atol=tolerance.atol,
-                            equal_nan=tolerance.equal_nan,
-                        )
+                    launch(candidate.kernel, (*inputs, *outputs))
+                    measured = compare_outputs(outputs, reference, tolerance)
                 except Exception as error:  # noqa: BLE001
                     first = str(error).strip().splitlines()
                     candidate.failure = (
                         f"{key}: {type(error).__name__}"
-                        + (f": {first[0][:80]}" if first else "")
+                        + (f": {first[0][:160]}" if first else "")
                     )
                     errors.append((candidate.label, error))
                     # A poisoned context would blame every later candidate: stop.
                     _assert_context_survived(candidate.label, error)
                 else:
                     candidate.checked += 1
+                    candidate.measured = worst(candidate.measured, measured)
         del inputs, reference, outputs
         torch.cuda.empty_cache()
 

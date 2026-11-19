@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import ast
+import functools
 import time
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
+from ..core.errors import SpecError
 from .config import EvalConfig
 from .plans import Plan, PlanSet
 from .report import Report, Result, _Results
@@ -123,8 +125,10 @@ def built_kernels(plans: Sequence[Plan], runs) -> list[BuiltKernel | None]:
 
 
 class BuildSet(_Results):
-    def __init__(self, results: list[Result], plans: PlanSet | None = None, seconds: float = 0.0):
+    def __init__(self, results: list[Result], plans: PlanSet | None = None, seconds: float = 0.0,
+                 tolerance=None):
         self.results, self.plans, self.seconds = list(results), plans, seconds
+        self.tolerance = tolerance  # what the kernels were validated at
 
     @property
     def built(self) -> list[Result]:
@@ -150,9 +154,11 @@ def build(plans: PlanSet | Sequence[Plan], workers: int | None = None, *,
     """Compile, validate and time every plan in its own worker (a crash fails one candidate).
 
     Parallelism: ``workers``, else the active ``Session.max_parallel``, else ``config``.
+    ``config.tolerance`` is required as soon as there is a plan to validate.
     """
     from ..core.session import current_session
-    from ..runtime.validate import BenchOptions
+    from ..runtime.inputs import check_distributions
+    from ..runtime.validate import BenchOptions, publish_reference
     from ..runtime.evaluate import run_candidates
 
     config = config or EvalConfig()
@@ -161,20 +167,26 @@ def build(plans: PlanSet | Sequence[Plan], workers: int | None = None, *,
     if timeout is None:
         timeout = session.settings.compile_timeout_secs or 0  # None in Settings: disabled
     plan_list = list(plans)
+    if plan_list and config.tolerance is None:
+        raise SpecError("build(): no validation tolerance declared; there is no default bound. "
+                        "Pass config=EvalConfig(tolerance=cl.Tolerance(rtol=...))")
+    reference_fn = functools.partial(publish_reference,
+                                     distributions=check_distributions(config.distributions))
     t0 = time.perf_counter()
     runs = run_candidates([p.tile for p in plan_list], _program_dtype(plans),
                           max_parallel=workers or session.max_parallel or config.max_parallel,
                           tolerance=config.tolerance, timeout_s=timeout,
                           compiler_pass_options=compiler_pass_options,
-                          benchmark=BenchOptions(config.warmup, config.iters))
+                          benchmark=BenchOptions(config.warmup, config.iters),
+                          reference_fn=reference_fn)
     kernels = built_kernels(plan_list, runs)
     results = [Result(p, r, k) for p, r, k in zip(plan_list, runs, kernels)]
     return BuildSet(results, plans if isinstance(plans, PlanSet) else None,
-                    time.perf_counter() - t0)
+                    time.perf_counter() - t0, config.tolerance)
 
 
 def evaluate(built: BuildSet | PlanSet | Sequence[Plan], config: EvalConfig | None = None) -> Report:
     """The ``Report`` of a ``BuildSet`` (``config`` is only used to build plans first)."""
     if not isinstance(built, BuildSet):
         built = build(built, config=config)
-    return Report(built.results, built.plans, {"build": built.seconds})
+    return Report(built.results, built.plans, {"build": built.seconds}, built.tolerance)

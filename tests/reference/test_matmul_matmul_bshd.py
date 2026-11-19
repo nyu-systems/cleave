@@ -2,6 +2,7 @@ import tilelang.language as T
 
 from tests._graphs import matmul_matmul_bshd_graph
 from cleave.runtime.compile import compile_and_run_prim_func
+from tests._tolerances import tolerance_for
 
 DTYPE = "float16"
 
@@ -86,4 +87,5 @@ def test_matmul_matmul_bshd():
         func,
         graph=matmul_matmul_bshd_graph(B, S_Q, S_KV, H, D),
         dtype=DTYPE,
+        tolerance=tolerance_for(matmul_matmul_bshd_graph),
     )

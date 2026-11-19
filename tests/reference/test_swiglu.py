@@ -2,6 +2,7 @@ import tilelang.language as T
 
 from tests._graphs import swiglu_graph
 from cleave.runtime.compile import compile_and_run_prim_func
+from tests._tolerances import tolerance_for
 
 DTYPE = "float16"
 
@@ -95,5 +96,6 @@ def test_swiglu():
         threads=128,
     )
     compile_and_run_prim_func(
-        func, graph=swiglu_graph(M, N, K), dtype=DTYPE
+        func, graph=swiglu_graph(M, N, K), dtype=DTYPE,
+        tolerance=tolerance_for(swiglu_graph),
     )

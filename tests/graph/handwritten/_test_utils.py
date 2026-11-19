@@ -5,7 +5,6 @@ from pathlib import Path
 
 from cleave.codegen import TilelangCodeGen
 from cleave.dynamic import EXPECTED_KERNELS_DIR
-from cleave.runtime.validate import DEFAULT_TOLERANCE, Tolerance
 from cleave.runtime.compile import check_code, compile_and_run_prim_func
 from cleave.runtime.gpu import _gpu_exec_guard
 from cleave.runtime.reference import build_inputs_and_reference, torch_dtype
@@ -71,9 +70,7 @@ def _kernel_input_buffers(kernel):
     ]
 
 
-def _run_with_scratch(
-    code_str, *, source_graph, dtype, tolerance: Tolerance = DEFAULT_TOLERANCE
-):
+def _run_with_scratch(code_str, *, source_graph, dtype, tolerance):
     """Validate a fused split-k kernel against a plain ``source_graph`` reference.
 
     The fused split+combine kernel takes A, B *plus* two internal partial buffers
@@ -133,7 +130,7 @@ def run_handwritten_test(
     make_inputs_fn=None,
     workloads_fn=None,
     out_idx=None,
-    tolerance: Tolerance = DEFAULT_TOLERANCE,
+    tolerance,
 ) -> None:
     """Assert the scheduled ``graph`` codegens to the expected kernel and runs.
 
@@ -157,6 +154,8 @@ def run_handwritten_test(
     A kernel with symbolic extents serves every shape of its operator from one compile, so
     it is checked against a sequence of workloads rather than a single one: ``workloads_fn``
     yields ``(inputs, reference)`` pairs and ``out_idx`` names the outputs.
+
+    ``tolerance`` is the bound the operator declares; there is no default.
     """
     code_str = gen_handwritten_code(graph)
     print("Generated Code:")

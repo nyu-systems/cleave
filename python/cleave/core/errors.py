@@ -31,7 +31,24 @@ class SmemExceeded(CompileError):
 
 
 class ValidationError(CleaveError, AssertionError):
-    pass
+    """A kernel failed at the validate stage; the subclasses say how."""
+
+
+class OutputMismatch(ValidationError):
+    """The kernel ran and its output is finite but outside the declared tolerance (or has
+    the wrong shape, dtype or number of outputs). ``measured`` holds the error per output."""
+
+    measured = None
+
+
+class NonFiniteOutput(ValidationError):
+    """A NaN on either side, or an infinity the reference does not have at that entry."""
+
+    measured = None
+
+
+class LaunchCrash(ValidationError):
+    """Launching the compiled kernel raised (the worker process itself survived)."""
 
 
 class CandidateTimeout(CleaveError, TimeoutError):

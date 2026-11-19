@@ -2,7 +2,6 @@
 
 from .registry import (
     EXPECTED_KERNELS_DIR,
-    GATHER_TOLERANCE,
     OPERATORS,
     DynamicOperator,
     get,
@@ -13,7 +12,6 @@ from .registry import (
 
 __all__ = [
     "EXPECTED_KERNELS_DIR",
-    "GATHER_TOLERANCE",
     "OPERATORS",
     "DynamicOperator",
     "get",

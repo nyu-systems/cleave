@@ -11,6 +11,9 @@ from pathlib import Path
 # now build a different kernel: a kernel-cache hit returns the saved one as it is.
 # 2: a reduction absorbed into another's loop is scheduled over its whole axis.
 SCHEMA = 2
+# What "validated" means for a saved kernel. A kernel-cache hit returns without validating,
+# so bump this whenever the comparison or its inputs change: saved kernels are then rebuilt.
+VALIDATION = 2
 
 
 @functools.lru_cache(maxsize=None)

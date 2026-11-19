@@ -2,7 +2,7 @@
 
 The structural half of this is asserted in ``tests/graph/apply_paging/``; what this adds
 is that the kernel the pipeline emits is numerically right over the operator's captured
-workloads, held to the same references and the same 1e-2 tolerance as the hand-written
+workloads, held to the same references and the same declared tolerance as the hand-written
 schedule for the same operator. The operator name is deliberately shared with the
 handwritten case of the same name (``tests/graph/handwritten/_cases.py``) so both are
 checked against identical inputs.
@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from cleave.dynamic.dense import build_paged_graph
 from cleave.dynamic.workloads import cases
-from cleave.dynamic import GATHER_TOLERANCE
+from cleave.dynamic import OPERATORS
 from cleave.codegen import TilelangCodeGen
 from cleave.dynamic.paging import PagingSpec
 from cleave.runtime.compile import _load_main_kernel_from_code, compile_and_run_prim_func
@@ -36,5 +36,5 @@ def test_gqa_paged_decode_h32_kv8_d128_ps1_pipeline():
         workloads_fn=lambda: cases(OPERATOR, dims),
         # Five declared inputs and the scale, then the two outputs.
         out_idx=[6, 7],
-        tolerance=GATHER_TOLERANCE,
+        tolerance=OPERATORS[OPERATOR].tolerance,
     )
