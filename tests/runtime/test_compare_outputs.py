@@ -137,6 +137,33 @@ def test_non_finite_takes_precedence_over_a_mismatch():
         compare_outputs([_row(5.0, 1.0), _row(float("nan"))], [_row(1.0, 1.0), _row(1.0)], tol)
 
 
+def test_a_non_finite_failure_says_whether_the_rest_of_the_output_is_right():
+    reference = torch.tensor([[4.0, 2.0, 1.0], [8.0, 1.0, INF]])
+    tol = Tolerance(rtol=1e-2)
+    # one stray infinity in an otherwise exact output ...
+    stray = reference.clone()
+    stray[0, 1] = INF
+    with pytest.raises(NonFiniteOutput) as error:
+        compare_outputs([stray], [reference], tol)
+    assert str(error.value) == (
+        "output 0: 1 infinite kernel entries where the reference is finite, 0 non-finite "
+        "reference entries not reproduced (of 6); of the 4 entries finite on both sides 0 are "
+        "out of tolerance (row-normalized error 0.000e+00)")
+    # ... is not the same finding as a kernel that is also wrong where it is finite
+    wrong = stray.clone()
+    wrong[1, 0] = 4.0
+    with pytest.raises(NonFiniteOutput, match=r"of the 4 entries finite on both sides 1 are "
+                                              r"out of tolerance \(row-normalized error 5.000e-01\)"):
+        compare_outputs([wrong], [reference], tol)
+    # a NaN is reported as such, with the same tail
+    nan = reference.clone()
+    nan[0, 0] = float("nan")
+    with pytest.raises(NonFiniteOutput, match=r"1 NaN in the kernel output, 0 in the reference "
+                                              r"\(of 6 entries\); of the 4 entries finite"):
+        compare_outputs([nan], [reference], tol)
+    assert error.value.measured is None  # never a measurement of a valid kernel
+
+
 def test_a_mismatch_reports_what_it_measured():
     reference = _row(2.0, 1.0)
     with pytest.raises(OutputMismatch, match="1 of 2 entries out of tolerance") as error:

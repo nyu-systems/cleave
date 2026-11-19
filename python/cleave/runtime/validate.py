@@ -119,24 +119,28 @@ def _compare_one(index, actual, reference, tol):
     wide = torch.promote_types(actual.dtype, torch.float32)
     act, ref = actual.to(wide), reference.to(wide)
     n_nan_act, n_nan_ref = int(torch.isnan(act).sum()), int(torch.isnan(ref).sum())
+    finite = torch.isfinite(ref)
+    # A non-finite reference entry is a defined answer (an empty row's -inf lse) and must be
+    # matched exactly; an infinity the reference does not have is a defect; a NaN always is.
+    unmatched = int(((~finite) & (act != ref) & ~torch.isnan(ref)).sum())
+    stray = int((finite & torch.isinf(act)).sum())
+    non_finite = ""
     if n_nan_act or n_nan_ref:
-        return None, "non_finite", (
+        non_finite = (
             f"output {index}: {n_nan_act} NaN in the kernel output, {n_nan_ref} in the "
             f"reference (of {act.numel()} entries)"
         )
-    finite = torch.isfinite(ref)
-    # A non-finite reference entry is a defined answer (an empty row's -inf lse) and must be
-    # matched exactly; an infinity the reference does not have is a defect.
-    unmatched = int(((~finite) & (act != ref)).sum())
-    stray = int((finite & ~torch.isfinite(act)).sum())
-    if unmatched or stray:
-        return None, "non_finite", (
+    elif unmatched or stray:
+        non_finite = (
             f"output {index}: {stray} infinite kernel entries where the reference is finite, "
             f"{unmatched} non-finite reference entries not reproduced (of {act.numel()})"
         )
 
+    # Everything below only looks at the entries that are finite on both sides (all of them
+    # where the reference is finite, once the checks above have passed).
+    comparable = finite & torch.isfinite(act)
     zero = torch.zeros((), dtype=wide, device=act.device)
-    err = torch.where(finite, (act - ref).abs(), zero)
+    err = torch.where(comparable, (act - ref).abs(), zero)
     mag = torch.where(finite, ref.abs(), zero)
     del act, ref
     # The row scale must not depend on whether a kernel keeps or drops a unit axis.
@@ -149,6 +153,13 @@ def _compare_one(index, actual, reference, tol):
     live = scale > 0
     rel = torch.where(live, err / torch.where(live, scale, torch.ones_like(scale)), zero)
     measured = MeasuredError(float(rel.max()), float(err.max()))
+    if non_finite:
+        # Say whether the kernel is otherwise right: one stray infinity and a kernel that is
+        # wrong everywhere are different findings.
+        return None, "non_finite", (
+            f"{non_finite}; of the {int(comparable.sum())} entries finite on both sides {n_bad} "
+            f"are out of tolerance (row-normalized error {measured.rel:.3e})"
+        )
     if not n_bad:
         return measured, None, ""
     return measured, "mismatch", (
