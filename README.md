@@ -96,14 +96,19 @@ def matmul(x: cl.Tensor["M", "K"], w: cl.Tensor["K", "N"]):
 
 
 def main():
-    kernel = cleave.compile(matmul, shapes=dict(M=128, N=128, K=4096), dtype=cl.f16, preset="fast")
+    # Every candidate is validated against a torch reference at the tolerance the operator
+    # declares (row-relative; there is no default).
+    tolerance = cl.Tolerance(rtol=5e-3)
+    kernel = cleave.compile(matmul, shapes=dict(M=128, N=128, K=4096), dtype=cl.f16, preset="fast",
+                            tolerance=tolerance)
     print(kernel.report.summary())
 
     # The same compile, stage by stage.
     prog = cleave.trace(matmul, dict(M=128, N=128, K=4096), cl.f16)
     graphs = cleave.superoptimize(prog, cleave.SuperoptConfig(split=("K",)))
     plans = schedule(graphs, cleave.ScheduleConfig(topk=100, split_k=(4, 8, 16)))
-    report = cleave.evaluate(cleave.build(plans, workers=8))
+    report = cleave.evaluate(cleave.build(plans, workers=8,
+                                          config=cleave.EvalConfig(tolerance=tolerance)))
     print(report.table(top=5, by="variant"))
     print(report.best())
 
@@ -113,6 +118,25 @@ if __name__ == "__main__":  # candidate workers are spawned processes
 ```
 
 See `demo/staged.py` for a complete runnable version.
+
+### Validation
+
+A candidate kernel is kept only if its output matches a same-dtype torch reference:
+`|actual - ref| <= rtol * max|ref| + atol`, where the max is taken over the entry's *row* (the
+last non-unit axis), so a row of small values is not excused by an absolute slack and an
+all-zero row must be reproduced exactly. Any NaN fails, an infinity must be exactly the one
+the reference has, and shapes and dtypes must agree.
+
+There is no default tolerance. Each operator declares its own `cl.Tolerance(rtol=..., atol=...)`
+(one, or one per output), set from its measured error (the next 1-2-5 step at or above 4x the
+largest error of its valid kernels; those sit within a few ulp of the reference, wrong kernels
+above 10% of the row max): `cleave.compile(..., tolerance=...)`,
+`@cleave.jit(tolerance=...)`, `cleave.EvalConfig(tolerance=...)`; the demos pass theirs to
+`cleave.examples.main`, the paged operators declare `(out, lse)` in `cleave.dynamic.registry`.
+The report carries the error every candidate measured (`report.to_dict()["validation"]`,
+`--json`) and counts validation failures as `OutputMismatch`, `NonFiniteOutput` or
+`LaunchCrash`. `python -m tests._measure_tolerances --gpus 0,1 --out DIR` re-measures every
+operator and prints the tolerance that follows.
 
 ## Development
 

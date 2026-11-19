@@ -19,5 +19,5 @@ if __name__ == "__main__":
         shapes=dict(M=4096, N=14336, K=4096),
         dtype=cl.f16,
         presets={"split-k": dict(M=128, N=6144, split=cl.Split("K", (4, 8, 16, 32)))},
-        tolerance=cl.Tolerance(rtol=1e-2),
+        tolerance=cl.Tolerance(rtol=5e-3),
     )

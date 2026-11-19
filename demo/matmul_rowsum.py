@@ -13,5 +13,5 @@ if __name__ == "__main__":
         matmul_rowsum,
         shapes=dict(M=4096, N=4096, K=64),
         dtype=cl.f16,
-        tolerance=cl.Tolerance(rtol=1e-2),
+        tolerance=cl.Tolerance(rtol=2e-3),
     )

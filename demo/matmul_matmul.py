@@ -17,5 +17,5 @@ if __name__ == "__main__":
         shapes=dict(BH=32, SQ=4096, SKV=4096, D=64),
         dtype=cl.f16,
         presets={"split": dict(SQ=64, split=cl.Split("SKV", (4, 8, 16, 32)), max_ops=8)},
-        tolerance=cl.Tolerance(rtol=1e-2),
+        tolerance=cl.Tolerance(rtol=5e-3),
     )

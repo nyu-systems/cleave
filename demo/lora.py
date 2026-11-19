@@ -17,4 +17,4 @@ def lora(M=16, N=4096, K=4096, R=16) -> cleave.Program:
 
 
 if __name__ == "__main__":
-    cleave.examples.main(lora, tolerance=cl.Tolerance(rtol=1e-2))
+    cleave.examples.main(lora, tolerance=cl.Tolerance(rtol=5e-3))

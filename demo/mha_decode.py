@@ -21,5 +21,5 @@ if __name__ == "__main__":
         dtype=cl.f16,
         split=cl.Split("SKV", (16, 32)),
         max_ops=14,  # split or not (the auto rule gives 13 unsplit)
-        tolerance=cl.Tolerance(rtol=1e-2),
+        tolerance=cl.Tolerance(rtol=5e-3),
     )

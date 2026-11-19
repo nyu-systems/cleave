@@ -33,7 +33,7 @@ def main():
 
     # 3. codegen + compile + validate in worker processes (at the operator's declared
     #    tolerance; there is no default) and time the survivors; 4. the report
-    config = cleave.EvalConfig(warmup=16, iters=1000, tolerance=cl.Tolerance(rtol=1e-2))
+    config = cleave.EvalConfig(warmup=16, iters=1000, tolerance=cl.Tolerance(rtol=5e-3))
     built = cleave.build(plans, workers=args.max_parallel, config=config)
     print(built)
     report = cleave.evaluate(built)

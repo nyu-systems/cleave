@@ -30,6 +30,10 @@ def _tolerance(out_rtol, lse_atol):
     The bf16 output is held relative to its row (the head_dim vector of one query row and
     head); the fp32 lse is a logarithm, with no row scale, so it is held absolutely. Neither
     gets the other's slack: an empty causal row is defined as exactly 0 / -inf.
+
+    Each value is the next 1-2-5 step at or above 4x the largest error the operator's valid
+    kernels measured over its captured workloads (``python -m tests._measure_tolerances``).
+    One bf16 ulp is 7.8e-3 of the row max and every kernel measures about that, hence 5e-2.
     """
     return (Tolerance(rtol=out_rtol), Tolerance(rtol=0.0, atol=lse_atol))
 
@@ -107,7 +111,7 @@ OPERATORS: dict[str, DynamicOperator] = {
             PagingSpec(num_qo_heads=32, num_kv_heads=8),
             _GQA,
             (32, 8, 128),
-            _tolerance(out_rtol=1e-2, lse_atol=1e-2),
+            _tolerance(out_rtol=5e-2, lse_atol=1e-5),
         ),
         _operator(
             "gqa_paged_decode_h32_kv4_d128_ps1",
@@ -115,7 +119,7 @@ OPERATORS: dict[str, DynamicOperator] = {
             PagingSpec(num_qo_heads=32, num_kv_heads=4, grid_order=("head", "batch")),
             _GQA,
             (32, 4, 128),
-            _tolerance(out_rtol=1e-2, lse_atol=1e-2),
+            _tolerance(out_rtol=5e-2, lse_atol=2e-5),
         ),
         _operator(
             "gqa_paged_decode_h32_kv8_d128_ps64",
@@ -132,7 +136,7 @@ OPERATORS: dict[str, DynamicOperator] = {
             ),
             _GQA,
             (32, 8, 128, 64),
-            _tolerance(out_rtol=1e-2, lse_atol=1e-2),
+            _tolerance(out_rtol=5e-2, lse_atol=5e-5),
             page_size=64,
         ),
         _operator(
@@ -142,14 +146,14 @@ OPERATORS: dict[str, DynamicOperator] = {
             # measured -- the captured requests' causal windows are a handful of tokens.
             _GQA_PREFILL,
             (32, 8, 128),
-            _tolerance(out_rtol=1e-2, lse_atol=1e-2),
+            _tolerance(out_rtol=5e-2, lse_atol=1e-5),
         ),
         _operator(
             "gqa_paged_prefill_causal_h32_kv4_d128_ps1",
             PagingSpec(num_qo_heads=32, num_kv_heads=4, kind=PAGED_PREFILL_CAUSAL, causal=True),
             _GQA_PREFILL,
             (32, 4, 128),
-            _tolerance(out_rtol=1e-2, lse_atol=1e-2),
+            _tolerance(out_rtol=5e-2, lse_atol=2e-5),
         ),
         _operator(
             "gqa_ragged_prefill_causal_h32_kv8_d128",
@@ -166,7 +170,7 @@ OPERATORS: dict[str, DynamicOperator] = {
             ),
             dict(query_rows=64, kv_tile=64, head_dim=128),
             (32, 8, 128),
-            _tolerance(out_rtol=1e-2, lse_atol=1e-2),
+            _tolerance(out_rtol=5e-2, lse_atol=2e-5),
         ),
         _operator(
             "gqa_ragged_prefill_causal_h32_kv4_d128",
@@ -180,7 +184,7 @@ OPERATORS: dict[str, DynamicOperator] = {
             ),
             dict(query_rows=64, kv_tile=64, head_dim=128),
             (32, 4, 128),
-            _tolerance(out_rtol=1e-2, lse_atol=1e-2),
+            _tolerance(out_rtol=5e-2, lse_atol=1e-5),
         ),
         _operator(
             "mla_paged_decode_h16_ckv512_kpe64_ps1",
@@ -189,7 +193,7 @@ OPERATORS: dict[str, DynamicOperator] = {
             MLASpec(num_qo_heads=16),
             dict(query_rows=16, kv_tile=64, n_threads=256, ckv=512, kpe=64),
             (16, 512, 64),
-            _tolerance(out_rtol=1e-2, lse_atol=1e-2),
+            _tolerance(out_rtol=5e-2, lse_atol=1e-4),
             scale=_wl.MLA_SM_SCALE,
         ),
         _operator(
@@ -209,7 +213,7 @@ OPERATORS: dict[str, DynamicOperator] = {
             ),
             dict(query_rows=16, kv_tile=64, n_threads=128, ckv=512, kpe=64),
             (16, 512, 64),
-            _tolerance(out_rtol=1e-2, lse_atol=1e-2),
+            _tolerance(out_rtol=5e-2, lse_atol=2e-4),
             scale=_wl.MLA_SM_SCALE,
         ),
     )

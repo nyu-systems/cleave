@@ -71,6 +71,7 @@ def test_validate_kernel_outputs_honors_a_per_operator_tolerance():
     out = torch.randn(4, 32, 128, device="cuda")
     lse = 10 * torch.randn(4, 32, device="cuda")
     lse[1, 3] = float("-inf")  # an empty request: defined, and to be reproduced exactly
+    lse[0, 0] = 0.0  # the perturbed entry: a few 1e-6 are not representable next to a 10
     scale = out.abs().amax(dim=-1, keepdim=True)
 
     def run(out_error, lse_error):

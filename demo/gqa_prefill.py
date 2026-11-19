@@ -17,5 +17,5 @@ if __name__ == "__main__":
         gqa_prefill,
         shapes=dict(HQ=32, HKV=8, SQ=4096, SKV=4096, D=64),
         dtype=cl.f16,
-        tolerance=cl.Tolerance(rtol=1e-2),
+        tolerance=cl.Tolerance(rtol=5e-3),
     )

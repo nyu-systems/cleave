@@ -19,5 +19,5 @@ if __name__ == "__main__":
         shapes=dict(B=1, H=128, SKV=1024, D=512, PE=64),
         dtype=cl.f16,
         max_ops=13,  # the engine default; the auto rule gives 15
-        tolerance=cl.Tolerance(rtol=1e-2),
+        tolerance=cl.Tolerance(rtol=5e-3),
     )

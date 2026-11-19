@@ -18,5 +18,5 @@ if __name__ == "__main__":
         matmul,
         shapes=dict(M=128, N=128, K=4096),
         dtype=cl.f16,
-        tolerance=cl.Tolerance(rtol=1e-2),
+        tolerance=cl.Tolerance(rtol=5e-3),
     )
