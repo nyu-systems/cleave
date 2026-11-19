@@ -46,7 +46,8 @@ def test_compile_matmul_end_to_end(cache_root, tmp_path):
     assert validation["tolerance"] == [{"rtol": TOLERANCE.rtol, "atol": TOLERANCE.atol}]
     assert 0 < validation["max_error"][0]["rel"] <= TOLERANCE.rtol
     assert len(validation["measured"]) >= len(report.correct)
-    assert "max error rel" in report.summary()
+    assert "max error rel " in report.summary()
+    assert f" of rtol {TOLERANCE.rtol:g}" in report.summary()
 
     prog = trace(programs.matmul, SHAPES, cl.f16)
     x, w = prog.random_inputs(seed=1)

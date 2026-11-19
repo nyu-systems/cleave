@@ -40,12 +40,24 @@ def worst_measured(measurements) -> list | None:
     return out
 
 
-def format_measured(worst) -> str:
-    """``rel 6.1e-04 abs 2.3e-03`` per output, for the stage report."""
+def format_measured(worst, tolerance=None) -> str:
+    """``rel 6.1e-04 of rtol 0.005`` per output, for the stage report: the measured error
+    beside the bound that governs it (both errors when the tolerance is not known)."""
     if not worst:
         return ""
-    tag = (lambda i: f"out{i} ") if len(worst) > 1 else (lambda i: "")
-    return ", ".join(f"{tag(i)}rel {w['rel']:.1e} abs {w['abs']:.1e}" for i, w in enumerate(worst))
+    bounds = tolerance_dicts(tolerance) or [None] * len(worst)
+    if len(bounds) == 1:
+        bounds = bounds * len(worst)
+    parts = []
+    for i, (w, bound) in enumerate(zip(worst, bounds)):
+        if bound is None:
+            text = f"rel {w['rel']:.1e} abs {w['abs']:.1e}"
+        else:
+            terms = [f"rel {w['rel']:.1e} of rtol {bound['rtol']:g}"] * bool(bound["rtol"])
+            terms += [f"abs {w['abs']:.1e} of atol {bound['atol']:g}"] * bool(bound["atol"])
+            text = ", ".join(terms) or f"rel {w['rel']:.1e} abs {w['abs']:.1e} of an exact bound"
+        parts.append((f"out{i} " if len(worst) > 1 else "") + text)
+    return "; ".join(parts)
 
 
 @dataclass(eq=False)
@@ -255,7 +267,7 @@ class Report(_Results):
         rows.append(("build", text + (f"  [{build_fail}]" if build_fail else ""), self.timings.get("build")))
         val_fail = Failures(r for r in self.results if not r.ok and r.stage == "validate")
         n_val = len(self) - len(build_fail)
-        worst = format_measured(self.measured_error())
+        worst = format_measured(self.measured_error(), self.tolerance)
         rows.append(("validate", f"{n_val - len(val_fail)} ok / {len(val_fail)} failed"
                      + (f"  [{val_fail}]" if val_fail else "")
                      + (f"  max error {worst}" if worst else ""), None))

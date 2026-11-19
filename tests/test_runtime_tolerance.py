@@ -7,7 +7,7 @@ the kernel-facing half (``_validate_kernel_outputs`` and the entry points above 
 import pytest
 import torch
 
-from cleave.core.errors import OutputMismatch, SpecError
+from cleave.core.errors import LaunchCrash, OutputMismatch, SpecError, ValidationError
 from cleave.dynamic import OPERATORS
 from cleave.runtime import compile as runtime_compile
 from cleave.runtime import validate
@@ -93,3 +93,17 @@ def test_validate_kernel_outputs_honors_a_per_operator_tolerance():
     # A declaration for the wrong number of outputs is an error, not a silent broadcast.
     with pytest.raises(SpecError, match="3 tolerances were declared for 2 outputs"):
         _validate([out, lse], [out, lse], tolerance=(out_tol, lse_tol, lse_tol))
+
+
+def test_a_kernel_that_cannot_be_launched_is_a_launch_crash_not_a_mismatch():
+    class Faulting:
+        def __call__(self, *inputs):
+            raise RuntimeError("CUDA error: an illegal memory access was encountered\nmore text")
+
+    reference = torch.zeros(4, device="cuda")
+    with _gpu_exec_guard(), pytest.raises(LaunchCrash) as error:
+        validate._validate_kernel_outputs(Faulting(), (), [reference], tolerance=Tolerance(rtol=1e-3))
+    assert str(error.value) == (
+        "kernel launch raised RuntimeError: CUDA error: an illegal memory access was encountered")
+    assert isinstance(error.value, ValidationError) and isinstance(error.value, AssertionError)
+    assert isinstance(error.value.__cause__, RuntimeError)

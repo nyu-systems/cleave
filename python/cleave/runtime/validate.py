@@ -226,7 +226,8 @@ def launch(kernel, args):
 
     try:
         result = kernel(*args)
-        torch.cuda.synchronize()
+        if torch.cuda.is_initialized():
+            torch.cuda.synchronize()
     except Exception as exc:  # noqa: BLE001 - typed, so it is not counted as a mismatch
         first = (str(exc).strip().splitlines() or [""])[0][:200]
         raise LaunchCrash(f"kernel launch raised {type(exc).__name__}: {first}") from exc

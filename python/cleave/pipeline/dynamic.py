@@ -306,7 +306,7 @@ class DynamicReport:
                 ("schedule", self.plans.summary().replace("\n  ", "  "), t.get("schedule")),
                 ("validate", f"{len(self.correct)} of {len(self.candidates)} correct over "
                  f"{self.n_workloads} workloads"
-                 + (f"  max error {format_measured(self.measured_error())}"
+                 + (f"  max error {format_measured(self.measured_error(), self.tolerance)}"
                     if self.measured_error() else ""), t.get("validate"))]
         rows += [("", f"  {n}x {k}", None) for k, n in self.histogram().items()]
         if self.expected:
