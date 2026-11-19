@@ -35,12 +35,12 @@ def _tolerance(out_rtol, lse_rtol):
 
     Both are relative to the row. For the bf16 output the row is the head_dim vector of one
     query row and head, and there is no absolute part: an empty causal row is exactly 0.
-    For the fp32 lse the row is the heads of one query row. Its error is proportional to its
-    magnitude (measured per operator: the same fraction of the row max, between 2e-7 and
-    1.6e-6, whether the lse is 2 or 25), so an absolute bound sized on one logit scale is
-    wrong on every other: at |lse| = 450 (logits x100) one fp32 ulp is already 3e-5.
-    ``LSE_ATOL`` only keeps a row whose lse is 0 from demanding a bit-exact answer; an empty
-    row's -inf is matched exactly either way.
+    For the fp32 lse the row is the heads of one query row. Its error grows with its
+    magnitude (measured per operator over |lse| of 2 .. 25: the largest absolute error rises
+    with the row max, the largest relative one stays level, between 2e-7 and 1.6e-6), so an
+    absolute bound sized on one logit scale is wrong on every other: at |lse| = 450 (logits
+    x100) one fp32 ulp is already 3e-5. ``LSE_ATOL`` only keeps a row whose lse is 0 from
+    demanding a bit-exact answer; an empty row's -inf is matched exactly either way.
 
     ``lse_rtol`` is the next 1-2-5 step at or above 4x the largest row-relative error the
     operator's valid kernels measured over its captured workloads and three seeds. ``out``

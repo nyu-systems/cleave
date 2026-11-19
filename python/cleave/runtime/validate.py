@@ -27,7 +27,9 @@ class Tolerance:
     ``scale`` is the largest finite ``|ref|`` of the entry's *row*: unit axes are dropped and
     the row is the last remaining axis (a vector is one row). ``rtol`` is therefore relative
     to the row, not to the entry, and an all-zero row demands ``|actual| <= atol``. ``atol``
-    is absolute, for outputs with no row scale (a log-sum-exp).
+    is absolute: the part of a bound that does not scale with the row. An operator's
+    measured error belongs in ``rtol``; ``atol`` is 0, or a small fixed floor where a row of
+    zeros is a legitimate value that cannot be reproduced bit for bit (a log-sum-exp of 0).
 
     There is no default bound anywhere: every operator declares its own, from a measured
     error (see :func:`compare_outputs`). A sequence of tolerances declares one per output.
