@@ -947,10 +947,13 @@ class GraphNode(Node):
                     assert (
                         edge.dst_node not in self.graph.nodes
                     ), f"Destination node {edge.dst_node.name} should not be in inner graph nodes."
+                    # src_id is the accumulator's index (what `_resolve_output_binding`
+                    # goes by), not the edge count: an accumulator may have several
+                    # readers outside the loop.
                     new_edge = AccumEdge(
                         self,
                         edge.dst_node,
-                        len(self.outputs),
+                        output_id,
                         edge.dst_id,
                         accum_node=node,
                     )
