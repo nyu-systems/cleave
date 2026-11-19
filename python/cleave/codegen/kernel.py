@@ -10,6 +10,7 @@ from ..ir.graph import (
     PlaceHolderNode,
 )
 from ..ir.ops.base import const_literal
+from ..ir.ops.reduction import Rescale
 from ..ir.graph_utils import find_topo_sort
 from .tensor_codegen import gen_copy, gen_tensor_allocation_str, gen_tensor_type
 from .buffer import BASE_INDENT, CodeBuffer
@@ -38,6 +39,51 @@ def _call(func: str, args: Sequence[str]) -> str:
 
 def _iter_sargs(graph):
     return graph.sargs if graph.iter_sargs is None else graph.iter_sargs
+
+
+def emission_order(graph) -> List[Node]:
+    """The order one tier's nodes are emitted in.
+
+    Dataflow order (``find_topo_sort``) for a graph that declares no lag node and no
+    rescaled accumulator: the same list, so the same text. With them, two orderings no
+    edge expresses are added. A lag node is emitted before the accumulator it snapshots
+    (it reads the value the *previous* iteration left, so its own input edge is not a
+    dependency), and a rescale factor is emitted before the accumulator it multiplies.
+    """
+    if not graph.lag_nodes and not graph.accum_scale:
+        return find_topo_sort(graph.nodes)
+    lag_ids = {id(n) for n in graph.lag_nodes}
+    lags_of = {}
+    for lag in graph.lag_nodes:
+        lags_of.setdefault(id(lag.inputs[0].src_node), []).append(lag)
+    factor_of = {id(acc): factor for acc, factor in graph.accum_scale.items()}
+
+    def deps(node):
+        if id(node) in lag_ids:
+            return []
+        found = [e.src_node for e in node.inputs] + lags_of.get(id(node), [])
+        factor = factor_of.get(id(node))
+        return found if factor is None else found + [factor]
+
+    order, state = [], {}  # state: 1 = on the stack, 2 = emitted
+
+    def visit(node):
+        seen = state.get(id(node))
+        if seen == 2:
+            return
+        assert seen is None, (
+            f"{node.name} would have to be emitted before itself: a lag node or a rescale "
+            "factor depends on the accumulator it is ordered in front of."
+        )
+        state[id(node)] = 1
+        for dep in deps(node):
+            visit(dep)
+        state[id(node)] = 2
+        order.append(node)
+
+    for node in graph.nodes:
+        visit(node)
+    return order
 
 
 class KernelEmitter:
@@ -458,7 +504,23 @@ class KernelEmitter:
             clear=node not in graph.accum_nodes,
             name_prefix=name_prefix,
         )
+        if graph.accum_scale and node in graph.accum_scale:
+            buf.block(self._emit_rescale(graph, node, name_prefix))
         buf.block(_call(func_name, call_args))
+
+    def _emit_rescale(self, graph, node, name_prefix) -> str:
+        """``acc *= factor`` on the accumulator's own buffer, right before it accumulates."""
+        factor = graph.accum_scale[node]
+        tname, scope = graph.tinfo_map[node]
+        fname, fscope = graph.tinfo_map[factor]
+        op = Rescale(
+            rank=len(kept_extents(graph.tmap[node].tile_size)),
+            lead=len(kept_extents(graph.tmap[factor].tile_size)),
+        )
+        func_name = self.emit_op_node(
+            op, mem_scope=fscope + scope, clear=False, name_prefix=name_prefix
+        )
+        return _call(func_name, [fname, tname])
 
     def _emit_subgraph(self, graph, node, buf, is_main_iter, name_prefix):
         sub = node.graph
@@ -538,7 +600,7 @@ class KernelEmitter:
         )
         self._emit_window_block(graph, name_prefix, buf)
         self._emit_prefetch_block(graph, name_prefix, buf)
-        for node in find_topo_sort(graph.nodes):
+        for node in emission_order(graph):
             if node in graph.prefetch_nodes or node in graph.window_nodes:
                 continue
             emitter = next(

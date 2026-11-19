@@ -86,7 +86,8 @@ def schedule_rolling_tier(t: SimpleNamespace) -> Graph:
     inner.tmap[inner_in] = Iterator(
         lambda i: ("0", f"{STEP} * {i}"), shape=(ROWS, KV), tile_size=(ROWS, STEP))
     for node in (t.shifted, t.p, t.psum):
-        inner.tmap[node] = Iterator(lambda i: ("0", "0"), shape=(ROWS, STEP), tile_size=(ROWS, STEP))
+        inner.tmap[node] = Iterator(
+            lambda i: ("0", "0"), shape=(ROWS, STEP), tile_size=(ROWS, STEP))
     for node in (t.m, t.m_prev, t.step, t.alpha, t.rowsum):
         inner.tmap[node] = Iterator(lambda i: ("0",), shape=(ROWS,), tile_size=(ROWS,))
     main = passes.annotate_args(main, is_main=True)

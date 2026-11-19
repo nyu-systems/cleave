@@ -96,7 +96,8 @@ def test_clone_remaps_lag_nodes_and_accum_scale():
     # the lag node of the clone snapshots the clone's max
     assert cloned.lag_nodes[0].inputs[0].src_node is cloned.accum_nodes[2]
     # the original is untouched
-    assert inner.lag_nodes == [t.m_prev] and inner.accum_scale == {t.rowsum: t.alpha, t.psum: t.alpha}
+    assert inner.lag_nodes == [t.m_prev]
+    assert inner.accum_scale == {t.rowsum: t.alpha, t.psum: t.alpha}
 
 
 def test_clone_keeps_the_stabilize_record():

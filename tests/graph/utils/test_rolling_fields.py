@@ -22,16 +22,19 @@ def _names(nodes):
     return [n.name for n in nodes]
 
 
-def test_fields_are_empty_by_default_and_last():
+def test_fields_are_empty_by_default_and_appended():
     from dataclasses import fields
 
     from cleave.ir.graph import Graph
 
     graph = Graph(nodes=[])
     assert graph.lag_nodes == [] and graph.accum_scale == {}
-    # Appended: no earlier field moved, so positional construction is what it was.
-    assert [f.name for f in fields(Graph)][-2:] == ["lag_nodes", "accum_scale"]
     assert Graph(nodes=[]).lag_nodes is not graph.lag_nodes
+    # Appended after every field the dataclass had: none of those moved, so positional
+    # construction is what it was.
+    names = [f.name for f in fields(Graph)]
+    assert names[0] == "nodes" and names.index("tmap") == 1
+    assert names.index("block_guard") < names.index("lag_nodes") < names.index("accum_scale")
 
 
 def test_a_factor_and_a_lag_node_are_not_accumulators():

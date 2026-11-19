@@ -104,6 +104,9 @@ _ALL = [
     _static("matmul_splitk_combine", (4, 128, 128), g.matmul_splitk_combine_graph),
     _static("matmul_splitk_partial", (4, 128, 128, 1024), g.matmul_splitk_partial_graph),
     _static("mha_bhsd", (1, 32, 4096, 4096, 64), g.mha_bhsd_graph),
+    # The same operator with a rolling softmax in place of the fixed shift: the shift
+    # cancels in O / l, so it is held to the reference and the tolerance of mha_bhsd.
+    _static("mha_bhsd_rolling", (1, 32, 4096, 4096, 64), g.mha_bhsd_graph),
     _static("mha_bshd", (1, 4096, 4096, 32, 64), g.mha_bshd_graph),
     _static("mha_split_combine", (32, 4, 4096, 64), g.mha_split_combine_graph),
     _static("mha_split_partial", (1, 32, 4, 4096, 1024, 64), g.mha_split_partial_graph),
