@@ -9,6 +9,7 @@ pytest.importorskip("tilelang")
 
 from cleave.ir.graph import GraphNode, TensorOp
 from cleave.ir.ops import (
+    NEG_FLT_MAX,
     Add,
     CausalMaskedExp,
     ConstFill,
@@ -28,10 +29,12 @@ from cleave.ir.ops import (
     PagedGather,
     RangeGather,
     ReduceSum,
+    Rescale,
     RowGather,
     RSqrt,
     Silu,
     Sqrt,
+    Stabilize,
     Sub,
 )
 from tests.graph.handwritten._cases import CASES
@@ -63,6 +66,12 @@ def _variants():
     yield ReduceSum((16, 32), axis=1)
     yield ReduceMax((16, 32), axis=-1)
     yield ReduceMax((16, 32), axis=1, name="other")
+    yield ReduceMax((16, 32), axis=-1, name="carried", accum_init=NEG_FLT_MAX)
+    marked = Exp((16, 32), name="marked")
+    marked.stabilize = Stabilize(axes=(-1,), scaled=(("rowsum", 1),))
+    yield marked
+    for rank, lead in ((1, 1), (2, 1), (2, 1), (2, 2), (3, 1)):
+        yield Rescale(rank, lead)
     yield PagedGather((16, 64), source_rows=128, index_extent=8, page_size=4)
     yield IndexGather((16,), index_extent=8, row_stride=1, clamp_index=7)
     yield RowGather((16, 64), source_rows=128, n_valid=4)
@@ -102,7 +111,8 @@ def test_equal_keys_mean_equal_macros():
         groups[op.macro_key()].append(op)
     assert len(groups) > 40
     for key, ops in groups.items():
-        n_in = len(getattr(ops[0], "inputs", ()))
+        # Rescale is no node (no `inputs`); its one operand besides the tile is the factor.
+        n_in = 1 if isinstance(ops[0], Rescale) else len(getattr(ops[0], "inputs", ()))
         for scope in ("g" * n_in + "r", "s" * n_in + "r", "r" * (n_in + 1), "g" * n_in + "s"):
             for clear in (False, True):
                 emitted = {_emit(op, scope, clear) for op in ops}
@@ -114,3 +124,26 @@ def test_key_tells_apart_literals_and_policies():
     a, b = (Matmul((64, 64, 32), warp_policy=p) for p in ("rows", "cols"))
     assert a.macro_key() != b.macro_key()
     assert ReduceSum((16, 32)).macro_key() != ReduceMax((16, 32)).macro_key()
+    assert Rescale(2, 1).macro_key() != Rescale(2, 2).macro_key()
+    assert Rescale(2, 1).macro_key() != Rescale(3, 1).macro_key()
+
+
+def test_rescale_is_emitted_for_register_operands():
+    """The equal-keys loop skips scopes an op refuses; make sure it does not skip them all."""
+    a, b = Rescale(2, 1), Rescale(2, 1)
+    assert a.macro_key() == b.macro_key()
+    assert _emit(a, "rr", False) == _emit(b, "rr", False) is not None
+
+
+def test_annotations_are_not_part_of_the_macro_key():
+    """A `Stabilize` record and a per-instance `accum_init` change what is built around the
+    op, never the op's own macro: marked and plain share one name and one body."""
+    plain, marked = Exp((16, 32)), Exp((16, 32), name="marked")
+    marked.stabilize = Stabilize(axes=(-1,), scaled=(("rowsum", 1),), rolling="", export=None)
+    assert marked.macro_key() == plain.macro_key()
+    assert _emit(marked, "rr", True) == _emit(plain, "rr", True) is not None
+    assert "stabilize" not in Exp._macro_attrs
+
+    carried = ReduceMax((16, 32), accum_init=NEG_FLT_MAX)
+    assert carried.macro_key() == ReduceMax((16, 32)).macro_key()
+    assert "accum_init" not in ReduceMax._macro_attrs

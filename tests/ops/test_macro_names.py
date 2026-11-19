@@ -1,12 +1,24 @@
 import ast
 import math
+import struct
 
 import pytest
 
 pytest.importorskip("tilelang")
 
 from cleave.codegen import TilelangCodeGen
-from cleave.ir.ops import Add, Div, Matmul, ReduceMax, Mul, ReduceSum, Sub
+from cleave.ir.ops import (
+    NEG_FLT_MAX,
+    Accumulate,
+    Add,
+    Div,
+    Matmul,
+    Mul,
+    ReduceMax,
+    ReduceSum,
+    Rescale,
+    Sub,
+)
 
 
 def _emit(cg, node, mem_scope, clear=False):
@@ -87,3 +99,67 @@ def test_reduce_max_macro_name():
     assert m == "ukernel_reduce_max_axis1_rr_clear" and m != s
     assert "T.reduce_max(" in cg.generated_macros[m] and "T.reduce_sum(" in cg.generated_macros[s]
     assert ReduceMax.accum_init == -math.inf and ReduceSum.accum_init is None
+
+
+def test_carried_max_start_is_per_instance():
+    """A carried softmax max starts at the most negative finite float32; `-inf` stays the
+    class default, and the start value is no part of the macro (it is the fill of the
+    accumulator's buffer, emitted where that is allocated)."""
+    assert NEG_FLT_MAX == -3.4028234663852886e38 and math.isfinite(NEG_FLT_MAX)
+    assert struct.unpack("f", struct.pack("f", NEG_FLT_MAX))[0] == NEG_FLT_MAX  # a float32
+    with pytest.raises(OverflowError):  # ... and no float16: such a buffer would hold -inf
+        struct.pack("e", NEG_FLT_MAX)
+
+    plain, carried = ReduceMax((16, 32)), ReduceMax((16, 32), accum_init=NEG_FLT_MAX)
+    assert carried.accum_init == NEG_FLT_MAX
+    assert plain.accum_init == -math.inf and "accum_init" not in vars(plain)
+    assert ReduceMax.accum_init == -math.inf and ReduceSum.accum_init is None
+    assert carried.macro_key() == plain.macro_key()
+    cg = TilelangCodeGen()
+    assert _emit(cg, carried, "rr") == _emit(cg, plain, "rr") == "ukernel_reduce_max_axis1_rr"
+    assert len(cg.generated_macros) == 1
+
+
+def test_only_a_max_is_a_running_accumulator():
+    assert ReduceMax.running_max is True and ReduceMax((16, 32)).running_max is True
+    for cls in (ReduceSum, Matmul, Accumulate, Mul):
+        assert cls.running_max is False, cls.__name__
+
+
+def test_rescale_macro_names_and_bodies():
+    cg = TilelangCodeGen()
+    full = _emit(cg, Rescale(rank=1, lead=1), "rr")
+    lead = _emit(cg, Rescale(rank=2, lead=1), "rr")
+    assert full == "ukernel_rescale_1dims_rr"
+    assert lead == "ukernel_rescale_lead1_2dims_rr"
+    assert cg.generated_macros[full] == (
+        "@T.macro\n"
+        "def ukernel_rescale_1dims_rr(S, ACC):\n"
+        "    for i0 in T.Parallel(*ACC.shape):\n"
+        "        ACC[i0] *= S[i0]\n"
+    )
+    assert cg.generated_macros[lead] == (
+        "@T.macro\n"
+        "def ukernel_rescale_lead1_2dims_rr(S, ACC):\n"
+        "    for i0, i1 in T.Parallel(*ACC.shape):\n"
+        "        ACC[i0, i1] *= S[i0]\n"
+    )
+    assert _defined_names(cg.prim_code) == [full, lead]
+    # Equal ranks, equal body: one macro however many accumulators use it.
+    assert _emit(cg, Rescale(rank=2, lead=1), "rr") == lead
+    assert len(cg.generated_macros) == 2
+
+    assert _emit(cg, Rescale(rank=3, lead=2), "rr") == "ukernel_rescale_lead2_3dims_rr"
+    assert "ACC[i0, i1, i2] *= S[i0, i1]" in cg.generated_macros["ukernel_rescale_lead2_3dims_rr"]
+
+
+@pytest.mark.parametrize("rank, lead", [(1, 2), (2, 0), (2, 3)])
+def test_rescale_factor_is_a_leading_slice(rank, lead):
+    with pytest.raises(AssertionError, match="Rescale"):
+        Rescale(rank=rank, lead=lead)
+
+
+@pytest.mark.parametrize("scope", ["sr", "rs", "gr"])
+def test_rescale_is_register_only(scope):
+    with pytest.raises(AssertionError, match="register"):
+        Rescale(rank=1, lead=1).gen_macro(mem_scope=scope, clear=False)

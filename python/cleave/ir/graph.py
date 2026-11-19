@@ -796,7 +796,10 @@ class TensorOp(PrimFuncNode):
 
 
 class ComputeOpNode(TensorOp):
-    pass
+    # True for an op whose accumulator is meaningful before its loop ends: a running max.
+    # A partial sum is not, so these are the only accumulators a node of their own loop
+    # may read (the lag snapshot of ``Graph.lag_nodes`` aside).
+    running_max: bool = False
 
 
 class ViewOpNode(TensorOp):

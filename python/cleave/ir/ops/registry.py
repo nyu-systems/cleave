@@ -35,6 +35,7 @@ from . import (
     PermuteView,
     RangeGather,
     ReduceSum,
+    Rescale,
     RowGather,
     RSqrt,
     Silu,
@@ -77,6 +78,7 @@ NO_REFERENCE: Dict[str, str] = {
     "MaskedLog2": _SCHED_ONLY,
     "ConstFill": "alternative producer in Graph.else_nodes, never in a source graph",
     "IndptrTileScan": "kernel-scope prologue, never in graph.nodes",
+    "Rescale": "in-place half of a rescaled accumulation (Graph.accum_scale), never in graph.nodes",
 }
 
 _UNARY = "unary elementwise; the identity fallback is exact"
@@ -99,6 +101,7 @@ AXIS_MAP_EXEMPT: Dict[str, str] = {
     "PermuteView": "not produced by lowering; identity fallback is inexact for perms",
     "ConstFill": "not a dataflow consumer (else_nodes)",
     "IndptrTileScan": "not a dataflow consumer (prologue)",
+    "Rescale": "not a dataflow consumer (Graph.accum_scale)",
 }
 
 
@@ -134,6 +137,7 @@ _SPECS = (
     _spec(RowGather),
     _spec(ConstFill),
     _spec(IndptrTileScan),
+    _spec(Rescale),
 )
 
 OPS: Dict[str, OpSpec] = {s.name: s for s in _SPECS}

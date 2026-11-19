@@ -4,6 +4,7 @@ import tvm
 from tvm import te
 
 from ..graph import ComputeOpNode
+from .base import MacroOp
 
 
 class Matmul(ComputeOpNode):
@@ -293,9 +294,15 @@ class ReduceMax(ReduceSum):
     kind = "reduce_max"
     _tl_reduce = "T.reduce_max"
     accum_init = -float("inf")
+    running_max = True
 
-    def __init__(self, dims, axis=-1, name=kind, dtype="float32", out_dtype="float32"):
+    def __init__(self, dims, axis=-1, name=kind, dtype="float32", out_dtype="float32",
+                 accum_init=None):
         super().__init__(dims, axis=axis, name=name, dtype=dtype, out_dtype=out_dtype)
+        # Per instance, so the class default (the identity of max) is untouched. Not a
+        # macro attribute: the fill is emitted where the accumulator is allocated.
+        if accum_init is not None:
+            self.accum_init = accum_init
 
     @staticmethod
     def _te_reduce(expr, axis):
@@ -361,3 +368,36 @@ class Accumulate(ComputeOpNode):
         func_name = f"ukernel_accumulate_{len(self.dims)}dims_{kwargs['mem_scope']}"
         func_name += "_clear" if kwargs["clear"] else ""
         return func_name
+
+
+class Rescale(MacroOp):
+    """``ACC *= S`` in place, ``S`` indexed by the leading ``lead`` axes of ``ACC``.
+
+    The in-place half of a rescaled accumulation (``Graph.accum_scale``): the codegen emits
+    it on the accumulator's own buffer, right before the accumulator's own macro. It is not
+    a node of the dataflow -- it produces no tile of its own -- and one body serves every
+    accumulator class (``ReduceSum``, ``Matmul``, ``Accumulate``), which is why the scale is
+    declared on the graph rather than being a variant of each of them. ``rank`` and ``lead``
+    are tile ranks of accumulator and factor (unit extents already squeezed).
+    """
+
+    _macro_attrs = ("rank", "lead")
+
+    def __init__(self, rank: int, lead: int):
+        assert 1 <= lead <= rank, f"Rescale: factor rank {lead} vs accumulator rank {rank}"
+        self.rank, self.lead = int(rank), int(lead)
+
+    def gen_macro(self, **kwargs) -> str:
+        s_scope, acc_scope = kwargs["mem_scope"]
+        assert s_scope == "r" and acc_scope == "r", "Rescale works on register fragments."
+        idx = [f"i{d}" for d in range(self.rank)]
+        macro_str = f"""\
+        @T.macro
+        def {self.get_macro_name(**kwargs)}(S, ACC):
+            for {", ".join(idx)} in T.Parallel(*ACC.shape):
+                ACC[{", ".join(idx)}] *= S[{", ".join(idx[: self.lead])}]"""
+        return self._format_code(macro_str)
+
+    def get_macro_name(self, **kwargs) -> str:
+        lead = "" if self.lead == self.rank else f"_lead{self.lead}"
+        return f"ukernel_rescale{lead}_{self.rank}dims_{kwargs['mem_scope']}"

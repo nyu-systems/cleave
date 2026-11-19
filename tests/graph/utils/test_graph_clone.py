@@ -7,7 +7,7 @@ import pytest
 pytest.importorskip("tilelang")
 
 from cleave.ir.graph import Graph, GraphNode, OutputNode, PlaceHolderNode
-from cleave.ir.ops import Matmul, Mul, wire_input
+from cleave.ir.ops import Exp, Matmul, Mul, ReduceSum, Stabilize, wire_input
 from cleave.ir.graph_utils import clone_graph, find_topo_sort, gather_all_nodes
 from tests.graph.handwritten._cases import CASES
 from tests.graph.handwritten._test_utils import gen_handwritten_code
@@ -59,6 +59,27 @@ def test_clone_copies_every_field_and_owns_its_state():
     mm_clone.set_tag("probe", 1)
     mm_clone.get_space_dim().append(0)
     assert mm.get_tag("probe") is None and mm.get_space_dim() == space
+
+
+def test_clone_keeps_the_stabilize_record():
+    """The annotation is written on the flat graph and read on its tiled clone."""
+    exp = Exp((16, 32), name="exp_0")
+    rowsum = ReduceSum((16, 32), name="rowsum_0")
+    plain = Exp((16,), name="exp_1", n_batch_dims=0)
+    wire_input(exp, rowsum, 0)
+    wire_input(rowsum, plain, 0)
+    graph = Graph(nodes=find_topo_sort(gather_all_nodes(OutputNode(plain, dtype="float32"))))
+    record = Stabilize(axes=(-1,), scaled=(("rowsum_0", 1),), rolling="why not", export="max_0")
+    exp.stabilize = record
+
+    clone = graph.clone()
+    by_name = {n.name: n for n in clone.nodes}
+    assert by_name["exp_0"] is not exp
+    assert by_name["exp_0"].stabilize == record
+    assert by_name["exp_1"].stabilize is None and Exp.stabilize is None
+    # Consuming the record on the clone (what the rewrite does) leaves the flat graph's.
+    by_name["exp_0"].stabilize = None
+    assert exp.stabilize == record
 
 
 @pytest.mark.parametrize("name", sorted(CASES))
