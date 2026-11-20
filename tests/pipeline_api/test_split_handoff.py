@@ -199,12 +199,31 @@ def test_kernel_call_hands_the_partial_outputs_over_in_the_logical_layout(factor
 
 def test_a_reshape_hand_off_would_scramble_the_partial_outputs():
     """Why the layout is carried: with split == HQ the stored and the logical shapes are
-    equal, so without the record the combine gets the tensors transposed and sums the
-    wrong axis. (This is what every split-first partial did before the record.)"""
-    kernel, inputs, want = _chained(8, None)
-    assert all(p.layout is None for p in kernel.stages[1].params)
+    equal, so a reshape hands the combine the tensors transposed and it sums the wrong
+    axis. (This is what every split-first partial did before the record.)"""
+    kernel, inputs, want = _chained(8, (ROWSUM, VALUE))
+    for param in kernel.stages[1].params:
+        param.layout = None  # what `Kernel.__call__` does for a Param without one
     got = kernel(*inputs)
     assert got.shape == want.shape and not torch.allclose(got, want, rtol=1e-2, atol=1e-3)
+
+
+@pytest.mark.parametrize("layouts, found", [(None, "no"), ((VALUE,), "1")])
+def test_a_partial_result_without_its_stored_layouts_is_not_chained(layouts, found):
+    """Records on both sides but no layouts next to the partial's source (a ``build_fn``
+    that returns the source alone): the hand-off could only be the reshape above, so the
+    Kernel is unrunnable instead of wrong."""
+    partial, combine = _lower(8)
+    stages, problem = _stages(partial, combine, layouts)
+    assert problem == (f"g0 split-k=8 partial: the partial's result carries {found} stored "
+                       "layouts for its 2 outputs, so they cannot be handed to the combine")
+    assert [p.index for p in stages[1].params] == [1, 0]  # still paired by record
+    assert all(p.layout is None for p in stages[1].params)
+    kernel = Kernel(stages, name="split", input_names=["q", "k", "v"],
+                    input_shapes=[(HQ, SQ, D), (HKV, 64, D), (HKV, 64, D)],
+                    output_shapes=[(HQ, SQ, D)], variant="split-k=8", unrunnable=problem)
+    with pytest.raises(NotImplementedError, match="carries .* stored layouts"):
+        kernel(*[torch.zeros(s) for s in kernel.input_shapes])
 
 
 def test_stage_layouts_survive_save_and_load(tmp_path):
@@ -263,11 +282,97 @@ def test_variants_pair_a_partial_only_with_a_combine_of_its_own_boundary():
     assert [m.label for m in both.variants()["split-k=8"].members] == [
         "fast partial of another cut", "other combine"]
 
-    # nothing that fits together: no variant, and best() says so
+    # nothing that fits together: no variant, and the report says why
+    assert report.unpaired() == both.unpaired() == {}
     apart = Report([_result(other_partial, "partial", 1.0, "p"), _result(combine, "combine", 0.5, "c")])
     assert apart.variants() == {}
-    with pytest.raises(CleaveError, match="no split-k=8 compiled, validated and timed"):
+    (why,) = apart.unpaired().values()
+    assert why == ("no partial writes what a combine reads: the partials write "
+                   "[#0 (8, 8, 64) float16, #1 (8, 8, 64, 64) float16], the combines read "
+                   "[#0 (8, 8, 64) float32, #1 (8, 8, 64, 64) float32]")
+    with pytest.raises(CleaveError, match="no split-k=8 compiled, validated and timed.*"
+                                          "split-k=8 unpaired: no partial writes what"):
         apart.best("split-k=8")
+    with pytest.raises(CleaveError, match="split-k=8 unpaired: no partial writes what"):
+        apart.best()
+
+
+def _without_records(graph, only=None):
+    """A copy of ``graph`` with the boundary records of its placeholders and outputs
+    removed (of the node at position ``only`` of that list, when given)."""
+    bare = graph.clone()
+    nodes = [n for n in bare.nodes if isinstance(n, (PlaceHolderNode, OutputNode))
+             and n.boundary is not None]
+    for node in nodes if only is None else [nodes[only]]:
+        node.boundary = None
+    return bare
+
+
+def _solo(latency_ms=5.0):
+    return Result(SimpleNamespace(label="solo plan", variant="solo", role="main"),
+                  _run(None, latency_ms))
+
+
+@pytest.mark.parametrize("bare_role", ["combine", "partial"])
+def test_records_on_one_side_only_are_refused_and_reported(bare_role):
+    """A combine built at IR level without records, next to a partial lowered by ``to_ir``
+    (or the other way round). Both consumers refuse it, and neither is silent: pairing it
+    by position is the guess the records replace."""
+    partial, combine = _lower(8)
+    if bare_role == "combine":
+        combine = _without_records(combine)
+    else:
+        partial = _without_records(partial)
+    assert (boundary_of(_plan(partial, "partial")) is None) == (bare_role == "partial")
+    assert (boundary_of(_plan(combine, "combine")) is None) == (bare_role == "combine")
+
+    stages, problem = _stages(partial, combine)
+    tagged_role = "partial" if bare_role == "combine" else "combine"
+    assert problem == (f"g0 split-k=8 {bare_role}: carries no boundary records while "
+                       f"g0 split-k=8 {tagged_role} does; every tensor crossing the cut "
+                       "needs a Boundary on both sides")
+    assert [(p.source, p.index, p.layout) for p in stages[1].params] == [("stage", -1, None)] * 2
+
+    report = Report([_result(partial, "partial", 1.0, "p"), _result(combine, "combine", 0.5, "c"),
+                     _solo()])
+    assert list(report.variants()) == ["solo"]  # the solo result is still there
+    side = {tagged_role: "[#0 (8, 8, 64) float32, #1 (8, 8, 64, 64) float32]",
+            bare_role: "tensors without boundary records"}
+    why = (f"no partial writes what a combine reads: the partials write {side['partial']}, "
+           f"the combines read {side['combine']}")
+    assert report.unpaired() == {"split-k=8": why}
+    assert report.to_dict()["unpaired"] == {"split-k=8": why}
+    assert f"[split-k=8 unpaired: {why}]" in report.summary()
+    with pytest.raises(CleaveError, match="split-k=8 unpaired: no partial writes"):
+        report.best("split-k=8")
+    assert report.to_dict()["best"] == "solo"
+
+
+def test_unreadable_records_do_not_take_the_report_down():
+    """Records on only some tensors of one side: a rewrite added a tensor to the cut without
+    saying which one it is. That pair is never chained, and the report of everything else
+    still stands (it used to raise out of variants(), summary() and to_dict())."""
+    partial, combine = _lower(8)
+    half = _without_records(partial, only=-1)  # one output keeps its record, one loses it
+    with pytest.raises(ValueError, match="boundary records on only some of"):
+        boundary_of(_plan(half, "partial"))
+
+    stages, problem = _stages(half, combine)
+    assert problem.startswith("g0 split-k=8 combine: boundary records on only some of")
+    assert [p.index for p in stages[1].params] == [-1, -1]
+
+    report = Report([_result(half, "partial", 1.0, "p"), _result(combine, "combine", 0.5, "c"),
+                     _solo()])
+    assert list(report.variants()) == ["solo"]
+    (why,) = report.unpaired().values()
+    assert why.startswith("p: boundary records on only some of")
+    assert "split-k=8 unpaired: p: boundary records on only some of" in report.summary()
+    assert report.to_dict()["best"] == "solo"
+
+    # a readable pair of the same variant is still found next to the unreadable plan
+    mixed = Report(report.results + [_result(partial, "partial", 2.0, "whole")])
+    assert [m.label for m in mixed.variants()["split-k=8"].members] == ["whole", "c"]
+    assert mixed.unpaired() == {}
 
 
 def test_variants_without_records_pair_as_before():

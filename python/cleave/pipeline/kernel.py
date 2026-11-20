@@ -22,8 +22,8 @@ class Param:
     # For a "stage" param, how the previous stage's kernel stores that output: the
     # ``(axes, pad)`` its tiling recorded (``Graph.stored_layouts``). ``shape`` is the
     # logical shape this kernel reads, so the tensor is brought back with ``to_logical``.
-    # None when nothing was recorded: the tensor is then reshaped to ``shape``, which is
-    # only right when the two differ by unit axes.
+    # None for a pair of hand-built graphs (no boundary records): the tensor is then
+    # reshaped to ``shape``, which is only right when the two differ by unit axes.
     layout: tuple | None = None
 
 
@@ -198,20 +198,40 @@ def _combine_params(plan, phs, partial_plan, partial_layouts):
     from ..runtime.reference import output_order
 
     outputs = output_order(partial_plan.tile.flat_graph)  # as the partial kernel returns them
-    want, have = boundary_of(plan), boundary_of(partial_plan)
-    if want is None or have is None:
+    unfed = [Param(ph.name, "stage", -1, _shape(ph)) for ph in phs]
+    try:
+        want, have = boundary_of(plan), boundary_of(partial_plan)
+    except ValueError as error:  # records on some tensors of one side only, or an index twice
+        return unfed, f"{plan.label}: {error}"
+    if want is None and have is None:
         return _combine_params_by_position(plan, phs, outputs)
+    if want is None or have is None:
+        # Records on one side only: a graph built outside ``to_ir`` next to a lowered one.
+        # The positional pairing is for graphs that have no records at all; here it would
+        # be the guess the records replace, so the pair is refused.
+        bare, tagged = (plan, partial_plan) if want is None else (partial_plan, plan)
+        return unfed, (f"{bare.label}: carries no boundary records while {tagged.label} "
+                       "does; every tensor crossing the cut needs a Boundary on both sides")
     problem = None
     if want != have:
         # Index, role, logical shape and dtype of every tensor, compared exactly: two
         # tensors of one shape are told apart by index and role, never by position.
         problem = (f"{plan.label}: the combine reads {_describe(want)} but the partial kernel "
                    f"{partial_plan.label} writes {_describe(have)}")
+    layouts = partial_layouts
+    if layouts is None or len(layouts) != len(outputs):
+        # Without the layouts the hand-off would be a reshape, which hands a split-first
+        # output over transposed -- silently so when the shapes coincide.
+        found = "no" if layouts is None else str(len(layouts))
+        problem = problem or (
+            f"{partial_plan.label}: the partial's result carries {found} stored layouts "
+            f"for its {len(outputs)} outputs, so they cannot be handed to the combine")
+        layouts = None
     position = {o.boundary.index: i for i, o in enumerate(outputs)}
     params = []
     for ph in phs:
         i = position.get(ph.boundary.index, -1)
-        layout = None if partial_layouts is None or i < 0 else partial_layouts[i]
+        layout = None if layouts is None or i < 0 else layouts[i]
         params.append(Param(ph.name, "stage", i, _shape(ph), layout))
     return params, problem
 
@@ -245,6 +265,10 @@ def stages_for(plans_and_results, program) -> tuple[list[Stage], str | None]:
     A combine's placeholders are paired with the partial's outputs by boundary record
     (``Boundary``: index and role, with logical shape and dtype compared exactly), and each
     takes the stored layout the partial's result carries, so ``Kernel.__call__`` can undo it.
+    A pair with records is a problem (the Kernel is unrunnable) when the two sides differ,
+    when only one side has records, or when the partial's result has no stored layouts.
+    Only a pair with no records at all (hand-built graphs) is paired by position and handed
+    over by reshape, as before the records.
     """
     from ..runtime.reference import graph_out_indices, placeholder_order
 

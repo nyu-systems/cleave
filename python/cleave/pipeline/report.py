@@ -192,21 +192,37 @@ class Report(_Results):
     def timed(self) -> list[Result]:
         return [r for r in self.results if r.ok and r.latency_ms is not None]
 
-    def variants(self) -> dict[str, VariantResult]:
-        """Best latency per variant: solo = best main; split-k=N = the fastest partial +
-        combine pair that pass the same tensors across the cut."""
+    def _resolve(self) -> tuple[dict[str, VariantResult], dict[str, str]]:
         timed: dict[str, dict[str, list[Result]]] = {}
         for r in self.timed:
             timed.setdefault(r.variant, {}).setdefault(r.role, []).append(r)
-        out = {}
+        out, unpaired = {}, {}
         for variant, roles in timed.items():
             if "main" in roles:
                 members = [_fastest(roles["main"])]
             else:
-                members = _fastest_pair(roles.get("partial", ()), roles.get("combine", ()))
+                members, why = _fastest_pair(roles.get("partial", ()), roles.get("combine", ()))
+                if why is not None:
+                    unpaired[variant] = why
             if members:
                 out[variant] = VariantResult(variant, sum(m.latency_us for m in members), members)
-        return out
+        return out, unpaired
+
+    def variants(self) -> dict[str, VariantResult]:
+        """Best latency per variant: solo = best main; split-k=N = the fastest partial +
+        combine pair that pass the same tensors across the cut (see ``unpaired``).
+
+        A split variant's latency is the sum of its two stage timings. The copy that hands
+        a partial's transposed outputs to the combine is in the partial's timing
+        (``runtime.reference.with_hand_off``), so the sum covers the stages and the
+        hand-off of a chained call; it is not a timing of the chained Kernel itself."""
+        return self._resolve()[0]
+
+    def unpaired(self) -> dict[str, str]:
+        """Split variants that have timed partial and combine kernels but no pair that fits
+        together, with the reason. Such a variant is not in ``variants()``; the stage
+        report, ``to_dict()`` and ``best(variant)`` say why instead of dropping it."""
+        return self._resolve()[1]
 
     def best(self, variant: str | None = None):
         """The fastest Kernel overall, or of one ``variant`` (``"solo"``, ``"split-k=8"``)."""
@@ -217,6 +233,10 @@ class Report(_Results):
             if not variants:
                 refused = getattr(self.plans, "refused", None) if not len(self) else None
                 why = f"; refused: {refused[0].reason}" if refused else ""
+                unpaired = self.unpaired()
+                for name in [variant] if variant is not None else unpaired:
+                    if name in unpaired:
+                        why += f"; {name} unpaired: {unpaired[name]}"
                 raise CleaveError(f"no {variant or 'kernel'} compiled, validated and timed "
                                   f"({len(self)} candidates; failures: {self.failures}{why})")
             win = min(variants.values(), key=lambda v: v.latency_us)
@@ -256,6 +276,8 @@ class Report(_Results):
             "timings_s": self.timings,
             "variants": {k: {"latency_us": v.latency_us, "kernels": [m.label for m in v.members]}
                          for k, v in variants.items()},
+            # split variants whose timed partial and combine kernels do not fit together
+            "unpaired": self.unpaired(),
             "best": None if not variants else min(variants.values(), key=lambda v: v.latency_us).variant,
         }
 
@@ -282,7 +304,7 @@ class Report(_Results):
                      + (f"  [{val_fail}]" if val_fail else "")
                      + (f"  max error {worst}" if worst else ""), None))
         bench_fail = Failures(r for r in self.results if not r.ok and r.stage == "bench")
-        variants = self.variants()
+        variants, unpaired = self._resolve()
         if variants:
             win = min(variants.values(), key=lambda v: v.latency_us)
             others = ", ".join(f"{v.variant} {v.latency_us:.2f}" for v in
@@ -292,6 +314,8 @@ class Report(_Results):
                 text += f"  (others: {others} us)"
         else:
             text = "no complete variant"
+        for name, why in unpaired.items():
+            text += f"  [{name} unpaired: {why}]"
         if bench_fail:
             text += f"  [{bench_fail}]"
         rows.append(("benchmark", text, self.timings.get("benchmark")))
@@ -315,9 +339,10 @@ def _fastest(results) -> Result:
     return min(results, key=lambda r: r.latency_ms)
 
 
-def _fastest_pair(partials, combines) -> list[Result] | None:
-    """``[partial, combine]`` with the lowest total latency among the pairs whose boundary
-    signatures are equal, or None when no partial matches any combine.
+def _fastest_pair(partials, combines) -> tuple[list[Result] | None, str | None]:
+    """``([partial, combine], None)``: the pair with the lowest total latency among those
+    whose boundary signatures are equal. ``(None, why)`` when there are partials and
+    combines but none fit together, ``(None, None)`` when one of the two is missing.
 
     The combine of a factor is searched once and shared by every split graph of the program,
     so the fastest partial and the fastest combine need not come from the same cut. Each is
@@ -326,26 +351,51 @@ def _fastest_pair(partials, combines) -> list[Result] | None:
     index, role, shape and dtype of every tensor crossing the cut -- not what the tensors
     hold: two cuts that pass equally shaped tensors with different contents would be
     paired. (Every cut of the programs searched today has one boundary and one combine.)
-    Plans without records all compare equal (None), which is the pairing there was before
-    the records.
-    """
-    from .kernel import boundary_of
 
-    signatures: dict[int, object] = {}  # plans of one lowered graph share the answer
+    This is the pairing ``kernel.stages_for`` accepts. Plans without records (hand-built
+    graphs) all compare equal, which is the pairing there was before the records. A side
+    with records never pairs with one without, and a plan whose records cannot be read
+    (set on some of its tensors only, or one index twice) pairs with nothing: either is a
+    graph built without saying which tensor is which, and the reason is returned so that
+    the variant is reported as unpaired instead of vanishing.
+    """
+    from .kernel import _describe, boundary_of
+
+    read: dict[int, tuple] = {}  # plans of one lowered graph share the answer
 
     def signature(result):
         graph = getattr(getattr(result.plan, "tile", None), "flat_graph", None)
-        if id(graph) not in signatures:
-            signatures[id(graph)] = boundary_of(result.plan)
-        return signatures[id(graph)]
+        if id(graph) not in read:
+            try:
+                read[id(graph)] = (boundary_of(result.plan), None)
+            except ValueError as error:
+                read[id(graph)] = (None, f"{result.label}: {error}")
+        return read[id(graph)]
 
     sides: dict[object, dict[str, list[Result]]] = {}
+    unreadable = []
     for role, results in (("partial", partials), ("combine", combines)):
         for r in results:
-            sides.setdefault(signature(r), {}).setdefault(role, []).append(r)
+            found, error = signature(r)
+            if error is None:
+                sides.setdefault(found, {}).setdefault(role, []).append(r)
+            elif error not in unreadable:
+                unreadable.append(error)
     pairs = [[_fastest(side["partial"]), _fastest(side["combine"])]
              for side in sides.values() if len(side) == 2]
-    return min(pairs, key=lambda pair: sum(m.latency_ms for m in pair), default=None)
+    if pairs:
+        return min(pairs, key=lambda pair: sum(m.latency_ms for m in pair)), None
+    if not partials or not combines:
+        return None, None
+    if unreadable:
+        return None, "; ".join(unreadable)
+
+    def tensors(role):
+        return " or ".join("tensors without boundary records" if found is None
+                           else _describe(found) for found, side in sides.items() if role in side)
+
+    return None, (f"no partial writes what a combine reads: the partials write "
+                  f"{tensors('partial')}, the combines read {tensors('combine')}")
 
 
 def _hist(counter) -> str:
