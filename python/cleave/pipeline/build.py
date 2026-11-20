@@ -164,11 +164,36 @@ class BuildSet(_Results):
         return f"BuildSet: {len(self)} candidates, {len(self.correct)} ok, failures: {self.failures}"
 
 
-def _program_dtype(plans) -> str:
+def _program(plans):
     program = getattr(plans, "program", None)
     if program is None and len(plans):
         program = plans[0].program
-    return str(getattr(program, "dtype", None) or "float16")
+    return program
+
+
+def _program_dtype(plans) -> str:
+    return str(getattr(_program(plans), "dtype", None) or "float16")
+
+
+def _reference_fn(distributions, program, publish):
+    """``publish(cache_dir, graph, dtype)`` over the input cases the kernels are held to.
+
+    ``distributions`` is what the caller asked for. A program whose softmax is exact
+    (``cl.softmax`` recorded the stabilize request) is right at any logit scale, so its
+    kernels are also held to every adversarial softmax case its inputs can be shaped into
+    (``cleave.runtime.inputs.adversarial_cases``), whether asked or not; they are timed on
+    the first case, as always. A fixed-shift or hand-written ``exp / sum`` makes no such
+    claim (its reference overflows on those inputs) and is validated on what was asked.
+    """
+    if not getattr(program, "stabilize_requests", ()):
+        return functools.partial(publish, distributions=distributions)
+    from ..runtime.inputs import adversarial_cases
+
+    def exact(reference_cache_dir, graph, dtype):
+        extra = tuple(d for d in adversarial_cases(graph) if d not in distributions)
+        return publish(reference_cache_dir, graph, dtype, distributions=distributions + extra)
+
+    return exact
 
 
 def _check_tolerance_fits(plan_list, tolerance) -> None:
@@ -224,8 +249,8 @@ def build(plans: PlanSet | Sequence[Plan], workers: int | None = None, *,
     if plan_list and config.tolerance is None:
         raise SpecError("build(): no validation tolerance declared; there is no default bound. "
                         "Pass config=EvalConfig(tolerance=cl.Tolerance(rtol=...))")
-    reference_fn = functools.partial(publish_reference,
-                                     distributions=check_distributions(config.distributions))
+    reference_fn = _reference_fn(check_distributions(config.distributions),
+                                 _program(plans), publish_reference)
     _check_tolerance_fits(plan_list, config.tolerance)
     t0 = time.perf_counter()
     runs = run_candidates([p.tile for p in plan_list], _program_dtype(plans),

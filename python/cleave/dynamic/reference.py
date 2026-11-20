@@ -17,7 +17,7 @@ import torch
 
 from ..core.errors import SpecError
 from ..core.settings import Settings
-from ..runtime.inputs import DISTRIBUTIONS as SHARED_DISTRIBUTIONS
+from ..runtime.inputs import SHARED_DISTRIBUTIONS
 from ..runtime.inputs import INCREASING_SPAN, LARGE_LOGIT_FACTOR
 
 SEED = 0

@@ -6,11 +6,25 @@ the *score* matmuls: the matmuls an ``Exp`` is reached from without crossing ano
 
 ``large_logits``  the query operand times 100, so every logit is 100 times larger;
 ``increasing``    logits that grow along the key axis for every query row, by more than
-                  fp32 ``exp`` can hold, so a running max changes at every tile.
+                  fp32 ``exp`` can hold, so a running max changes at every tile;
+``decreasing``    the same ramp the other way round: the row max is the first key, so a
+                  running max is final after the first tile and never moves again;
+``last_spike``    normal logits, except that the last key scores at least 64 above every
+                  other: the max jumps in the last tile, by more than everything
+                  accumulated before it survives;
+``constant``      every key is the same key: all logits of a row are equal, the softmax is
+                  uniform and a running max never moves;
+``offset``        normal-sized logits (on a 1/8 grid, see ``OFFSET``) that all sit about
+                  1e4 below zero: ``exp`` of any of them is 0, only the differences count.
+
+The first three are shared with the dynamic operators (``SHARED_DISTRIBUTIONS``); the others
+exist for the dense programs only.
 
 Each is requested explicitly (``EvalConfig.distributions`` for a program,
-``make_inputs(..., distribution=...)`` for a graph). A graph with no score matmul has no
-logits to shape, and asking for an adversarial distribution on it is an error.
+``make_inputs(..., distribution=...)`` for a graph); a program whose softmax is exact is
+validated on all of them (``ADVERSARIAL``, see ``cleave.pipeline.build``). A graph with no
+score matmul has no logits to shape, and asking for an adversarial distribution on it is an
+error.
 """
 
 from __future__ import annotations
@@ -20,13 +34,28 @@ from ..ir.graph import PlaceHolderNode
 from ..ir.ops import Div, Exp, Matmul, Mul, PermuteView, SplitView
 from .reference import placeholder_order
 
-DISTRIBUTIONS = ("normal", "large_logits", "increasing")
+# What a dynamic operator can be validated on as well (``cleave.dynamic.reference`` adds two
+# of its own), and what only a dense program can.
+SHARED_DISTRIBUTIONS = ("normal", "large_logits", "increasing")
+DISTRIBUTIONS = SHARED_DISTRIBUTIONS + ("decreasing", "last_spike", "constant", "offset")
+# Everything but ``normal``: what a program is held to once its softmax is exact.
+ADVERSARIAL = DISTRIBUTIONS[1:]
 
 LARGE_LOGIT_FACTOR = 100.0
 # ``increasing``: q.k ramps from 0 to ``a * INCREASING_SPAN * sqrt(K)`` along the keys (``K`` the
 # contracted width, ``a`` in [0.5, ...) per query row), i.e. over ``a * 128`` after the usual
 # 1/sqrt(K) scaling -- past ln(fp32 max) = 88.7.
 INCREASING_SPAN = 128.0
+# ``offset``: every logit is ``-OFFSET`` plus a normal-sized term, after the usual 1/sqrt(K)
+# scaling. The offset is the product of one coordinate of the contraction, ``OFFSET_QUERY``
+# on the query side; the other coordinates are rounded to multiples of ``OFFSET_GRID``. Their
+# products are then multiples of 1/64 and every partial sum of the contraction is exact in
+# fp32 (below 2^18 for K up to 512), in whatever order it is accumulated: the kernel and the
+# reference see the same logits bit for bit, so the case measures the softmax and not the
+# rounding of a sum at magnitude 1e5, where one fp32 ulp is 1e-3 of a logit.
+OFFSET = 1.0e4
+OFFSET_QUERY = 256.0
+OFFSET_GRID = 0.125
 
 
 def check_distributions(distributions) -> tuple:
@@ -38,6 +67,26 @@ def check_distributions(distributions) -> tuple:
             f"input distributions must be drawn from {DISTRIBUTIONS}, got {distributions!r}"
         )
     return names
+
+
+def adversarial_cases(graph) -> tuple:
+    """The adversarial cases ``graph``'s inputs can be shaped into, in ``ADVERSARIAL`` order.
+
+    All of them when every score matmul reads a query input and a separate key input; only
+    ``large_logits`` when one input is both; none when the graph has no score matmul or an
+    operand of one is computed (the logits of RMSNorm-ed operands are bounded, whatever the
+    inputs are).
+    """
+    scores = score_matmuls(graph)
+    try:
+        operands = [(_operand(m, 0)[0], _operand(m, 1)[0]) for m in scores]
+    except SpecError:
+        return ()
+    if not operands:
+        return ()
+    if {id(q) for q, _ in operands} & {id(k) for _, k in operands}:
+        return ("large_logits",)
+    return ADVERSARIAL
 
 
 def score_matmuls(graph) -> list:
@@ -152,8 +201,24 @@ def apply_distribution(graph, inputs, distribution):
     if both:
         raise SpecError(
             f"input {placeholders[both[0]].name!r} is both a query and a key of the scores; "
-            "the 'increasing' inputs need them to be separate inputs"
+            f"the {distribution!r} inputs need them to be separate inputs"
         )
+    if distribution == "constant":
+        for i, (matmul, node, views, _) in keys.items():
+            key_axis, _ = _operand_axes(matmul, 1, node, views)
+            if key_axis is not None:  # the first key, for every key
+                out[i] = inputs[i].narrow(key_axis, 0, 1).expand_as(inputs[i]).contiguous()
+        return tuple(out)
+    if distribution in ("last_spike", "offset"):
+        shape = _spike if distribution == "last_spike" else _offset
+        for i, (matmul, node, views) in queries.items():
+            _, contracted = _operand_axes(matmul, 0, node, views)
+            out[i] = shape(inputs[i], contracted, matmul.K)
+        for i, (matmul, node, views, sign) in keys.items():
+            key_axis, contracted = _operand_axes(matmul, 1, node, views)
+            out[i] = shape(inputs[i], contracted, matmul.K, key=(key_axis, sign))
+        return tuple(out)
+
     for i, (matmul, node, views) in queries.items():
         _, contracted = _operand_axes(matmul, 0, node, views)
         x = inputs[i].float()
@@ -171,5 +236,43 @@ def apply_distribution(graph, inputs, distribution):
             n = x.shape[key_axis]
             shape[key_axis] = n
             ramp = torch.arange(n, device=x.device, dtype=torch.float32) / (n - 1)
+            if distribution == "decreasing":
+                ramp = ramp.flip(0)
         out[i] = (sign * INCREASING_SPAN * ramp).reshape(shape).expand_as(x).to(x.dtype).contiguous()
     return tuple(out)
+
+
+def _first(x, contracted):
+    """The first coordinate of ``x`` along the contraction (a view)."""
+    return x if contracted is None else x.narrow(contracted, 0, 1)
+
+
+def _spike(x, contracted, width, key=None):
+    """``last_spike``: a query's first coordinate along the contraction becomes a positive
+    magnitude ``|q_0| + 0.5``; the last key becomes ``INCREASING_SPAN * sqrt(K)`` there and
+    zero elsewhere. It then scores ``magnitude * 128`` (at least 64) after the 1/sqrt(K)
+    scaling, while every other key scores as a normal key does."""
+    out = x.float().clone()
+    if key is None:
+        first = _first(out, contracted)
+        first.copy_(first.abs() + 0.5)
+        return out.to(x.dtype)
+    key_axis, sign = key
+    last = out if key_axis is None else out.narrow(key_axis, out.shape[key_axis] - 1, 1)
+    last.zero_()
+    _first(last, contracted).fill_(sign * INCREASING_SPAN * width ** 0.5)
+    return out.to(x.dtype)
+
+
+def _offset(x, contracted, width, key=None):
+    """``offset``: every coordinate on the ``OFFSET_GRID``; the first one along the
+    contraction is ``OFFSET_QUERY`` for a query and, for every key, the grid value whose
+    product with it is ``-OFFSET * sqrt(K)``."""
+    import torch
+
+    out = torch.round(x.float() / OFFSET_GRID) * OFFSET_GRID
+    value = OFFSET_QUERY
+    if key is not None:
+        value = -key[1] * round(OFFSET * width ** 0.5 / OFFSET_QUERY / OFFSET_GRID) * OFFSET_GRID
+    _first(out, contracted).fill_(value)
+    return out.to(x.dtype)

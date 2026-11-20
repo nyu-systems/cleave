@@ -1,10 +1,11 @@
 """The validation input distributions (CPU): ``normal`` and the adversarial softmax cases.
 
-``large_logits`` and ``increasing`` are generators only for the dense programs: none of them
-validates on them until its softmax is stabilized (today's fixed-shift references are NaN
-there). The dynamic operators have two more (``large_scale``, ``dominant_last``), and one
-operator's softmax is exact and validates on all four, which
-``test_adversarial_inputs_are_switched_on_per_operator`` pins.
+``large_logits`` and ``increasing`` are shared by the dense programs and the dynamic
+operators. The dense programs have four more (``decreasing``, ``last_spike``, ``constant``,
+``offset``), the dynamic operators two (``large_scale``, ``dominant_last``). A dense program
+is held to its adversarial cases once its softmax is exact, that is when ``cl.softmax``
+recorded the request (a fixed-shift reference is NaN on them); one dynamic operator's
+softmax is exact so far. ``test_adversarial_inputs_are_switched_on_per_operator`` pins both.
 """
 
 import inspect
@@ -25,9 +26,13 @@ from cleave.ir.ops import Exp
 from cleave.pipeline import EvalConfig
 from cleave.runtime import inputs as rt_inputs
 from cleave.runtime import reference as rt
-from cleave.runtime.inputs import DISTRIBUTIONS, INCREASING_SPAN, LARGE_LOGIT_FACTOR
+from cleave.runtime.inputs import (
+    ADVERSARIAL as DENSE_ADVERSARIAL, DISTRIBUTIONS, INCREASING_SPAN, LARGE_LOGIT_FACTOR, OFFSET,
+    OFFSET_GRID, SHARED_DISTRIBUTIONS, adversarial_cases,
+)
 
 from tests import _graphs as g
+from tests._softmax import exact_softmax
 from tests.frontend import _programs as programs
 
 DTYPE = "float16"
@@ -145,6 +150,124 @@ def test_increasing_follows_the_whole_key_axis_through_a_split():
     assert float(whole.min()) > 0.4 * INCREASING_SPAN and float(whole.max()) > 88.7
 
 
+@pytest.mark.parametrize("name", sorted(ATTENTION))
+def test_decreasing_is_the_increasing_ramp_the_other_way_round(name):
+    build, _ = ATTENTION[name]
+    graph = build()
+    falling, rising = _inputs(graph, "decreasing"), _inputs(graph, "increasing")
+    assert all(torch.isfinite(t).all() for t in falling)
+    for down, up in zip(_scores(graph, falling), _scores(graph, rising)):
+        steps = down.diff(dim=-1)
+        assert (steps <= 0).all(), "logits must never rise along the key axis"
+        # the row max is the first key, and a later tile (16 keys or more) is strictly below
+        assert (down[..., :-16] > down[..., 16:]).all()
+        assert (down[..., :1] >= down).all()
+        if name == "gqa_split_partial":
+            # the ramp runs along the whole key axis: it falls from one split to the next
+            assert (down[:, 1:, :, 0] < down[:, :-1, :, -1]).all()
+            continue
+        assert torch.equal(down, up.flip(-1))
+        span = down[..., 0] - down[..., -1]
+        assert float(span.min()) > 0.4 * INCREASING_SPAN / math.sqrt(2)
+        assert float(span.max()) > 88.7
+
+
+def _whole_key_axis(name, scores):
+    """Scores with the keys of the whole key axis last (a split partial holds them as
+    (split, rows, chunk))."""
+    if name != "gqa_split_partial":
+        return scores
+    return scores.permute(0, 2, 1, 3).flatten(2)
+
+
+@pytest.mark.parametrize("name", sorted(ATTENTION))
+def test_last_spike_puts_one_large_logit_on_the_last_key_of_every_row(name):
+    build, n_scores = ATTENTION[name]
+    graph = build()
+    normal, spiked = _inputs(graph, "normal"), _inputs(graph, "last_spike")
+    assert all(a.dtype == b.dtype and a.shape == b.shape for a, b in zip(normal, spiked))
+    assert all(torch.isfinite(t).all() for t in spiked)
+    for scores in _scores(graph, spiked):
+        scores = _whole_key_axis(name, scores)
+        last, rest = scores[..., -1], scores[..., :-1]
+        # a * 128 with a >= 0.5 (the fixtures' scales differ by up to sqrt(2)): for every
+        # row far above every other key, for most rows past what fp32 exp holds
+        assert float(last.min()) > 0.4 * INCREASING_SPAN / math.sqrt(2)
+        assert float(last.max()) > 88.7
+        assert float((last[..., None] - rest).min()) > 0.25 * INCREASING_SPAN
+        # the other keys score as normal keys do (around the fixtures' constant shift)
+        assert float(rest.max() - rest.min()) < 0.15 * INCREASING_SPAN
+    # per score matmul one query input and one key input are rewritten, nothing else
+    changed = [i for i, (a, b) in enumerate(zip(normal, spiked)) if not torch.equal(a, b)]
+    assert len(changed) == 2 * n_scores
+    assert all(torch.equal(a, b) for a, b in zip(normal, _inputs(graph, "normal")))
+
+
+@pytest.mark.parametrize("name", sorted(ATTENTION))
+def test_constant_makes_every_logit_of_a_row_the_same(name):
+    build, n_scores = ATTENTION[name]
+    graph = build()
+    normal, constant = _inputs(graph, "normal"), _inputs(graph, "constant")
+    for scores in _scores(graph, constant):
+        scores = _whole_key_axis(name, scores)
+        assert (scores == scores[..., :1]).all(), "one logit per row, bit for bit"
+        assert scores[..., 0].unique().numel() > 1, "the rows still differ from each other"
+    # only the keys are rewritten: every key is the first key
+    changed = [i for i, (a, b) in enumerate(zip(normal, constant)) if not torch.equal(a, b)]
+    assert len(changed) == n_scores
+
+
+@pytest.mark.parametrize("name", sorted(ATTENTION))
+def test_offset_moves_every_logit_far_below_zero_and_keeps_them_exact(name):
+    build, n_scores = ATTENTION[name]
+    graph = build()
+    normal, shifted = _inputs(graph, "normal"), _inputs(graph, "offset")
+    assert all(torch.isfinite(t).all() for t in shifted)
+    # per score matmul the query input and the key input are put on the grid, nothing else
+    changed = [i for i, (a, b) in enumerate(zip(normal, shifted)) if not torch.equal(a, b)]
+    assert len(changed) == 2 * n_scores
+    for i in changed:
+        steps = shifted[i].float() / OFFSET_GRID
+        assert (steps == steps.round()).all()
+    for scores in _scores(graph, shifted):
+        # about -1e4 per score matmul (again up to the fixtures' scales): exp of every logit
+        # is 0, so a softmax that does not subtract the max divides 0 by 0
+        assert float(scores.max()) < -0.5 * OFFSET
+        assert (scores.exp() == 0).all()
+        spread = scores.amax(dim=-1) - scores.amin(dim=-1)
+        assert 1.0 < float(spread.min()) and float(spread.max()) < 40.0  # normal-sized
+    # Every operand is on the grid, so each partial sum of a contraction is exact in fp32
+    # and the logits do not depend on the order they are accumulated in: summed back to
+    # front they are the same bits. (The normal inputs are not: there the order shows.)
+    for inputs, same in ((shifted, True), (normal, False)):
+        forward = _scores(graph, inputs)
+        backward = _scores(graph, [t.flip(-1) for t in inputs])
+        assert all(torch.equal(a, b) for a, b in zip(forward, backward)) is same
+
+
+def test_adversarial_cases_are_what_the_inputs_of_a_graph_can_be_shaped_into():
+    for build, _ in ATTENTION.values():
+        assert adversarial_cases(build()) == DENSE_ADVERSARIAL
+    assert DENSE_ADVERSARIAL == tuple(d for d in DISTRIBUTIONS if d != "normal")
+    assert adversarial_cases(g.matmul_graph(8, 8, 16)) == ()  # no softmax, no logits
+    # RMSNorm-ed operands: the logits are bounded whatever the inputs are
+    assert adversarial_cases(g.qknorm_graph(1, 4, 2, 8, 32, 16)) == ()
+
+    def self_attention(x: cl.Tensor["H", "S", "D"]):
+        return exact_softmax((x @ x.mT) / x.shape[-1] ** 0.5) @ x
+
+    from cleave.frontend import trace
+    from cleave.lower import to_ir
+
+    prog = trace(self_attention, dict(H=2, S=24, D=16), cl.f16)
+    graph = to_ir(prog.to_graph_structure(), dtype=DTYPE, out_dtype=DTYPE)
+    # one input is both the queries and the keys: it can be scaled, not ramped
+    assert adversarial_cases(graph) == ("large_logits",)
+    for distribution in DENSE_ADVERSARIAL[1:]:
+        with pytest.raises(SpecError, match="both a query and a key"):
+            _inputs(graph, distribution)
+
+
 def test_lowered_frontend_attention_is_recognized():
     from cleave.lower import to_ir
 
@@ -159,14 +282,15 @@ def test_lowered_frontend_attention_is_recognized():
 
 def test_adversarial_inputs_need_softmax_scores_and_a_known_name():
     matmul = g.matmul_graph(8, 8, 16)
-    for distribution in ("large_logits", "increasing"):
+    for distribution in DENSE_ADVERSARIAL:
         with pytest.raises(SpecError, match="no score matmul"):
             _inputs(matmul, distribution)
     with pytest.raises(SpecError, match="must be drawn from"):
         _inputs(matmul, "uniform")
     # A score operand that is computed (RMSNorm of q and k) cannot be shaped through an input.
-    with pytest.raises(SpecError, match="not read from an input"):
-        _inputs(g.qknorm_graph(1, 4, 2, 8, 32, 16), "increasing")
+    for distribution in DENSE_ADVERSARIAL:
+        with pytest.raises(SpecError, match="not read from an input"):
+            _inputs(g.qknorm_graph(1, 4, 2, 8, 32, 16), distribution)
     assert rt_inputs.check_distributions("normal") == ("normal",)
     assert rt_inputs.check_distributions(list(DISTRIBUTIONS)) == DISTRIBUTIONS
     with pytest.raises(SpecError, match="must be drawn from"):
@@ -178,7 +302,11 @@ def test_adversarial_inputs_are_switched_on_per_operator():
 
     Nothing asks for them by default. A dynamic operator declares that its softmax is exact
     (``exact_softmax``), and from then on every validation of it includes its adversarial
-    workloads; one operator does so far, and no dense program yet.
+    workloads; one operator does so far. A dense program says so by what it records: the
+    request for the exact softmax (``Program._stable_exp``, what ``cl.softmax`` records),
+    and the kernels of such a program are held to every adversarial case its inputs can be
+    shaped into, whatever was asked for. A fixed-shift program, or an ``exp / sum`` written
+    by hand, is validated on what was asked.
     """
     assert {name for name, op in OPERATORS.items() if op.exact_softmax} == {
         "gqa_paged_decode_h32_kv8_d128_ps1"}
@@ -192,6 +320,46 @@ def test_adversarial_inputs_are_switched_on_per_operator():
     assert inspect.signature(resolve_workloads).parameters["adversarial"].default is False
     assert cl.workloads.paged_decode().distribution == "normal"
 
+    from cleave.frontend import trace
+    from cleave.lower import to_ir
+    from cleave.pipeline.build import _reference_fn
+
+    def exact(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
+              v: cl.Tensor["H", "SKV", "D"]):
+        return exact_softmax((q @ k.mT) / q.shape[-1] ** 0.5) @ v
+
+    def by_hand(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
+                v: cl.Tensor["H", "SKV", "D"]):
+        e = cl.exp((q @ k.mT) / q.shape[-1] ** 0.5)
+        return (e / cl.sum(e, -1, keepdim=True)) @ v
+
+    seen = []
+
+    def publish(cache_dir, graph, dtype, distributions):
+        seen.append(distributions)
+        return "published"
+
+    def held_to(program, asked):
+        graph = to_ir(program.to_graph_structure(), dtype=DTYPE, out_dtype=DTYPE)
+        assert _reference_fn(asked, program, publish)("dir", graph, DTYPE) == "published"
+        return seen[-1]
+
+    shapes = dict(H=2, SQ=8, SKV=96, D=16)
+    fixed = programs.attention.trace(HQ=2, HKV=2, SQ=8, SKV=96, D=16)
+    assert trace(exact, shapes, cl.f16).stabilize_requests and not fixed.stabilize_requests
+    assert held_to(trace(exact, shapes, cl.f16), ("normal",)) == ("normal",) + DENSE_ADVERSARIAL
+    assert held_to(trace(exact, shapes, cl.f16), ("increasing", "normal")) == (
+        "increasing", "normal", "large_logits", "decreasing", "last_spike", "constant", "offset")
+    assert held_to(fixed, ("normal",)) == ("normal",)
+    assert held_to(trace(by_hand, shapes, cl.f16), ("normal",)) == ("normal",)
+    assert held_to(fixed, ("normal", "large_logits")) == ("normal", "large_logits")
+
+    def exact_softmax_alone(x: cl.Tensor["R", "C"]):
+        return exact_softmax(x)
+
+    # no score matmul: there are no logits to shape, so nothing is added
+    assert held_to(trace(exact_softmax_alone, dict(R=4, C=32), cl.f16), ("normal",)) == ("normal",)
+
 
 # ----------------------------------------------------------------------------- dynamic
 # logits x100 through the queries and through the scale; increasing along the keys; one
@@ -200,12 +368,18 @@ ADVERSARIAL = ("large_logits", "large_scale", "increasing", "dominant_last")
 
 
 def test_dynamic_distributions_extend_the_shared_ones():
-    assert dyn.DISTRIBUTIONS == DISTRIBUTIONS + ("large_scale", "dominant_last")
+    assert SHARED_DISTRIBUTIONS == ("normal", "large_logits", "increasing")
+    assert dyn.DISTRIBUTIONS == SHARED_DISTRIBUTIONS + ("large_scale", "dominant_last")
+    assert DISTRIBUTIONS == SHARED_DISTRIBUTIONS + ("decreasing", "last_spike", "constant", "offset")
     assert set(ADVERSARIAL) == set(dyn.DISTRIBUTIONS) - {"normal"}
-    # the dense programs know nothing of the two the dynamic operators add
+    # the dense programs know nothing of the two the dynamic operators add ...
     for name in ("large_scale", "dominant_last"):
         with pytest.raises(SpecError, match="must be drawn from"):
             rt_inputs.check_distributions(name)
+    # ... and the dynamic operators nothing of the four the dense programs add
+    for name in ("decreasing", "last_spike", "constant", "offset"):
+        with pytest.raises(SpecError, match="must be one of"):
+            dyn.apply_distribution("gqa_paged_decode", [], name)
     with pytest.raises(SpecError, match="must be one of"):
         dyn.apply_distribution("gqa_paged_decode", [], "uniform")
 

@@ -129,8 +129,17 @@ def test_validation_reference_is_finite_on_adversarial_inputs(fn, sizes, distrib
     assert all(float(r.float().abs().max()) > 0 for r in reference)
 
 
-@pytest.mark.parametrize("distribution", [d for d in DISTRIBUTIONS if d != "normal"])
+# ``constant`` is adversarial to a running max (it never moves), not to a plain exp: its
+# logits are normal-sized, so the plain twin's reference is finite on it.
+@pytest.mark.parametrize("distribution",
+                         [d for d in DISTRIBUTIONS if d not in ("normal", "constant")])
 def test_validation_reference_of_the_plain_twin_is_not(distribution):
     _, ir = _lowered(flash_twin, dict(HQ=32, HKV=32, SQ=64, SKV=256, D=64), cl.f16)
     _, reference, _ = build_inputs_and_reference(ir, "float16", device="cpu", distribution=distribution)
     assert not all(torch.isfinite(r).all() for r in reference)
+
+
+def test_validation_reference_of_the_plain_twin_is_finite_on_constant_rows():
+    _, ir = _lowered(flash_twin, dict(HQ=32, HKV=32, SQ=64, SKV=256, D=64), cl.f16)
+    _, reference, _ = build_inputs_and_reference(ir, "float16", device="cpu", distribution="constant")
+    assert all(torch.isfinite(r).all() for r in reference)
