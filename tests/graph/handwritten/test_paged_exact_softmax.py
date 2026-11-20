@@ -48,8 +48,14 @@ EDGE_KV_LENS = [1, 63, 64, 65, 128, 0, 700]
 # (``decreasing``), the output of an MLA row -- whose values are the keys themselves, the
 # first of them 0 -- is then the exp(-32 a) tail of its second key: 1e-38 for some heads,
 # the bottom of float32's range, where a kernel compiled with fast math flushes to zero and
-# the reference keeps a denormal. That is float32 underflow, not the softmax.
+# the reference keeps a denormal. That is float32 underflow, not the softmax, and it has
+# its own test with its own statement of what is right there:
+# ``test_a_row_under_float32s_range_is_right_or_exactly_zero`` (``SHORT_LENS``).
 EDGE_PREFILL_LENS = [(1, 1), (24, 24), (3, 70), (40, 30), (20, 0), (17, 145), (70, 100)]
+# The requests the tables above leave out: 2 .. 12 keys, eight of each, so that under the
+# mirrored ramp some row of every MLA batch lands in the last decades of float32's range
+# (a row and head does when its query's magnitude falls in a window a few tenths wide).
+SHORT_LENS = [2, 3, 4, 5, 12] * 8
 
 
 def _check(operator, kernel, inputs, reference, what=""):
@@ -197,6 +203,59 @@ def test_exact_split_pair_on_hand_made_requests(operator, step):
     assert [p[1] for p in kernel.scratch_params][::2] == [
         "Partial_ROWSUM", "Partial_VALUE", "Partial_MAX"]
     _run_hand_made(operator, kernel)
+
+
+@pytest.mark.parametrize("operator", sorted(OPERATORS))
+def test_a_row_under_float32s_range_is_right_or_exactly_zero(operator):
+    """What an output row at the bottom of float32's range comes out as: right, or 0.
+
+    The softmax weight of a key that scores ``d`` below its row's max is ``exp(-d)``. Under
+    the mirrored ramp the keys of a request of 2 .. 5 keys are 128 .. 32 logit units apart
+    (times the query's magnitude, 0.5 and up), so the weight of every key but the first is
+    1e-7 at best and far below float32's smallest normal (1.18e-38) for most rows. The
+    kernels are compiled with fast math, which flushes a result under that to zero where
+    the float32 reference keeps a denormal.
+
+    For a GQA operator that changes nothing: the first key's value carries the row. For
+    an MLA operator the values are the keys and the ramp's first key is the zero row, so
+    the output *is* the tail of the second key -- and where that is 1e-45 .. 1e-37 the
+    kernel returns exactly 0 against a reference from the bottom of float32's range. The
+    output bound has no absolute part (an empty row is exactly 0), so that is a
+    row-relative error of 1. It is float32 underflow and not the softmax: the lse of those
+    very rows is right, every row above the range is within the declared tolerance and
+    nothing is non-finite.
+
+    So one kind of row has two right answers here: a row whose reference maximum is under
+    what a flushed weight can carry -- twice float32's smallest normal times the largest
+    value entry -- may be exactly 0 instead. Every other row, and the whole lse, is held
+    to the operator's declared tolerance by the comparator every validation uses.
+    """
+    lens = [(n, n) for n in SHORT_LENS] if _is_prefill(operator) else SHORT_LENS
+    kernel = _compiled(operator_kernel_source(operator))
+    with _gpu_exec_guard():
+        inputs, (out, lse) = _workload(operator, lens, distribution="increasing",
+                                       flip_scale=True)
+        assert torch.isfinite(lse).all(), "every row has a key"
+        values = inputs[2]  # V of a GQA operator, the compressed keys of an MLA one
+        under_range = 2 * torch.finfo(torch.float32).tiny * float(values.float().abs().max())
+        row_max = out.float().abs().amax(dim=-1)
+        got = [torch.full_like(t, float("nan")) for t in (out, lse)]  # NaN unless written
+        kernel(*inputs, *got)
+        torch.cuda.synchronize()
+        flushed = (row_max <= under_range) & (got[0].float().abs().amax(dim=-1) == 0)
+        expected = out.clone()
+        expected[flushed] = 0
+        try:
+            compare_outputs(got, [expected, lse], OPERATORS[operator].tolerance,
+                            what="short@decreasing")
+        except AssertionError as error:
+            raise AssertionError(f"{operator} on {error}") from error
+        tails = int(((row_max > 0) & (row_max <= under_range)).sum())
+    if operator.startswith("mla"):
+        assert tails > 0, "no row of the batch reached the bottom of float32's range"
+    else:
+        # nothing to flush: the comparison above was the plain one
+        assert tails == 0 and torch.equal(expected, out)
 
 
 @pytest.mark.parametrize("operator", sorted(OPERATORS))
