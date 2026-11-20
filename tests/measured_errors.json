@@ -218,15 +218,15 @@
    "dtype": "bfloat16",
    "rel": 0.0078125,
    "seeds": 3,
-   "validated": 780
+   "validated": 960
   },
   {
-   "abs": 1.9073486328125e-06,
+   "abs": 0.000244140625,
    "absolute": true,
    "dtype": "float32",
-   "rel": 3.163262363159447e-07,
+   "rel": 4.1119432125924504e-07,
    "seeds": 3,
-   "validated": 780
+   "validated": 960
   }
  ],
  "dynamic:gqa_paged_decode_h32_kv8_d128_ps64": [
