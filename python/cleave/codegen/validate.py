@@ -315,12 +315,18 @@ class GraphValidator:
                 it = None if isinstance(operand, GraphNode) else tmap.get(operand)
                 if not isinstance(it, Iterator):
                     continue
-                axis = node.axis_arg if node.axis_arg >= 0 else len(it.tile_size) + node.axis_arg
-                if not 0 <= axis < len(it.tile_size):
-                    continue
-                assert it.tile_size[axis] == it.shape[axis], (
+                # Found from the axis the node was built with, not from ``axis_arg``:
+                # that is the ``dim`` of the emitted macro, an index into the stored
+                # operand, which has its unit extents squeezed out and the tile here
+                # has not.
+                axis = it.position(node.flat_axis, len(node.dims))
+                if axis is None:
+                    given, whole = 1, node.dims[node.flat_axis]
+                else:
+                    given, whole = it.tile_size[axis], it.shape[axis]
+                assert given == whole, (
                     f"{where}: {node.name!r} takes a max over a slice: the loop gives it "
-                    f"{it.tile_size[axis]} of {it.shape[axis]} elements of the reduced axis "
+                    f"{given} of {whole} elements of the reduced axis "
                     "per iteration, and it is not an accumulator, so every iteration "
                     "starts over."
                 )

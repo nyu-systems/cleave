@@ -15,8 +15,9 @@ from cleave.codegen import TilelangCodeGen
 from cleave.ir.graph import Iterator
 from cleave.ir.graph_utils import edit_graph
 from cleave.ir.ops import Copy, Exp, Stabilize, wire_input
+from cleave.schedule.tiling import rebase_reduction_axis
 
-from tests.graph._rolling_tier import ROWS, STEP, build_rolling_tier, schedule_rolling_tier
+from tests.graph._rolling_tier import KV, ROWS, STEP, build_rolling_tier, schedule_rolling_tier
 
 
 def _tier(**kw):
@@ -220,3 +221,56 @@ def test_a_max_over_the_whole_axis_is_fine_in_a_loop():
     t.inner.tmap[inner_in] = Iterator(
         lambda i: ("0", "0"), shape=(ROWS, STEP), tile_size=(ROWS, STEP))
     assert "ukernel_reduce_max_axis1_rr_clear" in TilelangCodeGen().gen(t.main)
+
+
+def _sliced_max(max_axis, it):
+    """The tier with its max (not carried) reading a tile ``it``, the max's ``dim`` set the
+    way the tiler sets it: for the buffer that tile is stored in."""
+    t = _tier(declare=False, carry=False, max_axis=max_axis)
+    t.inner.tmap[t.inner.binding[t.outer_in.name]] = it
+    rebase_reduction_axis(t.m, it)
+    return t
+
+
+@pytest.mark.parametrize("max_axis", [1, -1])
+def test_a_max_over_a_slice_of_a_single_row_is_refused(max_axis):
+    """The reduced axis is found from the axis the max was built with, not from its ``dim``.
+
+    One row per block, kept in the tier tile as a unit extent: the tile is ``(1, 64)`` of
+    ``(1, 256)``, the stored buffer ``(64,)``. A max that names its axis from the front
+    emits ``dim=0`` for that buffer, and dim 0 of the *tile* is the row: 1 of 1, whole.
+    Reading the ``dim`` as an index into the tile let this kernel through."""
+    it = Iterator(lambda i: ("0", f"{STEP} * {i}"), shape=(1, KV), tile_size=(1, STEP))
+    t = _sliced_max(max_axis, it)
+    assert t.m.axis_arg == (0 if max_axis == 1 else -1)
+    _refused(t, "'exp_0_max' takes a max over a slice: the loop gives it 64 of 256 elements")
+
+
+@pytest.mark.parametrize("max_axis", [1, -1])
+def test_a_max_over_one_element_per_iteration_is_refused(max_axis):
+    """A loop that walks the reduced axis one element at a time: the stored tile has no
+    such axis, so the max keeps the ``dim`` it was built with, which is not an index into
+    anything here. (It used to be read as one, found out of range, and skipped.)"""
+    it = Iterator(lambda i: ("0", f"{i}"), shape=(KV,), tile_size=(1,), axes=(1,))
+    t = _sliced_max(max_axis, it)
+    assert t.m.axis_arg == max_axis
+    _refused(t, "'exp_0_max' takes a max over a slice: the loop gives it 1 of 256 elements")
+
+
+def test_a_max_over_an_axis_the_tier_does_not_carry_is_refused():
+    """The tile holds a single element of the reduced axis and does not carry the dim."""
+    it = Iterator(lambda i: ("0",), shape=(ROWS,), tile_size=(ROWS,), axes=(0,))
+    _refused(_sliced_max(-1, it),
+             "'exp_0_max' takes a max over a slice: the loop gives it 1 of 256 elements")
+
+
+@pytest.mark.parametrize("max_axis", [1, -1])
+def test_a_max_over_the_whole_axis_of_a_single_row_is_fine(max_axis):
+    """... and the same single-row tile with the whole reduced axis in it passes the rule,
+    whichever way the axis is named and whether or not the tile carries the row dim."""
+    for it in (
+        Iterator(lambda i: ("0", "0"), shape=(1, KV), tile_size=(1, KV)),
+        Iterator(lambda i: ("0",), shape=(KV,), tile_size=(KV,), axes=(1,)),
+    ):
+        t = _sliced_max(max_axis, it)
+        TilelangCodeGen()._validate_graph(t.main, is_main=True)

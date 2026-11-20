@@ -21,14 +21,18 @@ import pytest
 pytest.importorskip("tilelang")
 pytest.importorskip("tvm")
 
-from cleave.ir.graph import Graph, GraphNode, OutputNode
+from cleave.ir.graph import Graph, GraphNode, Iterator, OutputNode
 from cleave.ir.graph_utils import find_topo_sort, gather_all_nodes
-from cleave.ir.ops import ReduceMax, ReduceSum
+from cleave.ir.ops import Matmul, ReduceMax, ReduceSum, wire_input
 from cleave.runtime.compile import build_candidate_code
 from cleave.schedule import apply_tiling
-from cleave.schedule.tiling import _normalize_inner_reduction_axes
+from cleave.schedule.tiling import _normalize_inner_reduction_axes, rebase_reduction_axis
 
-from tests._graphs import batched_matmul_splitk_combine_graph, mha_split_combine_graph
+from tests._graphs import (
+    batched_matmul_splitk_combine_graph,
+    matmul_rowsum_graph,
+    mha_split_combine_graph,
+)
 from tests._tolerances import tolerance_for
 from tests.graph.apply_tiling._test_utils import (
     assert_candidate_compiles_and_runs,
@@ -195,3 +199,107 @@ def test_unlooped_sum_over_a_front_named_axis_validates(output_tile, note):
 
     # The same sums, the same shapes and the same bound as the fixture named from the end.
     assert_candidate_compiles_and_runs(cand, tolerance_for(batched_matmul_splitk_combine_graph))
+
+
+# ------------------------------------------------- the main tier, reading a loop's accumulator
+def _matmul_column_sum_graph(B, M, N, K):
+    """``(A @ B).sum(dim=1) -> (B, N)``: a batched matmul summed over its rows.
+
+    ``matmul_rowsum_graph`` with the other axis summed, and named from the front. With the
+    matmul looped over ``K`` and the sum not looped, the sum reads the loop's accumulator.
+    """
+    mma = Matmul((B, M, N, K), dtype=DTYPE, out_dtype=ACCUM_DTYPE, name="mma_0", warp_policy="rows")
+    colsum = ReduceSum(
+        (B, M, N), axis=1, dtype=ACCUM_DTYPE, out_dtype=ACCUM_DTYPE, name="colsum_0"
+    )
+    wire_input(mma, colsum, 0)
+    OutputNode(colsum, dtype=DTYPE)
+    nodes = gather_all_nodes(mma, colsum)
+    return Graph(nodes=find_topo_sort([n for n in nodes if n.is_output()]))
+
+
+ACCUMULATOR_TILES = [
+    pytest.param([1, 64], "columns == rows: a wrong dim compiles and sums over the columns",
+                 id="cols64_equal_rows"),
+    pytest.param([1, 128], "TileLang refuses the shape a wrong dim gives", id="cols128"),
+]
+
+
+def _column_sum_candidate(output_tile):
+    graph = _matmul_column_sum_graph(2, 64, 128, 4096)
+    return build_tiled_candidate(graph, output_tile, _steps(graph, mma_0=64, colsum_0=64))
+
+
+@pytest.mark.parametrize(("output_tile", "note"), ACCUMULATOR_TILES)
+def test_an_unlooped_sum_over_a_loops_accumulator_reduces_its_own_axis(output_tile, note):
+    """The matmul is looped, the sum over its rows is not: the sum's input is the loop's
+    accumulator, stored ``(rows, columns)`` -- the batch dim is a unit extent of the block."""
+    cand = _column_sum_candidate(output_tile)
+    scheduled = apply_tiling(cand)
+
+    node, tier = _nodes(scheduled)["colsum_0"]
+    assert tier is None, "colsum_0 is looped; the case tests nothing"
+    edge = node.inputs[0]
+    assert isinstance(edge.src_node, GraphNode) and edge.accum_node.name == "mma_0"
+    stored = edge.src_node.graph.tmap[edge.accum_node].tile_size
+    assert [int(t) for t in stored] == [64, output_tile[-1]]
+    assert (node.axis, node.axis_arg) == (0, 0), note
+    assert (node.flat_axis, node.flat_axis_arg) == (1, 1)
+    assert set(_reduce_dims(build_candidate_code(cand)).values()) == {"0"}, note
+
+
+@pytest.mark.parametrize(("output_tile", "note"), ACCUMULATOR_TILES)
+def test_unlooped_sum_over_a_loops_accumulator_validates(output_tile, note):
+    """GPU: the kernel of an un-looped sum over a loop's accumulator is correct."""
+    cand = _column_sum_candidate(output_tile)
+    # The operator of matmul_rowsum_graph -- an fp16 matmul accumulated in fp32, summed
+    # over one axis, stored fp16 -- with the other axis summed: its bound.
+    assert_candidate_compiles_and_runs(cand, tolerance_for(matmul_rowsum_graph))
+
+
+# ------------------------------------------------- a reduction added after apply_tiling
+@pytest.mark.parametrize(
+    ("dims", "axis", "it", "expected"),
+    [
+        # A tier of apply_tiling: the leading batch dim is not carried.
+        pytest.param((2, 4, 64, 32), 2,
+                     Iterator(None, shape=(4, 64, 32), tile_size=(2, 64, 32), axes=(1, 2, 3)),
+                     (1, 1), id="front_named"),
+        pytest.param((2, 4, 64, 32), -3,
+                     Iterator(None, shape=(4, 64, 32), tile_size=(2, 64, 32), axes=(1, 2, 3)),
+                     (1, -3), id="named_from_the_end"),
+        # A unit extent the tier carries is not stored: one row of a block of 16.
+        pytest.param((16, 256), 1,
+                     Iterator(None, shape=(16, 256), tile_size=(1, 64), axes=(0, 1)),
+                     (0, 0), id="unit_extent_in_front"),
+        pytest.param((2, 4, 64, 32), -3,
+                     Iterator(None, shape=(4, 64, 32), tile_size=(2, 1, 32), axes=(1, 2, 3)),
+                     (1, -2), id="unit_extent_behind"),
+        # A hand-built tier (no record of the dims it carries): its tile is over the
+        # node's dims, here with the single row kept as a unit extent.
+        pytest.param((16, 256), 1, Iterator(None, shape=(1, 256), tile_size=(1, 64)),
+                     (0, 0), id="hand_built_single_row"),
+        pytest.param((2, 16, 256), 2, Iterator(None, shape=(16, 256), tile_size=(16, 64)),
+                     (1, 1), id="hand_built_leading_dim_missing"),
+        # The reduced axis is itself a unit extent: no dim to name, the built axis stays.
+        pytest.param((16, 256), 1, Iterator(None, shape=(16, 256), tile_size=(16, 1), axes=(0, 1)),
+                     (1, 1), id="reduced_axis_not_stored"),
+    ],
+)
+def test_a_reduction_is_rebased_from_the_tile_of_its_input(dims, axis, it, expected):
+    """``rebase_reduction_axis``: what ``apply_tiling`` does for the reductions it schedules,
+    for a reduction that is added to a scheduled graph afterwards."""
+    red = ReduceMax(dims, axis=axis, dtype=ACCUM_DTYPE, out_dtype=ACCUM_DTYPE, name="red")
+    for _ in range(2):
+        rebase_reduction_axis(red, it)
+        assert (red.axis, red.axis_arg) == expected
+    assert (red.flat_axis, red.flat_axis_arg) == (axis % len(dims), axis)
+
+
+def test_a_tile_knows_where_a_dim_of_its_node_sits():
+    carried = Iterator(None, shape=(4, 32), tile_size=(2, 32), axes=(0, 2))
+    assert [carried.position(dim, 3) for dim in range(3)] == [0, None, 1]
+    # Not recorded: aligned from the end, the missing dims missing from the front.
+    plain = Iterator(None, shape=(64, 32), tile_size=(64, 32))
+    assert [plain.position(dim, 4) for dim in range(4)] == [None, None, 0, 1]
+    assert [plain.position(dim, 2) for dim in range(2)] == [0, 1]

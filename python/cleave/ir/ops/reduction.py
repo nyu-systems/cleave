@@ -189,7 +189,27 @@ class Matmul(ComputeOpNode):
         return func_name
 
 class ReduceSum(ComputeOpNode):
-    """Sum over ``axis``; ``ReduceMax`` swaps the reducer."""
+    """Sum over ``axis``; ``ReduceMax`` swaps the reducer.
+
+    The reduced axis is held twice, in two index spaces:
+
+    * ``flat_axis`` / ``flat_axis_arg``: the axis the node was built with, over its full
+      ``dims`` (``flat_axis`` counted from the front, ``flat_axis_arg`` as given, so
+      possibly from the end). They never change. Anything that asks *which axis* the node
+      reduces reads these; on a scheduled graph, the place of that axis in a tier tile is
+      ``Iterator.position(node.flat_axis, len(node.dims))``.
+    * ``axis`` / ``axis_arg``: what is emitted. ``axis_arg`` is the ``dim`` given to
+      ``T.reduce_*`` and ``axis`` is in the macro's name. On a flat graph they are the
+      built axis. On a scheduled graph ``axis_arg`` indexes the buffer the input is
+      *stored* in, which has every unit extent of its tile squeezed out
+      (``codegen.operands.kept_extents``): neither ``dims`` nor a tier's
+      ``Iterator.tile_size``, which keeps the unit extents of the dims it carries. An axis
+      built from the front is counted from the front of that buffer, and ``axis`` is the
+      same number; one built from the end is counted from its end, and ``axis`` stays the
+      built axis. ``apply_tiling`` sets both for every reduction it schedules; a reduction
+      added to a scheduled graph afterwards is given them by
+      ``cleave.schedule.tiling.rebase_reduction_axis``.
+    """
 
     _macro_attrs = ("axis", "axis_arg", "dtype")
     kind = "reduction"  # macro-name stem, pinned: generated kernels keep it
@@ -215,9 +235,8 @@ class ReduceSum(ComputeOpNode):
         self.axis_arg = axis
         self.axis = axis if axis >= 0 else len(dims) + axis
         assert 0 <= self.axis < len(dims), f"Invalid reduction axis {axis} for {dims}"
-        # The axis as built, over the node's full ``dims``. ``axis`` / ``axis_arg`` are
-        # what the macro emits, and the tiler points them at the tile the input is stored
-        # in (unit extents squeezed); it derives them from these two, which never change.
+        # The axis as built (see the class docstring): the tiler derives ``axis`` /
+        # ``axis_arg`` from these two, which never change.
         self.flat_axis, self.flat_axis_arg = self.axis, axis
         self.output_dims = dims[: self.axis] + dims[self.axis + 1 :]
         input_batch_flags = [False] * len(dims)

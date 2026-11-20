@@ -29,13 +29,15 @@ ROWS, KV, STEP, TOTAL = 16, 256, 64, 64
 F32 = dict(dtype="float32", out_dtype="float32")
 
 
-def build_rolling_tier(declare: bool = True, carry: bool = True) -> SimpleNamespace:
+def build_rolling_tier(declare: bool = True, carry: bool = True, max_axis: int = -1) -> SimpleNamespace:
     """The loop and its reader, wired but not scheduled.
 
     ``declare=False`` leaves ``lag_nodes`` / ``accum_scale`` empty (what the tier looks like
     to code that does not know the fields); ``carry=False`` stops before ``loop.carry(m)``.
+    ``max_axis`` is how the max names its axis: ``-1`` (as lowering does) or ``1``, the
+    same axis from the front.
     """
-    m = ReduceMax((ROWS, KV), axis=-1, name="exp_0_max", accum_init=NEG_FLT_MAX, **F32)
+    m = ReduceMax((ROWS, KV), axis=max_axis, name="exp_0_max", accum_init=NEG_FLT_MAX, **F32)
     scores = m.inputs[0].src_node  # the tier's input tile
     m_prev, step, alpha = rolling_nodes(m, stem="exp_0", rows=(ROWS,), n_batch_dims=0, exp_cls=Exp)
     shifted = Sub((ROWS, KV), broadcast=0, name="exp_0_shifted", n_batch_dims=0, **F32)

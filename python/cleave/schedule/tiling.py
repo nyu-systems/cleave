@@ -538,17 +538,15 @@ def assign_tensor_map(
             top_bind_node[n.name] = top_bind_node[outer_node.name]
         bind_node = top_bind_node[n.name] if isinstance(n, PlaceHolderNode) else n
 
-        # get tile shape and tile size from candidate
-        shape = [
-            t
-            for i, t in enumerate(tile_map[bind_node.name])
-            if not n.is_batch_dim[i] or itile_map[bind_node.name][i] > 1
-        ]
-        tile_size = [
-            t
+        # get tile shape and tile size from candidate: a batch dim the iteration holds
+        # one element of is not carried in the tier
+        axes = [
+            i
             for i, t in enumerate(itile_map[bind_node.name])
             if not n.is_batch_dim[i] or t > 1
         ]
+        shape = [tile_map[bind_node.name][i] for i in axes]
+        tile_size = [itile_map[bind_node.name][i] for i in axes]
         iter_dims = [i // j > 1 for i, j in zip(shape, tile_size)]
         num_args = (
             len(graph_node.graph.extent)
@@ -562,6 +560,7 @@ def assign_tensor_map(
             get_offset_lambda(tile_size, arg_indices, num_args),
             shape=shape,
             tile_size=tile_size,
+            axes=tuple(axes),
         )
 
 
@@ -604,8 +603,24 @@ def _normalize_inner_reduction_axes(graph_node: GraphNode, itile_map: dict):
         _rebase_reduction_axis(node, None if tile is None else list(tile))
 
 
-def _normalize_main_reduction_axes(main: Graph, itile_map: dict):
-    """Rebase the reduction axes of the main tier onto the block tiles they read.
+def rebase_reduction_axis(node: ReduceSum, it: Iterator):
+    """``_rebase_reduction_axis`` from ``it``, the tile of the node's input in its tier.
+
+    ``apply_tiling`` does this for every reduction it schedules. A reduction added to a
+    scheduled graph afterwards has to be given its ``dim`` the same way, from the
+    ``Iterator`` of the tensor it reads.
+    """
+    rank = len(node.dims)
+    tile = [1] * rank  # a dim the tier does not carry is one the tile holds one element of
+    for dim in range(rank):
+        position = it.position(dim, rank)
+        if position is not None:
+            tile[dim] = it.tile_size[position]
+    _rebase_reduction_axis(node, tile)
+
+
+def _normalize_main_reduction_axes(main: Graph):
+    """Rebase the reduction axes of the main tier onto the tiles they read.
 
     A reduction that is not looped stays in the main tier, where a batch dim is a unit
     extent of every tile and is squeezed like any other: without this, a sum over a
@@ -616,12 +631,15 @@ def _normalize_main_reduction_axes(main: Graph, itile_map: dict):
             continue
         edge = node.inputs[0]
         if isinstance(edge.src_node, GraphNode):
-            # A loop's accumulator: its buffer holds one iteration tile.
+            # A loop's accumulator: the buffer is the one the loop's own tier allocates.
             accum_node = getattr(edge, "accum_node", None)
-            tile = None if accum_node is None else itile_map.get(accum_node.name)
+            it = None if accum_node is None else edge.src_node.graph.tmap.get(accum_node)
         else:
-            tile = main.tmap[edge.src_node].tile_size
-        _rebase_reduction_axis(node, None if tile is None else list(tile))
+            it = main.tmap.get(edge.src_node)
+        if isinstance(it, Iterator):
+            rebase_reduction_axis(node, it)
+        else:
+            _rebase_reduction_axis(node, None)
 
 
 def _iterative_reductions(nodes, rstep_map):
@@ -1127,7 +1145,7 @@ def apply_tiling(cand: List) -> List[Graph]:
             shape=shape,
             tile_size=tile_size,
         )
-    _normalize_main_reduction_axes(graphs["main"], itile_map)
+    _normalize_main_reduction_axes(graphs["main"])
 
     if any(getattr(n, "stabilize", None) is not None for n in ordered_nodes):
         # A softmax exp the scale analysis marked gets its max here, where the tiers are

@@ -52,10 +52,26 @@ class Iterator:
         offset: Callable[[str], tuple[str]],
         shape: tuple[int],
         tile_size: tuple[int],
+        axes: Optional[tuple[int]] = None,
     ):
         self.offset = offset  # offset('i') -> index expression tuple
         self.shape = shape
         self.tile_size = tile_size
+        # Which dims of the node's own shape the entries of ``shape`` / ``tile_size``
+        # stand for, when the tile leaves some out: a loop tier of ``apply_tiling`` does
+        # not carry a batch dim it holds one element of. ``None``: not recorded -- the
+        # tile is over the node's dims, any missing ones missing from the front.
+        self.axes = axes
+
+    def position(self, dim: int, rank: int) -> Optional[int]:
+        """Where dim ``dim`` of a node with ``rank`` dims sits in this tile.
+
+        ``None`` if the tile does not carry it: it then holds one element of that dim.
+        """
+        if self.axes is not None:
+            return self.axes.index(dim) if dim in self.axes else None
+        position = len(self.tile_size) - (rank - dim)  # aligned from the end
+        return position if position >= 0 else None
 
     def __repr__(self):
         return f"Iterator(offset={self.offset}, shape={self.shape}, tile_size={self.tile_size})"
