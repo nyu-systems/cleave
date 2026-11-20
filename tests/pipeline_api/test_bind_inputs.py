@@ -14,9 +14,10 @@ import cleave.lang as cl
 from cleave import pipeline as P
 from cleave.frontend import trace
 from cleave.ir.graph import PlaceHolderNode
-from cleave.pipeline.kernel import stages_for
+from cleave.pipeline.kernel import _fit, stages_for
 from cleave.pipeline.plans import Plan, bind_inputs, lower
 from cleave.pipeline.superopt import GraphSet
+from cleave.runtime.reference import execute, placeholder_order
 from tests._lowering import run_lowered
 
 
@@ -78,6 +79,51 @@ def test_search_graphs_bind_in_program_order(fn, sizes):
     assert graphs
     for graph in graphs:
         _check(graph, prog)
+
+
+def chained(q: cl.Tensor["BH", "SQ", "D"], k: cl.Tensor["BH", "SKV", "D"], v: cl.Tensor["BH", "SKV", "D"]):
+    return (q @ k.mT) @ v  # demo/matmul_matmul.py: k and v have one shape
+
+
+class _Tile:
+    def __init__(self, flat_graph):
+        self.flat_graph = flat_graph
+
+
+def _call(stages, graphs, inputs):
+    """``Kernel.__call__`` with the graph executor in place of each compiled stage."""
+    outs = []
+    for stage, graph in zip(stages, graphs):
+        feed = {p.name: _fit(inputs[p.index] if p.source == "input" else outs[p.index], p.shape)
+                for p in stage.params}
+        outs = execute(graph, [feed[n.name] for n in placeholder_order(graph)])
+    return outs
+
+
+def test_search_split_partials_bind_in_program_order():
+    """A split partial is bound like a solo graph (``_schedule_once``), and most searched
+    graphs whose binding the declaration order changed are partials: by graph order one
+    partial of this search took ``v`` for ``k`` and two could not be bound at all."""
+    prog = trace(chained, dict(BH=4, SQ=8, SKV=64, D=16), cl.f32)
+    graphs = [g for g in P.superoptimize(prog, P.SuperoptConfig(max_ops=8, split=("SKV",), cache=False))
+              if g.is_split and not g.invalid_split]
+    assert graphs
+    torch.manual_seed(0)
+    ins = [torch.randn(*s.shape) / 4 for s in prog.inputs]
+    (want,) = prog.reference(*ins)
+    for graph in graphs:
+        partial, combine = lower(graph, 4)
+        names = bind_inputs(partial, prog)
+        phs = {n.name: n for n in partial.nodes if isinstance(n, PlaceHolderNode)}
+        assert names is not None and sorted(names) == sorted(phs), graph.summary()
+        assert [phs[n].input_index for n in names] == list(range(len(prog.inputs)))
+        plans = [Plan(graph.index, "split-k=4", role, _Tile(ir), f"g{graph.index} {role}", 0, 4, graph, bound)
+                 for role, ir, bound in (("partial", partial, names), ("combine", combine, None))]
+        stages, problem = stages_for([(plan, None) for plan in plans], prog)
+        assert problem is None, graph.summary()
+        (got,) = _call(stages, (partial, combine), ins)
+        assert got.numel() == want.numel(), graph.summary()
+        torch.testing.assert_close(got.reshape(want.shape), want, rtol=1e-5, atol=1e-5)
 
 
 def test_kernel_stage_params_follow_the_binding():
