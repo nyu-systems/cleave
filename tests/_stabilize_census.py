@@ -130,6 +130,8 @@ FIXTURES = {
     "raw_statistics": (lambda: [S.raw_statistics_graph(32, 64, 4096, 64)], {}, None,
                        lambda c: c.n_threads == 128),
 }
+
+
 def _whole_head_dim(c):
     """mla_decode: the block holds all 512 head dims and the softmax loop steps 32 keys
     (the shape of the only tilings of this operator that validate on a GPU)."""
