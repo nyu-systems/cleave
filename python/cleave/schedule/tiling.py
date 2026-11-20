@@ -992,28 +992,54 @@ def _refuse_loops_that_miscount_their_tiles(main: Graph):
             )
 
 
-def _pipeline_one_loop(main: Graph):
-    """Leave ``T.Pipelined`` to the first loop of a kernel; emit the others as plain loops.
+# The narrowest innermost extent, in bytes, of a slice TileLang transfers in a pipeline.
+_PIPELINED_SLICE_BYTES = 16
+
+
+def _pipeline_one_loop(main: Graph, tile_map: dict, itile_map: dict, top_bind_node: dict):
+    """Leave ``T.Pipelined`` to the one loop of a kernel that TileLang can pipeline.
 
     A loop tier is emitted as ``T.Pipelined``, which lets TileLang turn the copies of the
     slices each iteration loads into asynchronous bulk transfers. The vendored TileLang
-    does that for one loop per kernel: the loop variable of a second pipelined loop is
-    left behind outside the loop, and the kernel fails at the very end of lowering ("In
-    PrimFunc main_kernel variables (i0,) are used, but are not passed in as API
-    arguments"). Two sums looped with different steps (a split combine), or two matmuls
-    that share no operand, each get a loop of their own; every such kernel died there.
+    loses the loop variable of such a loop in two cases, and the kernel then fails at
+    the very end of lowering ("In PrimFunc main_kernel variables (i0,) are used, but are
+    not passed in as API arguments"):
 
-    The second loop computes the same thing as a plain loop, and with it the kernel
-    lowers. The first keeps its pipeline: with the first serial and the second pipelined
-    TileLang lowers some kernels and not others. ``main.nodes`` is in emission order.
+    * it is not the first pipelined loop of the kernel: two sums looped with different
+      steps (a split combine), or two matmuls that share no operand, each get a loop of
+      their own, and every such kernel died there;
+    * the loop loads no slice it can transfer that way: the innermost extent of every
+      region it reads per iteration is under 16 bytes (four float16 row sums of a split
+      combine with only that sum looped; one, two or four columns of a matmul's
+      partials). A loop that also loads one wider slice lowers as it is.
+
+    Both lower as a plain loop, which computes the same thing: a loop with nothing to
+    transfer has nothing to overlap. Of two loops the first keeps its pipeline (with the
+    first serial and the second pipelined TileLang lowers some kernels and not others).
+    ``main.nodes`` is in emission order.
     """
+
+    def loads_a_slice_to_transfer(tier: Graph) -> bool:
+        for node in tier.nodes:
+            if not isinstance(node, PlaceHolderNode) or node.name not in top_bind_node:
+                continue
+            bound = top_bind_node[node.name]
+            block, step = tile_map.get(bound.name), itile_map.get(bound.name)
+            if block is None or step is None or len(block) != len(step):
+                continue
+            if not any(int(b) // int(t) > 1 for b, t in zip(block, step)):
+                continue  # handed down whole: the parent loads it once
+            if int(step[-1]) * ((int(bound.get_dtype(0).bits) + 7) // 8) >= _PIPELINED_SLICE_BYTES:
+                return True
+        return False
+
     pipelined = False
     for tier, owner in graph_tiers(main):
         if owner is None or tier.loop_kind != "pipelined":
             continue
-        if pipelined:
+        if pipelined or not loads_a_slice_to_transfer(tier):
             tier.loop_kind = "serial"
-        pipelined = True
+        pipelined = True  # a later loop is not the first, whatever this one became
 
 
 def _refuse_tile_that_misses_dims(node, shape, tile, expanded_tile):
@@ -1345,7 +1371,7 @@ def apply_tiling(cand: List) -> List[Graph]:
     lock_graph(graphs["main"])  # graph structure is fixed after this point
 
     graphs["main"].nodes = find_topo_sort(main_output_nodes)
-    _pipeline_one_loop(graphs["main"])
+    _pipeline_one_loop(graphs["main"], tile_map, itile_map, top_bind_node)
     canonical_output_binding = _get_output_binding_node(output_node)
     for node in graphs["main"].nodes:
         tile_size = []

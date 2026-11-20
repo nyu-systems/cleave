@@ -91,8 +91,11 @@ def test_apply_tiling_rmsnorm_matmul_split_combine(
 # partials per step. TileLang stopped at every one of them with "no available layout
 # found": the multiply reads the summed matmul partials, a fragment reduced from a rank-3
 # tensor, and ``1 / sqrt(rowsum / K)``, three ops on a fragment reduced from a rank-2 one.
+# The sixth, ([2, 6144], 4, 2), has only the row sum looped, two rows at a time: its loop
+# loads 4 bytes a row, and TileLang lost the loop variable until such a loop was emitted
+# as a plain one (tests/graph/apply_tiling/test_split_combine_placement.py).
 STAGED = [([2, 6144], 2, 2), ([2, 6144], 2, 4), ([2, 6144], 4, 4), ([4, 6144], 2, 2),
-          ([4, 6144], 2, 4)]
+          ([4, 6144], 2, 4), ([2, 6144], 4, 2)]
 
 
 def _combine_candidate(output_tile, mma_step, rowsum_step):

@@ -19,11 +19,15 @@ extent is around. Two kinds of tiling fell outside it:
 The first kind now builds and validates. The second is handed the right slices but still
 has no kernel: the slice has no reduced axis left for ``T.reduce_*`` to name.
 
-One more thing stood between a single-row tiling and a kernel, in what is emitted: a
-value the block computes one element of (the row sum of a single row that is not looped,
-an elementwise op on it) was allocated as a scalar, ``T.alloc_fragment(())``, while the
-tier's parameters, the slices it is handed and a loop's accumulators all spell such a
-tile 1-D: the copy into the output failed on ``()`` against ``(1,)``.
+Two more things stood between a single-row tiling and a kernel, both in what is emitted:
+
+* a value the block computes one element of (the row sum of a single row that is not
+  looped, an elementwise op on it) was allocated as a scalar, ``T.alloc_fragment(())``,
+  while the tier's parameters, the slices it is handed and a loop's accumulators all
+  spell such a tile 1-D: the copy into the output failed on ``()`` against ``(1,)``;
+* a loop that loads one column (or one element) per iteration was emitted as
+  ``T.Pipelined`` with nothing TileLang can transfer, which loses the loop variable
+  ("variables (i0,) are used, but are not passed in as API arguments").
 """
 
 import re
@@ -147,15 +151,29 @@ def test_a_loop_over_a_single_row_block_slices_the_stored_tile(name):
     assert (in_loop.count(":"), in_grid.count(":")) == (len(whole), len(dims)), (in_loop, in_grid)
 
 
-@pytest.mark.parametrize("name", ["rowsum_one_row", "combine_one_row", "batched_combine_one_row"])
+# The innermost extent of what the loop loads per iteration: a row of 32 or 64 elements, or
+# -- one column, one element -- a single one, which TileLang cannot transfer in a pipeline.
+LOOP_KIND = {
+    "rowsum_one_row": "Pipelined",
+    "combine_one_row": "Pipelined",
+    "batched_combine_one_row": "Pipelined",
+    "combine_one_column": "serial",
+    "combine_one_element": "serial",
+}
+
+
+@pytest.mark.parametrize("name", sorted(SINGLE_ROW))
 def test_a_loop_over_a_single_row_block_lowers(name):
-    """CPU: TileLang takes the kernel (it used to stop at the first slice of the loop)."""
+    """CPU: TileLang takes the kernel. It used to stop at the first slice of the loop; a
+    loop over single columns or single elements then stopped at the end of lowering, with
+    its loop variable left outside the loop, until such a loop was emitted serially."""
     build, dims, output_tile, steps, _ = SINGLE_ROW[name]
     code = build_candidate_code(_candidate(build(*dims), output_tile, **steps))
+    assert re.findall(r"for i0 in T\.(\w+)\(", code) == [LOOP_KIND[name]]
     assert "main_kernel" in lower_to_cuda(code)
 
 
-@pytest.mark.parametrize("name", ["rowsum_one_row", "combine_one_row", "batched_combine_one_row"])
+@pytest.mark.parametrize("name", sorted(SINGLE_ROW))
 def test_a_loop_over_a_single_row_block_validates(name):
     """GPU: the kernel of a looped single-row tiling is correct."""
     build, dims, output_tile, steps, _ = SINGLE_ROW[name]

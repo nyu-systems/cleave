@@ -63,7 +63,9 @@ from pathlib import Path
 #     reason; a float32 one gets tilings (both had none, for a ValueError).
 # 26: the softmax accept filter schedules a candidate exactly as the build does, so the
 #     top-k of a program with a marked softmax holds no tiling the build refuses.
-SCHEMA = 26
+# 27: a loop that loads no slice wide enough to transfer is a plain loop too: the split
+#     combines' tilings on a few rows or columns have kernels.
+SCHEMA = 27
 # What "validated" means for a saved kernel. A kernel-cache hit returns without validating,
 # so bump this whenever the comparison or its inputs change: saved kernels are then rebuilt.
 # (The inputs include the adversarial cases a program with an exact softmax is held to,

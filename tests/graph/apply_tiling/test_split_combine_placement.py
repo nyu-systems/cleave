@@ -23,8 +23,8 @@ behind the head dim, and no placement of such a combine got the staging.
 
 One placement was left to TileLang's own limits: each sum in a loop of its own (two steps
 below the split count). The vendored TileLang pipelines one loop per kernel -- the loop
-variable of a second ``T.Pipelined`` loop is left behind outside the loop -- so the tiler
-emits every loop after the first as a plain one.
+variable of a second ``T.Pipelined`` loop, and of one that loads nothing wide enough to
+transfer, is left behind outside the loop -- so the tiler emits those loops as plain ones.
 """
 
 import re
@@ -152,11 +152,39 @@ def test_a_kernel_with_one_loop_keeps_its_pipeline(placement):
     assert _loops(code) == [(name, "Pipelined") for name in loops]
 
 
-@pytest.mark.parametrize("steps", [(2, 4), (4, 2)], ids=["value_2_rowsum_4", "value_4_rowsum_2"])
-def test_a_split_combine_with_two_loops_validates(steps):
-    """GPU: the kernels that exist because the second loop is emitted serially."""
-    assert_candidate_compiles_and_runs(_candidate(*steps, split=8),
-                                       tolerance_for(mha_split_combine_graph))
+@pytest.mark.parametrize("rows, kind", [(2, "serial"), (4, "serial"), (8, "Pipelined"),
+                                        (128, "Pipelined")])
+def test_a_loop_with_nothing_to_transfer_is_not_pipelined(rows, kind):
+    """Only the row sum looped, on blocks of a few rows: each iteration loads two partials
+    of ``rows`` float16 row sums. Under 16 bytes a row, TileLang has nothing to transfer
+    in a pipeline and loses the loop variable (2 of this combine's tilings at split 4, 1 of
+    the RMSNorm combine's, 24 of each matmul split-K combine's); such a loop is emitted as
+    a plain one. From 16 bytes on it is pipelined as ever."""
+    steps, _ = PLACEMENTS["rowsum_looped"]
+    code = build_candidate_code(_candidate(*steps, rows=rows))
+    assert _loops(code) == [("GraphNode_rowsum_combine_0", kind)]
+    assert "main_kernel" in lower_to_cuda(code)
+
+
+def test_one_loop_stays_pipelined_whatever_else_it_loads():
+    """What that leaves alone: both sums in one loop load the row sums next to the value
+    partials, which are wide enough, so the loop keeps its pipeline even on four rows."""
+    steps, _ = PLACEMENTS["one_loop_for_both"]
+    code = build_candidate_code(_candidate(*steps, rows=4))
+    assert _loops(code) == [("GraphNode_rowsum_combine_0", "Pipelined")]
+    assert "main_kernel" in lower_to_cuda(code)
+
+
+@pytest.mark.parametrize("case", ["two_loops", "two_loops_swapped", "four_rows", "two_rows"])
+def test_a_split_combine_with_a_serial_loop_validates(case):
+    """GPU: the kernels that exist because a loop is emitted serially."""
+    cand = {
+        "two_loops": lambda: _candidate(2, 4, split=8),
+        "two_loops_swapped": lambda: _candidate(4, 2, split=8),
+        "four_rows": lambda: _candidate(*PLACEMENTS["rowsum_looped"][0], rows=4),
+        "two_rows": lambda: _candidate(*PLACEMENTS["rowsum_looped"][0], rows=2),
+    }[case]()
+    assert_candidate_compiles_and_runs(cand, tolerance_for(mha_split_combine_graph))
 
 
 @pytest.mark.parametrize("placement", ["neither_looped", "value_looped", "rowsum_looped"])
