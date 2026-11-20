@@ -17,6 +17,7 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <numeric>
 #include <thread>
 
 namespace cleave_superoptimizer {
@@ -204,6 +205,7 @@ void KernelGraphGenerator::generate_next_operator(
     return;
   }
   std::vector<DTensor> all_tensors = get_all_tensors(*c.kn_graph);
+  int branch = 0; // index of the next child state, in enumeration order
   for (type::KNOperatorType op_type : dim_strategy.get_knop_cand()) {
     CSO_VLOG(2) << std::string(depth * 2, ' ')
                 << "trying knop " << static_cast<int>(op_type)
@@ -250,9 +252,11 @@ void KernelGraphGenerator::generate_next_operator(
 
       if (new_op) {
         c.kn_graph->operators.push_back(new_op);
+        c.path.push_back(branch++);
         if (depth < max_depth) {
           num_tasks++;
-          SearchContext c_tmp{std::shared_ptr<kernel::Graph>(c.kn_graph->clone())};
+          SearchContext c_tmp{std::shared_ptr<kernel::Graph>(c.kn_graph->clone()),
+                              c.path};
 #pragma omp task
           {
             try {
@@ -264,6 +268,7 @@ void KernelGraphGenerator::generate_next_operator(
         } else {
           generate_next_operator(c, verify, depth + 1);
         }
+        c.path.pop_back();
         delete c.kn_graph->operators.back();
         c.kn_graph->operators.pop_back();
       }
@@ -310,9 +315,11 @@ void KernelGraphGenerator::generate_next_operator(
             continue;
           }
           c.kn_graph->operators.push_back(scalar_op);
+          c.path.push_back(branch++);
           if (depth < max_depth) {
             num_tasks++;
-            SearchContext c_tmp{std::shared_ptr<kernel::Graph>(c.kn_graph->clone())};
+            SearchContext c_tmp{std::shared_ptr<kernel::Graph>(c.kn_graph->clone()),
+                                c.path};
 #pragma omp task
             {
               try {
@@ -324,6 +331,7 @@ void KernelGraphGenerator::generate_next_operator(
           } else {
             generate_next_operator(c, verify, depth + 1);
           }
+          c.path.pop_back();
           delete c.kn_graph->operators.back();
           c.kn_graph->operators.pop_back();
         }
@@ -360,7 +368,7 @@ void KernelGraphGenerator::generate_kernel_graphs() {
         generate_next_operator(
             c,
             [this](SearchContext const &c) {
-              return this->verify(*c.kn_graph);
+              return this->verify(*c.kn_graph, c.path);
             },
             0);
       } catch (...) {
@@ -374,6 +382,7 @@ void KernelGraphGenerator::generate_kernel_graphs() {
 
   CSO_LOG(INFO) << "[Search] Generated " << num_tasks.load() << " tasks";
 
+  sort_generated_graphs();
   save_results();
 
   CSO_LOG(INFO) << "[Search] Finished kernel graph generation in "
@@ -472,13 +481,15 @@ bool KernelGraphGenerator::check_pattern(
   return result;
 }
 
-bool KernelGraphGenerator::verify(kernel::Graph &g) {
+bool KernelGraphGenerator::verify(kernel::Graph &g,
+                                  std::vector<int> const &path) {
   std::vector<DTensor> outputs = get_output_tensors(g);
 
     auto save_graph = [&]() {
 #pragma omp critical
       { 
         generated_graphs.push_back(json(g)); 
+        generated_graph_paths.push_back(path);
         _on_valid_graph();
       }
     };
@@ -542,6 +553,28 @@ bool KernelGraphGenerator::verify(kernel::Graph &g) {
   }
 
   return false;
+}
+
+// The tasks finish in any order, so generated_graphs is in completion order
+// and differs from run to run. Put it in search-tree order (depth first, each
+// state's branches in enumeration order), which is the order one thread walking
+// the tree finds the graphs in: a search then returns the same list every time.
+void KernelGraphGenerator::sort_generated_graphs() {
+  std::vector<size_t> order(generated_graphs.size());
+  std::iota(order.begin(), order.end(), size_t{0});
+  std::stable_sort(order.begin(), order.end(), [this](size_t a, size_t b) {
+    return generated_graph_paths[a] < generated_graph_paths[b];
+  });
+  std::vector<json> graphs;
+  std::vector<std::vector<int>> paths;
+  graphs.reserve(order.size());
+  paths.reserve(order.size());
+  for (size_t i : order) {
+    graphs.push_back(std::move(generated_graphs[i]));
+    paths.push_back(std::move(generated_graph_paths[i]));
+  }
+  generated_graphs = std::move(graphs);
+  generated_graph_paths = std::move(paths);
 }
 
 void KernelGraphGenerator::save_results() const {
