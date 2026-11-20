@@ -9,7 +9,8 @@ top-k cut) it checks what unit tests cannot afford to:
   (a) accepted == builds   the accept filter keeps a candidate iff the default build
                            (``build_candidate_code``) produces a kernel for it;
   (b) typed refusals       ``apply_tiling`` raises nothing but ``ScheduleRejected``;
-  (c) lowering parity      for accepted candidates (``--lower N`` evenly spread ones, or
+  (c) lowering parity      for accepted candidates (``--lower N`` evenly spread ones plus
+                           the ones a job singles out, or
                            ``all``): ``tilelang.lower`` for an offline sm_90a target gives
                            the same verdict for the stabilized kernel and for its plain
                            twin, the same tiling with the record taken off;
@@ -73,7 +74,8 @@ def _rsteps(cand):
     return [int(x) for v in cand.rstep_map.values() for x in (v.values() if v else ())]
 
 
-# name -> (graphs(), search options, compiler pass options, selector of the +nvcc kernel)
+# name -> (graphs(), search options, compiler pass options, selector of the +nvcc kernel
+#          [, selector of candidates that are always lowered, whatever --lower samples])
 FIXTURES = {
     "mha_4096_flash": (
         lambda: [S.softmax_ir(S.flash_attention, dict(H=32, SQ=4096, SKV=4096, D=64))],
@@ -95,9 +97,14 @@ FIXTURES = {
     "mla_prefill": (
         lambda: [_marked_fixture(G.mla_prefill_bhsd_graph, (1, 128, 4096, 4096, 192, 128))],
         {}, None, None),
+    # The only tilings of this operator that validate on a GPU hold the whole head dim in
+    # the block: output tile [1, 64, 512] with the softmax loop stepped 32 (20 of the 600).
     "mla_decode": (
         lambda: [_marked_fixture(G.mla_decode_bhsd_graph, (1, 128, 4096, 512, 64))],
-        {}, MLA, lambda c: _rsteps(c) == [512, 64, 32, 32]),
+        {}, MLA,
+        lambda c: (list(c.output_tile) == [1, 64, 512] and _rsteps(c) == [512, 64, 32, 32]
+                   and c.n_threads == 128),
+        lambda c: list(c.output_tile) == [1, 64, 512] and _rsteps(c)[2:] == [32, 32]),
     "qknorm": (
         lambda: [_marked_fixture(G.qknorm_graph, (1, 64, 8, 4096, 4096, 128))],
         {"topk": 32, "force_fusion": True}, None, lambda c: True),
@@ -190,7 +197,7 @@ def _lower(code, device_compile=False):
         return _first(e)
 
 
-def census(ir, search, options, n_lower, nvcc):
+def census(ir, search, options, n_lower, nvcc, focus=None):
     options = options or CompilerPassOptions()
     problems, rows = [], []
     force = search.get("force_fusion", False)
@@ -249,7 +256,10 @@ def census(ir, search, options, n_lower, nvcc):
         step = len(kept) / int(n_lower)
         chosen = [kept[int(k * step)] for k in range(int(n_lower))]
     named = [(c, r) for c, r in kept if nvcc is not None and nvcc(c)][:1]
-    for cand, row in chosen + [x for x in named if all(x[1] is not r for _, r in chosen)]:
+    extra = named + [(c, r) for c, r in kept if focus is not None and focus(c)]
+    for cand, row in chosen + extra:
+        if "lower" in row:
+            continue
         row["lower"] = _lower(row["code"])  # (c)
         row["plain_lower"] = "no plain twin" if row["plain_code"] is None else _lower(
             row["plain_code"])
@@ -301,8 +311,9 @@ def main(argv):
     if job.startswith("demo:"):
         irs, search = _demo_graphs(job[5:])
         options, nvcc = (MLA if job == "demo:mla_decode" else None), None
+        focus = None
     else:
-        graphs, search, options, nvcc = FIXTURES[job]
+        graphs, search, options, nvcc, focus = (FIXTURES[job] + (None,))[:5]
         irs = graphs()
     all_rows, all_problems = [], []
     for k, ir in enumerate(irs):
@@ -310,7 +321,8 @@ def main(argv):
         if not annotated(ir):
             print(f"{name}: no record (lowering marked no exp of this graph)")
             continue
-        rows, problems = census(ir, dict(search), options, n_lower, nvcc if with_nvcc else None)
+        rows, problems = census(ir, dict(search), options, n_lower,
+                                nvcc if with_nvcc else None, focus)
         summarize(name, rows, problems, with_nvcc)
         all_rows += [dict(r, graph=k) for r in rows]
         all_problems += problems

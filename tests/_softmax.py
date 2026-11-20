@@ -21,7 +21,7 @@ from __future__ import annotations
 import cleave.lang as cl
 from cleave.frontend import trace
 from cleave.ir.graph import OutputNode
-from cleave.ir.ops import Exp, Matmul, Mul, ReduceMax, ReduceSum, Stabilize
+from cleave.ir.ops import Div, Exp, Matmul, Mul, ReduceMax, ReduceSum, Stabilize
 from cleave.pipeline.plans import lower
 from cleave.pipeline.superopt import GraphSet
 
@@ -129,8 +129,23 @@ def exps(ir) -> list:
     return [n for n in ir.nodes if type(n) is Exp]
 
 
+def _computed_from(node, source) -> bool:
+    stack, seen = [node], set()
+    while stack:
+        n = stack.pop()
+        if n is source:
+            return True
+        if id(n) not in seen:
+            seen.add(id(n))
+            stack.extend(e.src_node for e in n.inputs)
+    return False
+
+
 def scaled_reductions(exp) -> tuple:
-    """``((name, 1), ...)``: the first reductions / contractions reached from ``exp``."""
+    """``((name, 1), ...)``: the reductions / contractions that sum a value still carrying
+    the scale of ``exp``: the first ones reached from it. The walk stops where the value is
+    divided by one of the exp's own reductions: the quotient no longer carries the scale,
+    so a matmul behind ``exp / sum(exp)`` is not one of them."""
     found, stack, seen = [], [exp], set()
     while stack:
         node = stack.pop(0)
@@ -141,6 +156,9 @@ def scaled_reductions(exp) -> tuple:
             seen.add(id(dst))
             if isinstance(dst, REDUCERS):
                 found.append(dst.name)
+            elif (type(dst) is Div and dst.const is None and edge.dst_id == 0
+                  and _computed_from(dst.inputs[1].src_node, exp)):
+                continue
             else:
                 stack.append(dst)
     return tuple((name, 1) for name in found)
@@ -173,13 +191,6 @@ def softmax_ir(fn, shapes, *softmax, dtype=cl.f16):
         assert bool(got.rolling) == bool(record.rolling), (exp.name, got, record)
         assert got.export == record.export, (exp.name, got, record)
     return ir
-
-
-def code_of(cand) -> str:
-    """Generated TileLang source of one candidate, through the default build."""
-    from cleave.runtime.compile import build_candidate_code
-
-    return build_candidate_code(cand)
 
 
 def raw_statistics_graph(BH, S_Q, S_KV, D):

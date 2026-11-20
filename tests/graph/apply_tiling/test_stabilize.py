@@ -819,3 +819,14 @@ def test_a_taken_node_name_is_a_bug_not_a_refusal(small):
     next(n for n in tiled.nodes if n.name.startswith("div_")).name = f"{small.exp.name}_shifted"
     with pytest.raises(AssertionError, match="already taken in this graph"):
         stab.stabilize(tiled)
+
+
+def test_every_codegen_caller_gets_the_rewrite(prefill):
+    """The pass is the tail of ``apply_tiling``, so a caller that runs the tiler and the
+    codegen passes itself -- the snapshot mirror does -- emits the same stabilized kernel
+    as the default build, not a plain exp against a stabilized reference."""
+    from tests.pipeline._pipeline import _build_code
+
+    code = _build_code(prefill.cand, False)
+    assert code == build_candidate_code(prefill.cand)
+    assert f"ukernel_rescale_1dims_rr(t_{prefill.exp.name}_alpha" in code
