@@ -141,8 +141,8 @@ def test_a_demo_job_censuses_the_searched_graphs(monkeypatch, tmp_path, capsys):
     censused. Flash form: every tiling is served; traced order: only the ones that hold
     the row whole."""
     monkeypatch.setenv("CLEAVE_CACHE_ROOT", str(tmp_path / "cache"))
-    status, lines, report = _run(tmp_path, capsys, "demo:mha_decode_exact")
-    assert status == 0 and lines[-1] == "demo:mha_decode_exact: ok", lines[-6:]
+    status, lines, report = _run(tmp_path, capsys, "demo:mha_decode_exact@256")
+    assert status == 0 and lines[-1] == "demo:mha_decode_exact@256: ok", lines[-6:]
     assert not report["unchecked"] and not report["problems"]
 
     by_graph = {}
@@ -157,10 +157,25 @@ def test_a_demo_job_censuses_the_searched_graphs(monkeypatch, tmp_path, capsys):
     assert counts == [(32, 8, 0), (32, 32, 24)]
     # the search saw no max: the records are lowering's, or set by hand where this tree's
     # frontend cannot make the request
-    heads = [line for line in lines if line.startswith("demo:mha_decode_exact[")]
+    heads = [line for line in lines if line.startswith("demo:mha_decode_exact@256[")]
     assert len(heads) == 2 and all(
         line.endswith(("[records: lowering]", "[records: by hand]")) for line in heads
     )
+
+
+def test_the_demo_at_its_own_shape_is_all_rolling(monkeypatch, tmp_path, capsys):
+    """The demo's default row (S_KV = 4096) is longer than a block: the flash form's tilings
+    all carry a running max, and the traced order has no tiling to census."""
+    monkeypatch.setenv("CLEAVE_CACHE_ROOT", str(tmp_path / "cache"))
+    status, lines, report = _run(tmp_path, capsys, "demo:mha_decode_exact")
+    assert status == 0 and lines[-1] == "demo:mha_decode_exact: ok", lines[-6:]
+    assert not report["unchecked"] and not report["problems"]
+    rows = report["rows"]
+    assert len({row["graph"] for row in rows}) == 1
+    assert (len(rows), sum(r["accepted"] for r in rows),
+            sum(r["tiling"] == "rolling" for r in rows)) == (32, 32, 32)
+    heads = [line for line in lines if line.startswith("demo:mha_decode_exact[")]
+    assert len(heads) == 2 and sum(" 0 raw candidates" in line for line in heads) == 1
 
 
 def test_importing_the_tool_leaves_the_process_alone():

@@ -1,4 +1,10 @@
-"""Exact softmax ``exp(x - max(x)) / sum``: tensor-tensor sub and the max reduction.
+"""Exact softmax ``exp(x - max(x)) / sum``.
+
+``cl.softmax`` records ``exp, sum, div`` and the request that the exp be stabilized: the
+search sees no max, and each schedule gets the shift it needs (the row max in a tile that
+holds the row, a running max across the tiles of a looped row). The max written out by hand
+(``cl.exp(x - cl.max(x))``: the tensor-tensor sub and the max reduction) stays in the
+language, and stays limited to rows that fit one block.
 
 ``test_search_*`` run the superoptimizer, ``test_gpu_*`` compile kernels (root conftest marks).
 """
@@ -23,19 +29,63 @@ def softmax_shift(x: cl.Tensor["R", "C"]):
     return cl.softmax(x, -1, shift=-4.0)
 
 
+def softmax_shift_free(x: cl.Tensor["R", "C"]):
+    return cl.softmax(x, -1, shift=0.0)
+
+
+def softmax_by_hand(x: cl.Tensor["R", "C"]):
+    e = cl.exp(x - cl.max(x, -1, keepdim=True))
+    return e / cl.sum(e, -1, keepdim=True)
+
+
 def attention(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
               v: cl.Tensor["H", "SKV", "D"]):
     return cl.softmax((q @ k.mT) / q.shape[-1] ** 0.5, dim=-1) @ v
+
+
+def attention_by_hand(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
+                      v: cl.Tensor["H", "SKV", "D"]):
+    """The max written out: what ``cl.softmax`` traced before it recorded the request."""
+    s = (q @ k.mT) / q.shape[-1] ** 0.5
+    e = cl.exp(s - cl.max(s, -1, keepdim=True))
+    return (e / cl.sum(e, -1, keepdim=True)) @ v
+
+
+def attention_unstabilized(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
+                           v: cl.Tensor["H", "SKV", "D"]):
+    """The twin of ``attention`` without the request: a plain ``exp / sum / div``."""
+    e = cl.exp((q @ k.mT) / q.shape[-1] ** 0.5)
+    return (e / cl.sum(e, -1, keepdim=True)) @ v
 
 
 def _kinds(prog):
     return [r.kind for r in prog.ops]
 
 
-def test_exact_softmax_traces_max_and_sub():
+def test_exact_softmax_records_the_request():
     prog = trace(softmax, {"R": 4, "C": 32}, cl.f32)
+    assert _kinds(prog) == ["input", "exp", "reduce_sum", "div"]
+    assert prog.ops[1].attr("stabilize") == 1
+    assert prog.stabilize_requests == ((prog.ops[0].out, 1),)
+    assert prog.ops[2].attr("dim") == 1 and prog._values[prog.ops[2].out].shape == (4, 1)
+    # the search is handed a plain exp: no max, no sub
+    ops = [o["op_type"] for o in prog.to_graph_structure()]
+    assert ops == ["kn_input_op", "kn_exp_op", "kn_reduce_sum_1_op", "kn_div_op",
+                   "kn_output_op"]
+    x = torch.randn(4, 32) * 30
+    torch.testing.assert_close(prog.reference(x)[0], torch.softmax(x, -1))
+    # the request is in the fingerprint: the program never shares a search or kernel cache
+    # entry with the same ops under a fixed shift of zero, which make no such claim
+    shift_free = trace(softmax_shift_free, {"R": 4, "C": 32}, cl.f32)
+    assert _kinds(shift_free) == _kinds(prog) and not shift_free.stabilize_requests
+    assert shift_free.fingerprint() != prog.fingerprint()
+
+
+def test_max_written_by_hand_traces_max_and_sub():
+    prog = trace(softmax_by_hand, {"R": 4, "C": 32}, cl.f32)
     assert _kinds(prog) == ["input", "reduce_max", "sub", "exp", "reduce_sum", "div"]
     assert prog.ops[1].attr("dim") == 1 and prog._values[prog.ops[1].out].shape == (4, 1)
+    assert not prog.stabilize_requests
     ops = [o["op_type"] for o in prog.to_graph_structure()]
     assert ops == ["kn_input_op", "kn_reduce_max_1_op", "kn_sub_op", "kn_exp_op",
                    "kn_reduce_sum_1_op", "kn_div_op", "kn_output_op"]
@@ -46,6 +96,7 @@ def test_exact_softmax_traces_max_and_sub():
 def test_shift_softmax_is_unchanged():
     prog = trace(softmax_shift, {"R": 4, "C": 32}, cl.f32)
     assert _kinds(prog) == ["input", "add", "exp", "reduce_sum", "div"]
+    assert not prog.stabilize_requests
 
 
 def test_tensor_sub_and_max_builder():
@@ -89,27 +140,61 @@ def test_paged_program_rejects_sub():
 
 
 def test_search_exact_softmax():
+    """No searched graph of ``cl.softmax`` contains a max: the search space is shift-free."""
     prog = trace(softmax, {"R": 16, "C": 256}, cl.f16)
+    graphs = P.superoptimize(prog, P.SuperoptConfig(cache=False))
+    assert len(graphs) >= 1 and not any({"max", "sub"} & set(g.ops) for g in graphs)
+    assert all({"exp", "sum", "div"} <= set(g.ops) for g in graphs)
+    assert graphs.program.stabilize_requests  # ... and the request travels with them
+
+
+def test_search_max_written_by_hand_keeps_its_max():
+    prog = trace(softmax_by_hand, {"R": 16, "C": 256}, cl.f16)
     graphs = P.superoptimize(prog, P.SuperoptConfig(cache=False))
     assert len(graphs) >= 1 and all({"max", "sub"} <= set(g.ops) for g in graphs)
 
 
 def test_search_max_row_limit_reason(tmp_path, monkeypatch):
+    """A max written by hand is an opaque reduction: it needs the whole row in one block."""
     from cleave.core.errors import CleaveError
     from cleave.pipeline.plans import MAX_ROW_LIMIT
 
     monkeypatch.setenv("CLEAVE_CACHE_ROOT", str(tmp_path))
     shapes = dict(H=32, SQ=64, SKV=4096, D=64)
-    prog = trace(attention, shapes, cl.f16)
+    prog = trace(attention_by_hand, shapes, cl.f16)
     plans = P.schedule(P.superoptimize(prog, P.SuperoptConfig(max_ops=14, cache=False)),
                        P.ScheduleConfig(topk=2))
     assert not plans and plans.refused
     assert {str(r.error) for r in plans.refused} == {MAX_ROW_LIMIT}
-    with pytest.raises(CleaveError, match="online softmax") as e:
-        P.compile(attention, shapes=shapes, dtype=cl.f16, split=False, preset="fast",
+    with pytest.raises(CleaveError, match="cl.softmax") as e:
+        P.compile(attention_by_hand, shapes=shapes, dtype=cl.f16, split=False, preset="fast",
                   superopt=P.SuperoptConfig(max_ops=14), schedule=P.ScheduleConfig(topk=2),
                   tolerance=tolerance_for("exact_attention"))
     assert MAX_ROW_LIMIT in e.value.report.summary()
+
+
+def test_search_long_rows_schedule_with_rolling_plans(tmp_path, monkeypatch):
+    """The same attention through ``cl.softmax``: S_KV = 4096 schedules, and every plan
+    carries a running max over the loop that tiles the keys."""
+    from cleave.schedule import apply_tiling
+    from cleave.schedule.stabilize import sites
+
+    monkeypatch.setenv("CLEAVE_CACHE_ROOT", str(tmp_path))
+    shapes = dict(H=32, SQ=64, SKV=4096, D=64)
+    prog = trace(attention, shapes, cl.f16)
+    plans = P.schedule(P.superoptimize(prog, P.SuperoptConfig(cache=False)),
+                       P.ScheduleConfig(topk=8))
+    assert len(plans) == 8 and {p.variant for p in plans} == {"solo"}
+    for plan in plans:
+        (site,) = sites(apply_tiling(plan.tile))
+        assert site.case == "rolling" and site.full == site.block == 4096
+        assert 1 < site.step < 4096 and len(site.scaled) == 2  # the row sum and P @ V
+    # they are the flash form (the row sum next to the value matmul, the division last);
+    # the traced order reads the exp next to its finished sum, so it has no rolling form
+    (flash,) = {p.graph.summary() for p in plans}
+    assert flash == "solo matmul>div>exp>sum>matmul>div"
+    assert [(r.variant, str(r.error)) for r in plans.refused] == [
+        ("solo", "no tiling candidates")]
 
 
 # ------------------------------------------------------------------ GPU
@@ -152,3 +237,51 @@ def test_gpu_exact_softmax_attention(cache_root):
     q = q * 4  # scores far from the fixed -50/sqrt(d) shift
     ref = torch.softmax((q.float() @ k.float().mT) / 8.0, -1) @ v.float()
     torch.testing.assert_close(kernel(q, k, v).float(), ref, rtol=2e-2, atol=2e-2)
+
+
+def test_gpu_exact_softmax_long_rows(cache_root):
+    """S_KV = 4096: every plan carries a running max (the online softmax). The kernels are
+    held to the adversarial softmax inputs by the build, and the returned one is checked
+    here on logits a fixed shift cannot hold."""
+    _gpu()
+    shapes = dict(H=32, SQ=64, SKV=4096, D=64)
+    kernel = P.compile(attention, shapes=shapes, dtype=cl.f16, split=False,
+                       tolerance=tolerance_for("exact_attention"),
+                       **{**FAST, "schedule": P.ScheduleConfig(topk=4)})
+    assert kernel.variant == "solo" and len(kernel.report.correct) >= 1
+    g = torch.Generator().manual_seed(0)
+    q, k, v = (torch.randn(s, generator=g).to("cuda", torch.float16)
+               for s in [(32, 64, 64), (32, 4096, 64), (32, 4096, 64)])
+    q = q * 40  # logits up to several hundred: exp of them overflows fp32
+    ref = torch.softmax((q.float() @ k.float().mT) / 8.0, -1) @ v.float()
+    out = kernel(q, k, v).float()
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2)
+
+
+def test_gpu_unstabilized_twin_is_caught_at_x100(cache_root):
+    """The validation has teeth: the twin without the request is a fine kernel on normal
+    inputs and fails on logits 100 times larger, classified as non-finite by the comparator.
+    The exact program is held to those inputs by the build itself, and passes."""
+    _gpu()
+    shapes = dict(H=32, SQ=64, SKV=256, D=64)
+    so, sc = P.SuperoptConfig(max_ops=14), P.ScheduleConfig(topk=4)
+    ev = P.EvalConfig(warmup=2, iters=20, max_parallel=4,
+                      tolerance=tolerance_for("exact_attention"))
+
+    twin = trace(attention_unstabilized, shapes, cl.f16)
+    assert not twin.stabilize_requests
+    plans = P.schedule(P.superoptimize(twin, so), sc)
+    normal = P.build(plans, config=ev)
+    assert len(normal.correct) >= 1
+    large = P.build(plans, config=ev.replace(distributions=("normal", "large_logits")))
+    assert not large.correct
+    for before, after in zip(normal.results, large.results):
+        if before.ok:  # the same kernel: only the inputs changed
+            assert after.stage == "validate" and after.error_type == "NonFiniteOutput", after
+            assert "large_logits inputs" in str(after.error)
+
+    exact = trace(attention, shapes, cl.f16)
+    assert exact.stabilize_requests
+    built = P.build(P.schedule(P.superoptimize(exact, so), sc), config=ev)
+    assert len(built.correct) >= 1

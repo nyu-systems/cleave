@@ -9,5 +9,5 @@ def attention(q, k, v):
 
 
 def exact_attention(q, k, v):
-    """softmax(Q K^T / sqrt(d)) V with the exact exp(s - max(s)) / sum."""
+    """softmax(Q K^T / sqrt(d)) V with the exact exp(s - max(s)) / sum, at any S_KV."""
     return cl.softmax((q @ k.mT) / q.shape[-1] ** 0.5, dim=-1) @ v

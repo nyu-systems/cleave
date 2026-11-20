@@ -71,7 +71,8 @@ class EvalConfig(_Replace):
     max_parallel: int = 8
     timeout_s: float | None = None  # None -> Settings.compile_timeout_secs
     # Input distributions every candidate is validated on (cleave.runtime.inputs.DISTRIBUTIONS);
-    # it is timed on the first.
+    # it is timed on the first. A program whose softmax is exact is held to its adversarial
+    # cases as well, whether they are listed here or not (cleave.pipeline.build).
     distributions: tuple[str, ...] = ("normal",)
 
     def __post_init__(self):

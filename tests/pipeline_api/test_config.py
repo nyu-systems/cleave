@@ -115,7 +115,9 @@ def test_cache_schema_retires_kernels_built_before_a_scheduler_fix(monkeypatch):
     # 8: no static split-attention partial validated and the partial -> combine Kernel was
     # unrunnable, so the saved winner of a split program could only be a solo kernel.
     # 9: gqa_paged_decode_h32_kv8_d128_ps1 built the unshifted exp, with no running max.
-    assert cache.SCHEMA >= 10
+    # 10: cl.softmax traced an opaque max; a program that made the request by hand was
+    # validated on normal inputs only.
+    assert cache.SCHEMA >= 11
     key = _kernel_key(prog, *cfgs)
     monkeypatch.setattr(cache, "SCHEMA", 1)
     assert _kernel_key(prog, *cfgs) != key

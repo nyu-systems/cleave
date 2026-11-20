@@ -24,9 +24,14 @@ from pathlib import Path
 # 10: gqa_paged_decode_h32_kv8_d128_ps1 builds the exact (running-max) softmax: the same
 #     paged program now emits a different kernel. (Paged kernels are not kernel-cached, so
 #     no stale one can be returned today.)
-SCHEMA = 10
+# 11: cl.softmax records the exact softmax as a request on its exp (no max in the program),
+#     every schedule of such a program gets its own shift (in-tile max or running max), and
+#     its kernels are validated on the adversarial softmax inputs as well.
+SCHEMA = 11
 # What "validated" means for a saved kernel. A kernel-cache hit returns without validating,
 # so bump this whenever the comparison or its inputs change: saved kernels are then rebuilt.
+# (The inputs include the adversarial cases a program with an exact softmax is held to,
+# cleave.runtime.inputs.ADVERSARIAL, which are not in the key by name.)
 VALIDATION = 2
 
 

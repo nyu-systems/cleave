@@ -35,10 +35,9 @@ def stable_exp(x, dim: int = -1):
 
 
 def exact_softmax(x, dim: int = -1):
-    """``softmax(x, dim)`` as the frontend will record it: the requested exp, its sum, the
+    """``softmax(x, dim)`` as the frontend records it: the requested exp, its sum, the
     division. No max and no shift."""
-    e = stable_exp(x, dim)
-    return e / cl.sum(e, dim, keepdim=True)
+    return cl.softmax(x, dim)
 
 
 # ------------------------------------------------------------------------------- programs

@@ -27,12 +27,12 @@ fixtures of ``tests/_graphs.py`` (the end2end cases), with the ``Stabilize`` rec
 the Exp by hand (checked against lowering's own where the tree's lowering writes one).
 
 ``demo:`` jobs: a demo's own program and configs through ``superoptimize`` and
-``plans.lower``, i.e. the *searched* graphs. The demo is traced with ``cl.softmax`` replaced
-by the form the frontend will record (``tests/_softmax.py::exact_softmax``: the requested
-exp, its sum, the division; the demos' ``shift=`` is dropped), so the search sees the
-shift-free program. The records are the ones lowering writes. On a tree whose frontend
-cannot make the request (no ``Program._stable_exp``) lowering writes none, and they are set
-by hand instead (``tests/_softmax.py::hand_record``); the summary says which.
+``plans.lower``, i.e. the *searched* graphs. The demo is traced with the ``shift=`` of its
+``cl.softmax`` dropped, so that it records the exact softmax (the requested exp, its sum,
+the division) and the search sees the shift-free program. The records are the ones lowering
+writes. On a tree whose frontend cannot make the request (no ``Program._stable_exp``)
+lowering writes none, and they are set by hand instead (``tests/_softmax.py::hand_record``);
+the summary says which.
 
 Exit status, also the last line printed:
 
@@ -148,7 +148,11 @@ DEMOS = {
     "mla_decode": (MLA, lambda c: _whole_head_dim(c) and c.n_threads == 128, _whole_head_dim),
     "qknorm": (None, lambda c: c.n_threads == 128, None),
     "mha_decode_exact": (None, None, None),
+    # the same demo at a row one block holds: one graph has in-tile and rolling tilings
+    "mha_decode_exact@256": (None, None, None),
 }
+# job -> (demo file, its command line), where they differ from (the job's name, none)
+DEMO_ARGV = {"mha_decode_exact@256": ("mha_decode_exact", ["--SKV", "256"])}
 
 
 def _demo_graphs(name):
@@ -181,12 +185,13 @@ def _demo_graphs(name):
     def requested_softmax(x, dim=-1, shift=None, **paged):
         if paged or not isinstance(x, Tensor):
             return real_softmax(x, dim, shift, **paged)
-        return S.exact_softmax(x, dim)
+        return real_softmax(x, dim)  # the demo's ``shift=`` dropped: the exact softmax
 
+    name, flags = DEMO_ARGV.get(name, (name, []))
     real_compile, real_target, argv = examples._compile, examples._target, sys.argv
     examples._compile, examples._target = fake_compile, lambda: "cpu"
     cl.softmax = requested_softmax
-    sys.argv = [str(ROOT / "demo" / f"{name}.py")]
+    sys.argv = [str(ROOT / "demo" / f"{name}.py"), *flags]
     sys.path.insert(0, str(ROOT / "demo"))  # the demos import each other by bare name
     try:
         runpy.run_path(sys.argv[0], run_name="__main__")

@@ -185,7 +185,8 @@ def describe_tile(t) -> str:
     return text
 
 
-MAX_ROW_LIMIT = "a max over a row longer than one block needs online softmax, which is not implemented"
+MAX_ROW_LIMIT = ("a max written by hand needs its whole row in one block, and this row is longer; "
+                 "cl.softmax carries a running max across the tiles of a row of any length")
 
 
 def _search(ir_graph, topk: int, force: bool, hints: dict | None,

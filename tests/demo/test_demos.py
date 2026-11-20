@@ -92,13 +92,14 @@ def test_every_demo_has_a_case():
 
 
 def _assert_declared(config, name):
-    """One measured bound for the operator, within the ceiling; normal inputs only."""
+    """One measured bound for the operator, within the ceiling; it asks for normal inputs."""
     tolerance = config.tolerance
     assert isinstance(tolerance, Tolerance), "the demo declares no tolerance"
     assert 0 < tolerance.rtol <= CEILING and tolerance.atol == 0
     # ... and exactly the one the rule gives for the pinned measurement of this demo
     assert tolerance == expected_tolerance(json.loads(MEASURED.read_text())[f"demo:{name}"])
-    # the adversarial input distributions exist but are not switched on for any operator yet
+    # No demo asks for more than the normal inputs. (The build holds a program whose softmax
+    # is exact to the adversarial cases as well, whatever is asked: pipeline.build.)
     assert config.distributions == ("normal",)
 
 
@@ -130,12 +131,17 @@ def test_staged_demo_declares_its_own_tolerance(monkeypatch):
 
 
 def test_mha_decode_exact_config(monkeypatch):
+    """The exact softmax at the decode demo's own shape: no max in the program (the request
+    stands for it), no split, and the search budget the auto rule gives."""
     seen = run_demo(monkeypatch, "mha_decode_exact", [])
     program, so = seen["program"], seen["so"]
     assert [r.kind for r in program.ops if r.kind != "input"] == [
-        "matmul", "div", "reduce_max", "sub", "exp", "reduce_sum", "div", "matmul"]
-    assert not so.split and so.resolve_max_ops(program) == 14
-    assert program.sizes == {"H": 32, "SQ": 64, "D": 64, "SKV": 256}
+        "matmul", "div", "exp", "reduce_sum", "div", "matmul"]
+    assert len(program.stabilize_requests) == 1
+    assert not so.split and so.max_ops == "auto" and so.resolve_max_ops(program) == 13
+    assert program.sizes == {"H": 32, "SQ": 64, "D": 64, "SKV": 4096}
+    # ... the shape of demo/mha_decode.py, whose softmax is still the fixed shift
+    assert run_demo(monkeypatch, "mha_decode", [])["program"].sizes == program.sizes
 
 
 @pytest.mark.parametrize("name", DEMOS)
