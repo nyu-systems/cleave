@@ -188,8 +188,16 @@ def describe_tile(t) -> str:
 MAX_ROW_LIMIT = "a max over a row longer than one block needs online softmax, which is not implemented"
 
 
-def _search(ir_graph, topk: int, force: bool, hints: dict | None):
+def _search(ir_graph, topk: int, force: bool, hints: dict | None,
+            refused: Counter | None = None):
+    """The top ``topk`` tilings of one lowered graph.
+
+    A graph with a marked softmax exp keeps only the tilings ``apply_tiling`` builds,
+    stabilization included, decided before the top-k cut; the reasons of the others are
+    added to ``refused``. For any other graph nothing changes.
+    """
     from ..schedule import search_tiling
+    from ..schedule.stabilize import stabilize_accept
 
     kw = dict(hints or {})
     if kw:
@@ -197,10 +205,19 @@ def _search(ir_graph, topk: int, force: bool, hints: dict | None):
         unknown = [k for k in kw if k not in accepted]
         if unknown:
             raise ScheduleRejected(f"search_tiling does not accept hints {unknown}")
+    stable = stabilize_accept(ir_graph)
+    if stable is not None:
+        user = kw.get("accept")
+        kw["accept"] = stable if user is None else (lambda cand: user(cand) and stable(cand))
     try:
         return list(search_tiling(ir_graph, topk=topk, force_fusion=force, **kw))
     except Exception as e:  # noqa: BLE001
+        # Not a refused candidate: the filter drops those itself. Whatever else it or the
+        # search raises is a bug, and names itself in the refusal of the whole graph.
         raise ScheduleRejected(f"{type(e).__name__}: {e}") from e
+    finally:
+        if stable is not None and refused is not None:
+            refused.update(stable.reasons)
 
 
 def _schedule_once(graphs: GraphSet, config: ScheduleConfig, force: bool):
@@ -209,13 +226,17 @@ def _schedule_once(graphs: GraphSet, config: ScheduleConfig, force: bool):
     topk, hints = config.topk, config.hints
 
     def add(g, variant, role, ir, factor, inputs=None):
+        reasons = Counter()
         try:
-            tiles = _search(ir, topk, force, hints)
+            tiles = _search(ir, topk, force, hints, reasons)
         except ScheduleRejected as e:
             refused.append(Refusal(g.index, variant, role, e))
             return
         if not tiles:
             why = MAX_ROW_LIMIT if "max" in g.ops else "no tiling candidates"
+            if reasons:  # every tiling was refused by the softmax filter: say why
+                why += f" ({sum(reasons.values())} refused: " + "; ".join(
+                    f"{n}x {reason}" for reason, n in reasons.most_common()) + ")"
             refused.append(Refusal(g.index, variant, role, ScheduleRejected(why)))
         for rank, t in enumerate(tiles):
             label = f"g{g.index} {variant} {role} #{rank} {describe_tile(t)}"
