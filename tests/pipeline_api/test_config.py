@@ -154,7 +154,8 @@ def test_cache_schema_retires_kernels_built_before_a_scheduler_fix(monkeypatch):
     # 31: every split graph of one-head attention with S_Q == D was refused at lowering.
     # 32: on two warp groups a matmul read its first operand from a fragment TileLang lays
     # out for other rows than each instruction computes.
-    assert cache.SCHEMA >= 33
+    # 33: reductions that share nothing were put in one loop by equal steps alone.
+    assert cache.SCHEMA >= 34
     key = _kernel_key(prog, *cfgs)
     monkeypatch.setattr(cache, "SCHEMA", 1)
     assert _kernel_key(prog, *cfgs) != key

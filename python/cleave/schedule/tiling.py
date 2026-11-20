@@ -1300,9 +1300,20 @@ def apply_tiling(cand: List) -> List[Graph]:
             for gnode in graphs["main"].nodes:
                 if isinstance(gnode, GraphNode):
                     accum_node = gnode.graph.accum_nodes[0]  # assume one accum node
-                    same_rstep = (
+                    node_rstep = _get_rstep_for_axis(node, cand.rstep_map[node])
+                    # A reduction that shares nothing with the loop joins it only
+                    # where the loop already steps the way the reduction does:
+                    # the same step, the same number of times. Equal steps over
+                    # axes of different length are not that: x @ w over K = 256
+                    # and y @ z over K2 = 512, both stepped by 32, were put in one
+                    # loop of 8 iterations that cut z into 16 tiles, and every
+                    # such tiling was then refused for the miscount. It gets a
+                    # loop of its own, as with any other pair of steps.
+                    same_loop = (
                         _get_rstep_for_axis(accum_node, cand.rstep_map[accum_node])
-                        == _get_rstep_for_axis(node, cand.rstep_map[node])
+                        == node_rstep
+                        and int(node.raxis[0].dom.extent) // node_rstep
+                        == gnode.graph.extent
                     )
 
                     # merge node and its ancestors into an existing graph when
@@ -1333,7 +1344,7 @@ def apply_tiling(cand: List) -> List[Graph]:
                     ]
 
                     if (
-                        not same_rstep
+                        not same_loop
                         and not shared_inner_nodes
                         and not existing_placeholders
                     ):

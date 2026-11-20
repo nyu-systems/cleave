@@ -82,7 +82,9 @@ from pathlib import Path
 #     where it used to read a fragment: 256-thread kernels on tiles of 256 rows or more
 #     computed half or more of their rows from the wrong operand rows, and the same
 #     tilings of attention had no kernel at all.
-SCHEMA = 33
+# 34: reductions that share no operand are put in one loop only where it steps both alike;
+#     with equal steps over axes of different length each gets a loop (they were refused).
+SCHEMA = 34
 # What "validated" means for a saved kernel. A kernel-cache hit returns without validating,
 # so bump this whenever the comparison or its inputs change: saved kernels are then rebuilt.
 # (The inputs include the adversarial cases a program with an exact softmax is held to,
