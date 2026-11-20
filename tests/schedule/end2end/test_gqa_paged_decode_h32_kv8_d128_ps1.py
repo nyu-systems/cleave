@@ -37,7 +37,7 @@ def test_gqa_paged_decode_h32_kv8_d128_ps1_pipeline():
     compile_and_run_prim_func(
         _load_main_kernel_from_code(code),
         dtype=DTYPE,
-        workloads_fn=lambda: cases(OPERATOR, dims, adversarial=True),
+        workloads_fn=lambda: cases(OPERATOR, dims, adversarial=True, keyed=True),
         # Five declared inputs and the scale, then the two outputs.
         out_idx=[6, 7],
         tolerance=OPERATORS[OPERATOR].tolerance,

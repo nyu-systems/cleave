@@ -660,6 +660,34 @@ def test_the_captured_cases_are_followed_by_the_adversarial_ones_only_on_request
     assert not any("@" in key for key, *_ in _keys(op, adversarial=False))
 
 
+def test_keyed_cases_lead_with_the_key_the_registry_gives_the_workload():
+    """``workloads.cases(keyed=True)`` names each case as ``keyed_workloads`` does, so the
+    validation of a hand-built kernel is logged under the same workload key as a searched
+    one's -- ``@<distribution>`` marking an adversarial workload in both."""
+    import importlib
+
+    wl = importlib.import_module("cleave.dynamic.workloads")
+    name = "gqa_paged_decode_h32_kv8_d128_ps64"
+    op = OPERATORS[name]
+
+    def fake(operator, axes, dims, page_size=1, scale=None, distribution="normal"):
+        return ("inputs", axes, page_size), ("expected", distribution)
+
+    original, wl.case = wl.case, fake
+    try:
+        keyed = list(wl.cases(name, op.dims, page_size=64, adversarial=True, keyed=True))
+        plain = list(wl.cases(name, op.dims, page_size=64, adversarial=True))
+        captured = list(wl.cases(name, op.dims, page_size=64, keyed=True))
+    finally:
+        wl.case = original
+    assert inspect.signature(wl.cases).parameters["keyed"].default is False
+    keys = [key for key, *_ in _keys(op, adversarial=True)]
+    assert [key for key, *_ in keyed] == keys and len(keys) == len(WORKLOADS[name]) + 12
+    assert [(inputs, expected) for _, inputs, expected in keyed] == plain
+    assert all(len(case) == 2 for case in plain)
+    assert [key for key, *_ in captured] == keys[:-12] and not any("@" in k for k in keys[:-12])
+
+
 def _keys(op, adversarial):
     """``op.keyed_workloads`` with the tensors stubbed out: the keys alone, on the CPU."""
     import dataclasses

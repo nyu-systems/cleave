@@ -37,11 +37,12 @@ from cleave.runtime.validate import compare_outputs
 KEEP = 6
 
 
-def _check(operator, kernel, inputs, reference):
+def _check(operator, kernel, inputs, reference, what=""):
+    """``what`` names the workload in a failure and in the validation log."""
     outputs = [torch.full_like(t, float("nan")) for t in reference]
     kernel(*inputs, *outputs)
     torch.cuda.synchronize()
-    compare_outputs(outputs, reference, OPERATORS[operator].tolerance)
+    compare_outputs(outputs, reference, OPERATORS[operator].tolerance, what=what)
 
 
 @pytest.mark.parametrize("operator", sorted(CASES))
@@ -52,9 +53,9 @@ def test_split_pair_matches_the_reference(operator):
     for key, inputs, reference in keyed_workloads(operator, keep=KEEP, adversarial=True)():
         with _gpu_exec_guard():
             try:
-                _check(operator, kernel, inputs, reference)
+                _check(operator, kernel, inputs, reference, what=key)
             except AssertionError as error:
-                raise AssertionError(f"{operator} on {key}: {error}") from error
+                raise AssertionError(f"{operator} on {error}") from error
         seen.append(key)
         del inputs, reference
         torch.cuda.empty_cache()

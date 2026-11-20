@@ -52,11 +52,13 @@ EDGE_KV_LENS = [1, 63, 64, 65, 128, 0, 700]
 EDGE_PREFILL_LENS = [(1, 1), (24, 24), (3, 70), (40, 30), (20, 0), (17, 145), (70, 100)]
 
 
-def _check(operator, kernel, inputs, reference):
+def _check(operator, kernel, inputs, reference, what=""):
+    """``what`` names the request in a failure and in the validation log: a hand-made case
+    whose name carries an ``@`` is an adversarial one there, like a registry workload's."""
     outputs = [torch.full_like(t, float("nan")) for t in reference]  # NaN unless written
     kernel(*inputs, *outputs)
     torch.cuda.synchronize()
-    return compare_outputs(outputs, reference, OPERATORS[operator].tolerance)
+    return compare_outputs(outputs, reference, OPERATORS[operator].tolerance, what=what)
 
 
 def _is_prefill(operator) -> bool:
@@ -172,9 +174,9 @@ def _run_hand_made(operator, kernel):
             elif name.startswith("tile_edges"):
                 assert 0 < n_empty < reference[1].shape[0]
             try:
-                _check(operator, kernel, inputs, reference)
+                _check(operator, kernel, inputs, reference, what=name)
             except AssertionError as error:
-                raise AssertionError(f"{operator} on {name}: {error}") from error
+                raise AssertionError(f"{operator} on {error}") from error
         del inputs, reference
         torch.cuda.empty_cache()
 
@@ -263,15 +265,15 @@ def test_without_the_running_max_the_adversarial_workloads_fail(operator):
         key = f"{workload_key(axes)}@{distribution}"
         with _gpu_exec_guard():
             inputs, reference = op.reference(axes, distribution=distribution)
-            _check(operator, kernels["exact"], inputs, reference)
+            _check(operator, kernels["exact"], inputs, reference, what=key)
             flat = (distribution == "increasing" and op.page_size == 1
                     and _longest_request(operator, inputs) == 1)
             if flat:
-                _check(operator, kernels["plain"], inputs, reference)
+                _check(operator, kernels["plain"], inputs, reference, what=key)
                 passed.append(key)
             else:
                 with pytest.raises(NonFiniteOutput) as info:
-                    _check(operator, kernels["plain"], inputs, reference)
+                    _check(operator, kernels["plain"], inputs, reference, what=key)
                 failed[key] = str(info.value)
         del inputs, reference
         torch.cuda.empty_cache()

@@ -452,12 +452,23 @@ def case(operator, axes, dims, page_size=1, scale=None, distribution="normal"):
     return inputs, expected(*inputs)
 
 
-def cases(operator, dims, page_size=1, scale=None, adversarial=False):
+def cases(operator, dims, page_size=1, scale=None, adversarial=False, keyed=False):
     """(inputs, expected outputs) for each captured workload, built one at a time; with
-    ``adversarial`` the operator's adversarial workloads follow them."""
+    ``adversarial`` the operator's adversarial workloads follow them. ``keyed`` leads each
+    with its key, as ``registry.keyed_workloads`` does: ``wl_<axes>``, and
+    ``wl_<axes>@<distribution>`` for an adversarial one."""
+    def one(axes, distribution="normal"):
+        built = case(operator, axes, dims, page_size=page_size, scale=scale,
+                     distribution=distribution)
+        if not keyed:
+            return built
+        from ..runtime.autotune import workload_key
+
+        key = workload_key(axes)
+        return (key if distribution == "normal" else f"{key}@{distribution}", *built)
+
     for axes in WORKLOADS[operator]:
-        yield case(operator, axes, dims, page_size=page_size, scale=scale)
+        yield one(axes)
     if adversarial:
         for distribution, axes in ADVERSARIAL_WORKLOADS[operator]:
-            yield case(operator, axes, dims, page_size=page_size, scale=scale,
-                       distribution=distribution)
+            yield one(axes, distribution)

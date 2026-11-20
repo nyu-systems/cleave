@@ -50,7 +50,8 @@ class Case:
         if self.out_idx is not None:
             kw.update(
                 out_idx=self.out_idx,
-                workloads_fn=lambda: cases(self.name, dims, **self.workload_kw),
+                # keyed, so the validation log says which workload an error belongs to
+                workloads_fn=lambda: cases(self.name, dims, keyed=True, **self.workload_kw),
             )
         elif len(self.parts) > 1:
             kw.update(scratch_source_graph=self.source(*self.source_dims))

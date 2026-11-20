@@ -79,7 +79,9 @@ def compile_and_run_prim_func(
     A kernel whose tensor extents are symbolic serves many shapes from one compile.
     ``workloads_fn`` validates such a kernel over a sequence of them: it yields
     ``(inputs, reference)`` pairs, one built and freed at a time, because a single
-    workload's tensors can run to several GiB.
+    workload's tensors can run to several GiB. A workload may lead with its key,
+    ``(key, inputs, reference)``: it then names the comparison in a failure and in the
+    validation log.
 
     ``tolerance`` is the operator's declared bound (a ``Tolerance``, or one per output);
     there is no default, so leaving it out is an error.
@@ -97,12 +99,13 @@ def compile_and_run_prim_func(
             raise ValueError("workloads_fn requires an explicit out_idx.")
         kernel = _compile(prim_func, out_idx)
         n = 0
-        for inputs, reference in workloads_fn():
+        for *key, inputs, reference in workloads_fn():
             # Per workload, not around the loop: the guard is a cross-process lock, so
             # holding it for the whole sequence would stall every other test worker.
             with _gpu_exec_guard():
                 _validate_kernel_outputs(
-                    kernel, tuple(inputs), _as_list(reference), tolerance=tolerance
+                    kernel, tuple(inputs), _as_list(reference), tolerance=tolerance,
+                    what=key[0] if key else "",
                 )
             del inputs, reference
             n += 1
