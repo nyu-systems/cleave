@@ -37,6 +37,7 @@ _MARKERS = {
         "tests/frontend/test_exact_softmax.py::test_search_",
         "tests/frontend/test_exact_softmax.py::test_gpu_",
         "tests/lower/test_broadcast_axis.py::test_search_",
+        "tests/pipeline_api/test_bind_inputs.py::test_search_",
     ),
     "slow": (
         "tests/schedule/end2end/",

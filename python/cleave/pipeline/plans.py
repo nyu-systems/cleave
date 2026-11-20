@@ -114,18 +114,27 @@ def lower(graph: SearchedGraph, split_factor: int | None = None) -> list:
 
 
 def bind_inputs(ir_graph, program) -> tuple[str, ...] | None:
-    """Placeholder name for each Program input, matched in order, else by unique shape."""
+    """Placeholder name for each Program input.
+
+    Paired by the position lowering recorded on each graph input (``input_index``: the
+    structure declares its inputs in the program's order). ``ir_graph.nodes`` is a
+    topological order, so two inputs of one shape may come the other way round there;
+    a graph without the record is only bound where the shapes leave no choice.
+    """
     from ..ir.graph import PlaceHolderNode
 
     if program is None or not hasattr(program, "inputs"):
         return None
     phs = [n for n in ir_graph.nodes if isinstance(n, PlaceHolderNode)]
-    ph_shapes = [tuple(int(s) for s in n.get_shape(0)) for n in phs]
     want = [tuple(int(s) for s in spec.shape) for spec in program.inputs]
     if len(phs) != len(want):
         return None
-    if ph_shapes == want:
-        return tuple(n.name for n in phs)
+    declared = [getattr(n, "input_index", None) for n in phs]
+    if None not in declared and sorted(declared) == list(range(len(phs))):
+        phs = [n for _, n in sorted(zip(declared, phs), key=lambda pair: pair[0])]
+        if [_shape(n) for n in phs] == want:
+            return tuple(n.name for n in phs)
+    ph_shapes = [_shape(n) for n in phs]
     taken, names = set(), []
     for shape in want:
         hits = [i for i, s in enumerate(ph_shapes) if s == shape and i not in taken]
@@ -134,6 +143,10 @@ def bind_inputs(ir_graph, program) -> tuple[str, ...] | None:
         taken.add(hits[0])
         names.append(phs[hits[0]].name)
     return tuple(names)
+
+
+def _shape(node) -> tuple[int, ...]:
+    return tuple(int(s) for s in node.get_shape(0))
 
 
 def describe_tile(t) -> str:

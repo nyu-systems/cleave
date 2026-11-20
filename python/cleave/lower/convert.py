@@ -634,5 +634,10 @@ def to_ir(
             ctx.register(node, op.outputs)
     if not ctx.outputs:
         raise ValueError("No output nodes found in graph structure.")
+    # The structure declares its inputs in the program's order; ``Graph.nodes`` is a
+    # topological order and forgets it, so each input keeps its position.
+    declared = [t.guid for _, op in ops if op.kind == "input" for t in op.outputs]
+    for position, guid in enumerate(declared):
+        ctx.nodes[guid][0].input_index = position
     nodes = gather_all_nodes(*ctx.outputs)
     return Graph(nodes=find_topo_sort([n for n in nodes if n.is_output()]))

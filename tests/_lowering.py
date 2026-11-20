@@ -22,3 +22,18 @@ def lower_to_cuda(code: str, *, device_compile: bool = False, arch: str = "sm_90
     with tvm.transform.PassContext(opt_level=3, config=configs), target:
         artifact = tilelang.lower(main_kernel, target=target, enable_device_compile=device_compile)
     return artifact.kernel_source
+
+
+def run_lowered(ir_graph, program, inputs) -> list:
+    """Torch reference of a lowered flat graph on a Program's inputs (program order).
+
+    The inputs reach the graph the way a compiled kernel gets them: bound to placeholders
+    by ``pipeline.plans.bind_inputs``, then fed in the graph's argument order.
+    """
+    from cleave.pipeline.plans import bind_inputs
+    from cleave.runtime.reference import execute, placeholder_order
+
+    names = bind_inputs(ir_graph, program)
+    assert names is not None, "placeholders do not bind to the program inputs"
+    by_name = dict(zip(names, inputs))
+    return execute(ir_graph, [by_name[n.name] for n in placeholder_order(ir_graph)])
