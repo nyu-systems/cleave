@@ -1102,10 +1102,12 @@ def apply_tiling(cand: List) -> List[Graph]:
                 physical_coord_exprs.append(None)
 
             # The stored layout is decided here and nowhere else, so it is recorded here:
-            # no consumer has to recover it from the extents of the two shapes.
+            # no consumer has to recover it from the extents of the two shapes. The pad is
+            # counted against the rank, not against `logical_shape`: without a reorder
+            # that is the very list the unit dims were just appended to.
             graphs["main"].stored_layouts[node.name] = (
                 stored_axes,
-                len(physical_shape) - len(logical_shape),
+                len(physical_shape) - len(stored_axes),
             )
 
             num_args = (

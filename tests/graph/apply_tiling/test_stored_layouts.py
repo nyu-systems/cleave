@@ -85,6 +85,52 @@ def test_stored_layouts_of_hand_built_graphs(case):
         assert clone.stored_layouts == layouts and clone.stored_layouts is not scheduled.stored_layouts
 
 
+def _t(guid, dims):
+    return {"guid": guid, "num_dims": len(dims), "dim": list(dims), "dtype": "float16"}
+
+
+def _op(op_type, ins, outs, **extra):
+    return {"op_type": op_type, "input_tensors": ins, "output_tensors": outs, **extra}
+
+
+def _rowsum_and_value(BH, SQ, SKV, D):
+    """exp(Q K^T) reduced two ways, both outputs of one unsplit graph."""
+    q, k, v = _t(1, (BH, SQ, D)), _t(2, (BH, SKV, D)), _t(3, (BH, SKV, D))
+    scores, weights = _t(4, (BH, SQ, SKV)), _t(5, (BH, SQ, SKV))
+    return [
+        _op("kn_input_op", [], [q]),
+        _op("kn_input_op", [], [k]),
+        _op("kn_input_op", [], [v]),
+        _op("kn_matmul_op", [q, k], [scores], trans_A=False, trans_B=True),
+        _op("kn_exp_op", [scores], [weights]),
+        _op("kn_reduce_sum_2_op", [weights], [_t(6, (BH, SQ, 1))]),
+        _op("kn_matmul_op", [weights, v], [_t(7, (BH, SQ, D))], trans_A=False, trans_B=False),
+        _op("kn_output_op", [_t(6, (BH, SQ, 1))], []),
+        _op("kn_output_op", [_t(7, (BH, SQ, D))], []),
+    ]
+
+
+@pytest.mark.parametrize("dims", [(32, 4096, 4096, 64), (4, 64, 1024, 64)])
+def test_a_padded_sibling_output_without_a_split_records_its_pad(dims):
+    """Two loop-fed outputs and no split: nothing is reordered, but the row sum is still
+    padded to the rank of the value output. The pad has to be in the record, or a correct
+    kernel of such a program is refused for a shape it does have."""
+    from cleave.ir.graph import GraphNode
+    from cleave.lower import to_ir
+
+    BH, SQ, _, D = dims
+    graph = to_ir(_rowsum_and_value(*dims))
+    candidates = search_tiling(graph, topk=PL.TOPK)
+    assert candidates
+    for cand in candidates:
+        scheduled = apply_tiling(cand)
+        rowsum, value = _outputs(scheduled)
+        assert all(isinstance(o.inputs[0].src_node, GraphNode) for o in (rowsum, value))
+        assert scheduled.stored_layouts == {rowsum.name: ((0, 1), 1), value.name: IDENTITY3}
+        assert tuple(scheduled.tmap[rowsum].shape) == (BH, SQ, 1)
+        assert tuple(scheduled.tmap[value].shape) == (BH, SQ, D)
+
+
 @pytest.mark.parametrize("name", PL.fixture_names())
 def test_stored_shape_formula_equals_tmap(name):
     """``stored_shape == tuple(logical[a] for a in axes) + (1,) * pad`` for every output of
