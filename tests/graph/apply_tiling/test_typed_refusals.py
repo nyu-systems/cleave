@@ -32,6 +32,14 @@ One more tiling was *built*, and is refused now:
   with equal extents the column sums of ``w`` were stored by the row block of ``x @ w``,
   and ``exp(x) * 2`` was cut along the columns of ``exp(x) @ b`` while ``exp(x)`` was held
   whole. The kernels lowered and wrote wrong values.
+
+And one graph had no tiling and no reason:
+
+* outputs whose axes do not pair with the canonical output's at all (the extents differ).
+  The policy raised ``NotImplementedError`` while it rated its first tile, which ended the
+  search of the whole graph; only the pipeline's schedule stage turned that into a
+  refusal, with the name of the exception for a reason. The policy refuses the graph
+  itself now, and says which output and which axis.
 """
 
 import re
@@ -518,6 +526,67 @@ def test_a_sibling_output_on_its_own_axis_is_launched_as_before():
         ir = _identity_graph(row_sums_next_to_product, sizes)
         built, refused = _outcomes(search_tiling(ir, topk=1000))
         assert built and not refused
+
+
+UNPAIRED = [
+    # the column sums of w run along N, and would be launched on the rows of x @ w
+    (column_sums_next_to_product, dict(M=128, K=256, N=64),
+     "reduction_0_3 (64,) is an output next to mma_2 (128, 64), whose launch grid serves "
+     "every output of the kernel: its axis 0 would be launched on axis 0 of the grid, "
+     "which has 128 elements where it has 64"),
+    (column_sums_next_to_product, dict(M=64, K=256, N=128),
+     "reduction_0_3 (128,) is an output next to mma_2 (64, 128), whose launch grid serves "
+     "every output of the kernel: its axis 0 would be launched on axis 0 of the grid, "
+     "which has 64 elements where it has 128"),
+    # exp(x) * 2 keeps the K columns the product contracts
+    (scaled_next_to_product, dict(M=128, K=64, N=32),
+     "mul_4 (128, 64) is an output next to mma_3 (128, 32), whose launch grid serves "
+     "every output of the kernel: its axis 1 would be launched on axis 1 of the grid, "
+     "which has 32 elements where it has 64"),
+]
+
+
+@pytest.mark.parametrize("fn, sizes, reason", UNPAIRED,
+                         ids=["columns_shorter", "columns_longer", "contracted_axis_kept"])
+def test_an_output_the_launch_grid_cannot_serve_is_a_typed_refusal(fn, sizes, reason):
+    """``x @ w`` next to ``sum(w, 0)`` with ``M != N``, and ``exp(x) @ b`` next to
+    ``exp(x) * 2`` with ``K != N``. Every output of a kernel is tiled on the launch grid of
+    the canonical one, its axes paired with that output's by position and extent. Where
+    the extents differ there is no pairing, and the policy raised ``NotImplementedError``
+    ("Same-launch multi-output currently requires sibling outputs to drop only trailing
+    non-batch axes.") from the rating of its first tile: the search of the whole graph
+    ended with an exception no caller of ``search_tiling`` expects. It is the policy's
+    own refusal of the graph now, and names the output and the axis."""
+    ir = _identity_graph(fn, sizes)
+    with pytest.raises(ScheduleRejected) as refusal:
+        search_tiling(ir, topk=1000)
+    assert str(refusal.value) == reason
+
+
+@pytest.mark.parametrize("fn, sizes, reason", UNPAIRED,
+                         ids=["columns_shorter", "columns_longer", "contracted_axis_kept"])
+def test_the_pipeline_reports_an_unserved_output_with_its_reason(fn, sizes, reason):
+    """The schedule stage records the policy's refusal as it is. It used to be the one
+    place that caught the exception, and the reason it gave was the exception's name:
+    "ScheduleRejected: NotImplementedError: Same-launch multi-output currently ..."."""
+    from cleave import pipeline as P
+
+    plans = P.schedule(GraphSet.identity(trace(fn, sizes, cl.f16)), P.ScheduleConfig(topk=8))
+    assert not list(plans)
+    # refused once as it is and once more under forced fusion, for the same reason
+    assert plans.refused and {str(r.error) for r in plans.refused} == {reason}
+    assert all(type(r.error) is ScheduleRejected for r in plans.refused)
+
+
+def test_outputs_that_pair_with_the_grid_are_searched_as_before():
+    """What the refusal leaves alone: the same programs where the extents agree (the
+    pairing is then checked per tiling, above), and outputs on the axes they are launched
+    on at any extents."""
+    for fn, sizes in ((column_sums_next_to_product, dict(M=128, K=256, N=128)),
+                      (scaled_next_to_product, dict(M=128, K=64, N=64)),
+                      (row_sums_next_to_product, dict(M=128, K=256, N=64)),
+                      (row_sums_next_to_product, dict(M=64, K=256, N=128))):
+        assert search_tiling(_identity_graph(fn, sizes), topk=1000)
 
 
 def test_the_canonical_view_of_a_shared_ancestor_is_kept_and_the_other_reported():

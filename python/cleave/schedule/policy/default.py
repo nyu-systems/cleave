@@ -146,18 +146,39 @@ class DefaultPolicy:
         return expanded_tile
 
     def _project_canonical_tile_to_output(self, canonical_tile, node):
+        """The tile of output ``node`` under the tile of the canonical output.
+
+        One launch grid serves every output of a kernel, and it is the canonical
+        output's: another output is tiled, launched and stored on the axes of the
+        canonical one that its own axes are paired with -- the batch axes in order, then
+        its other axes onto the leading non-batch axes of the canonical output. An
+        output whose axes do not pair that way has no tile for any candidate: the graph
+        is refused here, with the reason, instead of ending the search with an
+        exception that names no output (``NotImplementedError``, for ``x @ w`` next to
+        ``sum(w, 0)`` whenever ``M != N``, and for ``exp(x) @ b`` next to ``exp(x) * 2``).
+        The pairing is by position and extent; ``apply_tiling`` checks it against the
+        graph for each tiling (``_refuse_siblings_on_another_axis``).
+        """
         canonical_node = self.canonical_output_node
         if canonical_node is None or node == canonical_node:
             return list(canonical_tile)
 
         canonical_shape = list(canonical_node.get_space_dim())
         node_shape = list(node.get_space_dim())
+
+        def refuse(why):
+            return ScheduleRejected(
+                f"{node.name} {tuple(int(e) for e in node_shape)} is an output next to "
+                f"{canonical_node.name} {tuple(int(e) for e in canonical_shape)}, whose "
+                f"launch grid serves every output of the kernel: {why}"
+            )
+
         canonical_batch_flags = self._get_visible_batch_dim_flags(canonical_node)
         node_batch_flags = self._get_visible_batch_dim_flags(node)
         if len(canonical_batch_flags) != len(canonical_shape) or len(node_batch_flags) != len(
             node_shape
         ):
-            raise NotImplementedError("Output batch flags do not match node rank.")
+            raise refuse("its batch axes are not known")
 
         canonical_batch_axes = [
             i for i, is_batch_dim in enumerate(canonical_batch_flags) if is_batch_dim
@@ -166,8 +187,9 @@ class DefaultPolicy:
             i for i, is_batch_dim in enumerate(node_batch_flags) if is_batch_dim
         ]
         if len(node_batch_axes) != len(canonical_batch_axes):
-            raise NotImplementedError(
-                "Same-launch multi-output currently requires matching batch-axis rank."
+            raise refuse(
+                f"it has {len(node_batch_axes)} batch axes and the grid "
+                f"{len(canonical_batch_axes)}"
             )
 
         canonical_non_batch_axes = [
@@ -177,16 +199,19 @@ class DefaultPolicy:
             i for i, is_batch_dim in enumerate(node_batch_flags) if not is_batch_dim
         ]
         if len(node_non_batch_axes) > len(canonical_non_batch_axes):
-            raise NotImplementedError(
-                "Sibling outputs cannot have more non-batch axes than the canonical output."
+            raise refuse(
+                f"it has {len(node_non_batch_axes)} axes behind the batch axes and the "
+                f"grid {len(canonical_non_batch_axes)}"
             )
 
         projected_tile = [int(canonical_tile[axis]) for axis in canonical_batch_axes]
         for idx, axis in enumerate(node_non_batch_axes):
             canonical_axis = canonical_non_batch_axes[idx]
             if int(node_shape[axis]) != int(canonical_shape[canonical_axis]):
-                raise NotImplementedError(
-                    "Same-launch multi-output currently requires sibling outputs to drop only trailing non-batch axes."
+                raise refuse(
+                    f"its axis {axis} would be launched on axis {canonical_axis} of the "
+                    f"grid, which has {int(canonical_shape[canonical_axis])} elements "
+                    f"where it has {int(node_shape[axis])}"
                 )
             projected_tile.append(int(canonical_tile[canonical_axis]))
         return projected_tile
