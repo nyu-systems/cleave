@@ -102,19 +102,39 @@ def test_carry_is_idempotent():
 
 
 def test_carry_rewires_readers_outside_the_loop():
-    """A max that is read in the loop AND exported: the reader outside gets an AccumEdge
-    that names the max by its accumulator index."""
+    """A max that is read in the loop AND twice outside it: every reader outside gets an
+    AccumEdge that names the max by its accumulator index.
+
+    Two readers, because one cannot tell the index from an edge count: the loop has two
+    edges when ``carry`` runs, which is also the index the max gets, and only the second
+    reader's number runs ahead (to an output the loop does not have) when edges are counted.
+    """
     t = build_rolling_tier(carry=False)
-    exported = OutputNode(t.m, dtype="float32")  # a plain edge across the loop boundary
-    assert not isinstance(exported.inputs[0], AccumEdge)
+    # two plain edges across the loop boundary
+    readers = [OutputNode(t.m, dtype="float32") for _ in range(2)]
+    assert not any(isinstance(r.inputs[0], AccumEdge) for r in readers)
+    edges_before = len(t.loop.outputs)
 
     index = t.loop.carry(t.m)
-    edge = exported.inputs[0]
-    assert isinstance(edge, AccumEdge) and edge.src_node is t.loop and edge.accum_node is t.m
-    assert edge.src_id == index == 2 and edge.dst_id == 0
-    assert edge in t.loop.outputs and edge not in t.m.outputs
-    assert all(e.dst_node is not exported for e in t.m.outputs)
-    assert t.loop._resolve_output_binding(edge.src_id)[0] is t.m
+    assert index == next(i for i, n in enumerate(t.inner.accum_nodes) if n is t.m) == 2
+    # Counting edges gives the first reader 2 as well; it is the second one that tells.
+    assert edges_before == index
+
+    rewired = [r.inputs[0] for r in readers]
+    assert rewired[0] is not rewired[1]
+    for edge in rewired:
+        assert isinstance(edge, AccumEdge) and edge.src_node is t.loop and edge.accum_node is t.m
+        assert edge.src_id == index and edge.dst_id == 0
+        assert any(edge is e for e in t.loop.outputs) and not any(edge is e for e in t.m.outputs)
+        bound, shape, _ = t.loop._resolve_output_binding(edge.src_id)
+        assert bound is t.m and list(shape) == list(t.m.get_shape(0)) == [ROWS]
+    assert len(t.loop.outputs) == edges_before + 2
+    # only the readers inside the loop are left on the max itself
+    assert sorted((e.dst_node.name, e.dst_id) for e in t.m.outputs) == [
+        ("exp_0_max_prev", 0), ("exp_0_max_step", 1), ("exp_0_shifted", 1)]
+    # the accumulators that were there keep their numbers
+    assert sorted((e.accum_node.name, e.src_id) for e in t.loop.outputs[:edges_before]) == [
+        ("psum_0", 1), ("rowsum_0", 0)]
 
 
 def test_carry_refuses_what_is_not_a_compute_node_of_the_loop():
