@@ -251,9 +251,13 @@ class _Ctx:
         # those a binary op takes with unit axes dropped (``broadcast_index``).
         self.read_as: Dict[int, List[Tuple[str, Tuple[int, ...]]]] = {}
         self.reshaped: set = set()
-        # Input op -> its position among the structure's input ops. Every input op is
-        # counted, also one no output reads: it is not converted and gets no placeholder,
-        # and the inputs declared after it keep their place.
+        # Input op -> its position among the structure's input ops: the program's order
+        # of its inputs, which the graph rebuilt from the outputs forgets. Every input op
+        # is counted, also one no output reads: it is not converted and gets no
+        # placeholder, and the inputs declared after it keep their place. This is the one
+        # definition of that position; both records of it (``Boundary.index``, which
+        # pairs split stages, and ``input_index``, which binds a program's inputs) are
+        # written from it in ``placeholder``.
         self.input_position: Dict[int, int] = {
             idx: position
             for position, idx in enumerate(
@@ -331,14 +335,17 @@ class _Ctx:
             return len(out_dims) - 1
         return None
 
-    def placeholder(self, t: KGTensor, boundary: Optional[Boundary] = None) -> PlaceHolderNode:
-        """The placeholder for ``t``; ``boundary`` when an input op declares it."""
+    def placeholder(self, t: KGTensor, position: Optional[int] = None) -> PlaceHolderNode:
+        """The placeholder for ``t``; ``position`` (``input_position``) when an input op
+        declares it: the node's ``boundary`` index and its ``input_index``."""
         node = PlaceHolderNode(name=f"input_{t.guid}")
         shape = self.shape(t)
         dtype = self.dtype if t.dtype is None else str(t.dtype)
         node.set_shape(shape)
         node.set_dtype(tvm.DataType(dtype))
-        node.boundary = boundary
+        node.boundary = None if position is None else Boundary(position)
+        if position is not None:
+            node.input_index = position
         self.nodes[t.guid] = (node, 0)
         self.shapes[t.guid] = shape
         self.dtypes[t.guid] = dtype
@@ -512,7 +519,7 @@ def _input(ctx: _Ctx, idx: int, op: KGOp) -> Built:
     # The k-th input op is input k of the graph. A graph is rebuilt in discovery order
     # from its outputs below, so this is the only place the declaration order is known.
     if op.outputs:
-        ctx.placeholder(op.outputs[0], Boundary(ctx.input_position[idx]))
+        ctx.placeholder(op.outputs[0], ctx.input_position[idx])
     return None, ()
 
 
@@ -794,11 +801,5 @@ def to_ir(
         if other is not None:
             raise ValueError(f"input {guid} is read as {shape} by {name} and as {other[1]} by "
                              f"{other[0]}; an input has one layout")
-    # The structure declares its inputs in the program's order; ``Graph.nodes`` is a
-    # topological order and forgets it, so each input keeps its position.
-    declared = [t.guid for _, op in ops if op.kind == "input" for t in op.outputs]
-    for position, guid in enumerate(declared):
-        if guid in ctx.nodes:  # an input that no output reads has no placeholder
-            ctx.nodes[guid][0].input_index = position
     nodes = gather_all_nodes(*ctx.outputs)
     return Graph(nodes=find_topo_sort([n for n in nodes if n.is_output()]))

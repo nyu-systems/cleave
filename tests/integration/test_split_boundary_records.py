@@ -126,6 +126,43 @@ def test_an_input_no_output_reads_keeps_its_place_in_the_count():
     assert [ph.input_index for ph in boundary_order(_placeholders(graph))] == [0, 2]
 
 
+def test_an_inputs_place_is_one_number_in_both_of_its_records():
+    """The place of an input among the structure's input ops is written on its placeholder
+    twice: as the index of its ``boundary`` (which pairs the stages of a split) and as
+    ``input_index`` (which binds the program's inputs). It is one number, from one count of
+    the input ops. There used to be two counts with two rules -- the input ops for the
+    first, the tensors that input ops declare for the second -- and they part ways behind
+    an input op that declares two tensors: the inputs after it were numbered (1, 2) in one
+    record and (2, 3) in the other."""
+    graph = to_ir([
+        _op("kn_input_op", [], [_t(7, (4, 8)), _t(8, (4, 8))]),  # one op, two tensors
+        _op("kn_input_op", [], [_t(1, (4, 8))]),
+        _op("kn_input_op", [], [_t(2, (8, 16))]),
+        _op("kn_matmul_op", [_t(1, (4, 8)), _t(2, (8, 16))], [_t(3, (4, 16))]),
+        _op("kn_output_op", [_t(3, (4, 16))], []),
+    ])
+    phs = boundary_order(_placeholders(graph))
+    assert [ph.name for ph in phs] == ["PlaceHolder_input_1", "PlaceHolder_input_2"]
+    assert [ph.boundary.index for ph in phs] == [1, 2]
+    assert [ph.input_index for ph in phs] == [1, 2]
+
+
+@pytest.mark.parametrize("name", SPLIT_FIXTURES)
+def test_both_records_agree_on_every_lowered_input(name):
+    """Partial and combine of every split fixture: wherever lowering says which input a
+    placeholder is, it says so once."""
+    structure = _load(name)
+    family = name.split("/")[0]
+    symbols = dict(SYMBOL_MAPS[family])
+    if family == "gqa":  # as in test_split_pair_carries_the_cut_order
+        symbols[16] = 4 * symbols[8]
+    ((partial, combine),) = to_bundles([structure], symbol_map=symbols, split_factors=[4])
+    for graph in (partial, combine):
+        phs = _placeholders(graph)
+        assert phs and all(ph.boundary is not None for ph in phs), name
+        assert [ph.input_index for ph in phs] == [ph.boundary.index for ph in phs], name
+
+
 def _three_outputs():
     x = _t(1, (4, 8))
     return [
