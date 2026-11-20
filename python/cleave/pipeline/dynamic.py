@@ -542,7 +542,13 @@ def compile_dynamic(fn, *, dtype=None, preset="default", superopt=None, schedule
                            filter_before_topk=filter_before_topk)
     note("schedule", plans)
     if not plans:
-        raise CleaveError(f"{program.name}: the access layer refused every tiling\n{plans.summary()}")
+        # The tilings are ranked by cost before the access layer reads them, so a small
+        # topk can hold none it accepts (MLA decode: none of the first 100).
+        hint = "" if filter_before_topk else (
+            f" of the {sc.topk} ranked first; raise topk, or pass filter_before_topk=True "
+            "to rank only the tilings the layer accepts")
+        raise CleaveError(f"{program.name}: the access layer refused every tiling{hint}\n"
+                          f"{plans.summary()}")
     t2 = time.perf_counter()
     by_cand = {}
     for p in plans:

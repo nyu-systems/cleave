@@ -372,6 +372,39 @@ def test_custom_workloads_are_not_extended_with_adversarial_ones(monkeypatch):
         (["solo kv=64", "solo kv=32", "pair S=4", "tuned kv=64 q=16"], ["mine_0", "mine_1"])]
 
 
+def test_a_topk_that_holds_no_accepted_tiling_says_how_to_get_past_it(monkeypatch):
+    """The tilings are ranked by cost before the access layer reads them, so a small topk
+    can hold none it accepts (``mla_paged_decode`` at ``topk=100``: the 512-wide head dim
+    is split in every one). The refusal names the two ways out; with the filter already
+    on there is none to name."""
+    import cleave.pipeline.dynamic as dynamic_mod
+    from cleave.core.errors import CleaveError
+    from cleave.pipeline import ScheduleConfig
+    from cleave.pipeline.plans import PlanSet, Refusal
+
+    class Graphs(tuple):
+        from_cache = True
+
+    def nothing(graphs, spec, config, *, split_graphs=(), filter_before_topk=False):
+        refused = [Refusal(0, "solo", "main", ValueError("the head dim is tiled"))] * 3
+        return PlanSet([], graphs, config, refused)
+
+    monkeypatch.setattr(dynamic_mod, "superoptimize", lambda *a, **k: Graphs())
+    monkeypatch.setattr(dynamic_mod, "schedule_paged", nothing)
+    fn, hints = build("kv8")
+    with pytest.raises(CleaveError) as info:
+        cleave.compile(fn, hints=hints, schedule=ScheduleConfig(topk=100))
+    first, *rest = str(info.value).splitlines()
+    assert first.endswith(
+        "the access layer refused every tiling of the 100 ranked first; raise topk, or pass "
+        "filter_before_topk=True to rank only the tilings the layer accepts")
+    assert "3x ValueError: the head dim is tiled" in "\n".join(rest)
+    with pytest.raises(CleaveError) as info:
+        cleave.compile(fn, hints=hints, schedule=ScheduleConfig(topk=100),
+                       filter_before_topk=True)
+    assert str(info.value).splitlines()[0].endswith("the access layer refused every tiling")
+
+
 # ----------------------------------------------------------------- a cache with no row
 def test_a_cache_without_a_row_is_answered_without_a_launch():
     """Every request of a batch may have no key, and the key tensors of a ragged batch then
