@@ -321,9 +321,13 @@ def _fastest_pair(partials, combines) -> list[Result] | None:
 
     The combine of a factor is searched once and shared by every split graph of the program,
     so the fastest partial and the fastest combine need not come from the same cut. Each is
-    validated alone, on its own random inputs: only the boundary records can tell that a
-    partial writes what a combine reads. Plans without records all compare equal (None),
-    which is the pairing there was before the records.
+    validated alone, on its own random inputs, so no validation sees whether a partial
+    writes what a combine reads; the boundary records are the check there is. They compare
+    index, role, shape and dtype of every tensor crossing the cut -- not what the tensors
+    hold: two cuts that pass equally shaped tensors with different contents would be
+    paired. (Every cut of the programs searched today has one boundary and one combine.)
+    Plans without records all compare equal (None), which is the pairing there was before
+    the records.
     """
     from .kernel import boundary_of
 

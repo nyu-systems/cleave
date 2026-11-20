@@ -22,7 +22,8 @@ class Param:
     # For a "stage" param, how the previous stage's kernel stores that output: the
     # ``(axes, pad)`` its tiling recorded (``Graph.stored_layouts``). ``shape`` is the
     # logical shape this kernel reads, so the tensor is brought back with ``to_logical``.
-    # None when nothing was recorded: the two then differ by unit axes at most.
+    # None when nothing was recorded: the tensor is then reshaped to ``shape``, which is
+    # only right when the two differ by unit axes.
     layout: tuple | None = None
 
 
