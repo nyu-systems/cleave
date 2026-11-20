@@ -78,7 +78,9 @@ KERNELS = {
 }
 
 # The SCHEMA these digests were generated under, and the digests. Re-pin both together.
-PINNED_SCHEMA = 13
+# (27: the merge of three packages. The eight texts are the ones pinned under 13: none of
+# the bumps 14 .. 27 changes a kernel of these programs.)
+PINNED_SCHEMA = 27
 PINNED = {
     'softmax_64x1024/in-tile': ('tile=[2, 1024] rstep=[1024]', '8211bb6438573d68'),
     'softmax_mid_4x256x64/in-tile': ('tile=[1, 256, 2] rstep=[256]', '77c506ba7b618bee'),

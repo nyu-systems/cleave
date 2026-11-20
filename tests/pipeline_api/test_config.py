@@ -117,7 +117,33 @@ def test_cache_schema_retires_kernels_built_before_a_scheduler_fix(monkeypatch):
     # 9: gqa_paged_decode_h32_kv8_d128_ps1 built the unshifted exp, with no running max.
     # 10: cl.softmax traced an opaque max; a program that made the request by hand was
     # validated on normal inputs only.
-    assert cache.SCHEMA >= 13
+    # 11: a running max rescaled its accumulators on every iteration, also where they are
+    # too wide for a thread's registers (the exact MLA decode).
+    # 12: a softmax over an axis other than the last had no in-place max behind a squeezed
+    # unit dim or in a loop that does not tile that axis (such tilings were refused).
+    # 13: eight of the nine paged layers built the unshifted exp, and a split-KV pair handed
+    # its combine two partials, without the running max.
+    # 14: the Kernel saved for a program with an input written in keepdim form could not be
+    # called (the input was not bound).
+    # 15: a split partial whose sums take the whole per-split extent in one step was refused.
+    # 16: sibling reductions over one axis started at different steps, so the loop they
+    # share miscounted its tiles; a float32 flash-form softmax had no tiling.
+    # 17: an un-looped split partial was launched with an input in the place of an output.
+    # 18: a factor computed elementwise from a sum of lower rank was not staged through
+    # shared memory (the RMSNorm split-K combine).
+    # 19: a tiling whose kernel cannot compile for a unit extent was built.
+    # 20: an output next to the canonical one was launched on an axis it was paired with by
+    # extent only, and wrote wrong values.
+    # 21: a matmul operand that lost a batch axis the output has one entry of was refused,
+    # and one that a reduction left in a fragment had no layout.
+    # 22: a tile of unit extents only was allocated as a scalar; single-row tilings of a
+    # rank-1 value had no kernel.
+    # 23: every loop of a kernel was pipelined, and TileLang pipelines one.
+    # 24: a tensor-core matmul over an extent no multiple of 16 divides had no tiling and no
+    # reason (float16), or no tiling at all (float32).
+    # 25: the softmax accept filter kept tilings the build then refused for a unit extent.
+    # 26: a loop that loads no slice wide enough to transfer was pipelined.
+    assert cache.SCHEMA >= 27
     key = _kernel_key(prog, *cfgs)
     monkeypatch.setattr(cache, "SCHEMA", 1)
     assert _kernel_key(prog, *cfgs) != key
