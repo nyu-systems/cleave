@@ -135,7 +135,9 @@ def test_honours_the_searched_tile(case):
     # are its kv head's group of query heads; every other layer writes the whole query tile.
     epi_rows = spec.group if spec.kind in DECODE_KINDS else rows
     assert tuple(_named(graph, "div_0").dims) == (epi_rows, width)
-    assert tuple(_named(graph, "log2_0").dims) == (epi_rows,)
+    # ``lse_0`` where the layer's softmax is exact (log2 of the row sum plus the max).
+    (lse,) = [n for n in graph.nodes if n.name in ("log2_0", "lse_0")]
+    assert tuple(lse.dims) == (epi_rows,)
     # And the block size, which the policy searches alongside the tile rather than deriving.
     assert graph.n_threads == tiling["n_threads"]
 

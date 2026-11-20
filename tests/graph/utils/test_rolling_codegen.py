@@ -31,8 +31,13 @@ def _calls(code, macro):
     return [re.sub(r"\s+", " ", s).strip() for s in re.split(r"\n(?=    \S)", body) if s.strip()]
 
 
+# The hand-written cases whose loop declares a rolling softmax: the static one, and the
+# paged operators whose softmax is exact so far.
+ROLLING = {"mha_bhsd_rolling", "gqa_paged_decode_h32_kv8_d128_ps1"}
+
+
 # ------------------------------------------------------------------------- emission order
-@pytest.mark.parametrize("name", sorted(set(CASES) - {"mha_bhsd_rolling"}))
+@pytest.mark.parametrize("name", sorted(set(CASES) - ROLLING))
 def test_without_the_fields_the_order_is_the_topological_sort(name):
     graphs = CASES[name].graph()
     for graph in graphs if isinstance(graphs, list) else [graphs]:
@@ -40,6 +45,21 @@ def test_without_the_fields_the_order_is_the_topological_sort(name):
             assert not tier.lag_nodes and not tier.accum_scale
             order, topo = emission_order(tier), find_topo_sort(tier.nodes)
             assert len(order) == len(topo) and all(a is b for a, b in zip(order, topo))
+
+
+@pytest.mark.parametrize("name", sorted(ROLLING))
+def test_the_rolling_cases_declare_both_fields_on_one_loop_tier(name):
+    """``ROLLING`` is exactly the cases the test above leaves out, and for a reason."""
+    tiers = [tier for tier, _ in graph_tiers(CASES[name].graph())]
+    declared = [tier for tier in tiers if tier.lag_nodes or tier.accum_scale]
+    assert len(declared) == 1 and declared[0].lag_nodes and declared[0].accum_scale
+    order = emission_order(declared[0])
+    assert {id(n) for n in order} == {id(n) for n in declared[0].nodes}
+    at = {id(n): i for i, n in enumerate(order)}
+    for lag in declared[0].lag_nodes:  # the snapshot precedes the accumulator it reads
+        assert at[id(lag)] < at[id(lag.inputs[0].src_node)]
+    for acc, factor in declared[0].accum_scale.items():
+        assert at[id(factor)] < at[id(acc)]
 
 
 def test_rolling_order_puts_the_snapshot_and_the_factor_first():

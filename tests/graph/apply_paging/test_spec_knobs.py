@@ -28,7 +28,7 @@ pytest.importorskip("tilelang")
 from cleave.dynamic.dense import build_mla_paged_graph, build_paged_graph
 from cleave.codegen import TilelangCodeGen
 from cleave.ir.graph import OutputNode, PlaceHolderNode
-from cleave.ir.ops import Log2, MaskedLog2
+from cleave.ir.ops import Log2, Lse2, MaskedLog2, MaskedLse2
 from cleave.dynamic.paging import (
     MLA_PAGED_DECODE,
     MLA_PAGED_PREFILL_CAUSAL,
@@ -255,6 +255,7 @@ def test_emit_lse_false_drops_the_second_output(kind):
     assert [n.name for n in graph.args if isinstance(n, OutputNode)] == ["OutputNode_0"]
     # Two node types, because the causal layers emit the row-predicated flavour of the same
     # epilogue node -- looking for only one of them would miss three of the six builders.
-    assert not [n for n in graph.nodes if isinstance(n, (Log2, MaskedLog2))]
+    # And both again in the two-operand form a layer with an exact softmax emits instead.
+    assert not [n for n in graph.nodes if isinstance(n, (Log2, MaskedLog2, Lse2, MaskedLse2))]
     # ... and it still emits: dropping an output must not leave the epilogue half-wired.
     assert TilelangCodeGen().gen(graph)

@@ -179,6 +179,28 @@ def _build_tensor_maps(main, inner, spec, dense, built, grid) -> None:
         b.rowsum: ("t_rowsum_0", "r"),
         b.value_mma: ("t_mma_1", "r"),
     }
+    if b.rolling is not None:
+        _rolling_maps(main, inner, b.loop_node, b.score_mma, b.rolling, mq)
+
+
+def _rolling_maps(main, inner, loop_node, score_mma, rolling, rows: int) -> None:
+    """The tiles of an exact softmax's rolling update, on top of a layer's own maps.
+
+    The masked score has the score matmul's tile; the carried max, its snapshot, its step
+    and the rescale factor are one value per query row, register fragments like the row
+    sum. The loop node gains the max as its last accumulator tile.
+    """
+    inner.tmap[rolling.score] = inner.tmap[score_mma]
+    for node in (rolling.row_max, rolling.max_prev, rolling.max_step, rolling.alpha):
+        inner.tmap[node] = _whole((rows,))
+    main.tmap[loop_node] = [*main.tmap[loop_node], _whole((rows,))]
+    inner.tinfo_map.update({
+        rolling.score: ("t_score_0", "r"),
+        rolling.row_max: ("t_exp_0_max", "r"),
+        rolling.max_prev: ("t_exp_0_max_prev", "r"),
+        rolling.max_step: ("t_exp_0_max_step", "r"),
+        rolling.alpha: ("t_exp_0_alpha", "r"),
+    })
 
 
 def _slab_tensor_maps(main, inner, spec, dense, *, grid, nodes) -> None:

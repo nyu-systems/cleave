@@ -9,20 +9,27 @@ from tilelang.carver.roller import Edge
 from ...codegen import passes
 from ...ir.graph import AccumEdge, Graph, GraphNode, OutputNode, PlaceHolderNode, ScalarScan
 from ...ir.ops import (
+    NEG_FLT_MAX,
     CausalMaskedExp,
+    CausalMaskedScore,
     Copy,
     Div,
+    Exp2,
     IndexGather,
     IndptrTileScan,
     Log2,
+    Lse2,
     MaskedExp,
+    MaskedScore,
     Matmul,
     PagedGather,
     RangeGather,
+    ReduceMax,
     ReduceSum,
     RowGather,
 )
 from ...ir.ops.gather import BUFFER_BOUND
+from ...ir.rolling import rolling_nodes
 
 # exp2 is a single instruction where exp is a call, so the scale rides in the log2
 # domain: exp(x * s) == exp2(x * s * LOG2E).
@@ -74,17 +81,23 @@ def _passthrough(*names) -> dict:
     return {name: (lambda v: lambda i: v)(name) for name in names}
 
 
-def _exp(dense, rows: int, causal: bool = False, **kwargs):
-    """The masked softmax exp; the scale arrives as a runtime scalar in the log2 domain."""
-    cls, args = (
-        (CausalMaskedExp, ("tile_base", "valid_len", "diag", "scale2"))
+def _exp(dense, rows: int, causal: bool = False, shift: bool = False, **kwargs):
+    """The masked softmax exp; the scale arrives as a runtime scalar in the log2 domain.
+
+    With ``shift`` it is the exp of the exact softmax: its operand is the masked score
+    (``_score``), already scaled, and it takes that score's running row max as a second
+    input, so the scale is no argument of its own.
+    """
+    cls, mask = (
+        (CausalMaskedExp, ("tile_base", "valid_len", "diag"))
         if causal
-        else (MaskedExp, ("tile_base", "valid_len", "scale2"))
+        else (MaskedExp, ("tile_base", "valid_len"))
     )
     return cls(
         (rows, dense.kv_tile),
         scale=None,
-        scalar_args=args,
+        scalar_args=mask if shift else (*mask, "scale2"),
+        shift=shift,
         dtype=dense.accum_dtype,
         out_dtype=dense.accum_dtype,
         name="exp_0",
@@ -93,11 +106,42 @@ def _exp(dense, rows: int, causal: bool = False, **kwargs):
     )
 
 
-def _gqa_body(spec, dense, rows: int, make_exp, stage_p: bool = True) -> tuple:
+def _score(dense, rows: int, causal: bool = False, **kwargs):
+    """The exp operand of the exact softmax: the score scaled into the log2 domain, masked
+    columns at the finite value the running max starts from."""
+    cls, args = (
+        (CausalMaskedScore, ("tile_base", "valid_len", "diag", "scale2"))
+        if causal
+        else (MaskedScore, ("tile_base", "valid_len", "scale2"))
+    )
+    return cls(
+        (rows, dense.kv_tile),
+        scalar_args=args,
+        dtype=dense.accum_dtype,
+        out_dtype=dense.accum_dtype,
+        name="score_0",
+        n_batch_dims=0,
+        **kwargs,
+    )
+
+
+def _gqa_body(spec, dense, rows: int, make_exp, stage_p: bool = True, make_score=None) -> tuple:
     """Q @ K^T -> exp -> {row sum, @ V}: ``(score_mma, exp, rowsum, value_mma)``.
 
     ``stage_p`` stages P through shared for the value matmul; without it tilelang feeds the
     fragment to the second gemm in place (wgmma_rs).
+
+    With ``make_score`` the softmax is exact and the tuple gains a fifth entry, the nodes of
+    the rolling update (``score``, ``row_max``, ``max_prev``, ``max_step``, ``alpha``):
+
+        score   = make_score()   <- score_mma     the exp operand, masked, in the log2 domain
+        row_max = ReduceMax      <- score         carried across the loop, from -FLT_MAX
+        exp     = make_exp()     <- (score, row_max)                   P = exp2(score - max)
+        alpha   = exp2(max_prev - row_max)        what the loop's accumulators are scaled by
+
+    The caller declares them on its loop tier before the ``GraphNode`` exists
+    (``lag_nodes = [max_prev]``, ``accum_scale = {rowsum: alpha, value_mma: alpha}``) and
+    then carries the max (``loop_node.carry(row_max)``).
     """
     bn, head_dim = dense.kv_tile, dense.head_dim
     score_mma = Matmul(
@@ -125,10 +169,35 @@ def _gqa_body(spec, dense, rows: int, make_exp, stage_p: bool = True) -> tuple:
     )
     if stage_p:
         value_mma.stage_fragment_operands_in_shared = (0,)
-    _connect(score_mma, exp, 0, 0)
+    if make_score is None:
+        _connect(score_mma, exp, 0, 0)
+        _connect(exp, rowsum, 0, 0)
+        _connect(exp, value_mma, 0, 0)
+        return score_mma, exp, rowsum, value_mma
+    score = make_score()
+    # The max is taken over the scaled, masked score and is float32 like it: its start
+    # value, the most negative finite float32, is no value of a narrower type.
+    row_max = ReduceMax(
+        (rows, bn),
+        axis=-1,
+        dtype=dense.accum_dtype,
+        out_dtype=dense.accum_dtype,
+        name="exp_0_max",
+        accum_init=NEG_FLT_MAX,
+    )
+    max_prev, max_step, alpha = rolling_nodes(
+        row_max, stem="exp_0", rows=(rows,), n_batch_dims=0, exp_cls=Exp2
+    )
+    _connect(score_mma, score, 0, 0)
+    _connect(score, row_max, 0, 0)
+    _connect(score, exp, 0, 0)
+    _connect(row_max, exp, 0, 1)
     _connect(exp, rowsum, 0, 0)
     _connect(exp, value_mma, 0, 0)
-    return score_mma, exp, rowsum, value_mma
+    rolling = SimpleNamespace(
+        score=score, row_max=row_max, max_prev=max_prev, max_step=max_step, alpha=alpha
+    )
+    return score_mma, exp, rowsum, value_mma, rolling
 
 
 def _paged_gathers(spec, dense, head_scalar: str) -> tuple:
@@ -180,12 +249,18 @@ def _name_inputs(spec, ph_q, ph_k, ph_v, ph_idx=None) -> None:
 
 def _normalise(
     loop_node, value, rowsum, shape, accum_dtype, out_dtype, emit_lse,
-    div_cls=Div, log2_cls=Log2, **kwargs,
+    div_cls=Div, log2_cls=Log2, row_max=None, lse_cls=Lse2, **kwargs,
 ) -> tuple:
     """The floored divide and, with ``emit_lse``, the log2 of the row sum.
 
     ``value``/``rowsum`` are ``(accumulator, index in the loop tier)``; ``kwargs`` go to
     both the divide and the log2 (row predication). Returns ``(div, log2, outputs)``.
+
+    ``row_max``, the same pair for the carried max of an exact softmax, makes the second
+    output ``log2(l) + m`` (``lse_cls``): the row sum is then a sum of ``exp2(s - m)``. It
+    is read unfloored -- a row with nothing live has ``l = 0`` and the max still at its
+    finite start, which gives the -inf the operator defines -- and the divide keeps its
+    floor, which is then a guard for exactly that row and nothing else.
     """
     div = div_cls(
         shape,
@@ -202,15 +277,17 @@ def _normalise(
     outputs = [_output(div, out_dtype, 0)]
     log2 = None
     if emit_lse:
-        log2 = log2_cls(
+        log2 = (log2_cls if row_max is None else lse_cls)(
             shape[:1],
             dtype=accum_dtype,
             out_dtype=accum_dtype,
-            name="log2_0",
+            name="log2_0" if row_max is None else "lse_0",
             n_batch_dims=0,
             **kwargs,
         )
         _accum_edge(loop_node, log2, rowsum[1], 0, rowsum[0])
+        if row_max is not None:
+            _accum_edge(loop_node, log2, row_max[1], 1, row_max[0])
         outputs.append(_output(log2, accum_dtype, 1))
     return div, log2, outputs
 
@@ -238,10 +315,13 @@ def _partial_stores(rows: int, cols: int, accum_dtype: str):
     return store_d, store_o
 
 
-def _decode_epilogue(spec, dense, loop_node, rowsum, rowsum_id, value_mma, value_id, split):
+def _decode_epilogue(
+    spec, dense, loop_node, rowsum, rowsum_id, value_mma, value_id, split, row_max=None
+):
     """The GQA decode layers' epilogue: normalise and emit the lse, or store raw partials.
 
-    Returns ``(div, log2, store_d, store_o, outputs)``; the unused half is None.
+    ``row_max`` is ``(carried max, index in the loop tier)`` of an exact softmax, for the
+    lse. Returns ``(div, log2, store_d, store_o, outputs)``; the unused half is None.
     """
     group, head_dim = spec.group, dense.head_dim
     if split is None:
@@ -253,8 +333,13 @@ def _decode_epilogue(spec, dense, loop_node, rowsum, rowsum_id, value_mma, value
             dense.accum_dtype,
             dense.out_dtype,
             spec.emit_lse,
+            row_max=row_max,
         )
         return div, log2, None, None, outputs
+    assert row_max is None, (
+        "a split-KV partial of an exact softmax has to store its max as a third partial for "
+        "the combine to weigh the splits by; neither is built yet"
+    )
     store_d, store_o = _partial_stores(group, head_dim, dense.accum_dtype)
     _accum_edge(loop_node, store_d, rowsum_id, 0, rowsum)
     _accum_edge(loop_node, store_o, value_id, 0, value_mma)

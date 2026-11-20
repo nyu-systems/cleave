@@ -9,6 +9,10 @@ overwrite after annotation without changing a byte of this operator's source).
 Two head counts are covered because they exercise different spec values -- the query
 head group (4 vs 8) and, with it, the opposite grid order -- so passing both shows the
 layer is parametric and not a template for one operator.
+
+The softmax of the kv8 operator is exact: its loop carries a running row max (``EXACT``).
+The kv4 operator, and every split-KV partial, still build the unshifted exp; they follow
+one at a time, each against the latency gate, so both forms are pinned here until then.
 """
 
 from __future__ import annotations
@@ -18,9 +22,25 @@ import pytest
 pytest.importorskip("tilelang")
 
 from tests.graph.apply_paging._test_utils import OPERATOR_CASES
-from cleave.dynamic.dense import build_paged_graph, paged_kernel_source
-from cleave.ir.graph import GraphNode, OutputNode, PlaceHolderNode
-from cleave.ir.ops import Div, Log2, MaskedExp, Matmul, PagedGather, ReduceSum
+from cleave.codegen import TilelangCodeGen
+from cleave.dynamic import OPERATORS
+from cleave.dynamic.dense import build_mla_paged_graph, build_paged_graph, paged_kernel_source
+from cleave.dynamic.paging import DenseAttention, MLASpec, build_split_decode
+from cleave.dynamic.paging.specs import CombineTiling
+from cleave.ir.graph import AccumEdge, GraphNode, OutputNode, PlaceHolderNode
+from cleave.ir.ops import (
+    NEG_FLT_MAX,
+    Div,
+    Exp2,
+    Log2,
+    Lse2,
+    MaskedExp,
+    MaskedScore,
+    Matmul,
+    PagedGather,
+    ReduceMax,
+    ReduceSum,
+)
 
 # Read out of the operator registry rather than restated here, so this file cannot hold a
 # second copy of the specs that drifts from the one the expected kernels and the demos are built from.
@@ -33,11 +53,18 @@ CASES = {
         "gqa_paged_decode_h32_kv4_d128_ps1",
     )
 }
+# The operators whose single-kernel softmax is exact so far.
+EXACT = {"gqa_paged_decode_h32_kv8_d128_ps1"}
+
+
+def _loop(graph):
+    return next(n for n in graph.nodes if isinstance(n, GraphNode))
 
 
 @pytest.mark.parametrize("operator", sorted(CASES))
 def test_access_layer_structure(operator):
     spec = CASES[operator]
+    exact = operator in EXACT
     graph = build_paged_graph(spec)
 
     # `args` is the emitted signature, and paged attention declares five inputs then two
@@ -71,11 +98,16 @@ def test_access_layer_structure(operator):
         (batch, heads) if spec.grid_order == ("batch", "head") else (heads, batch)
     )
 
-    # The epilogue divides by a floored denominator and takes the log of it.
-    assert isinstance(next(n for n in graph.nodes if n.name == "div_0"), Div)
-    assert isinstance(next(n for n in graph.nodes if n.name == "log2_0"), Log2)
+    # The epilogue divides by a floored denominator and takes the log of it: of the row sum
+    # alone, or, where the softmax is exact, of the row sum plus the carried max.
+    div = next(n for n in graph.nodes if n.name == "div_0")
+    assert type(div) is Div and div.denom_floor == 1e-30
+    lse = outputs[1].inputs[0].src_node
+    assert (type(lse), lse.name) == ((Lse2, "lse_0") if exact else (Log2, "log2_0"))
+    assert not [n.name for n in graph.nodes if n.name == ("log2_0" if exact else "lse_0")]
 
-    inner = next(n for n in graph.nodes if isinstance(n, GraphNode)).graph
+    loop = _loop(graph)
+    inner = loop.graph
     # The KV tiles are gathered, the softmax is masked, and the scale is a runtime value:
     # the dense Mul/Sub/Exp chain is gone.
     gathers = [n for n in inner.nodes if isinstance(n, PagedGather)]
@@ -85,14 +117,53 @@ def test_access_layer_structure(operator):
     )
     exp = next(n for n in inner.nodes if isinstance(n, MaskedExp))
     assert exp.scale is None, "the softmax scale arrives as a runtime scalar"
-    assert not [n for n in inner.nodes if type(n).__name__ in ("Mul", "Sub", "Exp")]
+    assert exp.shift is exact
+    assert not [n for n in inner.nodes if type(n).__name__ in ("Mul", "Exp")]
+    subs = [n.name for n in inner.nodes if type(n).__name__ == "Sub"]
+    if exact:
+        # The exp is the shifted form: it reads the masked, scaled score and that score's
+        # running row max, and takes the mask scalars alone -- the scale is the score's.
+        score = next(n for n in inner.nodes if isinstance(n, MaskedScore))
+        row_max = next(n for n in inner.nodes if isinstance(n, ReduceMax))
+        assert (score.name, row_max.name) == ("score_0", "exp_0_max")
+        assert score.inputs[0].src_node.name == "mma_0"
+        assert [e.src_node for e in exp.inputs] == [score, row_max]
+        assert row_max.inputs[0].src_node is score, "the max is taken after scaling"
+        assert score.scalar_args == ("tile_base", "valid_len", "scale2")
+        assert exp.scalar_args == ("tile_base", "valid_len")
+        # float32 statistics; the max starts at the most negative finite float32
+        assert row_max.accum_init == NEG_FLT_MAX and row_max.axis == 1
+        assert {score.out_dtype, row_max.out_dtype} == {"float32"}
+        # The rolling update is declared on the tier: a snapshot of the max, and one factor
+        # exp2(m_prev - m) for both accumulators. Its only subtraction is that step.
+        assert subs == ["exp_0_max_step"]
+        assert [n.name for n in inner.lag_nodes] == ["exp_0_max_prev"]
+        assert inner.lag_nodes[0].inputs[0].src_node is row_max
+        alpha = next(n for n in inner.nodes if n.name == "exp_0_alpha")
+        assert type(alpha) is Exp2 and alpha.inputs[0].src_node.name == "exp_0_max_step"
+        assert {acc.name: f for acc, f in inner.accum_scale.items()} == {
+            "rowsum_0": alpha, "mma_1": alpha}
+        # The lse reads the row sum and the max through the loop's accumulators, by index.
+        assert all(isinstance(e, AccumEdge) and e.src_node is loop for e in lse.inputs)
+        assert [(e.accum_node.name, e.src_id) for e in lse.inputs] == [
+            ("rowsum_0", 0), ("exp_0_max", 2)]
+        assert [(e.accum_node.name, e.src_id) for e in div.inputs] == [
+            ("mma_1", 1), ("rowsum_0", 0)]
+    else:
+        assert not subs and not inner.lag_nodes and not inner.accum_scale
+        assert exp.inputs[0].src_node.name == "mma_0" and len(exp.inputs) == 1
+        assert exp.scalar_args == ("tile_base", "valid_len", "scale2")
+        assert not [n for n in inner.nodes if isinstance(n, (MaskedScore, ReduceMax))]
 
     # The loop's bound is runtime, not the proxy extent the scheduler tiled against.
     assert inner.extent == 1
     assert inner.loop_trip == "T.ceildiv(valid_len, 64)"
     assert inner.loop_kind == "serial", "a gather loop must not be pipelined"
     assert [n.name for n in inner.prefetch_nodes] == ["paged_gather_k", "paged_gather_v"]
-    assert [n.name for n in inner.accum_nodes] == ["rowsum_0", "mma_1"]
+    # The carried max is appended behind the automatic accumulators, whose indices stay.
+    assert [n.name for n in inner.accum_nodes] == ["rowsum_0", "mma_1"] + (
+        ["exp_0_max"] if exact else [])
+    assert len(graph.tmap[loop]) == len(inner.accum_nodes)
     assert len([n for n in inner.nodes if isinstance(n, Matmul)]) == 2
     assert isinstance(next(n for n in inner.nodes if n.name == "rowsum_0"), ReduceSum)
 
@@ -169,3 +240,98 @@ def test_honours_the_schedules_thread_count():
     assert scheduled.n_threads == 128
     scheduled.n_threads = 256
     assert apply_paging(scheduled, SPEC).n_threads == 256
+
+
+# ------------------------------------------------------------------ the exact softmax
+def _exact(graph) -> bool:
+    """Whether a paged graph's loop tier carries a running max (and then all of it does)."""
+    inner = _loop(graph).graph
+    exp = next(n for n in inner.nodes if isinstance(n, MaskedExp))
+    carried = [n.name for n in inner.accum_nodes if isinstance(n, ReduceMax)]
+    assert bool(carried) == exp.shift == bool(inner.lag_nodes) == bool(inner.accum_scale)
+    return exp.shift
+
+
+@pytest.mark.parametrize("operator", sorted(OPERATORS))
+def test_which_operators_have_an_exact_softmax(operator):
+    """One operator at a time: the conversion is per operator, not per builder."""
+    op = OPERATORS[operator]
+    build = build_mla_paged_graph if isinstance(op.spec, MLASpec) else build_paged_graph
+    assert _exact(build(op.spec, **op.tuned_tiling)) == (operator in EXACT)
+
+
+def test_the_split_partial_of_an_exact_operator_is_not_converted_yet():
+    """A partial of an exact softmax must hand its max to the combine; until both exist the
+    split pair keeps the unshifted form (and the text of its expected pair)."""
+    spec = CASES["gqa_paged_decode_h32_kv8_d128_ps1"]
+    dense = DenseAttention(query_rows=16, kv_tile=64, head_dim=128, n_threads=128,
+                           dtype="bfloat16", accum_dtype="float32", out_dtype="bfloat16")
+    partial, _combine = build_split_decode(
+        spec, dense, 8, CombineTiling(split=8, split_step=1, cols=128, n_threads=128))
+    assert not _exact(partial)
+    assert [n.name for n in _loop(partial).graph.accum_nodes] == ["rowsum_0", "mma_1"]
+
+
+@pytest.mark.parametrize("tiling", [dict(kv_tile=32), dict(kv_tile=128), dict(query_rows=32),
+                                    dict(head_dim=64)])
+def test_the_exact_softmax_follows_the_operator_not_the_tiling(tiling):
+    graph = build_paged_graph(SPEC, **tiling)
+    # (query heads, kv heads, head dim) name the operator; a different head dim is another
+    assert _exact(graph) == (tiling.get("head_dim", 128) == 128)
+    if not _exact(graph):
+        return
+    inner = _loop(graph).graph
+    rows, kv = tiling.get("query_rows", 16), tiling.get("kv_tile", 64)
+    by_name = {n.name: n for n in inner.nodes}
+    assert tuple(inner.tmap[by_name["score_0"]].tile_size) == (rows, kv)
+    for name in ("exp_0_max", "exp_0_max_prev", "exp_0_max_step", "exp_0_alpha"):
+        assert tuple(inner.tmap[by_name[name]].tile_size) == (rows,), name
+        assert inner.tinfo_map[by_name[name]] == (f"t_{name}", "r")
+    assert tuple(graph.tmap[_loop(graph)][2].tile_size) == (rows,)
+
+
+def test_exact_kernel_text():
+    """What the exact softmax adds to the kernel, statement by statement."""
+    source = paged_kernel_source(SPEC)
+    body = source[source.index("def GraphNode_0_iter("):source.index("def GraphNode_0(")]
+    flat = "".join(body.split()).replace(",)", ")")
+    statements = [
+        "ukernel_mma_ssr_transB_clear(PlaceHolder_QQ,t_paged_gather_k,t_mma_0)",
+        "ukernel_maskedscore_scale_rt2_2dims_rr(t_mma_0,tile_base,valid_len,scale2,t_score_0)",
+        "ukernel_copy_1dims_rr(t_exp_0_max,t_exp_0_max_prev)",
+        "ukernel_reduce_max_axis1_rr(t_score_0,t_exp_0_max)",
+        "ukernel_maskedexp_shift2_2dims_rrr(t_score_0,t_exp_0_max,tile_base,valid_len,t_exp_0)",
+        "ukernel_sub_1dims_rrr(t_exp_0_max_prev,t_exp_0_max,t_exp_0_max_step)",
+        "ukernel_exp2_1dims_rr(t_exp_0_max_step,t_exp_0_alpha)",
+        "ukernel_rescale_1dims_rr(t_exp_0_alpha,t_rowsum_0)",
+        "ukernel_reduction_axis1_rr(t_exp_0,t_rowsum_0)",
+        "T.copy(t_exp_0,t_exp_0_cast)",
+        "ukernel_rescale_lead1_2dims_rr(t_exp_0_alpha,t_mma_1)",
+        "ukernel_mma_ssr(t_exp_0_cast,t_paged_gather_v,t_mma_1)",
+    ]
+    at = [flat.index(s) for s in statements]
+    assert at == sorted(at)
+    # The max is carried: allocated and filled outside the loop, never inside it.
+    assert "t_exp_0_max=T.alloc_fragment" not in flat
+    assert "T.fill(t_exp_0_max, -3.4028234663852886e38)" in source
+    assert "T.clear(t_rowsum_0)" in source and "T.clear(t_mma_1)" in source
+    # A masked score is that same finite value and a masked P the literal 0: no -inf.
+    assert source.count("-3.4028234663852886e38") == 2 and "infinity" not in source
+    assert "T.exp2(A[m0, m1] - M[m0]), 0.0)" in source
+    assert "T.exp2(A[m0, m1] * scale2)" not in source
+    # lse = log2(l) + m with the row sum unfloored; the floor guards the divide alone.
+    assert "ukernel_lse2_1dims_rrg(t_rowsum_0, t_exp_0_max, OutputNode_1)" in source
+    assert "B[i0] = T.log2(A[i0]) + M[i0]" in source
+    assert source.count("T.max(") == 1 and "T.max(B[i0], 1e-30)" in source
+
+
+def test_exact_kernel_without_the_lse():
+    """With no lse the carried max has no reader after the loop, and the kernel still emits."""
+    from dataclasses import replace
+
+    graph = build_paged_graph(replace(SPEC, emit_lse=False))
+    assert _exact(graph)
+    assert not [n for n in graph.nodes if isinstance(n, (Log2, Lse2))]
+    assert [n.name for n in graph.args if isinstance(n, OutputNode)] == ["OutputNode_0"]
+    source = TilelangCodeGen().gen(graph)
+    assert "lse2" not in source and "T.fill(t_exp_0_max, -3.4028234663852886e38)" in source
