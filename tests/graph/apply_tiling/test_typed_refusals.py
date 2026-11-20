@@ -370,6 +370,14 @@ def test_siblings_over_one_axis_are_stepped_together(dtype, first):
     and the row sum at 32, for every candidate; the loop-extent guard refused all of them
     (the kernels they used to build summed half the row), and a float32 flash-form softmax
     had no tiling where float16 had all of them. Siblings over one axis start together.
+
+    CPU only, and on purpose: what is pinned is that the tilings exist and that their loop
+    counts its tiles. On a GPU the float32 kernels run (12 of 14; 2 exceed shared memory)
+    at 1.04e-3 to 1.12e-3 of the row maximum, which is what every float32 tensor-core
+    matmul measures here (a plain float32 matmul: 1.02e-3, on the tree without this
+    change too) and 50 times the 2e-5 ceiling of a float32 output: no float32 matmul
+    program can be validated under the current rule, so there is no tolerance to declare
+    for these and no GPU test.
     """
     shapes = dict(R=64, C=4096, D=64)
 
@@ -593,3 +601,88 @@ def test_a_float32_matmul_over_such_an_axis_starts_at_a_step_it_has(K):
     assert cands and all(K % _step(c, matmul) == 0 for c in cands)
     built, refused = _outcomes(cands)
     assert len(built) == len(cands) and not refused
+
+
+# ------------------------------------------ what starting siblings together leaves alone
+
+
+def _policy_of(ir):
+    return TCPolicy([n for n in ir.nodes if isinstance(n, OutputNode)], get_arch("cuda"),
+                    flat_graph=ir)
+
+
+def _first_steps(policy):
+    alone = {n: policy._assign_reduce_step(n) for n in policy.ordered_nodes}
+    return alone, policy._start_siblings_together(alone)
+
+
+def sums_over_two_axes(v: cl.Tensor["R", "R"], x: cl.Tensor["R", "C"]):
+    """(v @ exp(x)) / sum(exp(x), -1): the matmul reduces the rows of exp(x), the row sum
+    its columns -- one group, two axes."""
+    e = cl.exp(x)
+    return (v @ e) / cl.sum(e, -1, keepdim=True)
+
+
+def test_group_members_on_different_axes_are_not_started_together():
+    """The shared-axis condition. The matmul and the row sum read one ``exp`` and feed one
+    divide, so they are one compatible group, and the larger of their first steps is a
+    step the other could take. They reduce different axes of it -- each gets a loop of
+    its own -- and keep their own first steps."""
+    ir = _identity_graph(sums_over_two_axes, dict(R=1024, C=4096), cl.f32)
+    matmul, rowsum = _one(ir, Matmul), _one(ir, ReduceSum)
+    policy = _policy_of(ir)
+    by_name = {n.name: n for n in policy.ordered_nodes}
+    assert any({by_name[matmul.name], by_name[rowsum.name]} <= set(group)
+               for group in policy.compatible_reduction_groups)
+    tokens = policy.reduction_axis_provenance
+    assert tokens[by_name[matmul.name]][0] and tokens[by_name[rowsum.name]][0]
+    assert not tokens[by_name[matmul.name]][0] & tokens[by_name[rowsum.name]][0]
+    alone, starts = _first_steps(policy)
+    own = {n.name: int(next(iter(alone[by_name[n.name]].values()))) for n in (matmul, rowsum)}
+    assert own == {matmul.name: 16, rowsum.name: 32}  # apart, as in the flash form
+    (name,) = [it.var.name for it in matmul.raxis]
+    assert 32 in policy.get_node_reduce_step_candidates(by_name[matmul.name])[name]
+    assert starts == alone
+
+
+def normalized_and_plain(x: cl.Tensor["R", "C"], w: cl.Tensor["C", "D"]):
+    """softmax(x) @ w + exp(x) @ w: both matmuls contract the columns of exp(x); the first
+    one behind the row sum that normalizes them."""
+    e = cl.exp(x)
+    return (e / cl.sum(e, -1, keepdim=True)) @ w + e @ w
+
+
+def test_a_sibling_pinned_to_its_whole_axis_is_not_moved_and_moves_nobody():
+    """The full-extent exclusion. ``softmax(x) @ w`` contracts the axis its own ancestor,
+    the row sum, reduces, so the policy pins it to the whole axis
+    (``_full_extent_reduction_axis_ids``). ``exp(x) @ w`` next to it contracts the same
+    axis of the same ``exp``, is in its group, and is not behind the sum. The pinned one
+    stays at its extent; the other is not pulled up to it and keeps its own first step."""
+    C = 4096
+    ir = _identity_graph(normalized_and_plain, dict(R=64, C=C, D=64))
+    policy = _policy_of(ir)
+    matmuls = [n for n in policy.ordered_nodes if isinstance(n, Matmul)]
+    (pinned,) = [n for n in matmuls if 0 in policy._full_extent_reduction_axis_ids.get(n, set())]
+    (plain,) = [n for n in matmuls if n is not pinned]
+    assert any({pinned, plain} <= set(group) for group in policy.compatible_reduction_groups)
+    tokens = policy.reduction_axis_provenance
+    assert tokens[pinned][0] & tokens[plain][0]  # one axis of one tensor
+    alone, starts = _first_steps(policy)
+    assert [int(v) for v in alone[pinned].values()] == [C]
+    assert [int(v) for v in alone[plain].values()] == [32]
+    assert starts == alone
+
+
+def test_siblings_are_only_started_at_steps_they_can_take():
+    """The step-candidate check: whatever the row length, a member starts at one of its
+    own step candidates. (Members of one cluster reduce one dim of one tensor, so they
+    have one extent and, the pinned ones aside, one list of candidates: the check cannot
+    be made to fail from a program, and removing it changes no candidate list.)"""
+    for C in (48, 80, 4096):
+        ir = _identity_graph(flash_rows, dict(R=64, C=C, D=64), cl.f32)
+        policy = _policy_of(ir)
+        _, starts = _first_steps(policy)
+        for node, step in starts.items():
+            for name, value in step.items():
+                assert int(value) in policy.get_node_reduce_step_candidates(node)[name], (C, node.name)
+
