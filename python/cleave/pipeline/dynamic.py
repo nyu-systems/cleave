@@ -421,6 +421,28 @@ class PagedKernel(Kernel):
         scalars = iter(p for p in inputs if p.is_scalar)
         return [s if s is not None else next(scalars) for s in slots]
 
+    def _no_key_in_any_cache(self, bound) -> bool:
+        """Whether the caches have no row at all and the KV table gives no request one.
+
+        That is the one call a kernel cannot be launched for whose answer the inputs still
+        define. Caches without a row under a table that gives requests keys, or one cache
+        with rows next to one without, define no answer: such a call is refused."""
+        caches = self.attention.caches
+        empty = [c.name for c in caches if bound[c.name].numel() == 0]
+        if not empty:
+            return False
+        if len(empty) < len(caches):
+            filled = [c.name for c in caches if c.name not in empty]
+            raise ValueError(f"{self.name}: {', '.join(empty)} has no row but "
+                             f"{', '.join(filled)} does; the caches are read through one table")
+        indptr = self.attention._table_param(self.attention.pages.indptr)
+        table = bound[indptr.name]
+        spanned = int(table[-1]) - int(table[0]) if table.numel() else 0
+        if spanned:
+            raise ValueError(f"{self.name}: {indptr.name} gives the requests {spanned} "
+                             f"entries of caches that have no row ({', '.join(empty)})")
+        return True
+
     def __call__(self, *args, **named):
         import torch
 
@@ -452,12 +474,12 @@ class PagedKernel(Kernel):
         outs = [torch.empty([sizes[d.name] if hasattr(d, "name") else int(d) for d in dims],
                             dtype=dt.torch, device=q.device)
                 for dims, dt in zip(self.attention.output_dims(), self.attention.output_dtypes())]
-        if any(bound[cache.name].numel() == 0 for cache in self.attention.caches):
-            # A cache without a row holds no key for any request, so every output row is
-            # what the operator defines for an empty window: 0, and -inf in the lse.
-            # Nothing is launched: the ragged and slab kernels address their caches through
-            # TMA descriptors, and one cannot be built for a zero-sized tensor (TileLang
-            # 0.1.13 raises "globalAddress must be non-null" before the kernel starts).
+        if self._no_key_in_any_cache(bound):
+            # No request has a key, so every output row is what the operator defines for
+            # an empty window: 0, and -inf in the lse. Nothing is launched: the ragged and
+            # slab kernels address their caches through TMA descriptors, and one cannot be
+            # built for a zero-sized tensor (TileLang 0.1.13 raises "globalAddress must be
+            # non-null" before the kernel starts).
             outs[0].zero_()
             for lse in outs[1:]:
                 lse.fill_(float("-inf"))

@@ -379,7 +379,11 @@ def test_a_cache_without_a_row_is_answered_without_a_launch():
     kernel cannot be launched to give it: its caches are TMA sources, and a zero-sized tensor
     has no descriptor (TileLang raises ``InternalError: Invalid TMA descriptor arguments ...
     globalAddress must be non-null`` before the kernel starts). ``PagedKernel`` answers such
-    a call itself, and launches as usual as soon as a cache has a row."""
+    a call itself, and launches as usual as soon as the caches have a row.
+
+    It answers only what the inputs define. Caches without a row under a KV table that
+    gives requests keys, or one cache with rows next to one without, are refused: with K
+    filled and V empty the lse is finite, so -inf would be a wrong answer, not a missing one."""
     import torch
 
     from cleave.pipeline.dynamic import PagedKernel
@@ -401,15 +405,32 @@ def test_a_cache_without_a_row_is_answered_without_a_launch():
     assert out.shape == (13, 32, 128) and out.dtype == torch.bfloat16 and not out.any()
     assert lse.shape == (13, 32) and lse.dtype == torch.float32
     assert torch.isneginf(lse).all()
-    # by name as well, and with only one of the two caches empty
-    named = dict(q=q, k=k, v=torch.zeros(1, 8, 128, dtype=torch.bfloat16),
-                 qo_indptr=qo_indptr, kv_indptr=kv_indptr, sm_scale=0.088)
+    # by name as well, and with a table that starts anywhere: it spans no entry
+    named = dict(q=q, k=k, v=v, qo_indptr=qo_indptr, kv_indptr=kv_indptr + 7, sm_scale=0.088)
     out, lse = kernel(**named)
     assert not launched and not out.any() and torch.isneginf(lse).all()
 
-    # one spare row and the kernel is launched as before, on outputs it has to fill
+    # the same empty caches under a table that gives the requests 12 keys: no answer
+    keyed = torch.tensor([0, 5, 9, 12], dtype=torch.int32)
+    with pytest.raises(ValueError, match="kv_indptr gives the requests 12 entries of caches "
+                                         r"that have no row \(k, v\)"):
+        kernel(q, k, v, qo_indptr, keyed, 0.088)
+    # one cache with rows and one without, whatever the table says: the lse of the first
+    # is finite, and there is nothing to weigh by it
+    rows = torch.zeros(12, 8, 128, dtype=torch.bfloat16)
+    for table in (keyed, kv_indptr):
+        with pytest.raises(ValueError, match="v has no row but k does"):
+            kernel(q, rows, v, qo_indptr, table, 0.088)
+        with pytest.raises(ValueError, match="k has no row but v does"):
+            kernel(**dict(named, k=k, v=rows, kv_indptr=table))
+    assert not launched
+
+    # one spare row in each and the kernel is launched as before, on outputs it has to fill
     k = v = torch.zeros(1, 8, 128, dtype=torch.bfloat16)
     kernel(q, k, v, qo_indptr, kv_indptr, 0.088)
     (args,) = launched
     assert len(args) == 8 and args[1] is k and args[5] == 0.088
     assert [tuple(t.shape) for t in args[6:]] == [(13, 32, 128), (13, 32)]
+    # ... also when the table gives the requests keys: that is the kernel's to answer
+    kernel(q, rows, rows, qo_indptr, keyed, 0.088)
+    assert len(launched) == 2 and launched[1][4] is keyed
