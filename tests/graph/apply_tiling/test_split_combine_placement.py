@@ -158,14 +158,18 @@ def test_a_kernel_with_one_loop_keeps_its_pipeline(placement):
     assert _loops(code) == [(name, "Pipelined") for name in loops]
 
 
-@pytest.mark.parametrize("rows, kind", [(2, "serial"), (4, "serial"), (32, "Pipelined"),
-                                        (128, "Pipelined")])
+@pytest.mark.parametrize("rows, kind", [(2, "serial"), (4, "serial"), (8, "serial"),
+                                        (16, "serial"), (32, "Pipelined"), (128, "Pipelined")])
 def test_a_loop_with_nothing_to_transfer_is_not_pipelined(rows, kind):
     """Only the row sum looped, on blocks of a few rows: each iteration loads two partials
     of ``rows`` float16 row sums. Under 16 bytes a row, TileLang has nothing to transfer
     in a pipeline and loses the loop variable (2 of this combine's tilings at split 4, 1 of
     the RMSNorm combine's, 24 of each matmul split-K combine's); such a loop is emitted as
-    a plain one. Two partials of 32 row sums and more are pipelined as ever."""
+    a plain one. So is one whose slice would land off its 128-byte boundary -- 8 or 16 row
+    sums a partial, 32 or 64 bytes an iteration cut out of longer rows: it lowered as a
+    pipeline and faulted at launch (the next test, and
+    ``tests/graph/apply_tiling/test_pipelined_slices.py``). Two partials of 32 row sums and
+    more are pipelined as ever."""
     steps, _ = PLACEMENTS["rowsum_looped"]
     code = build_candidate_code(_candidate(*steps, rows=rows))
     assert _loops(code) == [("GraphNode_rowsum_combine_0", kind)]

@@ -84,7 +84,10 @@ from pathlib import Path
 #     tilings of attention had no kernel at all.
 # 34: reductions that share no operand are put in one loop only where it steps both alike;
 #     with equal steps over axes of different length each gets a loop (they were refused).
-SCHEMA = 34
+# 35: a loop that would transfer a slice that is no multiple of 128 bytes is a plain loop:
+#     such kernels faulted when they were launched (misaligned address). (The fault of 28,
+#     found a second time: 28's rule is the one in the tree, and no text moves at 35.)
+SCHEMA = 35
 # What "validated" means for a saved kernel. A kernel-cache hit returns without validating,
 # so bump this whenever the comparison or its inputs change: saved kernels are then rebuilt.
 # (The inputs include the adversarial cases a program with an exact softmax is held to,

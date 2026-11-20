@@ -1045,7 +1045,8 @@ def _pipeline_one_loop(main: Graph, tile_map: dict, itile_map: dict, top_bind_no
 
     * the loop transfers a slice that is not a whole number of 128-byte units and is not
       one run of consecutive elements of its tensor (two partials of 8 or 16 float16 row
-      sums out of a longer row). A pipeline keeps several iterations' slices in one
+      sums out of a longer row; two partials of a matmul on tiles of 16 or 8 elements).
+      A pipeline keeps several iterations' slices in one
       buffer, the slice of stage ``k`` at ``k`` times the slice's size, and a slice that
       is not one run is loaded as a tensor tile, which needs its destination on a
       128-byte boundary: stage 1 of a 32- or 64-byte slice is not on one. (A slice that
