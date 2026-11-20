@@ -191,11 +191,17 @@ class Matmul(ComputeOpNode):
 class ReduceSum(ComputeOpNode):
     """Sum over ``axis``; ``ReduceMax`` swaps the reducer."""
 
-    _macro_attrs = ("axis", "axis_arg", "dtype")
+    _macro_attrs = ("axis", "axis_arg", "dtype", "fold_rank")
     kind = "reduction"  # macro-name stem, pinned: generated kernels keep it
     _tl_reduce = "T.reduce_sum"
     # Fill value of a loop accumulator before its first iteration (None: T.clear).
     accum_init = None
+    # Set by the tiler when the stored input tile has a unit extent on the reduced axis: a
+    # loop that walks that axis one element at a time. The kernel stores a tile without
+    # its unit extents, so the tile has no such axis left for ``T.reduce_*`` to name, and
+    # reducing it is folding it into the output element by element. The rank of both.
+    fold_rank = None
+    _tl_fold = "{b} += {a}"
 
     @staticmethod
     def _te_reduce(expr, axis):
@@ -273,6 +279,17 @@ class ReduceSum(ComputeOpNode):
         a_scope, b_scope = kwargs["mem_scope"]
         assert b_scope == "r", "ReduceSum only support register accumulation."
 
+        if self.fold_rank is not None:
+            idx = ", ".join(f"i{d}" for d in range(self.fold_rank))
+            a, b = f"A[{idx}]", f"B[{idx}]"
+            fold = f"{b} = {a}" if kwargs["clear"] else self._tl_fold.format(a=a, b=b)
+            macro_str = f"""\
+            @T.macro
+            def {self.get_macro_name(**kwargs)}(A, B):
+                for {idx} in T.Parallel(*B.shape):
+                    {fold}"""
+            return self._format_code(macro_str)
+
         macro_str = f"""\
         @T.macro
         def {self.get_macro_name(**kwargs)}(A, B):
@@ -287,7 +304,8 @@ class ReduceSum(ComputeOpNode):
         return self._format_code(macro_str)
 
     def get_macro_name(self, **kwargs) -> str:
-        func_name = f"ukernel_{self.kind}_axis{self.axis}_{kwargs['mem_scope']}"
+        where = f"axis{self.axis}" if self.fold_rank is None else f"fold_{self.fold_rank}dims"
+        func_name = f"ukernel_{self.kind}_{where}_{kwargs['mem_scope']}"
         func_name += "_clear" if kwargs["clear"] else ""
         return func_name
 
@@ -297,6 +315,7 @@ class ReduceMax(ReduceSum):
 
     kind = "reduce_max"
     _tl_reduce = "T.reduce_max"
+    _tl_fold = "{b} = T.max({b}, {a})"
     accum_init = -float("inf")
     running_max = True
 

@@ -16,7 +16,8 @@ from pathlib import Path
 #    read), and a divisor over two unit axes is broadcast along the one the program names.
 # 5: a reduction that is not looped reduces its own axis of the stored tile.
 # 6: a candidate with an absorbed reduction is rated (and cut at top-k) as its kernel.
-SCHEMA = 6
+# 7: a reduction stepped one element at a time folds its tile (it used not to compile).
+SCHEMA = 7
 # What "validated" means for a saved kernel. A kernel-cache hit returns without validating,
 # so bump this whenever the comparison or its inputs change: saved kernels are then rebuilt.
 VALIDATION = 2

@@ -538,16 +538,20 @@ def assign_tensor_map(
             top_bind_node[n.name] = top_bind_node[outer_node.name]
         bind_node = top_bind_node[n.name] if isinstance(n, PlaceHolderNode) else n
 
-        # get tile shape and tile size from candidate
+        # get tile shape and tile size from candidate. A batch dim that is a unit
+        # extent of the whole block is not stored. One the block holds several of is,
+        # even at one per iteration: the loop walks it (a split axis at step 1), and
+        # dropping it here would hand every iteration the whole block.
+        block_tile = tile_map[bind_node.name]
         shape = [
             t
-            for i, t in enumerate(tile_map[bind_node.name])
-            if not n.is_batch_dim[i] or itile_map[bind_node.name][i] > 1
+            for i, t in enumerate(block_tile)
+            if not n.is_batch_dim[i] or t > 1
         ]
         tile_size = [
             t
             for i, t in enumerate(itile_map[bind_node.name])
-            if not n.is_batch_dim[i] or t > 1
+            if not n.is_batch_dim[i] or block_tile[i] > 1
         ]
         iter_dims = [i // j > 1 for i, j in zip(shape, tile_size)]
         num_args = (
@@ -581,9 +585,14 @@ def _rebase_reduction_axis(node: ReduceSum, tile):
     are visited again on every merge into that loop.
     """
     axis = node.flat_axis
-    node.axis, node.axis_arg = axis, node.flat_axis_arg
-    if tile is None or len(tile) != len(node.dims) or _is_unit(tile[axis]):
-        # A unit extent on the reduced axis itself leaves the tile without that axis.
+    node.axis, node.axis_arg, node.fold_rank = axis, node.flat_axis_arg, None
+    if tile is None or len(tile) != len(node.dims):
+        return
+    if _is_unit(tile[axis]):
+        # The stored tile has no reduced axis left (a loop walks it one element at a
+        # time): the node folds the tile into its output instead (``fold_rank``). A tile
+        # of unit extents only is stored with one of them.
+        node.fold_rank = max(1, sum(1 for extent in tile if not _is_unit(extent)))
         return
     if node.flat_axis_arg < 0:
         node.axis_arg = -1 - sum(1 for extent in tile[axis + 1 :] if not _is_unit(extent))
