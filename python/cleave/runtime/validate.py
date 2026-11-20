@@ -220,10 +220,11 @@ def _compare_one(index, actual, reference, tol):
     )
 
 
-def _log_validation(what, actual, tolerances, results):
+def _log_validation(what, actual, tolerances, results, roles=None):
     path = Settings.from_env().validation_log
     if path is None:
         return
+    roles = roles or ("",) * len(actual)
     record = {
         "context": os.environ.get("CLEAVE_VALIDATION_CONTEXT")
         or os.environ.get("PYTEST_CURRENT_TEST", ""),
@@ -235,8 +236,10 @@ def _log_validation(what, actual, tolerances, results):
                 "rtol": tol.rtol, "atol": tol.atol, "kind": kind,
                 "rel": None if measured is None else measured.rel,
                 "abs": None if measured is None else measured.abs,
+                # the boundary role of an output that has one (a split partial's shift)
+                **({"role": role} if role else {}),
             }
-            for act, tol, (measured, kind, _) in zip(actual, tolerances, results)
+            for act, tol, (measured, kind, _), role in zip(actual, tolerances, results, roles)
         ],
     }
     line = (json.dumps(record, separators=(",", ":")) + "\n").encode()
@@ -249,7 +252,7 @@ def _log_validation(what, actual, tolerances, results):
         os.close(fd)
 
 
-def compare_outputs(actual, reference, tolerance, *, what: str = ""):
+def compare_outputs(actual, reference, tolerance, *, what: str = "", roles=None):
     """Hold every kernel output to its reference; the one comparison every validation uses.
 
     Returns one :class:`MeasuredError` per output. Raises ``OutputMismatch`` when a finite
@@ -257,7 +260,8 @@ def compare_outputs(actual, reference, tolerance, *, what: str = ""):
     ``NonFiniteOutput`` for any NaN, an infinity the reference does not have, or a
     non-finite reference entry that is not reproduced exactly; non-finite entries take no
     part in the row scale. ``tolerance`` is one ``Tolerance`` or one per output. ``what``
-    names the kernel in the message and in the ``CLEAVE_VALIDATION_LOG`` record.
+    names the kernel in the message and in the ``CLEAVE_VALIDATION_LOG`` record; ``roles``
+    (the boundary role of each output, when known) only goes into that record.
     """
     actual, reference = list(actual), list(reference)
     prefix = f"{what}: " if what else ""
@@ -271,7 +275,7 @@ def compare_outputs(actual, reference, tolerance, *, what: str = ""):
         _compare_one(i, act, ref, tol)
         for i, (act, ref, tol) in enumerate(zip(actual, reference, tolerances))
     ]
-    _log_validation(what, actual, tolerances, results)
+    _log_validation(what, actual, tolerances, results, roles)
     measured = tuple(m for m, _, _ in results)
     for kind, error_cls in (("non_finite", NonFiniteOutput), ("mismatch", OutputMismatch)):
         messages = [message for _, k, message in results if k == kind]
@@ -420,7 +424,7 @@ def _as_list(reference):
 
 
 def _validate_kernel_outputs(
-    kernel, inputs, reference, *, tolerance, what: str = "", stored_layouts=None,
+    kernel, inputs, reference, *, tolerance, what: str = "", stored_layouts=None, roles=None,
 ):
     """Run ``kernel(*inputs)`` and hold it to ``reference``; the measured error per output.
 
@@ -428,7 +432,8 @@ def _validate_kernel_outputs(
     shape and compares with :func:`compare_outputs` at the operator's declared
     ``tolerance`` (there is no default). ``stored_layouts`` is the layout ``apply_tiling``
     recorded for each output, in the kernel's output order; without it (a hand-written
-    kernel) the layout is recovered from the extents. Must run inside a ``_gpu_exec_guard``.
+    kernel) the layout is recovered from the extents. ``roles``: see ``compare_outputs``.
+    Must run inside a ``_gpu_exec_guard``.
     """
     import torch
 
@@ -445,7 +450,7 @@ def _validate_kernel_outputs(
             reconcile_output_layout(ref, act.shape, layout)
             for ref, act, layout in zip(reference, actual, layouts)
         ]
-    measured = compare_outputs(actual, reference, tolerance, what=what)
+    measured = compare_outputs(actual, reference, tolerance, what=what, roles=roles)
     del actual, reference
     torch.cuda.empty_cache()
     torch.cuda.ipc_collect()
@@ -455,7 +460,7 @@ def _validate_kernel_outputs(
 def _check_kernel(
     kernel, *, graph=None, dtype=None, reference_cache_dir=None,
     tolerance=None, benchmark: BenchOptions | None = None, distributions=("normal",),
-    stored_layouts=None,
+    stored_layouts=None, roles=None,
 ):
     """Validate ``kernel`` against the graph reference, then optionally time it.
 
@@ -486,7 +491,7 @@ def _check_kernel(
                 measured = worst(measured, _validate_kernel_outputs(
                     kernel, inputs, reference, tolerance=tolerance,
                     what="" if distribution == "normal" else f"{distribution} inputs",
-                    stored_layouts=stored_layouts,
+                    stored_layouts=stored_layouts, roles=roles,
                 ))
         if benchmark is None:
             return measured, None

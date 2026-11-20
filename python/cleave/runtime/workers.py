@@ -61,12 +61,15 @@ def _run_task(task):
     ``check_fn`` returns ``(cuda_src, latency_ms)``, optionally followed by the measured
     error per output; a validation failure may carry one too (``exc.measured``).
     The candidate's stored output layouts are handed over only when the build recorded
-    them, so a ``check_fn`` written without that keyword keeps working.
+    them, and the roles of its outputs only when one of them has a role, so a ``check_fn``
+    written without those keywords keeps working.
     """
     try:
         extra = {}
         if task.get("stored_layouts") is not None:
             extra["stored_layouts"] = task["stored_layouts"]
+        if task.get("roles") is not None:
+            extra["roles"] = task["roles"]
         cuda_src, latency_ms, *rest = task["check_fn"](
             task["code_str"], out_idx=task["out_idx"],
             reference_cache_dir=task["reference_cache_dir"],

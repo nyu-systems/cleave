@@ -93,9 +93,10 @@ def test_output_roles_reads_the_boundary_records():
 
 # ------------------------------------------------------------------------- run_candidates
 
-def _check(code_str, *, out_idx, reference_cache_dir, tolerance=None, benchmark=None):
-    """Worker-side fake: reports the declaration it was handed."""
-    return repr(tolerance), 0.0
+def _check(code_str, *, out_idx, reference_cache_dir, tolerance=None, benchmark=None,
+           roles=None):
+    """Worker-side fake: reports the declaration and the roles it was handed."""
+    return repr((tolerance, roles)), 0.0
 
 
 @pytest.mark.skipif("fork" not in mp.get_all_start_methods(), reason="needs fork")
@@ -117,12 +118,13 @@ def test_every_candidate_is_checked_at_the_bounds_of_its_own_outputs(monkeypatch
 
     solo, partial, combine = run(BY_ROLE)
     assert (solo.ok, partial.ok, combine.ok) == (True, True, True)
-    assert solo.cuda_src == combine.cuda_src == repr((OUT,))
-    assert partial.cuda_src == repr((OUT, OUT, SHIFT))
+    # the roles go with the task (for the validation log) only where an output has one
+    assert solo.cuda_src == combine.cuda_src == repr(((OUT,), None))
+    assert partial.cuda_src == repr(((OUT, OUT, SHIFT), PARTIAL))
 
     solo, partial, combine = run(OUT)
     assert (solo.ok, partial.ok, combine.ok) == (True, False, True)
-    assert solo.cuda_src == repr(OUT)
+    assert solo.cuda_src == repr((OUT, None))
     assert partial.stage == "validate" and isinstance(partial.error, ValidationError)
     assert "returns outputs of role ['shift']" in str(partial.error)
 
@@ -130,6 +132,31 @@ def test_every_candidate_is_checked_at_the_bounds_of_its_own_outputs(monkeypatch
     assert (solo.ok, partial.ok, combine.ok) == (True, False, True)
     assert "no validation tolerance declared for the outputs of role ['shift']" in str(
         partial.error)
+
+
+# ------------------------------------------------------------------------------------ log
+
+def test_the_validation_log_names_the_role_of_an_output(tmp_path, monkeypatch):
+    """The measuring tool tells a partial's shift from its sums by the role in the record,
+    not by the place the kernel returns it in."""
+    import json
+
+    import torch
+
+    from cleave.runtime.validate import compare_outputs
+
+    log = tmp_path / "validation.jsonl"
+    monkeypatch.setenv("CLEAVE_VALIDATION_LOG", str(log))
+    shift = torch.randn(4, 8)
+    sums = torch.rand(4, 8).to(torch.float16)
+    compare_outputs([shift, sums], [shift, sums], (SHIFT, OUT), what="a partial",
+                    roles=("shift", ""))
+    compare_outputs([sums], [sums], OUT, what="a combine")
+    partial, combine = [json.loads(line) for line in log.read_text().splitlines()]
+    assert [o.get("role") for o in partial["outputs"]] == ["shift", None]
+    assert [o["dtype"] for o in partial["outputs"]] == ["float32", "float16"]
+    assert [o["rtol"] for o in partial["outputs"]] == [SHIFT.rtol, OUT.rtol]
+    assert "role" not in combine["outputs"][0]
 
 
 # --------------------------------------------------------------------------------- report

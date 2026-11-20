@@ -269,11 +269,13 @@ def run_candidates(
         return reference
 
     def declared_for(cand):
-        """The declaration as it applies to this candidate's outputs (their roles are only
-        known for a candidate that comes with its lowered graph)."""
+        """``(declaration, roles)``: the declaration as it applies to this candidate's
+        outputs, and their boundary roles when one of them has a role. (The roles are only
+        known for a candidate that comes with its lowered graph.)"""
         graph = cand.flat_graph
         known = tolerance is not None and getattr(graph, "nodes", None) is not None
-        return tolerances_of(tolerance, output_roles(graph) if known else None)
+        roles = output_roles(graph) if known else None
+        return tolerances_of(tolerance, roles), roles if roles and any(roles) else None
 
     def finish(job, result, pbar):
         results[job["idx"] - 1] = result
@@ -311,7 +313,7 @@ def run_candidates(
             code_str, stored_layouts = built if isinstance(built, tuple) else (built, None)
             job["stored_layouts"] = stored_layouts
             try:
-                declared = declared_for(cand)
+                declared, roles = declared_for(cand)
             except SpecError as exc:
                 error = _parent_error(ValidationError, label, "tolerance", exc)
                 fail(job, "validate", error, pbar, code_str)
@@ -320,7 +322,7 @@ def run_candidates(
             task = {
                 "check_fn": check_fn, "code_str": code_str, "out_idx": cand_out_idx,
                 "reference_cache_dir": cand_ref_dir, "tolerance": declared,
-                "benchmark": benchmark, "stored_layouts": stored_layouts,
+                "benchmark": benchmark, "stored_layouts": stored_layouts, "roles": roles,
             }
             worker = None
             try:

@@ -173,7 +173,7 @@ def build_candidate_code(cand, options: CompilerPassOptions | None = None):
 
 def check_code(
     code_str, *, graph=None, dtype=None, out_idx=None, reference_cache_dir=None,
-    tolerance=None, benchmark: BenchOptions | None = None, stored_layouts=None,
+    tolerance=None, benchmark: BenchOptions | None = None, stored_layouts=None, roles=None,
 ):
     """``(cuda_src, latency_ms | None, measured)``: compile, validate and optionally time
     one kernel; ``measured`` is the error per output the comparison found.
@@ -184,6 +184,7 @@ def check_code(
     declared a tolerance for fails here, before it is compiled.
     ``stored_layouts`` is the second half of :func:`build_candidate`'s result: how the
     kernel stores each output. Without it the reference is laid out by matching extents.
+    ``roles``: the boundary role of each output, for the validation log.
     """
     with _stage("validate"):
         require_tolerance(tolerance)
@@ -198,6 +199,6 @@ def check_code(
 
     measured, latency_ms = _check_kernel(
         kernel, graph=graph, dtype=dtype, reference_cache_dir=reference_cache_dir,
-        tolerance=tolerance, benchmark=benchmark, stored_layouts=stored_layouts,
+        tolerance=tolerance, benchmark=benchmark, stored_layouts=stored_layouts, roles=roles,
     )
     return kernel.get_kernel_source(), latency_ms, measured
