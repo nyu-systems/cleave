@@ -97,10 +97,10 @@ def _op(op_type, ins, outs, **extra):
 def _rowsum_and_value(BH, SQ, SKV, D, weights="float32"):
     """exp(Q K^T) reduced two ways, both outputs of one unsplit graph.
 
-    ``weights`` is the dtype the exp is stored in. In float32 -- what lowering makes of a
-    traced program -- the row sum and the value matmul step ``S_KV`` together. Stored in
-    float16, the policy steps the row sum twice as far as the matmul (it sizes each
-    reduction's step alone, by what it reads), and the two cannot share a loop.
+    ``weights`` is the dtype the exp is stored in: float32 is what lowering makes of a
+    traced program. Stored in float16, the row sum's own first step is twice the value
+    matmul's (the policy sizes each reduction's step by what it reads); the two share a
+    loop over ``S_KV``, so the policy starts them together.
     """
     q, k, v = _t(1, (BH, SQ, D)), _t(2, (BH, SKV, D)), _t(3, (BH, SKV, D))
     scores, weights = _t(4, (BH, SQ, SKV)), _t(5, (BH, SQ, SKV), weights)
@@ -117,8 +117,9 @@ def _rowsum_and_value(BH, SQ, SKV, D, weights="float32"):
     ]
 
 
+@pytest.mark.parametrize("weights", ["float32", "float16"])
 @pytest.mark.parametrize("dims", [(32, 4096, 4096, 64), (4, 64, 1024, 64)])
-def test_a_padded_sibling_output_without_a_split_records_its_pad(dims):
+def test_a_padded_sibling_output_without_a_split_records_its_pad(dims, weights):
     """Two loop-fed outputs and no split: nothing is reordered, but the row sum is still
     padded to the rank of the value output. The pad has to be in the record, or a correct
     kernel of such a program is refused for a shape it does have."""
@@ -126,10 +127,12 @@ def test_a_padded_sibling_output_without_a_split_records_its_pad(dims):
     from cleave.lower import to_ir
 
     BH, SQ, _, D = dims
-    graph = to_ir(_rowsum_and_value(*dims))
+    graph = to_ir(_rowsum_and_value(*dims, weights=weights))
     candidates = search_tiling(graph, topk=PL.TOPK)
     assert candidates
     for cand in candidates:
+        steps = {n.name: next(iter(v.values())) for n, v in cand.rstep_map.items() if v}
+        assert steps["reduction_2_5"] == steps["mma_6"]  # one loop, one step
         scheduled = apply_tiling(cand)
         rowsum, value = _outputs(scheduled)
         assert all(isinstance(o.inputs[0].src_node, GraphNode) for o in (rowsum, value))
@@ -140,22 +143,29 @@ def test_a_padded_sibling_output_without_a_split_records_its_pad(dims):
 
 @pytest.mark.parametrize("dims", [(32, 4096, 4096, 64), (4, 64, 1024, 64)])
 def test_siblings_stepped_apart_are_refused_and_record_nothing(dims):
-    """The same graph with the exp stored in float16: every candidate steps the row sum
-    twice as far as the value matmul. Both are in one loop over ``S_KV``, which then runs
-    twice as many iterations as the weights have tiles. The tiler refuses that (it used to
-    build a kernel that read past the row, and this file recorded its layouts), so there
-    is no stored layout to speak of. The limit is the policy's; when it steps siblings
-    together this test fails, and the float16 form belongs in the test above."""
+    """The same graph with the exp stored in float16, and the step maps the policy used to
+    propose for it: the row sum stepping twice as far as the value matmul. Both are in one
+    loop over ``S_KV``, which then runs twice as many iterations as the weights have
+    tiles. The tiler refuses that (it used to build a kernel that read past the row, and
+    this file recorded its layouts), so there is no stored layout to speak of."""
+    from cleave.arch import get_arch
     from cleave.lower import to_ir
+    from cleave.schedule.policy.default import TCPolicy
 
     SKV = dims[2]
     graph = to_ir(_rowsum_and_value(*dims, weights="float16"))
+    policy = TCPolicy([n for n in graph.nodes if isinstance(n, OutputNode)], get_arch("cuda"),
+                      flat_graph=graph)
     candidates = search_tiling(graph, topk=PL.TOPK)
     assert candidates
-    for cand in candidates:
+    for together in candidates:
+        rstep = {n: {k: step // 2 for k, step in v.items()} if n.name == "mma_6" else v
+                 for n, v in together.rstep_map.items()}
+        cand = policy.compute_tile_dict(list(together.output_tile), rstep)
+        cand.n_threads = together.n_threads
         steps = {n.name: next(iter(v.values())) for n, v in cand.rstep_map.items() if v}
         rowsum, value = steps["reduction_2_5"], steps["mma_6"]
-        assert rowsum == 2 * value
+        assert cand.valid and rowsum == 2 * value
         with pytest.raises(ScheduleRejected) as refusal:
             apply_tiling(cand)
         assert str(refusal.value) == (

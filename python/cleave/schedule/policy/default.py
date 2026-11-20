@@ -1029,11 +1029,62 @@ class DefaultPolicy:
         sorted_tiles = sorted(visited_tiles, key=lambda td: prio(td))
         return sorted_tiles
 
+    def _start_siblings_together(self, base_iter_map):
+        """``base_iter_map`` with the reductions that share an axis started at one step.
+
+        ``_assign_reduce_step`` picks the smallest step of each reduction on its own (a
+        tensor-core matmul by the byte width of its operand, any other reduction by its
+        read pattern), and ``expand_iterative_tiles`` then enlarges the steps of a
+        compatible group in lockstep: members that start apart stay apart. Two members
+        that reduce the same axis of the same tensor -- the row sum and the value matmul
+        of a flash-form softmax -- end up in one loop, which has one trip count; with
+        different steps it miscounts the tiles of one of them, so ``apply_tiling``
+        refuses every such candidate (float32 operands: the matmul starts at 16, the
+        row sum at 32, and the softmax had no tiling at all).
+
+        Such members start at the largest of their own smallest steps: none goes below
+        what it asked for, and from there the lockstep keeps them equal. A member whose
+        axis is pinned to its full extent, or that cannot take that step, is left as it
+        is; so is any reduction that shares no axis with a member of its group.
+        """
+        aligned = dict(base_iter_map)
+        for group in self.compatible_reduction_groups:
+            members = [
+                n
+                for n in group
+                if len(n.raxis) == 1
+                and 0 not in self._full_extent_reduction_axis_ids.get(n, set())
+                and self.reduction_axis_provenance.get(n, [set()])[0]
+            ]
+            # members that reduce one tensor dim: connected through shared axis tokens
+            clusters = []
+            for node in members:
+                tokens = set(self.reduction_axis_provenance[node][0])
+                joined = [c for c in clusters if c[1] & tokens]
+                for c in joined:
+                    clusters.remove(c)
+                clusters.append(
+                    (
+                        [m for c in joined for m in c[0]] + [node],
+                        set().union(tokens, *(c[1] for c in joined)),
+                    )
+                )
+            for nodes, _ in clusters:
+                if len(nodes) < 2:
+                    continue
+                names = [n.raxis[0].var.name for n in nodes]
+                start = max(int(base_iter_map[n][name]) for n, name in zip(nodes, names))
+                for node, name in zip(nodes, names):
+                    if start in self.get_node_reduce_step_candidates(node)[name]:
+                        aligned[node] = {**base_iter_map[node], name: start}
+        return aligned
+
     def propose_iterative_tiles(self, base_tile):
-        # 1. find minimum reduction step for each reduction node
-        base_iter_map = {
-            node: self._assign_reduce_step(node) for node in self.ordered_nodes
-        }
+        # 1. find minimum reduction step for each reduction node; reductions that will
+        #    share a loop axis start together
+        base_iter_map = self._start_siblings_together(
+            {node: self._assign_reduce_step(node) for node in self.ordered_nodes}
+        )
 
         # 2. find all possible output tiles that work with the minumum reduction step
         base_iter_tiles = self.dfs_smem_tile(base_tile, base_iter_map)

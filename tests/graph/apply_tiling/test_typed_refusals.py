@@ -10,7 +10,9 @@ Four tilings the policy proposes and the tiler used to mishandle or mis-type:
 * reductions merged into one loop with different steps. The loop keeps the trip count of
   the reduction that created it while the tiles are cut by the other one, so the kernel was
   *built*, with a loop that ran past the end of its tiles: ``for i0 in T.Pipelined(1024)``
-  over 32 tiles of 128.
+  over 32 tiles of 128. The policy proposed nothing else for two reductions of one operand
+  whose first steps differ; it starts them together now, and the refusal is for step maps
+  that come from elsewhere.
 
 * a grid dim that no single launch axis indexes. The tiler always refused it on purpose,
   but with ``ValueError``.
@@ -32,14 +34,17 @@ pytest.importorskip("tilelang")
 pytest.importorskip("tvm")
 
 import cleave.lang as cl
+from cleave.arch import get_arch
 from cleave.core.errors import ScheduleRejected
 from cleave.frontend import trace
+from cleave.ir.graph import OutputNode
 from cleave.ir.graph_utils import graph_tiers
 from cleave.ir.ops import Div, Exp, Matmul, ReduceSum
 from cleave.pipeline.plans import lower
 from cleave.pipeline.superopt import GraphSet
 from cleave.schedule import apply_tiling, search_tiling
 from cleave.schedule import tiling
+from cleave.schedule.policy.default import TCPolicy
 
 
 def traced_order_attention(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
@@ -84,6 +89,19 @@ def _step(cand, node):
     return int(step)
 
 
+def _stepping_half(ir, cand, node):
+    """``cand`` with ``node`` stepping half as far as it does: what the policy proposed
+    for a pair of sibling reductions while it picked each one's first step on its own."""
+    policy = TCPolicy([n for n in ir.nodes if isinstance(n, OutputNode)], get_arch("cuda"),
+                      flat_graph=ir)
+    rstep = {n: {k: int(step) // 2 for k, step in v.items()} if n.name == node.name else v
+             for n, v in cand.rstep_map.items()}
+    apart = policy.compute_tile_dict(list(cand.output_tile), rstep)
+    assert apart.valid
+    apart.n_threads = cand.n_threads
+    return apart
+
+
 def _outcomes(cands):
     built, refused = [], []
     for cand in cands:
@@ -121,8 +139,11 @@ def test_value_read_inside_and_outside_a_loop_is_a_typed_refusal():
 def test_merged_reductions_with_different_steps_are_a_typed_refusal(monkeypatch):
     ir = _identity_graph(column_weighted, dict(M=128, K=4096, N=256))
     matmul, colsum = _one(ir, Matmul), _one(ir, ReduceSum)
-    cands = search_tiling(ir, topk=1000)
-    assert cands
+    together = search_tiling(ir, topk=1000)
+    assert together and all(_step(c, matmul) == _step(c, colsum) for c in together)
+    # The step maps the policy used to propose for this graph: the matmul at half the
+    # step of the column sum, in every candidate.
+    cands = [_stepping_half(ir, cand, matmul) for cand in together]
 
     # The defect, with the guard taken out: every candidate builds a loop whose trip count
     # is not the number of tiles its inner tensors are cut into.
@@ -131,7 +152,7 @@ def test_merged_reductions_with_different_steps_are_a_typed_refusal(monkeypatch)
             tiling, "_refuse_loops_that_miscount_their_tiles", lambda main: None, raising=False
         )
         for cand in cands:
-            assert _step(cand, matmul) != _step(cand, colsum)
+            assert 2 * _step(cand, matmul) == _step(cand, colsum)
             (loop,) = [tier for tier, owner in graph_tiers(apply_tiling(cand)) if owner]
             assert loop.extent == 4096 // _step(cand, colsum)
             cut = {
@@ -152,6 +173,14 @@ def test_merged_reductions_with_different_steps_are_a_typed_refusal(monkeypatch)
             rf"into {tiles} tiles \({_step(cand, matmul)} of 4096\)",
             text,
         ), text
+
+    # The policy's own candidates step the two together: one loop that counts its tiles.
+    built, refused = _outcomes(together)
+    assert len(built) == len(together) and not refused
+    for cand, tiled in built:
+        (loop,) = [tier for tier, owner in graph_tiers(tiled) if owner]
+        assert loop.extent == 4096 // _step(cand, matmul)
+        assert {n.name for n in loop.accum_nodes} == {matmul.name, colsum.name}
 
 
 def gram(x: cl.Tensor["M", "K"]):
@@ -265,41 +294,56 @@ def test_matmul_operand_with_a_unit_batch_dim_is_tiled():
     assert built and not refused
 
 
-def test_float32_siblings_are_refused_rather_than_miscounted():
-    """A limit that holds today, pinned so that its fix has a case that flips.
+@pytest.mark.parametrize("dtype, first", [(cl.f32, 32), (cl.f16, 32)], ids=["f32", "f16"])
+def test_siblings_over_one_axis_are_stepped_together(dtype, first):
+    """The flash-form softmax: the row sum and the value matmul reduce the same axis of
+    the same ``exp`` and end up in one loop.
 
     The policy picks the smallest step of each reduction on its own (``TCPolicy.
     _assign_reduce_step``: a tensor-core matmul by the byte width of its operand, any other
-    reduction by its read pattern) and then enlarges the steps of a group in lockstep. Two
-    reductions of one operand that start apart stay apart: with float32 operands the value
-    matmul steps half of what the row sum steps, for every candidate. The tiler merges
-    both into one loop, which used to run the row sum's trip count over the matmul's
-    tiles and so summed half the row. The loop-extent guard refuses all of them: a
-    float32 flash-form softmax has no tiling, where float16 has all of them.
+    reduction by its read pattern) and then enlarges the steps of a group in lockstep, so
+    two that start apart stay apart. With float32 operands the value matmul started at 16
+    and the row sum at 32, for every candidate; the loop-extent guard refused all of them
+    (the kernels they used to build summed half the row), and a float32 flash-form softmax
+    had no tiling where float16 had all of them. Siblings over one axis start together.
     """
     shapes = dict(R=64, C=4096, D=64)
 
-    ir = _identity_graph(flash_rows, shapes, cl.f32)
+    ir = _identity_graph(flash_rows, shapes, dtype)
     matmul, rowsum = _one(ir, Matmul), _one(ir, ReduceSum)
-    cands = search_tiling(ir, topk=1000)
-    assert cands and all(2 * _step(c, matmul) == _step(c, rowsum) for c in cands)
-    built, refused = _outcomes(cands)
-    for cand, text in refused:
-        assert re.fullmatch(
-            rf"GraphNode_\S+ runs {4096 // _step(cand, rowsum)} iterations but dim \d of "
-            rf"\S+ is cut into {4096 // _step(cand, matmul)} tiles "
-            rf"\({_step(cand, matmul)} of 4096\)",
-            text,
-        ), text
-    # THE LIMIT. Once the policy steps the two together, these build.
-    assert not built and len(refused) == len(cands)
+    policy = TCPolicy([n for n in ir.nodes if isinstance(n, OutputNode)], get_arch("cuda"),
+                      flat_graph=ir)
+    by_name = {n.name: n for n in policy.ordered_nodes}
+    alone = {n.name: policy._assign_reduce_step(n) for n in (matmul, rowsum)}
+    starts = policy._start_siblings_together(
+        {n: policy._assign_reduce_step(n) for n in policy.ordered_nodes})
+    own = {name: int(next(iter(step.values()))) for name, step in alone.items()}
+    # float32: the matmul's own first step is half the row sum's; float16: they agree
+    assert own == {matmul.name: 16 if dtype is cl.f32 else 32, rowsum.name: 32}
+    # neither starts below its own first step, and both start at the larger one
+    assert {int(next(iter(starts[by_name[n.name]].values()))) for n in (matmul, rowsum)} == {first}
 
-    ir = _identity_graph(flash_rows, shapes, cl.f16)
-    matmul, rowsum = _one(ir, Matmul), _one(ir, ReduceSum)
     cands = search_tiling(ir, topk=1000)
     assert cands and all(_step(c, matmul) == _step(c, rowsum) for c in cands)
+    assert min(_step(c, matmul) for c in cands) == first
     built, refused = _outcomes(cands)
     assert len(built) == len(cands) and not refused
+    for cand, tiled in built:
+        (loop,) = [tier for tier, owner in graph_tiers(tiled) if owner]
+        assert loop.extent == 4096 // _step(cand, matmul)
+        assert {n.name for n in loop.accum_nodes} == {matmul.name, rowsum.name}
+
+
+def test_reductions_that_share_no_axis_keep_their_own_first_step():
+    """What starting together must leave alone: LoRA's ``X @ W`` and ``X @ A`` read one
+    input but are not siblings of one group, and ``(X @ A) @ B`` reduces another axis."""
+    from tests._graphs import lora_graph, matmul_matmul_graph
+
+    for graph in (lora_graph(16, 4096, 4096, 16), matmul_matmul_graph(4096, 64, 64)):
+        policy = TCPolicy([n for n in graph.nodes if isinstance(n, OutputNode)],
+                          get_arch("cuda"), flat_graph=graph)
+        alone = {n: policy._assign_reduce_step(n) for n in policy.ordered_nodes}
+        assert policy._start_siblings_together(alone) == alone
 
 
 def test_a_consistent_loop_is_not_refused():

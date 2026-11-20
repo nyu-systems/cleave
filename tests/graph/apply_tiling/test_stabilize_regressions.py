@@ -23,10 +23,11 @@ Every candidate of every program goes through the default build. Anything but a
 Who refuses is pinned per case, as a histogram of reasons, because "no kernel" alone does
 not say the rewrite had a say: a looped tiling of ``sum_next_to_exp`` and of
 ``unscaled_attention`` is already refused by the tiler (the exp would be read outside its
-loop), and every tiling the policy proposes for ``column_weighted`` by the tiler's
-loop-extent guard (the policy steps the matmul and the column sum differently). For
-``column_weighted`` the rewrite is therefore also tried on tilings that step both
-reductions together, which the policy does not propose today.
+loop). Every tiling the policy proposes for ``column_weighted`` steps the matmul and the
+column sum together and reaches the rewrite, which refuses it for the obstacle the
+analysis recorded. (The policy used to step the two apart, and the tiler's loop-extent
+guard refused all of them before the rewrite had a say; those step maps are still tried,
+built by hand.)
 """
 
 import dataclasses
@@ -94,7 +95,7 @@ CASES = {
                        (SINGLE_ROW, 1)]),
     "column_weighted": (S.column_weighted, dict(M=128, K=4096, N=256),
                         (dict(axis=-2, rolling=TRAILING),), 0,
-                        [(MISCOUNT, 52)]),
+                        [(_no_rolling_form("its leading axes"), 46)]),
     "max_normalized": (S.max_normalized, dict(R=256, C=4096, D=64),
                        (dict(rolling=TAKES_MAX),), 0,
                        [(_no_rolling_form(TAKES_MAX), 34)]),
@@ -228,21 +229,50 @@ def _stepped_together(ir, cands):
     return built
 
 
+def _stepped_apart(ir, cands, matmul):
+    """``cands`` with the matmul stepping half as far as the column sum: the step maps the
+    policy proposed for this graph while it picked each reduction's first step alone."""
+    for node in ir.nodes:
+        if isinstance(node, Matmul):
+            node.set_tag("tensorcore_config", True)
+    outputs = [n for n in ir.nodes if isinstance(n, OutputNode)]
+    policy = TCPolicy(outputs, get_arch("cuda"), flat_graph=ir)
+    apart = []
+    for cand in cands:
+        rstep = {n: {k: int(step) // 2 for k, step in v.items()} if n.name == matmul.name else v
+                 for n, v in cand.rstep_map.items()}
+        twin = policy.compute_tile_dict(list(cand.output_tile), rstep)
+        assert twin.valid
+        twin.n_threads = cand.n_threads
+        apart.append(twin)
+    return apart
+
+
 def test_factor_on_the_trailing_axis_is_refused_by_the_rewrite(monkeypatch):
-    """``(v @ e) / sum(e, 0)`` on the policy's own tilings, with the tiler's loop-extent
-    guard taken out so that they reach the rewrite: it refuses every one of them, with the
-    obstacle the analysis records, and without that obstacle because the loop does not
-    count the tiles of the softmax axis."""
-    ir, _, _ = _column_weighted()
+    """``(v @ e) / sum(e, 0)`` on the policy's own tilings: the rewrite refuses every one
+    of them, with the obstacle the analysis records.
+
+    On the step maps the policy used to propose (the matmul at half the column sum's
+    step), with the tiler's loop-extent guard taken out so that they reach the rewrite:
+    the same refusal, and without the recorded obstacle because the loop does not count
+    the tiles of the softmax axis."""
+    ir, matmul, _ = _column_weighted()
     cands = search_tiling(ir, topk=1000)
-    monkeypatch.setattr(tiling, "_refuse_loops_that_miscount_their_tiles", lambda main: None)
+    wanted = [(_no_rolling_form("its leading axes"), 46)]
 
     _, reasons = _census(cands)
-    wanted = [(_no_rolling_form("its leading axes"), 52)]
     assert _histogram(reasons, wanted) == Counter(dict(wanted))
 
-    _, reasons = _census(search_tiling(_without_obstacle(ir), topk=1000))
-    assert _histogram(reasons, [(TRIP_COUNT, 52)]) == Counter({TRIP_COUNT: 52})
+    _, reasons = _census(_stepped_apart(ir, cands, matmul))
+    assert _histogram(reasons, [(MISCOUNT, 46)]) == Counter({MISCOUNT: 46})
+
+    monkeypatch.setattr(tiling, "_refuse_loops_that_miscount_their_tiles", lambda main: None)
+    _, reasons = _census(_stepped_apart(ir, cands, matmul))
+    assert _histogram(reasons, wanted) == Counter(dict(wanted))
+
+    bare = _without_obstacle(ir)
+    _, reasons = _census(_stepped_apart(bare, search_tiling(bare, topk=1000), matmul))
+    assert _histogram(reasons, [(TRIP_COUNT, 46)]) == Counter({TRIP_COUNT: 46})
 
 
 def test_factor_on_the_trailing_axis_is_refused_on_a_consistent_loop():
