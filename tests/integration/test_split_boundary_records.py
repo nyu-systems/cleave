@@ -108,6 +108,24 @@ def test_solo_graph_numbers_inputs_and_outputs_by_declaration():
         n.boundary for n in graph.nodes if n.is_output() or n.is_placeholder()]
 
 
+def test_an_input_no_output_reads_keeps_its_place_in_the_count():
+    """``to_ir`` does not lower an op that no output reads, so such an input has no
+    placeholder. It is still an input op of the structure: the inputs declared after it
+    keep their index. Counting the inputs that were converted instead numbered the third
+    input 1, the place of the one that is not there, while ``input_index`` (which binds
+    the program's inputs) said 2."""
+    graph = to_ir([
+        _op("kn_input_op", [], [_t(1, (4, 8))]),
+        _op("kn_input_op", [], [_t(9, (4, 8))]),  # declared, read by nothing
+        _op("kn_input_op", [], [_t(2, (8, 16))]),
+        _op("kn_matmul_op", [_t(1, (4, 8)), _t(2, (8, 16))], [_t(3, (4, 16))]),
+        _op("kn_output_op", [_t(3, (4, 16))], []),
+    ])
+    assert {ph.name: ph.boundary for ph in _placeholders(graph)} == {
+        "PlaceHolder_input_1": Boundary(0), "PlaceHolder_input_2": Boundary(2)}
+    assert [ph.input_index for ph in boundary_order(_placeholders(graph))] == [0, 2]
+
+
 def _three_outputs():
     x = _t(1, (4, 8))
     return [
@@ -205,6 +223,28 @@ def test_combine_inputs_take_the_partial_outputs_in_boundary_order():
     combine = to_ir(aligned[1])
     assert boundary_signature(_placeholders(combine)) == boundary_signature(_outputs(partial))
     assert [shape for _, _, shape, _ in boundary_signature(_placeholders(combine))] == declared
+
+
+def test_a_combine_that_leaves_an_output_unread_still_names_the_ones_it_reads():
+    """The combine's k-th input op is the partial's output k whether or not the combine
+    reads every one of them. A combine that leaves the scaled exp unread reads outputs 0
+    and 2: its second placeholder is the row max, and must not be numbered 1 -- which is
+    the scaled exp -- because the input before it was not lowered."""
+    partial_ops, combine_ops = _three_output_bundle()
+    unread = {12, 15}  # the scaled exp as the combine declares it, and its sum
+    combine_ops = [op for op in combine_ops
+                   if not unread & {t["guid"] for t in op["input_tensors"]}]
+    assert [op["op_type"] for op in combine_ops].count("kn_input_op") == 3  # still declared
+
+    partial = to_ir(partial_ops)
+    aligned = gp._align_split_boundary_inputs([partial_ops, combine_ops])
+    combine = to_ir(aligned[1])
+    written = {index: rest for index, *rest in boundary_signature(_outputs(partial))}
+    read = boundary_signature(_placeholders(combine))
+    assert [index for index, *_ in read] == [0, 2]
+    assert all(written[index] == rest for index, *rest in read)
+    assert [ph.name for ph in boundary_order(_placeholders(combine))] == [
+        "PlaceHolder_input_11", "PlaceHolder_input_13"]
 
 
 def _rename_symbols(bundle, mapping):

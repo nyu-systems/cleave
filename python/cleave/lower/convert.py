@@ -251,7 +251,15 @@ class _Ctx:
         # those a binary op takes with unit axes dropped (``broadcast_index``).
         self.read_as: Dict[int, List[Tuple[str, Tuple[int, ...]]]] = {}
         self.reshaped: set = set()
-        self.n_inputs = 0  # input ops converted so far
+        # Input op -> its position among the structure's input ops. Every input op is
+        # counted, also one no output reads: it is not converted and gets no placeholder,
+        # and the inputs declared after it keep their place.
+        self.input_position: Dict[int, int] = {
+            idx: position
+            for position, idx in enumerate(
+                idx for idx, op in ops if op.kind == "input" and op.outputs
+            )
+        }
         for _, op in ops:
             for t in op.inputs:
                 if t.dtype is not None:
@@ -504,8 +512,7 @@ def _input(ctx: _Ctx, idx: int, op: KGOp) -> Built:
     # The k-th input op is input k of the graph. A graph is rebuilt in discovery order
     # from its outputs below, so this is the only place the declaration order is known.
     if op.outputs:
-        ctx.placeholder(op.outputs[0], Boundary(ctx.n_inputs))
-        ctx.n_inputs += 1
+        ctx.placeholder(op.outputs[0], Boundary(ctx.input_position[idx]))
     return None, ()
 
 
