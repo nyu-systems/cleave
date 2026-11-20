@@ -211,9 +211,9 @@ class Program:
         their args alone); the attribute tells the pipeline that this program asked for
         the exact, shift-invariant softmax. It is part of the fingerprint, so the program
         never shares a search or kernel cache entry with a hand-written
-        ``exp(x) / sum(exp(x))``. Only ``cl.softmax`` records it, always next to the sum
-        and the divide over the same ``dim``: ``reference`` trusts ``dim``, while
-        lowering derives the axis from the graph.
+        ``exp(x) / sum(exp(x))``. It is ``cl.softmax``'s record and nobody else's: it
+        must sit next to the sum and the divide over the same ``dim``, because
+        ``reference`` trusts ``dim`` while lowering derives the axis from the graph.
         """
         self._check(a, "softmax")
         if not -a.ndim <= dim < a.ndim:
