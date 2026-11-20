@@ -20,7 +20,10 @@ unset) it runs
 
 The table has one row per operator and output: a histogram of the measured row-relative
 errors, the largest error of the candidates that are clearly valid, and the tolerance that
-follows from it by the rule in ``recommend``. Declare that value (``demo/<name>.py``,
+follows from it by the rule in ``recommend``. For a dense program that is its error on the
+normal inputs: where its softmax is exact its kernels also run on the adversarial softmax
+inputs, at the same bound, and those comparisons are counted without feeding it
+(``ADVERSARIAL_CASE``). Declare that value (``demo/<name>.py``,
 ``cleave.dynamic.registry``, ``tests/_tolerances.py``); never one chosen to make a kernel pass.
 
 ``--pin`` writes the measurement to ``tests/measured_errors.json``.
@@ -153,6 +156,26 @@ def feeds_rtol(absolute: bool, abs_error: float) -> bool:
     return not (absolute and abs_error <= ATOL_FLOOR)
 
 
+# A dense program's tolerance is declared from its error on the normal inputs. Once its
+# softmax is exact its kernels are also validated on the adversarial softmax inputs
+# (``cleave.runtime.inputs.ADVERSARIAL``), at that same bound: those comparisons are counted
+# and held to the declaration like any other, and they are no input to it. A bound is never
+# loosened for an adversarial case; a kernel that needs more than the bound there fails.
+# (Measured on this operator family: a row dominated by its last keys is off by up to two
+# fp16 ulps of its max, 1.2e-3 .. 1.9e-3, against 9.8e-4 .. 1.2e-3 on normal inputs; as an
+# input that would turn every declared 5e-3 into 1e-2.)
+# Such a comparison is logged with the case in its ``what`` ("increasing inputs") and is
+# given this kind in the table, passed or not (a non-finite one stays non-finite: nothing
+# was measured). One that is over the bound is a finding, and the table says so.
+ADVERSARIAL_CASE = "adversarial"
+
+
+def _adversarial_whats() -> frozenset:
+    from cleave.runtime.inputs import ADVERSARIAL
+
+    return frozenset(f"{name} inputs" for name in ADVERSARIAL)
+
+
 def expected_tolerances(outputs) -> list:
     """Per measured output (an entry of ``measured_errors.json``), the ``Tolerance`` the rule
     gives, or None for an output no valid kernel was measured on."""
@@ -275,6 +298,7 @@ def _test_operators():
 def load(out: Path) -> dict:
     """operator -> output index -> list of (dtype, absolute part?, rel, abs, kind, seed)."""
     operator_of = _test_operators()
+    adversarial = _adversarial_whats()
     table = defaultdict(lambda: defaultdict(list))
     for path in sorted((out / "validation").glob("*.jsonl")):
         seed = path.stem.rpartition("__")[2]
@@ -292,12 +316,16 @@ def load(out: Path) -> dict:
                     continue
                 context = "test:" + operator_of(node)
                 context = context.replace("test:dynamic:", "dynamic:")
+            # a dense program on one of its adversarial softmax cases (the dynamic operators
+            # name theirs by workload, and count them: see the table's docstring)
+            hard = not context.startswith("dynamic:") and record.get("what", "") in adversarial
             for i, o in enumerate(record["outputs"]):
                 # Every output is judged by its row-relative error, whatever bound it was
                 # validated at when this was logged; "absolute" only records that the
                 # operator declares an absolute part as well (ATOL_FLOOR).
+                kind = ADVERSARIAL_CASE if hard and o["kind"] != "non_finite" else o["kind"]
                 table[context][i].append(
-                    (o["dtype"], o["atol"] > 0, o["rel"], o["abs"], o["kind"], seed))
+                    (o["dtype"], o["atol"] > 0, o["rel"], o["abs"], kind, seed))
     return table
 
 
@@ -323,9 +351,11 @@ def rows(table):
             counts = defaultdict(int)
             for _, _, rel, _, kind, _ in entries:
                 counts[_bucket(rel, kind)] += 1
-            measured = [(rel, abs_) for _, _, rel, abs_, kind, _ in entries
+            measured = [(rel, abs_, kind) for _, _, rel, abs_, kind, _ in entries
                         if rel is not None and kind != "non_finite"]
             limit = valid_limit(dtype)
+            hard = [rel for rel, _, kind in measured if kind == ADVERSARIAL_CASE]
+            measured = [(rel, abs_) for rel, abs_, kind in measured if kind != ADVERSARIAL_CASE]
             valid = [(rel, abs_) for rel, abs_ in measured if rel <= limit]
             feeding = [rel for rel, abs_ in valid if feeds_rtol(absolute, abs_)]
             # No valid comparison at all: nothing was measured. Valid ones that the floor
@@ -339,6 +369,8 @@ def rows(table):
                 "largest_valid_abs": max((abs_ for _, abs_ in valid), default=None),
                 "ambiguous": sorted(rel for rel, _ in measured if limit < rel < WRONG),
                 "within_floor": len(valid) - len(feeding),
+                # a dense program's passes on adversarial inputs: counted, no input to rtol
+                "adversarial": len(hard), "largest_adversarial": max(hard, default=None),
                 "rtol": None if largest is None else recommend(largest, dtype),
                 "atol": ATOL_FLOOR if absolute else 0.0,
             }
@@ -348,8 +380,9 @@ def measured_errors(table) -> dict:
     """operator -> per output ``{dtype, rel, abs, absolute, seeds, validated}``: the largest
     clearly-valid error of each output, which is all the rule needs (``MEASURED``).
 
-    ``rel`` is taken over the comparisons that feed the rtol (``feeds_rtol``); ``abs`` and
-    ``validated`` over all of them."""
+    ``rel`` is taken over the comparisons that feed the rtol (``feeds_rtol``, and for a
+    dense program the normal inputs only: ``ADVERSARIAL_CASE``); ``abs`` over the valid
+    comparisons on normal inputs and ``validated`` over all of them."""
     out = defaultdict(list)
     for r in rows(table):
         assert r["output"] == len(out[r["operator"]]), r
@@ -374,6 +407,12 @@ def markdown(table) -> str:
             f", atol={r['atol']:g}" if r["atol"] else "")
         if r["within_floor"]:
             tol += f" ({r['within_floor']} within the floor alone)"
+        if r["adversarial"]:
+            over = r["rtol"] is None or r["largest_adversarial"] > r["rtol"]
+            tol += (f" ({r['adversarial']} on adversarial inputs, largest "
+                    f"{r['largest_adversarial']:.2e}: "
+                    + ("OVER THE BOUND, a finding" if over else "held to the bound, no input to it")
+                    + ")")
         if r["ambiguous"]:
             tol += f" (AMBIGUOUS: {len(r['ambiguous'])} in ({valid_limit(r['dtype']):g}, " \
                    f"{WRONG:g}), max {r['ambiguous'][-1]:.2e})"
