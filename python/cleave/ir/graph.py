@@ -59,7 +59,7 @@ class Iterator:
         self.tile_size = tile_size
         # Which dims of the node's own shape the entries of ``shape`` / ``tile_size``
         # stand for, when the tile leaves some out: a loop tier of ``apply_tiling`` does
-        # not carry a batch dim it holds one element of. ``None``: not recorded -- the
+        # not carry a dim its block holds one element of. ``None``: not recorded -- the
         # tile is over the node's dims, any missing ones missing from the front.
         self.axes = axes
 

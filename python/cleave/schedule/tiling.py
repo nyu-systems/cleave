@@ -538,14 +538,14 @@ def assign_tensor_map(
             top_bind_node[n.name] = top_bind_node[outer_node.name]
         bind_node = top_bind_node[n.name] if isinstance(n, PlaceHolderNode) else n
 
-        # get tile shape and tile size from candidate: a batch dim the iteration holds
-        # one element of is not carried in the tier
-        axes = [
-            i
-            for i, t in enumerate(itile_map[bind_node.name])
-            if not n.is_batch_dim[i] or t > 1
-        ]
-        shape = [tile_map[bind_node.name][i] for i in axes]
+        # get tile shape and tile size from candidate. The loop is handed the buffer its
+        # parent stores, which has no dim the block holds a single element of (codegen's
+        # ``kept_extents``; an all-unit tile stays 1-D), so the tier carries exactly the
+        # other dims -- whether or not they are batch dims, and also where an iteration
+        # takes one element of them: that extent is squeezed when the slice is loaded.
+        block_tile = tile_map[bind_node.name]
+        axes = [i for i, t in enumerate(block_tile) if t > 1] or [len(block_tile) - 1]
+        shape = [block_tile[i] for i in axes]
         tile_size = [itile_map[bind_node.name][i] for i in axes]
         iter_dims = [i // j > 1 for i, j in zip(shape, tile_size)]
         num_args = (
