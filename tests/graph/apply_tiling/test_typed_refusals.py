@@ -1,14 +1,22 @@
 """``apply_tiling`` refuses a tiling it cannot build with ``ScheduleRejected`` (CPU).
 
-A value computed inside a loop and also read outside it: the loop's inner placeholders
-leaked into the main graph and the candidate died with ``KeyError: 'PlaceHolder_...'`` at
-the main ``tmap`` fill. It is the traced-order softmax, ``exp / sum(exp)`` followed by the
-value matmul, whenever the row sum is looped: ``exp`` goes into the loop with the sum and
-is still read by the ``div`` outside it.
+Two tilings the policy proposes and the tiler used to mishandle:
 
-It is a per-candidate refusal now: callers that drop a candidate on ``ScheduleRejected``
-(the pipeline's schedule stage, the softmax accept filter) can tell it from a bug.
+* a value computed inside a loop and also read outside it. The loop's inner placeholders
+  then leaked into the main graph and the candidate died with ``KeyError:
+  'PlaceHolder_...'`` at the main ``tmap`` fill. It is the traced-order softmax,
+  ``exp / sum(exp)`` followed by the value matmul, whenever the row sum is looped: ``exp``
+  goes into the loop with the sum and is still read by the ``div`` outside it.
+* reductions merged into one loop with different steps. The loop keeps the trip count of
+  the reduction that created it while the tiles are cut by the other one, so the kernel was
+  *built*, with a loop that ran past the end of its tiles: ``for i0 in T.Pipelined(1024)``
+  over 32 tiles of 128.
+
+Both are per-candidate refusals now: callers that drop a candidate on ``ScheduleRejected``
+(the pipeline's schedule stage, the softmax accept filter) can tell them from a bug.
 """
+
+import re
 
 import pytest
 
@@ -19,10 +27,11 @@ import cleave.lang as cl
 from cleave.core.errors import ScheduleRejected
 from cleave.frontend import trace
 from cleave.ir.graph_utils import graph_tiers
-from cleave.ir.ops import Div, Exp, ReduceSum
+from cleave.ir.ops import Div, Exp, Matmul, ReduceSum
 from cleave.pipeline.plans import lower
 from cleave.pipeline.superopt import GraphSet
 from cleave.schedule import apply_tiling, search_tiling
+from cleave.schedule import tiling
 
 
 def traced_order_attention(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
@@ -30,6 +39,12 @@ def traced_order_attention(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV"
     """softmax(QK^T) @ V with the softmax written out: the exp feeds the sum AND the div."""
     e = cl.exp((q @ k.mT) / q.shape[-1] ** 0.5)
     return (e / cl.sum(e, -1, keepdim=True)) @ v
+
+
+def column_weighted(v: cl.Tensor["M", "K"], x: cl.Tensor["K", "N"]):
+    """(v @ e) / sum(e, 0): the matmul and the column sum both reduce K, and share ``e``."""
+    e = cl.exp(x)
+    return (v @ e) / cl.sum(e, 0, keepdim=True)
 
 
 def _identity_graph(fn, shapes):
@@ -82,3 +97,53 @@ def test_value_read_inside_and_outside_a_loop_is_a_typed_refusal():
     for _, tiled in built:
         for tier, owner in graph_tiers(tiled):
             assert owner is None or exp.name not in {n.name for n in tier.nodes}
+
+
+def test_merged_reductions_with_different_steps_are_a_typed_refusal(monkeypatch):
+    ir = _identity_graph(column_weighted, dict(M=128, K=4096, N=256))
+    matmul, colsum = _one(ir, Matmul), _one(ir, ReduceSum)
+    cands = search_tiling(ir, topk=1000)
+    assert cands
+
+    # The defect, with the guard taken out: every candidate builds a loop whose trip count
+    # is not the number of tiles its inner tensors are cut into.
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            tiling, "_refuse_loops_that_miscount_their_tiles", lambda main: None, raising=False
+        )
+        for cand in cands:
+            assert _step(cand, matmul) != _step(cand, colsum)
+            (loop,) = [tier for tier, owner in graph_tiers(apply_tiling(cand)) if owner]
+            assert loop.extent == 4096 // _step(cand, colsum)
+            cut = {
+                it.shape[d] // it.tile_size[d]
+                for it in loop.tmap.values()
+                for d in range(len(it.shape))
+                if it.shape[d] // it.tile_size[d] > 1
+            }
+            assert cut == {4096 // _step(cand, matmul)}
+
+    # With it: a typed refusal that names the loop, both counts and the tensor.
+    built, refused = _outcomes(cands)
+    assert not built and len(refused) == len(cands)
+    for cand, text in refused:
+        trips, tiles = 4096 // _step(cand, colsum), 4096 // _step(cand, matmul)
+        assert re.fullmatch(
+            rf"GraphNode_{colsum.name} runs {trips} iterations but dim \d of \S+ is cut "
+            rf"into {tiles} tiles \({_step(cand, matmul)} of 4096\)",
+            text,
+        ), text
+
+
+def test_a_consistent_loop_is_not_refused():
+    """The guard looks at the trip count only: the flash-form loop (row sum and value
+    matmul stepped together over the keys) passes it untouched."""
+    from tests._graphs import mha_bhsd_graph
+    from tests.graph.apply_tiling._test_utils import build_tiled_candidate
+
+    rstep = {"mma_0": {"v3": 64}, "mul_0": {}, "sub_0": {}, "exp_0": {}, "div_0": {},
+             "mma_1": {"v3": 32}, "rowsum_0": {"v2": 32}}
+    tiled = apply_tiling(build_tiled_candidate(mha_bhsd_graph(1, 32, 4096, 4096, 64),
+                                               [1, 64, 64], rstep))
+    (loop,) = [tier for tier, owner in graph_tiers(tiled) if owner is not None]
+    assert loop.extent == 4096 // 32 and len(loop.accum_nodes) == 2

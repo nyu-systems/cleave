@@ -704,6 +704,29 @@ def _refuse_per_iteration_values_read_outside(main: Graph):
                     )
 
 
+def _refuse_loops_that_miscount_their_tiles(main: Graph):
+    """Refuse a loop whose trip count is not the number of tiles it steps through.
+
+    A loop has one counter, and every inner tensor dim that is cut into more than one tile
+    is sliced with it (``assign_tensor_map``). The trip count comes from the reduction that
+    created the loop; a reduction merged into the loop later with another step leaves dims
+    cut into a different number of tiles ("the existing inner graph extent wins"). The
+    loop then runs past the end of those dims, or stops short of it: 4096 iterations over
+    128 tiles of 32. Such a kernel reads memory it does not own or drops part of the sum.
+    """
+    for tier, owner in graph_tiers(main):
+        if owner is None:
+            continue
+        for node, it in tier.tmap.items():
+            for dim, (extent, step) in enumerate(zip(it.shape, it.tile_size)):
+                tiles = int(extent) // int(step)
+                if tiles > 1 and tiles != tier.extent:
+                    raise ScheduleRejected(
+                        f"{owner.name} runs {tier.extent} iterations but dim {dim} of "
+                        f"{node.name} is cut into {tiles} tiles ({step} of {extent})"
+                    )
+
+
 def apply_tiling(cand: List) -> List[Graph]:
     output_nodes = [n for n in cand.flat_graph.nodes if n.is_output()]
     output_node = _select_canonical_output_node(output_nodes)
@@ -899,6 +922,7 @@ def apply_tiling(cand: List) -> List[Graph]:
             )
             _normalize_inner_reduction_axes(graph_node, itile_map)
     _refuse_per_iteration_values_read_outside(graphs["main"])
+    _refuse_loops_that_miscount_their_tiles(graphs["main"])
     lock_graph(graphs["main"])  # graph structure is fixed after this point
 
     graphs["main"].nodes = find_topo_sort(main_output_nodes)

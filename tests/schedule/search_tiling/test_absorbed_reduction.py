@@ -7,6 +7,8 @@ up inside the ``S_KV`` loop. The loop has one counter, so it cannot advance a se
 contracted one ``D`` block per ``S_KV`` step and read past the tile.
 """
 
+import re
+
 import pytest
 
 from cleave import codegen
@@ -135,12 +137,26 @@ def test_refuses_to_step_an_axis_that_an_absorbed_reduction_holds_whole():
     # Rank 128: at the end2end case's rank of 16 the up projection never iterates.
     candidates = _policy(g.lora_graph(16, 4096, 4096, 128), False).emit_config(1000)
 
-    n_refused = 0
+    n_refused = n_built = 0
     for cand in candidates:
         label = f"tile={list(cand.output_tile)} rstep={cand.rstep_map}"
         absorbed = [node.name for node in _absorbed(cand)]
         if not absorbed:
-            apply_tiling(cand)  # nothing is held whole, so nothing is refused
+            # Nothing is held whole, so this rule refuses nothing. The tiling may still be
+            # refused for the other reason two matmuls cannot share ``X``: ``X @ W`` and
+            # ``X @ A`` stepped differently give a loop whose trip count is not the number
+            # of tiles of ``X``.
+            try:
+                apply_tiling(cand)
+                n_built += 1
+            except ScheduleRejected as e:
+                assert re.fullmatch(
+                    r"GraphNode_mma_down runs \d+ iterations but dim 1 of PlaceHolder_AA is "
+                    r"cut into \d+ tiles \(\d+ of 4096\)",
+                    str(e),
+                ), f"{label}: {e}"
+                steps = {n.name: next(iter(v.values())) for n, v in cand.rstep_map.items() if v}
+                assert steps["mma_base"] != steps["mma_down"], label
             continue
         assert absorbed == ["mma_down"], label
         with pytest.raises(ScheduleRejected, match="mma_base is shared with an absorbed"):
@@ -148,3 +164,4 @@ def test_refuses_to_step_an_axis_that_an_absorbed_reduction_holds_whole():
         n_refused += 1
 
     assert n_refused, "no candidate steps all three matmuls; the case tests nothing"
+    assert n_built, "no candidate without an absorbed reduction is built; the case tests nothing"
