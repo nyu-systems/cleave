@@ -14,6 +14,7 @@ it used to lower to an op with an operand of another shape wired in, or -- where
 happened to agree -- to an op on the wrong axis. An op that no output reads is not lowered.
 """
 
+import random
 import re
 
 import pytest
@@ -23,10 +24,11 @@ pytest.importorskip("tilelang")
 
 import cleave.lang as cl
 from cleave import pipeline as P
-from cleave.core.errors import LoweringRejected
+from cleave.core.errors import LoweringRejected, SpecError
 from cleave.frontend import trace
+from cleave.frontend.program import Program
 from cleave.ir.graph import OutputNode, PlaceHolderNode
-from cleave.ir.ops import Add, Div, Exp, Matmul, Mul, ReduceSum, Sub
+from cleave.ir.ops import Add, Div, Exp, Matmul, Mul, ReduceMax, ReduceSum, Sub
 from cleave.lower.convert import to_ir
 from cleave.pipeline.plans import lower
 from cleave.pipeline.superopt import GraphSet
@@ -604,3 +606,70 @@ def test_the_same_ops_refuse_the_graph_once_an_output_reads_them():
     with pytest.raises(LoweringRejected, match=r"kn_mul_op at index 2: the operand \(3, 4, 1\) is "
                                                r"broadcast along axis 2"):
         lower(graph)
+
+
+# ------------------------------------------------------------------ whatever lowers is right
+
+SIZES = {"A": 4, "B": 4, "C": 6, "E": 3, "U": 1}  # equal extents and unit extents on purpose
+
+
+def _random_program(seed):
+    """Up to six elementwise / reduction ops over one to three inputs of rank 2 or 3; the
+    last value is the output, so most programs also have ops that no output reads."""
+    rng = random.Random(seed)
+    prog = Program(f"random{seed}", dtype=cl.f32)
+    for name, size in SIZES.items():
+        prog.dim(name, size)
+    rank = rng.choice([2, 2, 3])
+    values = [prog.input(f"x{i}", [rng.choice(list(SIZES)) for _ in range(rank)])
+              for i in range(rng.choice([1, 2, 2, 3]))]
+    for _ in range(rng.randint(1, 6)):
+        kind = rng.choice(["binary", "binary", "binary", "scalar", "exp", "sum", "sum", "max"])
+        a, b = rng.choice(values), rng.choice(values)
+        try:
+            if kind == "binary":
+                value = prog._binary(rng.choice(["add", "sub", "mul", "div"]), a, b)
+            elif kind == "scalar":
+                value = prog._binary(rng.choice(["add", "mul", "div"]), a, rng.choice([2.0, 0.5]))
+            elif kind == "exp":
+                value = a.exp()
+            else:
+                value = getattr(a, kind)(rng.randrange(a.ndim), keepdim=True)
+        except SpecError:
+            continue  # shapes that do not broadcast
+        values.append(value)
+    if len(values) == len(prog.inputs):
+        return None
+    prog.output(values[-1])
+    return prog
+
+
+@pytest.mark.parametrize("first", range(0, 600, 100))
+def test_random_programs_lower_to_what_they_compute_or_are_refused(first):
+    """No third outcome: a program either has a typed refusal, or its flat graph reads every
+    operand in the shape it declares and computes ``Program.reference``."""
+    lowered = 0
+    for seed in range(first, first + 100):
+        prog = _random_program(seed)
+        if prog is None:
+            continue
+        (graph,) = GraphSet.identity(prog)
+        try:
+            (ir,) = lower(graph)
+        except LoweringRejected:
+            continue
+        lowered += 1
+        for n in ir.nodes:
+            if type(n) in (Add, Sub, Mul, Div, ReduceSum, ReduceMax):
+                for e in n.inputs:
+                    declared = tuple(int(d) for d in n.input_buffers[e.dst_id].shape)
+                    assert _shape(e.src_node, e.src_id) == declared, (seed, n.name, e.dst_id)
+        torch.manual_seed(seed)
+        inputs = [torch.rand(*s.shape) + 0.5 for s in prog.inputs]
+        (want,) = prog.reference(*inputs)
+        (got,) = _run(ir, prog, inputs)
+        assert got.numel() == want.numel(), (seed, tuple(got.shape), tuple(want.shape))
+        if torch.isfinite(want).all():  # a chain of exps overflows on its own
+            error = float((got.reshape(want.shape) - want).abs().max())
+            assert error <= 1e-4 * max(float(want.abs().max()), 1e-6), (seed, error)
+    assert lowered >= 50  # the property is about programs that lower
