@@ -9,6 +9,66 @@ from ..ir.graph import (
 )
 from ..ir.graph_utils import find_topo_sort
 from ..ir.ops import Div, Exp, Matmul, Mul, ReduceSum
+from .operands import kept_extents
+
+# A Hopper warp-group gemm (WGMMA): four warps make a group, and one instruction computes
+# a tile of 64 rows, 16 to a warp, in columns that are a multiple of 8 to a warp.
+_WARP_THREADS = 32
+_GROUP_WARPS = 4
+_WARP_ROWS = 16
+_WARP_COLS = 8
+
+
+def wgmma_row_warps(warp_policy: str, m: int, n: int, n_threads: int) -> tuple:
+    """How many warps TileLang may lay along the rows of a warp-group gemm.
+
+    The gemm of an ``(m, n)`` tile on ``n_threads`` threads under ``Matmul.warp_policy``;
+    empty when TileLang does not issue it as a warp-group gemm at all (fewer than 64 rows,
+    or a block that is not whole warp groups). This is ``ComputeWgmmaWarpPartition`` of the
+    vendored TileLang (``src/cuda/op/gemm.cc``): ``rows`` takes the most row warps that
+    divide the tile, ``cols`` the fewest. ``even`` picks by a ratio it computes in single
+    precision, so every partition it could pick is returned.
+    """
+    num_warps = n_threads // _WARP_THREADS
+    if n_threads % _WARP_THREADS or num_warps % _GROUP_WARPS or m < 4 * _WARP_ROWS:
+        return ()
+    valid = [
+        row_warps
+        for row_warps in range(_GROUP_WARPS, num_warps + 1, _GROUP_WARPS)
+        if num_warps % row_warps == 0
+        and m % (row_warps * _WARP_ROWS) == 0
+        and n % (num_warps // row_warps * _WARP_COLS) == 0
+    ]
+    if not valid or warp_policy == "even":
+        return tuple(valid)
+    return (max(valid) if warp_policy == "rows" else min(valid),)
+
+
+def register_operand_is_misplaced(warp_policy: str, m: int, n: int, n_threads: int) -> bool:
+    """Whether TileLang computes a warp-group gemm of an ``(m, n)`` tile on the wrong rows
+    when its first operand is a fragment.
+
+    TileLang 0.1.13 lays the two fragments of such a gemm out differently. With ``G`` warp
+    groups along the rows and ``R`` instructions per group, warp ``j`` of group ``g`` holds
+    for instruction ``r`` the 16 rows from
+
+    * ``64 * G * r + 64 * g + 16 * j`` of the operand (``make_mma_load_layout``: all the
+      warps side by side, then repeated), and
+    * ``64 * R * g + 64 * r + 16 * j`` of the result (``make_mma_store_layout``: a group
+      owns consecutive rows).
+
+    The instruction multiplies whatever the registers of its group hold, so the result
+    rows it writes are the product of other operand rows wherever the two differ: for
+    every ``(g, r)`` but the first and the last as soon as ``G >= 2`` and ``R >= 2``. On
+    256 threads a 256-row tile comes out with rows 64..127 and 128..191 exchanged, a
+    512-row tile with six of its eight 64-row bands misplaced. Nothing fails: the kernel
+    lowers, runs, and is wrong. With one group, or one instruction per group, the two
+    layouts are the same.
+    """
+    return any(
+        row_warps // _GROUP_WARPS >= 2 and m // (row_warps * _WARP_ROWS) >= 2
+        for row_warps in wgmma_row_warps(warp_policy, m, n, n_threads)
+    )
 
 
 # TODO: have all levels of the graph with OutputNode (this should make this function smoother)
@@ -173,6 +233,9 @@ def annotate_fragment_layout_conflicts(graph: Graph) -> Graph:
     is laid out from the tensor it reduces, the gemm wants its operand in the tensor-core
     layout, and nothing serves both. It is staged like the operands of a matmul of two
     computed values (``annotate_tinfo``).
+
+    And for the first operand of a matmul whose block is two warp groups tall, wherever
+    that operand is a fragment (``stage_misplaced_register_operands``).
     """
 
     def reset_graph(cur_graph: Graph) -> None:
@@ -287,6 +350,88 @@ def annotate_fragment_layout_conflicts(graph: Graph) -> Graph:
 
     reset_graph(graph)
     annotate_graph(graph)
+    return stage_misplaced_register_operands(graph)
+
+
+def stage_misplaced_register_operands(graph: Graph) -> Graph:
+    """Stage the first operand of a matmul that TileLang would multiply on the wrong rows.
+
+    A matmul reads its first operand from a fragment when that operand is computed
+    (``exp(s) @ v``), is an input another node of the loop reads too (``x`` under
+    ``x @ w`` next to ``sum(x * x)``, or under two matmuls), or has to be cast. On a block
+    two warp groups tall whose tile needs more than one instruction per group, TileLang
+    lays that fragment out for other rows than the ones each instruction writes
+    (``register_operand_is_misplaced``), and the kernel is silently wrong: six tilings of
+    the RMSNorm split-K partial and six of SwiGLU, all 256 threads with row tiles of 256
+    or 512, were built, launched and failed validation with half or three quarters of
+    their rows exchanged. Read from shared memory the operand has no fragment layout, and
+    the gemm addresses it per warp group itself.
+
+    An input of the loop that only matmuls read (``x`` under ``x @ w1`` and ``x @ w2``)
+    is a fragment for no reader's sake: it is loaded into shared memory instead, as an
+    input with a single reader is, and no fragment is left to copy back. Any other
+    operand is staged (``Matmul.stage_fragment_operands_in_shared``).
+
+    ``graph`` is the main tier (it carries ``n_threads``). Run after every pass that
+    writes ``stage_fragment_operands_in_shared``.
+    """
+    n_threads = getattr(graph, "n_threads", None)
+    if not isinstance(n_threads, int):
+        return graph
+
+    def reads_a_fragment(cur_graph: Graph, cur_node: Matmul) -> bool:
+        edge = cur_node.inputs[0]
+        src = edge.src_node
+        if isinstance(src, GraphNode):
+            accum_node = getattr(edge, "accum_node", None)
+            if accum_node is None:
+                return False
+            scope = src.graph.tinfo_map.get(accum_node, (None, None))[1]
+            in_dtype = accum_node.out_dtype
+        else:
+            scope = cur_graph.tinfo_map.get(src, (None, None))[1]
+            in_dtype = (
+                src.out_dtype if isinstance(src, ComputeOpNode) else str(src.get_dtype(0))
+            )
+        # A cast is emitted into a fragment unless the operand is staged
+        # (``OperandResolver._resolve_operand``).
+        return scope == "r" or in_dtype != cur_node.dtype
+
+    def annotate_graph(cur_graph: Graph) -> None:
+        for cur_node in cur_graph.nodes:
+            if isinstance(cur_node, GraphNode):
+                annotate_graph(cur_node.graph)
+                continue
+            if not isinstance(cur_node, Matmul) or len(cur_node.inputs) != 2:
+                continue
+            if 0 in cur_node.stage_fragment_operands_in_shared:
+                continue
+            # Only 16-bit operands go to the warp-group instruction.
+            if cur_node.dtype not in ("float16", "bfloat16"):
+                continue
+            it = cur_graph.tmap.get(cur_node)
+            extents = [] if it is None else kept_extents(it.tile_size)
+            if len(extents) < 2 or not all(isinstance(e, int) for e in extents[-2:]):
+                continue
+            if not register_operand_is_misplaced(
+                cur_node.warp_policy, int(extents[-2]), int(extents[-1]), n_threads
+            ):
+                continue
+            if not reads_a_fragment(cur_graph, cur_node):
+                continue
+            src = cur_node.inputs[0].src_node
+            if (
+                isinstance(src, PlaceHolderNode)
+                and str(src.get_dtype(0)) == cur_node.dtype
+                and all(isinstance(edge.dst_node, Matmul) for edge in src.outputs)
+            ):
+                cur_graph.tinfo_map[src] = (cur_graph.tinfo_map[src][0], "s")
+                continue
+            cur_node.stage_fragment_operands_in_shared = tuple(
+                sorted({0, *cur_node.stage_fragment_operands_in_shared})
+            )
+
+    annotate_graph(graph)
     return graph
 
 
@@ -347,7 +492,8 @@ def annotate_mla_accumulation_layout_conflict(graph: Graph) -> Graph:
 
     reset_graph(graph)
     annotate_graph(graph)
-    return graph
+    # The reset above also dropped what this rule staged; it holds whatever the pattern.
+    return stage_misplaced_register_operands(graph)
 
 
 def init_graph_layout(graph: Graph) -> Graph:

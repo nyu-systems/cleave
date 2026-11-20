@@ -78,7 +78,11 @@ from pathlib import Path
 # 32: the split graphs of a program with a unit batch dim and equal trailing extents (one
 #     head, S_Q == D) lower; they were refused at the combine's division, so the best kernel
 #     of such a program can now be a split variant.
-SCHEMA = 32
+# 33: on a block two warp groups tall, a matmul reads its first operand from shared memory
+#     where it used to read a fragment: 256-thread kernels on tiles of 256 rows or more
+#     computed half or more of their rows from the wrong operand rows, and the same
+#     tilings of attention had no kernel at all.
+SCHEMA = 33
 # What "validated" means for a saved kernel. A kernel-cache hit returns without validating,
 # so bump this whenever the comparison or its inputs change: saved kernels are then rebuilt.
 # (The inputs include the adversarial cases a program with an exact softmax is held to,
