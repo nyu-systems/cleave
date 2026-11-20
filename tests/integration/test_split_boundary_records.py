@@ -157,6 +157,56 @@ def test_boundary_order_refuses_to_guess():
         boundary_order(outputs)
 
 
+def _three_output_bundle():
+    """A normalised split bundle (split dim first, rank 3) whose partial declares a row sum,
+    a scaled exp and a row max -- the outputs of an exact-softmax partial -- and whose
+    combine declares its inputs in that order, as a cut does."""
+    x = _t(1, (2, 4, 8))  # (split, rows, columns)
+    partial = [
+        _op("kn_input_op", [], [x]),
+        _op("kn_exp_op", [x], [_t(2, (2, 4, 8))]),
+        _op("kn_reduce_sum_2_op", [_t(2, (2, 4, 8))], [_t(3, (2, 4, 1))]),
+        _op("kn_mul_op", [_t(2, (2, 4, 8))], [_t(4, (2, 4, 8))], scalar=2.0),
+        _op("kn_reduce_max_2_op", [x], [_t(5, (2, 4, 1))]),
+        _op("kn_output_op", [_t(3, (2, 4, 1))], []),  # 0: the row sum
+        _op("kn_output_op", [_t(4, (2, 4, 8))], []),  # 1: the scaled exp
+        _op("kn_output_op", [_t(5, (2, 4, 1))], []),  # 2: the row max
+    ]
+    combine = [
+        _op("kn_input_op", [], [_t(11, (2, 4, 1))]),
+        _op("kn_input_op", [], [_t(12, (2, 4, 8))]),
+        _op("kn_input_op", [], [_t(13, (2, 4, 1))]),
+        _op("kn_reduce_sum_0_op", [_t(11, (2, 4, 1))], [_t(14, (4, 1))]),
+        _op("kn_reduce_sum_0_op", [_t(12, (2, 4, 8))], [_t(15, (4, 8))]),
+        _op("kn_reduce_max_0_op", [_t(13, (2, 4, 1))], [_t(16, (4, 1))]),
+        _op("kn_output_op", [_t(14, (4, 1))], []),
+        _op("kn_output_op", [_t(15, (4, 8))], []),
+        _op("kn_output_op", [_t(16, (4, 1))], []),
+    ]
+    return [partial, combine]
+
+
+def test_combine_inputs_take_the_partial_outputs_in_boundary_order():
+    """``_align_split_boundary_inputs`` gives the combine's k-th input the shape the partial
+    stores its k-th output in. The k-th output is the one with boundary index k: the
+    partial's node list has its three outputs as (row sum, row max, scaled exp), and read
+    in that order the scaled exp would be given the shape of the row max."""
+    bundle = _three_output_bundle()
+    partial = to_ir(bundle[0])
+    listed = [tuple(out.get_shape()) for out in _outputs(partial)]
+    declared = [tuple(out.get_shape()) for out in boundary_order(_outputs(partial))]
+    assert listed == [(2, 4), (2, 4), (2, 4, 8)] and declared == [(2, 4), (2, 4, 8), (2, 4)]
+
+    aligned = gp._align_split_boundary_inputs(bundle)
+    assert aligned[0] is bundle[0]
+    inputs = [op["output_tensors"][0] for op in aligned[1] if op["op_type"] == "kn_input_op"]
+    assert [tuple(t["dim"][: t["num_dims"]]) for t in inputs] == declared
+    # the two sides of the cut are then the same tensors, index by index
+    combine = to_ir(aligned[1])
+    assert boundary_signature(_placeholders(combine)) == boundary_signature(_outputs(partial))
+    assert [shape for _, _, shape, _ in boundary_signature(_placeholders(combine))] == declared
+
+
 def _rename_symbols(bundle, mapping):
     renamed = json.loads(json.dumps(bundle))
     for ops in renamed:
