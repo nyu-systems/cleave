@@ -53,14 +53,19 @@ def _broadcast_is_ambiguous(dims: Tuple[int, ...], other_shape: Tuple[int, ...])
             and tuple(other_shape) == tuple(dims[:-2]) + (dims[-1],))
 
 
-def _broadcast_from_symbols(lhs: Tuple[int, ...], rhs: Tuple[int, ...]) -> Optional[int]:
+def _broadcast_from_symbols(lhs: Tuple[int, ...], rhs: Tuple[int, ...], rank: int) -> Optional[int]:
     """The broadcast index read off the raw dims of the two structure tensors, else None.
 
     Before ``symbol_map`` two axes of one extent are still different symbols, and a
     reduction leaves its axis behind as a literal ``1``: the axis the operand does not span.
+    ``rank`` is the rank of the lhs *value*, which has dropped the axes reduced before it
+    (a split combine divides ``(1, BH, SQ, D)`` by ``(1, BH, SQ, 1)``: values of rank 3 and 2).
     """
     lhs, rhs = tuple(lhs), tuple(rhs)
-    if len(lhs) < 2:
+    if len(lhs) != rank and len(lhs) == len(rhs):
+        kept = [i for i in range(len(lhs)) if not lhs[i] == rhs[i] == 1]
+        lhs, rhs = tuple(lhs[i] for i in kept), tuple(rhs[i] for i in kept)
+    if len(lhs) != rank or rank < 2:
         return None
     if len(rhs) == len(lhs):  # keepdim form
         if rhs[:-2] != lhs[:-2]:
@@ -391,7 +396,7 @@ class _Ctx:
         if not _broadcast_is_ambiguous(ls, rs):
             return _infer_broadcast_index(ls, rs)
         lhs_dims, rhs_dims = tuple(_dims(lhs)), tuple(_dims(rhs))
-        index = _broadcast_from_symbols(lhs_dims, rhs_dims) if len(lhs_dims) == len(ls) else None
+        index = _broadcast_from_symbols(lhs_dims, rhs_dims, len(ls))
         if index is None:
             (lrank, laxes, _), (rrank, raxes, _) = self.kept_axes(lhs), self.kept_axes(rhs)
             if lrank == rrank and set(raxes) <= set(laxes):

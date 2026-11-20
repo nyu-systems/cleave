@@ -21,7 +21,7 @@ from cleave.ir.ops import Div, Mul
 from cleave.lower.convert import to_ir
 from cleave.pipeline.plans import lower
 from cleave.pipeline.superopt import GraphSet
-from cleave.runtime.reference import execute
+from cleave.runtime.reference import execute, placeholder_order
 
 SHAPES = [
     # (annotation dims, sizes, softmax dim, expected broadcast index of the Div)
@@ -156,6 +156,54 @@ def test_undecidable_broadcast_is_refused_not_guessed():
     ir = to_ir(structure, dtype="float32", out_dtype="float32")
     (mul,) = [n for n in ir.nodes if type(n) is Mul]
     assert mul.broadcast == 1
+
+
+def test_symbolic_rule_table():
+    from cleave.lower.convert import _broadcast_from_symbols as rule
+
+    assert rule((12, 8), (12, 1), 2) == 0 and rule((12, 8), (1, 8), 2) == 1
+    assert rule((20, 12, 8), (20, 12, 1), 3) == 0 and rule((20, 12, 8), (20, 1, 8), 3) == 1
+    assert rule((12, 8), (12,), 2) == 0 and rule((12, 8), (8,), 2) == 1
+    # a unit batch axis of the value is not a reduced axis
+    assert rule((1, 12, 8), (1, 12, 1), 3) == 0 and rule((1, 12, 8), (1, 1, 8), 3) == 1
+    # both tensors still list an axis reduced before them: the values have dropped it
+    assert rule((1, 20, 12, 8), (1, 20, 12, 1), 3) == 0
+    assert rule((1, 20, 12, 8), (1, 20, 1, 8), 3) == 1
+    assert rule((1, 20, 12, 8), (1, 20, 12, 1), 4) == 0  # ... unless the value has rank 4
+    # nothing to go by
+    assert rule((8, 8), (8,), 2) is None and rule((8, 8), (1, 1), 2) is None
+    assert rule((20, 12, 8), (1, 12, 8), 3) is None  # a reduced batch axis
+    assert rule((2, 20, 12, 8), (20, 12), 3) is None
+
+
+def test_split_combine_divides_by_the_row_sums():
+    """The combine of split attention as ``lower/process.py`` hands it to ``to_ir``.
+
+    ``sum_split(o) / sum_split(l)`` with S_Q == D: the two structure tensors are
+    ``(1, BH, SQ, D)`` and ``(1, BH, SQ, 1)`` while the values have rank 3 and 2.
+    """
+    bh, split, sq, d = 20, 2, 28, 44  # symbols; SQ and D both stand for 64
+    structure = [
+        {"op_type": "kn_input_op", "input_tensors": [], "output_tensors": [_t(1, (bh, split, sq))]},
+        {"op_type": "kn_input_op", "input_tensors": [], "output_tensors": [_t(2, (bh, split, sq, d))]},
+        {"op_type": "kn_reduce_sum_1_op", "input_tensors": [_t(1, (split, bh, sq, 1))],
+         "output_tensors": [_t(3, (1, bh, sq, 1))]},
+        {"op_type": "kn_reduce_sum_1_op", "input_tensors": [_t(2, (split, bh, sq, d))],
+         "output_tensors": [_t(4, (1, bh, sq, d))]},
+        {"op_type": "kn_div_op", "input_tensors": [_t(4, (1, bh, sq, d)), _t(3, (1, bh, sq, 1))],
+         "output_tensors": [_t(5, (1, bh, sq, d))]},
+        {"op_type": "kn_output_op", "input_tensors": [_t(5, (1, bh, sq, d))], "output_tensors": []},
+    ]
+    ir = to_ir(structure, dtype="float32", out_dtype="float32",
+               symbol_map={bh: 4, split: 4, sq: 64, d: 64})
+    (div,) = [n for n in ir.nodes if type(n) is Div]
+    assert div.broadcast == 0
+    torch.manual_seed(0)
+    by_shape = {(4, 4, 64): torch.rand(4, 4, 64) + 0.5, (4, 4, 64, 64): torch.randn(4, 4, 64, 64)}
+    order = [tuple(int(v) for v in n.get_shape(0)) for n in placeholder_order(ir)]
+    (got,) = execute(ir, [by_shape[shape] for shape in order])
+    want = by_shape[(4, 4, 64, 64)].sum(1) / by_shape[(4, 4, 64)].sum(1).unsqueeze(-1)
+    torch.testing.assert_close(got.reshape(want.shape), want, rtol=1e-5, atol=1e-6)
 
 
 def test_a_reduced_batch_axis_is_refused():
