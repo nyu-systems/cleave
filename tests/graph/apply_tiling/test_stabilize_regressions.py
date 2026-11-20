@@ -79,9 +79,8 @@ FROM_MINUS_INF = (stab.StabilizeRefused,
 
 
 def _no_rolling_form(obstacle):
-    """The record's own obstacle. Its wording is the scale analysis's where lowering wrote
-    the record and this module's where it was set by hand; ``obstacle`` is the phrase the
-    two share."""
+    """The record's own obstacle. Its wording is the scale analysis's, which wrote the
+    record at lowering; ``obstacle`` is the phrase of it the cases below spell out."""
     return (stab.StabilizeRefused,
             rf"exp_\d+: no rolling form: .*{re.escape(obstacle)}.*")
 

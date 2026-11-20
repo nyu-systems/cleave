@@ -2,18 +2,15 @@
 
 The stabilization rewrite (``cleave.schedule.stabilize``) consumes a record the scale
 analysis writes on each softmax ``Exp`` at lowering time. The programs here are written out
-(``exp``, ``sum``, ``div``) and lowered as identity graphs; :func:`softmax_ir` then makes
-sure every softmax Exp carries the record the test expects:
+(the requested ``exp``, ``sum``, ``div``) and lowered as identity graphs; :func:`softmax_ir`
+then CHECKS the record lowering wrote on every softmax Exp against the one the test expects:
+same softmax axis, same scaled reductions (read off the graph: the first reductions /
+contractions reached from the Exp), an obstacle to the rolling form exactly where one is
+expected, same exported max.
 
-* where lowering already wrote one (a tree whose frontend records the request and whose
-  ``plans.lower`` runs the analysis), it is CHECKED against the expectation: same softmax
-  axis, same scaled reductions, an obstacle to the rolling form exactly where one is
-  expected, same exported max;
-* otherwise it is set by hand, from the graph: the scaled reductions are the first
-  reductions / contractions reached from the Exp.
-
-So the same tests pin the rewrite on hand-set records and, once the analysis is in the
-tree, on the analysis's own.
+There is no other mode: an Exp that lowering left without a record fails the test that
+lowered it, and so does a program that cannot make the request. The rewrite tests therefore
+always run on the analysis's own records.
 """
 
 from __future__ import annotations
@@ -29,9 +26,9 @@ REDUCERS = (ReduceSum, ReduceMax, Matmul)
 
 
 def stable_exp(x, dim: int = -1):
-    """The ``exp`` of a softmax over ``dim``: the frontend's request where it has one."""
-    request = getattr(x.program, "_stable_exp", None)
-    return cl.exp(x) if request is None else request(x, dim)
+    """The ``exp`` of a softmax over ``dim``, as the frontend requests it (what
+    ``cl.softmax`` records in front of its sum and its division)."""
+    return x.program._stable_exp(x, dim)
 
 
 def exact_softmax(x, dim: int = -1):
@@ -166,12 +163,13 @@ def scaled_reductions(exp) -> tuple:
 
 
 def hand_record(exp):
-    """The record of a softmax Exp of a *searched* graph, read off the graph by hand, or
-    ``None`` where this rule cannot tell.
+    """The record of a softmax Exp read off the graph by hand, or ``None`` where this rule
+    cannot tell.
 
-    For a tree whose lowering does not run the scale analysis: the census of the demos'
-    searched graphs needs a record on every softmax Exp, and no test spells one out for a
-    graph the search produced. The rule covers a softmax over the LAST axis of the Exp:
+    A second derivation of what the scale analysis writes, independent of it: the tests
+    hold the two against each other (``tests/schedule/search_tiling/
+    test_stabilize_census.py``). Nothing sets a record from it. The rule covers a softmax
+    over the LAST axis of the Exp:
 
     * ``scaled``: :func:`scaled_reductions`; each of them has to consume the Exp's last
       axis (a ``ReduceSum`` / ``ReduceMax`` over the last axis, or a ``Matmul`` whose left
@@ -180,8 +178,6 @@ def hand_record(exp):
       of its own finished reductions (traced order: ``exp / sum(exp)`` before the value
       matmul).
 
-    The census checks hold for any record (the pass has to be safe on a hand-set one); a
-    plausible record makes it exercise the paths the analysis's records will.
     """
     scaled = scaled_reductions(exp)
     if not scaled:
@@ -227,7 +223,7 @@ def hand_record(exp):
 
 
 def softmax_ir(fn, shapes, *softmax, dtype=cl.f16):
-    """Lower ``fn`` and make sure each Exp carries the record ``softmax`` describes.
+    """Lower ``fn`` and check that each Exp carries the record ``softmax`` describes.
 
     One dict per Exp of the lowered graph, in graph order: ``axis`` (from the end, default
     -1), ``rolling`` (the obstacle text, default none), ``export`` (default none). No dict
@@ -244,10 +240,8 @@ def softmax_ir(fn, shapes, *softmax, dtype=cl.f16):
             rolling=want.get("rolling", ""),
             export=want.get("export"),
         )
-        if exp.stabilize is None:
-            exp.stabilize = record
-            continue
-        got = exp.stabilize  # written by the scale analysis: it has to agree
+        got = exp.stabilize  # written by the scale analysis: it has to be there, and agree
+        assert got is not None, f"{exp.name}: lowering wrote no record (expected {record})"
         assert got.axes == record.axes, (exp.name, got, record)
         assert dict(got.scaled) == dict(record.scaled), (exp.name, got, record)
         assert bool(got.rolling) == bool(record.rolling), (exp.name, got, record)

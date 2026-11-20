@@ -126,7 +126,7 @@ def test_one_refused_graph_keeps_a_demo_job_from_ok(monkeypatch, tmp_path, capsy
     note = "graph g1: refused at lowering: LoweringRejected: nope"
     monkeypatch.setattr(
         tool, "_demo_graphs",
-        lambda name: ([("g0", S.softmax_ir(*ROWS), "by hand")], {}, [note]),
+        lambda name: ([("g0", S.softmax_ir(*ROWS), "lowering")], {}, [note]),
     )
     status, lines, report = _run(tmp_path, capsys, "demo:mha_prefill")
     assert status == 2 and lines[-1] == "demo:mha_prefill: NOT CHECKED, 1 item(s)"
@@ -155,12 +155,9 @@ def test_a_demo_job_censuses_the_searched_graphs(monkeypatch, tmp_path, capsys):
         for rows in by_graph.values()
     )
     assert counts == [(32, 8, 0), (32, 32, 24)]
-    # the search saw no max: the records are lowering's, or set by hand where this tree's
-    # frontend cannot make the request
+    # the search saw no max: the records are lowering's
     heads = [line for line in lines if line.startswith("demo:mha_decode_exact@256[")]
-    assert len(heads) == 2 and all(
-        line.endswith(("[records: lowering]", "[records: by hand]")) for line in heads
-    )
+    assert len(heads) == 2 and all(line.endswith("[records: lowering]") for line in heads)
 
 
 def test_the_demo_at_its_own_shape_is_all_rolling(monkeypatch, tmp_path, capsys):
@@ -210,7 +207,7 @@ def test_importing_the_tool_leaves_the_process_alone():
 def test_record_set_by_hand_on_a_searched_graph(fn, shapes, obstacle):
     """``hand_record`` reads off a graph what the tests of the written-out programs spell
     out: the last axis, the reductions that sum the exp, and whether the exp is read next
-    to one of them. Where lowering wrote a record itself, the two agree."""
+    to one of them. Lowering wrote a record itself, and the two agree."""
     ir = S.lowered(fn, shapes)
     (exp,) = S.exps(ir)
     record = S.hand_record(exp)
@@ -222,10 +219,10 @@ def test_record_set_by_hand_on_a_searched_graph(fn, shapes, obstacle):
         reader, _, finished = record.rolling.partition(
             " reads the exp next to the finished reduction ")
         assert reader.startswith(obstacle) and finished in dict(record.scaled)
-    if exp.stabilize is not None:  # written by the scale analysis
-        assert exp.stabilize.axes == record.axes
-        assert dict(exp.stabilize.scaled) == dict(record.scaled)
-        assert bool(exp.stabilize.rolling) == bool(record.rolling)
+    assert exp.stabilize is not None  # written by the scale analysis
+    assert exp.stabilize.axes == record.axes
+    assert dict(exp.stabilize.scaled) == dict(record.scaled)
+    assert bool(exp.stabilize.rolling) == bool(record.rolling)
 
 
 @pytest.mark.parametrize(
@@ -238,6 +235,7 @@ def test_record_set_by_hand_on_a_searched_graph(fn, shapes, obstacle):
 )
 def test_no_record_by_hand_off_the_last_axis(fn, shapes):
     """The by-hand rule only knows a softmax over the last axis; anywhere else it gives no
-    record, and the census reports the graph as not checked."""
+    record (lowering's own, which the census uses, covers these)."""
     (exp,) = S.exps(S.lowered(fn, shapes))
     assert S.hand_record(exp) is None
+    assert exp.stabilize is not None and exp.stabilize.axes == (-2,)

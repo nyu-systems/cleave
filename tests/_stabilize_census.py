@@ -22,17 +22,16 @@ top-k cut) it checks what unit tests cannot afford to:
 
 Jobs come from two sources.
 
-``fixture`` jobs: the written-out programs of ``tests/_softmax.py`` and the attention
-fixtures of ``tests/_graphs.py`` (the end2end cases), with the ``Stabilize`` record put on
-the Exp by hand (checked against lowering's own where the tree's lowering writes one).
+``fixture`` jobs: the written-out programs of ``tests/_softmax.py``, whose records are
+lowering's own, checked against the expectation the job spells out, and the attention
+fixtures of ``tests/_graphs.py`` (the end2end cases: IR built by hand, never lowered), with
+the ``Stabilize`` record put on the Exp by hand.
 
 ``demo:`` jobs: a demo's own program and configs through ``superoptimize`` and
 ``plans.lower``, i.e. the *searched* graphs. The demo is traced with the ``shift=`` of its
 ``cl.softmax`` dropped, so that it records the exact softmax (the requested exp, its sum,
 the division) and the search sees the shift-free program. The records are the ones lowering
-writes. On a tree whose frontend cannot make the request (no ``Program._stable_exp``)
-lowering writes none, and they are set by hand instead (``tests/_softmax.py::hand_record``);
-the summary says which.
+writes; a graph it leaves without one is reported as not checked.
 
 Exit status, also the last line printed:
 
@@ -202,7 +201,7 @@ def _demo_graphs(name):
         cl.softmax, sys.argv = real_softmax, argv
         sys.path.remove(str(ROOT / "demo"))
     program = seen["program"]
-    requests = getattr(program, "stabilize_requests", None)
+    requests = program.stabilize_requests
     graphs, notes = [], []
     for g in superoptimize(program, seen["so"].replace(split=())):
         if g.is_split or g.invalid_split:
@@ -216,18 +215,9 @@ def _demo_graphs(name):
             label = f"g{g.index}" if len(irs) == 1 else f"g{g.index}.{k}"
             if annotated(ir):
                 graphs.append((label, ir, "lowering"))
-            elif requests is not None:
+            else:
                 notes.append(f"graph {label}: no record (lowering marked no exp of it; the "
                              f"program makes {len(requests)} request(s))")
-            else:  # this tree's frontend cannot make the request: records by hand
-                found = [(exp, S.hand_record(exp)) for exp in S.exps(ir)]
-                if not found or any(record is None for _, record in found):
-                    notes.append(f"graph {label}: no record (no request in this tree, and "
-                                 "the by-hand rule does not cover this graph)")
-                    continue
-                for exp, record in found:
-                    exp.stabilize = record
-                graphs.append((label, ir, "by hand"))
     options = {"force_fusion": True} if seen["sc"].fusion == "force" else {}
     return graphs, options, notes
 
@@ -395,8 +385,9 @@ def run(job, n_lower="8", with_nvcc=False):
     else:
         build, search, options, nvcc, focus = (FIXTURES[job] + (None,))[:5]
         irs = build()
-        graphs = [("" if len(irs) == 1 else str(k), ir, "by hand, or lowering's checked "
-                   "against the expectation") for k, ir in enumerate(irs)]
+        graphs = [("" if len(irs) == 1 else str(k), ir, "the fixture's: lowering's checked "
+                   "against the expectation, or by hand on hand-built IR")
+                  for k, ir in enumerate(irs)]
     all_rows, all_problems = [], []
     for label, ir, records in graphs:
         name = f"{job}[{label}]" if label else job

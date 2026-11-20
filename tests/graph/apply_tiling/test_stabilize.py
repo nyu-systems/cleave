@@ -3,8 +3,8 @@
 ``apply_tiling`` ends by giving every ``Exp`` that carries a ``Stabilize`` record the max its
 tiling needs: in place when the softmax axis is whole in the Exp's tile, carried across
 iterations (with the accumulators rescaled) when the tier's loop tiles it. The records are
-set by ``tests/_softmax.py`` (by hand, or checked against the scale analysis where lowering
-already ran it).
+the scale analysis's own, written at lowering and checked by ``tests/_softmax.py`` against
+what each test expects.
 
 Pinned here: the hook and what it leaves alone, both forms and their text, the exported max
 of a split-partial-shaped graph, the Exp that read storage, and every refusal.
