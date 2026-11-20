@@ -922,10 +922,11 @@ class DefaultPolicy:
                 tuple((k, tuple(v.items())) for k, v in rstep_map.items()),
             ) in visited_tiles:
                 return
-            # The walk prunes on the steps at face value, which never cost more than the
-            # kernel does: a state whose kernel does not fit is still the way to the
-            # states behind it (an absorbed reduction stops being one once its
-            # descendant reaches its extent). What is emitted is rated as the kernel.
+            # The walk prunes on the steps at face value, as it always did: a state whose
+            # kernel does not fit is still the way to the states behind it (an absorbed
+            # reduction stops being one once its descendant reaches its extent), so
+            # pruning on the kernel would lose those. What is emitted is rated as the
+            # kernel.
             state = self._rate_steps(tile, rstep_map)
             visited_tiles[
                 (

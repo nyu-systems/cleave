@@ -230,7 +230,8 @@ def test_refuses_to_step_an_axis_that_an_absorbed_reduction_holds_whole(K):
 
 
 def test_a_candidate_whose_kernel_does_not_fit_is_not_proposed():
-    """MLA decode at batch 2: the kernel of 192 of 444 proposed candidates did not fit.
+    """MLA decode at batch 2: 472 candidates were proposed, 444 of them with an absorbed
+    reduction, and the kernel of 192 of those did not fit.
 
     ``Q K^T`` over the latent dim (and over the positional one) is absorbed into the
     ``S_KV`` loop, so the kernel holds the whole 512-wide latent tile in every iteration.

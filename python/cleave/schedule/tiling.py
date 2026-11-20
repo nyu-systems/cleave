@@ -583,7 +583,9 @@ def _rebase_reduction_axis(node: ReduceSum, tile):
     axis = node.flat_axis
     node.axis, node.axis_arg = axis, node.flat_axis_arg
     if tile is None or len(tile) != len(node.dims) or _is_unit(tile[axis]):
-        # A unit extent on the reduced axis itself leaves the tile without that axis.
+        # A unit extent on the reduced axis itself (a loop that walks the axis one
+        # element at a time) leaves the stored tile without that axis: there is no
+        # ``dim`` to give, and such a tiling does not compile.
         return
     if node.flat_axis_arg < 0:
         node.axis_arg = -1 - sum(1 for extent in tile[axis + 1 :] if not _is_unit(extent))
