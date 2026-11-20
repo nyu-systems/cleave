@@ -52,7 +52,7 @@ from tests import _softmax as S
 
 NEXT_TO_SUM = "reads the exp next to the finished reduction"
 SHARED = "the shared sum is also scaled by the other exp; one factor per accumulator"
-TRAILING = "the factor is not on the leading axes"
+TRAILING = "the factor is not on its leading axes"
 TAKES_MAX = "takes a max of the scaled value"
 
 # The refusals, by who raises them (numbers are folded to N by ``_reason_key``).
@@ -74,7 +74,11 @@ FROM_MINUS_INF = (stab.StabilizeRefused,
 
 
 def _no_rolling_form(obstacle):
-    return (stab.StabilizeRefused, rf"exp_\d+: no rolling form: {re.escape(obstacle)}")
+    """The record's own obstacle. Its wording is the scale analysis's where lowering wrote
+    the record and this module's where it was set by hand; ``obstacle`` is the phrase the
+    two share."""
+    return (stab.StabilizeRefused,
+            rf"exp_\d+: no rolling form: .*{re.escape(obstacle)}.*")
 
 
 # name -> (program, shapes, one expectation per exp, kernels built (all in-tile),
@@ -82,7 +86,7 @@ def _no_rolling_form(obstacle):
 CASES = {
     "two_softmaxes": (S.two_softmaxes, dict(R=256, C=4096),
                       (dict(rolling=SHARED), dict(rolling=SHARED)), 1,
-                      [(_no_rolling_form(SHARED), 35), (SINGLE_ROW, 8)]),
+                      [(_no_rolling_form("is also scaled by"), 35), (SINGLE_ROW, 8)]),
     "column_weighted": (S.column_weighted, dict(M=128, K=4096, N=256),
                         (dict(axis=-2, rolling=TRAILING),), 0,
                         [(MISCOUNT, 52)]),
@@ -229,7 +233,7 @@ def test_factor_on_the_trailing_axis_is_refused_by_the_rewrite(monkeypatch):
     monkeypatch.setattr(tiling, "_refuse_loops_that_miscount_their_tiles", lambda main: None)
 
     _, reasons = _census(cands)
-    wanted = [(_no_rolling_form(TRAILING), 52)]
+    wanted = [(_no_rolling_form("its leading axes"), 52)]
     assert _histogram(reasons, wanted) == Counter(dict(wanted))
 
     _, reasons = _census(search_tiling(_without_obstacle(ir), topk=1000))
@@ -260,8 +264,9 @@ def test_factor_on_the_trailing_axis_is_refused_on_a_consistent_loop():
         assert {n.name for n in loop.accum_nodes} == {matmul.name, colsum.name}
 
         exp.stabilize = record
-        assert _try(cand) == (None, (stab.StabilizeRefused,
-                                     f"{exp.name}: no rolling form: {TRAILING}"))
+        tiled, refusal = _try(cand)
+        assert tiled is None and refusal[0] is stab.StabilizeRefused
+        assert re.fullmatch(_no_rolling_form("its leading axes")[1], refusal[1]), refusal
 
         rows, cols = (int(t) for t in cand.output_tile)
         if rows != cols:

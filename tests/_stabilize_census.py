@@ -133,19 +133,19 @@ FIXTURES = {
 def _whole_head_dim(c):
     """mla_decode: the block holds all 512 head dims and the softmax loop steps 32 keys
     (the shape of the only tilings of this operator that validate on a GPU)."""
-    return (list(c.output_tile) == [1, 64, 512] and c.n_threads == 128
-            and _rsteps(c)[-2:] == [32, 32])
+    return list(c.output_tile) == [1, 64, 512] and _rsteps(c)[-2:] == [32, 32]
 
 
-# name -> (compiler pass options, selector of the +nvcc kernel)
+# name -> (compiler pass options, selector of the +nvcc kernel,
+#          selector of candidates that are always lowered, whatever --lower samples)
 DEMOS = {
-    "mha_prefill": (None, None),
-    "gqa_prefill": (None, None),
-    "mqa_prefill": (None, None),
-    "mla_prefill": (None, None),
-    "mla_decode": (MLA, _whole_head_dim),
-    "qknorm": (None, lambda c: c.n_threads == 128),
-    "mha_decode_exact": (None, None),
+    "mha_prefill": (None, None, None),
+    "gqa_prefill": (None, None, None),
+    "mqa_prefill": (None, None, None),
+    "mla_prefill": (None, None, None),
+    "mla_decode": (MLA, lambda c: _whole_head_dim(c) and c.n_threads == 128, _whole_head_dim),
+    "qknorm": (None, lambda c: c.n_threads == 128, None),
+    "mha_decode_exact": (None, None, None),
 }
 
 
@@ -383,8 +383,7 @@ def run(job, n_lower="8", with_nvcc=False):
     unchecked = []
     if job.startswith("demo:"):
         graphs, search, notes = _demo_graphs(job[5:])
-        options, nvcc = DEMOS[job[5:]]
-        focus = None
+        options, nvcc, focus = DEMOS[job[5:]]
         unchecked += notes
     else:
         build, search, options, nvcc, focus = (FIXTURES[job] + (None,))[:5]
