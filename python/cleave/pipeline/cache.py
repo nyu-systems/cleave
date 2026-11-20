@@ -55,7 +55,9 @@ from pathlib import Path
 #     paired with by extent only (such kernels were built, and wrote wrong values).
 # 22: a matmul operand that lost a batch axis the output has one entry of lowers again, and
 #     one that a reduction left in a fragment is staged through shared memory.
-SCHEMA = 22
+# 23: a tile of unit extents only is allocated 1-D, as its slices and parameters spell it:
+#     single-row tilings of a rank-1 value have kernels.
+SCHEMA = 23
 # What "validated" means for a saved kernel. A kernel-cache hit returns without validating,
 # so bump this whenever the comparison or its inputs change: saved kernels are then rebuilt.
 # (The inputs include the adversarial cases a program with an exact softmax is held to,

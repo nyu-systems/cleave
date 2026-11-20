@@ -15,7 +15,7 @@ from ..ir.graph_utils import find_topo_sort
 from .tensor_codegen import gen_copy, gen_tensor_allocation_str, gen_tensor_type
 from .buffer import BASE_INDENT, CodeBuffer
 from .macros import qualify_name
-from .operands import emit_alloc, kept_extents, tc_layout
+from .operands import emit_alloc, kept_extents, stored_extents, tc_layout
 
 
 def _bind_node(graph, arg, is_main):
@@ -522,7 +522,7 @@ class KernelEmitter:
                 buf,
                 graph,
                 node,
-                kept_extents(graph.tmap[node].tile_size),
+                stored_extents(graph.tmap[node].tile_size),
                 node.out_dtype,
             )
         staged = set(getattr(node, "stage_fragment_operands_in_shared", ()))

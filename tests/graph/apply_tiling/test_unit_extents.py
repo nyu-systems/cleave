@@ -18,6 +18,12 @@ extent is around. Two kinds of tiling fell outside it:
 
 The first kind now builds and validates. The second is handed the right slices but still
 has no kernel: the slice has no reduced axis left for ``T.reduce_*`` to name.
+
+One more thing stood between a single-row tiling and a kernel, in what is emitted: a
+value the block computes one element of (the row sum of a single row that is not looped,
+an elementwise op on it) was allocated as a scalar, ``T.alloc_fragment(())``, while the
+tier's parameters, the slices it is handed and a loop's accumulators all spell such a
+tile 1-D: the copy into the output failed on ``()`` against ``(1,)``.
 """
 
 import re
@@ -155,6 +161,52 @@ def test_a_loop_over_a_single_row_block_validates(name):
     build, dims, output_tile, steps, _ = SINGLE_ROW[name]
     cand = _candidate(build(*dims), output_tile, **steps)
     assert_candidate_compiles_and_runs(cand, tolerance_for(build))
+
+
+# -------------------------------------------------- a block that computes one element
+def _one_row_not_looped():
+    return _candidate(rowsum_graph(4096, 4096), [1], rowsum_0=4096)
+
+
+def test_a_tile_of_one_element_is_allocated_one_dimensional():
+    """The row sum of a single row, not looped: the block computes one element. Its
+    buffer was allocated as a scalar while the output slice it is copied into is 1-D
+    ("StructuralEqual check failed ... () ... (1,)"); every such candidate died at
+    parse. It is allocated the way the rest of the kernel spells an all-unit tile."""
+    code = build_candidate_code(_one_row_not_looped())
+    assert "for i0 in" not in code
+    assert re.findall(r"t_rowsum_0 = T\.alloc_fragment\(\((.*?)\), ", code) == ["1,"]
+    assert "OutputNode: T.Tensor((1), " in code
+    assert "main_kernel" in lower_to_cuda(code)
+
+
+def test_an_elementwise_op_on_one_element_lowers():
+    """CPU: ``rowsum(x) / y`` on single rows -- the divide's tile, and both its operands',
+    hold one element -- whether the row sum is looped or not (7 of this program's 46
+    tilings; TileLang: "ValueError: ()")."""
+    import cleave.lang as cl
+    from cleave.frontend import trace
+    from cleave.pipeline.plans import lower
+    from cleave.pipeline.superopt import GraphSet
+    from cleave.schedule import search_tiling
+
+    def rowsum_over(x: cl.Tensor["R", "C"], y: cl.Tensor["R", "ONE"]):
+        return cl.sum(x, -1, keepdim=True) / y
+
+    (graph,) = GraphSet.identity(trace(rowsum_over, dict(R=64, C=4096, ONE=1), cl.f16))
+    (ir,) = lower(graph)
+    single_rows = [c for c in search_tiling(ir, topk=1000) if list(c.output_tile) == [1]]
+    steps = sorted(int(v) for c in single_rows for r in c.rstep_map.values() for v in r.values())
+    assert steps[0] < 4096 and steps[-1] == 4096  # looped and not
+    for cand in (single_rows[0], single_rows[-1]):
+        code = build_candidate_code(cand)
+        assert "T.alloc_fragment((), " not in code
+        assert "main_kernel" in lower_to_cuda(code)
+
+
+def test_a_block_that_computes_one_element_validates():
+    """GPU: the single row that is not looped, against the reference."""
+    assert_candidate_compiles_and_runs(_one_row_not_looped(), tolerance_for(rowsum_graph))
 
 
 # ------------------------------------------------- a split axis walked one partial at a time

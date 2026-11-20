@@ -8,6 +8,14 @@ def kept_extents(dims):
     return [d for d in dims if not isinstance(d, int) or d > 1]
 
 
+def stored_extents(dims):
+    """The extents a tile's own buffer is allocated with: ``kept_extents``, except that
+    a tile of unit extents only is stored 1-D, not as a scalar. That is how the tier's
+    parameters and the slices it is handed already spell such a tile (``_iter_signature``,
+    ``_tile_slices``), and what a loop allocates for its accumulators."""
+    return kept_extents(dims) or [1]
+
+
 def tc_layout(graph, node) -> bool:
     return graph.tlayout_map.get(node, "") == "tc"
 
@@ -52,7 +60,7 @@ class OperandResolver:
             ), f"Accumulation node must be ComputeOpNode, but got {edge.accum_node=}"
             in_dtype = edge.accum_node.out_dtype
             tname, scope = src.graph.tinfo_map[edge.accum_node]
-            shape = kept_extents(src.graph.tmap[edge.accum_node].tile_size)
+            shape = stored_extents(src.graph.tmap[edge.accum_node].tile_size)
         else:
             in_dtype = (
                 src.out_dtype
@@ -60,7 +68,7 @@ class OperandResolver:
                 else str(src.get_dtype(0))
             )
             tname, scope = graph.tinfo_map[src]
-            shape = kept_extents(graph.tmap[src].tile_size)
+            shape = stored_extents(graph.tmap[src].tile_size)
 
         stage = input_idx in staged
         if in_dtype != node.dtype and input_idx not in getattr(
