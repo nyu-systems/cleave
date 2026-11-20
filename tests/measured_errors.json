@@ -200,15 +200,15 @@
    "dtype": "bfloat16",
    "rel": 0.0078125,
    "seeds": 3,
-   "validated": 600
+   "validated": 879
   },
   {
-   "abs": 2.86102294921875e-06,
+   "abs": 0.000244140625,
    "absolute": true,
    "dtype": "float32",
-   "rel": 2.3187803321889078e-07,
+   "rel": 4.207826123092673e-07,
    "seeds": 3,
-   "validated": 600
+   "validated": 879
   }
  ],
  "dynamic:gqa_paged_decode_h32_kv8_d128_ps1": [
@@ -218,7 +218,7 @@
    "dtype": "bfloat16",
    "rel": 0.0078125,
    "seeds": 3,
-   "validated": 993
+   "validated": 1095
   },
   {
    "abs": 0.000244140625,
@@ -226,7 +226,7 @@
    "dtype": "float32",
    "rel": 4.1119432125924504e-07,
    "seeds": 3,
-   "validated": 993
+   "validated": 1095
   }
  ],
  "dynamic:gqa_paged_decode_h32_kv8_d128_ps64": [
@@ -236,51 +236,51 @@
    "dtype": "bfloat16",
    "rel": 0.0078125,
    "seeds": 3,
-   "validated": 210
+   "validated": 453
   },
   {
-   "abs": 7.62939453125e-06,
+   "abs": 0.00030517578125,
    "absolute": true,
    "dtype": "float32",
-   "rel": 4.2349378759354295e-07,
+   "rel": 4.335380197062477e-07,
    "seeds": 3,
-   "validated": 210
+   "validated": 453
   }
  ],
  "dynamic:gqa_paged_prefill_causal_h32_kv4_d128_ps1": [
   {
-   "abs": 0.03125,
+   "abs": 0.015625,
    "absolute": false,
    "dtype": "bfloat16",
    "rel": 0.0078125,
    "seeds": 3,
-   "validated": 597
+   "validated": 846
   },
   {
-   "abs": 2.86102294921875e-06,
+   "abs": 0.000213623046875,
    "absolute": true,
    "dtype": "float32",
-   "rel": 5.631478074974439e-07,
+   "rel": 6.411700610442495e-07,
    "seeds": 3,
-   "validated": 597
+   "validated": 846
   }
  ],
  "dynamic:gqa_paged_prefill_causal_h32_kv8_d128_ps1": [
   {
-   "abs": 0.03125,
+   "abs": 0.015625,
    "absolute": false,
    "dtype": "bfloat16",
    "rel": 0.0078125,
    "seeds": 3,
-   "validated": 687
+   "validated": 936
   },
   {
-   "abs": 2.384185791015625e-06,
+   "abs": 0.000244140625,
    "absolute": true,
    "dtype": "float32",
-   "rel": 5.611486812995281e-07,
+   "rel": 5.383989218898932e-07,
    "seeds": 3,
-   "validated": 687
+   "validated": 936
   }
  ],
  "dynamic:gqa_ragged_prefill_causal_h32_kv4_d128": [
@@ -288,17 +288,17 @@
    "abs": 0.03125,
    "absolute": false,
    "dtype": "bfloat16",
-   "rel": 0.008733624592423439,
+   "rel": 0.0078125,
    "seeds": 3,
-   "validated": 87
+   "validated": 264
   },
   {
-   "abs": 1.9073486328125e-06,
+   "abs": 0.00042724609375,
    "absolute": true,
    "dtype": "float32",
-   "rel": 3.8946535596551257e-07,
+   "rel": 6.849729743407806e-07,
    "seeds": 3,
-   "validated": 87
+   "validated": 264
   }
  ],
  "dynamic:gqa_ragged_prefill_causal_h32_kv8_d128": [
@@ -306,53 +306,53 @@
    "abs": 0.03125,
    "absolute": false,
    "dtype": "bfloat16",
-   "rel": 0.009389671497046947,
+   "rel": 0.0078125,
    "seeds": 3,
-   "validated": 135
+   "validated": 312
   },
   {
-   "abs": 2.86102294921875e-06,
+   "abs": 0.0003662109375,
    "absolute": true,
    "dtype": "float32",
-   "rel": 5.712441861760453e-07,
+   "rel": 6.818531232966052e-07,
    "seeds": 3,
-   "validated": 135
+   "validated": 312
   }
  ],
  "dynamic:mla_paged_decode_h16_ckv512_kpe64_ps1": [
   {
-   "abs": 0.03125,
+   "abs": 0.125,
    "absolute": false,
    "dtype": "bfloat16",
    "rel": 0.0078125,
    "seeds": 3,
-   "validated": 306
+   "validated": 513
   },
   {
-   "abs": 1.9073486328125e-05,
+   "abs": 0.0018310546875,
    "absolute": true,
    "dtype": "float32",
-   "rel": 1.159774228653987e-06,
+   "rel": 1.1372815151844407e-06,
    "seeds": 3,
-   "validated": 306
+   "validated": 513
   }
  ],
  "dynamic:mla_paged_prefill_causal_h16_ckv512_kpe64_ps1": [
   {
-   "abs": 0.03125,
+   "abs": 0.125,
    "absolute": false,
    "dtype": "bfloat16",
-   "rel": 0.008097166195511818,
+   "rel": 0.0078125,
    "seeds": 3,
-   "validated": 459
+   "validated": 636
   },
   {
-   "abs": 3.4332275390625e-05,
+   "abs": 0.003662109375,
    "absolute": true,
    "dtype": "float32",
-   "rel": 1.5946823168633273e-06,
+   "rel": 4.96828897667001e-06,
    "seeds": 3,
-   "validated": 459
+   "validated": 636
   }
  ],
  "test:attention": [
