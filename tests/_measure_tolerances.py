@@ -139,11 +139,12 @@ def recommend(largest_valid: float, dtype: str) -> float:
 # The rtol is measured where it is what bounds the output. A comparison in which every
 # entry is within the floor is inside ``rtol * rowmax + ATOL_FLOOR`` whatever the rtol, so
 # it says nothing about the rtol: its row-relative error is the floor's share of a small
-# row, not an error that grows with the row. That is a row whose lse is 0 or close to it
-# (one key with a logit near 0; logits that only fall along the keys), where 2 or 3 fp32
-# ulps of the operands are 5e-7 .. 7e-7 of a row max of 0.6. Such a comparison is counted
-# and held to the declared bound like any other; it does not feed ``largest valid``
-# (``feeds_rtol``). A comparison with a single entry over the floor feeds it in full.
+# row, not an error that grows with the row. Measured on gqa_paged_decode_h32_kv8_d128_ps1
+# with logits that only fall along the keys (the lse of a row is then close to 0): errors
+# of 3e-7 .. 4e-7 are 5e-7 .. 7e-7 of a row max of 0.6, which as an rtol input would ask
+# for 5e-6, while the declared 2e-6 * rowmax + 1e-6 holds those rows with 5x to spare.
+# Such a comparison is counted and held to the declared bound like any other; it does not
+# feed ``largest valid`` (``feeds_rtol``). One entry over the floor and it feeds in full.
 ATOL_FLOOR = step125(SAFETY * ULP["float32"] / math.log(2))  # 1e-6
 
 

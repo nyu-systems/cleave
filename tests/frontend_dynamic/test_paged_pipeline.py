@@ -287,6 +287,9 @@ def test_an_exact_operator_is_validated_on_its_adversarial_workloads(monkeypatch
     assert {k.partition("@")[2] for k in _adversarial(keys)} == {
         "large_logits", "large_scale", "increasing", "dominant_last"}
     assert kernel.report.n_workloads == captured + 12
+    summary = kernel.report.summary()
+    assert f"3 of 3 correct over {captured + 12} workloads" in summary
+    assert "split pairs over" not in summary
     # they are never timed
     (_, _, timed), = [c for c in calls if c[0] == "time"]
     assert len(timed) == 3 and not _adversarial(timed)
@@ -340,6 +343,10 @@ def test_the_split_pairs_of_an_exact_operator_are_not_sent_its_adversarial_workl
     assert report.dispatch and report.dispatch["n_workloads"] == captured
     assert len(timings) == 2 and len(timings[1][1]) == captured  # the calibration
     assert set(kernel.dispatch_sources) == {"split", "single"}
+    # and the report does not count the pairs among what passed the adversarial workloads
+    assert report.validated_on() == (
+        f"{captured + 12} workloads (split pairs over {captured}: the captured ones)")
+    assert f"5 of 5 correct over {report.validated_on()}" in report.summary()
 
     # asked for, the adversarial workloads go to every candidate in one pass (and the
     # pairs then fail on a GPU, which is what the caller asked to see)

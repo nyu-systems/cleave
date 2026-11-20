@@ -320,13 +320,25 @@ class DynamicReport:
         """Per output, the largest error measured over the correct candidates' workloads."""
         return worst_measured(c.measured for c in self.correct)
 
+    def validated_on(self) -> str:
+        """What the correct candidates were checked on. The split pairs of an operator
+        whose softmax is exact are not sent its adversarial workloads yet
+        (``_validation_passes``); a line that counted them with the single kernels would
+        claim more than was checked."""
+        pairs = {c.checked for c in self.correct if c.split}
+        single = {c.checked for c in self.correct if not c.split}
+        text = f"{self.n_workloads} workloads"
+        if pairs and single and pairs != single:
+            text += f" (split pairs over {max(pairs)}: the captured ones)"
+        return text
+
     def summary(self) -> str:
         graphs, t = self.plans.graphs, self.timings
         rows = [("superoptimize", f"{len(graphs)} dense graph(s), "
                  f"{'cache hit' if graphs.from_cache else 'searched'}", t.get("superoptimize")),
                 ("schedule", self.plans.summary().replace("\n  ", "  "), t.get("schedule")),
                 ("validate", f"{len(self.correct)} of {len(self.candidates)} correct over "
-                 f"{self.n_workloads} workloads"
+                 f"{self.validated_on()}"
                  + (f"  max error {format_measured(self.measured_error(), self.tolerance)}"
                     if self.measured_error() else ""), t.get("validate"))]
         rows += [("", f"  {n}x {k}", None) for k, n in self.histogram().items()]
