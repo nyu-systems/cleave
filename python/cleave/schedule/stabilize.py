@@ -189,11 +189,9 @@ def _locate(tier, owner, exp, threads=None) -> Site:
         raise _refused(exp, f"its tile {tile} holds a single row")
 
     if step == block:
-        if a != -1 and (owner is not None or any(t == 1 for t in tile[:axis])):
-            # An un-looped reduction over a non-last axis is emitted with the flat-graph
-            # `dim`; once a unit dim in front of it is squeezed out of the tile that is
-            # the wrong axis. A max would have the same defect.
-            raise _refused(exp, f"softmax axis {a} is not the last axis and is not looped")
+        # Whatever axis the softmax is over, in the main tier or in a loop that does not
+        # tile it: the max gets the `dim` of the tile it reads (`rebase_reduction_axis`),
+        # as the sums next to it do.
         if st.export is not None:
             if owner is not None:
                 raise _refused(

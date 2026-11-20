@@ -35,6 +35,16 @@ def softmax_shift_free(x: cl.Tensor["R", "C"]):
     return cl.softmax(x, -1, shift=0.0)
 
 
+def softmax_mid(x: cl.Tensor["H", "C", "R"]):
+    return cl.softmax(x, 1)
+
+
+def attention_over_queries(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
+                           v: cl.Tensor["H", "SKV", "D"]):
+    """Attention normalized over the queries: every key's column of weights sums to 1."""
+    return cl.softmax((q @ k.mT) / q.shape[-1] ** 0.5, dim=-2) @ v
+
+
 def softmax_by_hand(x: cl.Tensor["R", "C"]):
     e = cl.exp(x - cl.max(x, -1, keepdim=True))
     return e / cl.sum(e, -1, keepdim=True)
@@ -239,6 +249,46 @@ def test_gpu_exact_softmax_attention(cache_root):
     q = q * 4  # scores far from the fixed -50/sqrt(d) shift
     ref = torch.softmax((q.float() @ k.float().mT) / 8.0, -1) @ v.float()
     torch.testing.assert_close(kernel(q, k, v).float(), ref, rtol=2e-2, atol=2e-2)
+
+
+def test_gpu_exact_softmax_over_a_middle_axis(cache_root):
+    """``softmax(x, 1)`` of a batched input: the softmax axis is not the last one, and the
+    batch dim in front of it is a unit extent the stored tile does not have. Every plan
+    takes the max in place over the right axis of that tile."""
+    _gpu()
+    from cleave.runtime.inputs import ADVERSARIAL
+
+    kernel = P.compile(softmax_mid, shapes=dict(H=4, C=256, R=64), dtype=cl.f16, split=False,
+                       tolerance=tolerance_for("softmax_mid"), **FAST)
+    report = kernel.report
+    assert len(report.correct) >= 1
+    assert all(r.cases == ("normal",) + ADVERSARIAL for r in report.results)
+    x = (torch.randn(4, 256, 64) * 30).to("cuda", torch.float16)
+    torch.testing.assert_close(kernel(x).float(), torch.softmax(x.float(), 1),
+                               rtol=2e-2, atol=2e-3)
+
+
+def test_gpu_exact_softmax_over_the_queries(cache_root):
+    """Attention normalized over the queries (``dim=-2``): the exp sits in the loop of the
+    value matmul, which tiles the keys, and each iteration takes the max over the whole
+    query axis of its tile."""
+    _gpu()
+    from cleave.runtime.inputs import ADVERSARIAL
+
+    shapes = dict(H=32, SQ=64, SKV=1024, D=64)
+    kernel = P.compile(attention_over_queries, shapes=shapes, dtype=cl.f16, split=False,
+                       tolerance=tolerance_for("exact_attention"), **FAST)
+    report = kernel.report
+    assert kernel.variant == "solo" and len(report.correct) >= 1
+    assert all(r.cases == ("normal",) + ADVERSARIAL for r in report.results)
+    g = torch.Generator().manual_seed(0)
+    q, k, v = (torch.randn(s, generator=g).to("cuda", torch.float16)
+               for s in [(32, 64, 64), (32, 1024, 64), (32, 1024, 64)])
+    q = q * 40  # logits up to several hundred
+    ref = torch.softmax((q.float() @ k.float().mT) / 8.0, -2) @ v.float()
+    out = kernel(q, k, v).float()
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2)
 
 
 def test_gpu_exact_softmax_long_rows(cache_root):

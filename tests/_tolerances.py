@@ -66,6 +66,7 @@ TOLERANCES = {
     # ---- traced test programs (tests/frontend/_programs.py, test_exact_softmax.py)
     "matmul": Tolerance(rtol=5e-3),
     "softmax": Tolerance(rtol=1e-3),
+    "softmax_mid": Tolerance(rtol=2e-3),  # over the middle axis of a batched input
     "exact_attention": Tolerance(rtol=5e-3),
     # the fixed-shift attention, split: partials, combines and the chained Kernel
     "attention": Tolerance(rtol=5e-3),

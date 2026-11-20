@@ -405,12 +405,12 @@
  ],
  "test:exact_attention": [
   {
-   "abs": 0.00048828125,
+   "abs": 0.001953125,
    "absolute": false,
    "dtype": "float16",
    "rel": 0.0009756097570061684,
    "seeds": 3,
-   "validated": 396
+   "validated": 630
   }
  ],
  "test:flash_attention_sd_graph": [
@@ -685,6 +685,16 @@
    "rel": 0.00013758943532593548,
    "seeds": 3,
    "validated": 84
+  }
+ ],
+ "test:softmax_mid": [
+  {
+   "abs": 7.62939453125e-06,
+   "absolute": false,
+   "dtype": "float16",
+   "rel": 0.0004397537268232554,
+   "seeds": 3,
+   "validated": 126
   }
  ],
  "test:swiglu_graph": [

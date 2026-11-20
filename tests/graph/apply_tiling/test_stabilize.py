@@ -436,7 +436,7 @@ COLUMN = dict(H=4, K=4096, N=256)
     ("fn", "shapes", "softmax", "cases"),
     [
         (S.flash_attention, SMALL, (), {"rolling", "in-tile"}),
-        (S.column_average, COLUMN, (dict(axis=-2),), {"rolling"}),
+        (S.column_average, COLUMN, (dict(axis=-2),), {"rolling", "in-tile"}),
         (S.column_average_2d, dict(K=4096, N=1024), (dict(axis=-2),), {"rolling", "in-tile"}),
     ],
     ids=["last_axis", "first_axis_behind_a_batch_dim", "first_axis"],
@@ -484,7 +484,6 @@ def test_a_loop_tile_of_one_column_is_refused_as_a_single_row():
         f"{e}: its tile (N,) holds a single row": 12,
         f"{e}: its tile (N, N, N) holds a single row": 1,
         f"{e}: one element of the softmax axis per iteration; the tile would lose that axis": 8,
-        f"{e}: softmax axis -2 is not the last axis and is not looped": 1,
     }
     tier, owner, node = _find(_pristine(ir, single), e)
     it = tmap_by_name(tier)[e]
@@ -749,10 +748,6 @@ def _single_row(t):
     _retile(t.tier, t.exp, tile=(1, 32))
 
 
-def _first_axis_whole_in_a_loop(t):
-    _record(t, axes=(-2,))
-
-
 def _export_in_a_loop_that_holds_the_row(t):
     _retile(t.tier, t.exp, tile=(64, 256))
     _record(t, export="m")
@@ -812,7 +807,6 @@ ROLLING_REFUSALS = [
     (_block_holds_half_the_row,
      r"the softmax axis is spread over grid blocks \(128 of 256 per block\)"),
     (_single_row, r"its tile \(1, 32\) holds a single row"),
-    (_first_axis_whole_in_a_loop, r"softmax axis -2 is not the last axis and is not looped"),
     (_export_in_a_loop_that_holds_the_row,
      r"exported max 'm' would accumulate over a loop that does not tile the softmax axis"),
     (_one_element_steps, r"one element of the softmax axis per iteration"),
@@ -869,10 +863,6 @@ def _block_holds_half_the_row_main(t):
     _retile(t.tier, t.exp, tile=(1, 64, 128))
 
 
-def _unit_dim_in_front(t):
-    _record(t, axes=(-2,))
-
-
 def _single_row_main(t):
     _retile(t.tier, t.exp, tile=(1, 1, 256))
 
@@ -880,7 +870,6 @@ def _single_row_main(t):
 MAIN_REFUSALS = [
     (_block_holds_half_the_row_main,
      r"the softmax axis is spread over grid blocks \(128 of 256 per block\)"),
-    (_unit_dim_in_front, r"softmax axis -2 is not the last axis and is not looped"),
     (_single_row_main, r"its tile \(1, 1, 256\) holds a single row"),
 ]
 

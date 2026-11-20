@@ -37,9 +37,18 @@ def softmax_rows(x: cl.Tensor["R", "C"]):
     return cl.softmax(x, -1)
 
 
+def softmax_mid(x: cl.Tensor["H", "C", "R"]):
+    return cl.softmax(x, 1)
+
+
 def attention(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
               v: cl.Tensor["H", "SKV", "D"]):
     return cl.softmax((q @ k.mT) / q.shape[-1] ** 0.5, dim=-1) @ v
+
+
+def attention_over_queries(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
+                           v: cl.Tensor["H", "SKV", "D"]):
+    return cl.softmax((q @ k.mT) / q.shape[-1] ** 0.5, dim=-2) @ v
 
 
 def flash_wide_values(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
@@ -56,6 +65,11 @@ WIDE = dict(H=8, SQ=64, SKV=1024, D=64, DV=512)
 # here, it makes the request the way ``cl.softmax`` does.
 KERNELS = {
     "softmax_64x1024/in-tile": (softmax_rows, dict(R=64, C=1024), "in-tile"),
+    # a softmax axis that is not the last: behind a squeezed batch dim, and inside the loop
+    # of the value matmul
+    "softmax_mid_4x256x64/in-tile": (softmax_mid, dict(H=4, C=256, R=64), "in-tile"),
+    "attention_over_queries_skv1024/in-tile": (
+        attention_over_queries, dict(H=32, SQ=64, SKV=1024, D=64), "in-tile"),
     "attention_skv256/in-tile": (attention, SHORT, "in-tile"),
     "flash_skv256/in-tile": (S.flash_attention, SHORT, "in-tile"),
     "flash_skv256/rolling": (S.flash_attention, SHORT, "rolling"),
@@ -64,9 +78,11 @@ KERNELS = {
 }
 
 # The SCHEMA these digests were generated under, and the digests. Re-pin both together.
-PINNED_SCHEMA = 12
+PINNED_SCHEMA = 13
 PINNED = {
     'softmax_64x1024/in-tile': ('tile=[2, 1024] rstep=[1024]', '8211bb6438573d68'),
+    'softmax_mid_4x256x64/in-tile': ('tile=[1, 256, 2] rstep=[256]', '77c506ba7b618bee'),
+    'attention_over_queries_skv1024/in-tile': ('tile=[1, 64, 32] rstep=[32, 1, 32]', '2e88cd515f035f38'),
     'attention_skv256/in-tile': ('tile=[1, 64, 32] rstep=[32, 256, 256]', 'd5982c362d1466dd'),
     'flash_skv256/in-tile': ('tile=[1, 64, 32] rstep=[32, 256, 256]', '9464e85013b3084e'),
     'flash_skv256/rolling': ('tile=[1, 64, 32] rstep=[32, 32, 32]', '963ffee491434feb'),

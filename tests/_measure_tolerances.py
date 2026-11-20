@@ -289,6 +289,8 @@ def _test_operators():
         if path == "tests/pipeline_api/test_split_attention.py":
             return "attention"
         if path == "tests/frontend/test_exact_softmax.py":
+            if "middle_axis" in test:
+                return "softmax_mid"
             return "softmax" if "standalone" in test else "exact_attention"
         return node
 
