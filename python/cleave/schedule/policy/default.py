@@ -5,6 +5,7 @@ from .common import (
     coalesced_tensor_shape,
 )
 from .bestfit import BestFit
+from ...core.errors import ScheduleRejected
 from .hint import TileDict, Stride
 from ...ir.graph import ViewOpNode
 from ...ir.analysis import (
@@ -973,10 +974,20 @@ class DefaultPolicy:
                 for n in base_rstep_map
                 if n.raxis
             }
-            steps = {
-                n: step[step.index(base_rstep_map[n][n.raxis[0].var.name]) :]
-                for n, step in _steps.items()
-            }
+            steps = {}
+            for n, step in _steps.items():
+                base = base_rstep_map[n][n.raxis[0].var.name]
+                if base not in step:
+                    # A tensor-core reduction starts at the tensor-core step whatever its
+                    # extent is ("for the case of padding", `_assign_reduce_step`), and the
+                    # walk only knows the steps that divide the extent: nothing pads the
+                    # last tile of a reduction.
+                    raise ScheduleRejected(
+                        f"{n.name}: its reduction over {int(n.raxis[0].dom.extent)} elements "
+                        f"starts at the tensor-core step {base}, which does not divide it; "
+                        "the last tile of a reduction is not padded"
+                    )
+                steps[n] = step[step.index(base) :]
 
             add_to_queue(base_td.output_tile, base_rstep_map)
             while not queue.empty():

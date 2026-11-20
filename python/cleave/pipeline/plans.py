@@ -212,6 +212,8 @@ def _search(ir_graph, topk: int, force: bool, hints: dict | None,
         kw["accept"] = stable if user is None else (lambda cand: user(cand) and stable(cand))
     try:
         return list(search_tiling(ir_graph, topk=topk, force_fusion=force, **kw))
+    except ScheduleRejected:
+        raise  # the policy's own refusal of the whole graph, with its reason
     except Exception as e:  # noqa: BLE001
         # Not a refused candidate: the filter drops those itself. Whatever else it or the
         # search raises is a bug, and names itself in the refusal of the whole graph.
