@@ -346,6 +346,40 @@ OUTCOMES = {
 }
 
 
+def test_the_softmax_accept_filter_schedules_as_the_build_does(monkeypatch):
+    """The softmax filter keeps a candidate iff the default build schedules it: both go
+    through ``schedule_kernel``. The refusals above are the build's, not ``apply_tiling``'s,
+    so a filter that asked ``apply_tiling`` alone agreed with the build only as long as
+    the rewrite happened to refuse the same tilings first."""
+    from cleave.core.errors import ScheduleRejected
+    from cleave.schedule import search_tiling
+    from cleave.schedule import tiling
+    from cleave.schedule.stabilize import stabilize_accept
+    from tests import _softmax as S
+
+    # exp / sum(exp) with the exp marked; its divide reads the exp next to the sum, so no
+    # rolling form: every tiling that is served holds a row whole
+    ir = S.softmax_ir(S.softmax_rows, dict(R=64, C=1024),
+                      dict(rolling="reads the exp next to the finished reduction"))
+    accept = stabilize_accept(ir)
+    cands = search_tiling(ir, topk=1000)
+    kept = [accept(c) for c in cands]
+    assert kept == [_build(c)[0] is not None for c in cands]
+    served = [c for c, ok in zip(cands, kept) if ok]
+    assert served and len(served) < len(cands)
+
+    # By construction: whatever the build's own check refuses, the filter refuses, for
+    # the same reason.
+    def refuse_everything(main):
+        raise ScheduleRejected("probe: no kernel for this graph")
+
+    monkeypatch.setattr(tiling, "refuse_unit_extents", refuse_everything)
+    probe = stabilize_accept(ir)
+    assert not any(probe(c) for c in served)
+    assert dict(probe.reasons) == {"probe: no kernel for this graph": len(served)}
+    assert {_build(c) for c in served} == {(None, "probe: no kernel for this graph")}
+
+
 @pytest.mark.parametrize("name", sorted(OUTCOMES))
 def test_every_candidate_is_built_or_refused_with_a_reason(name):
     """Every tiling the policy proposes for the two split combines: a kernel, or a typed

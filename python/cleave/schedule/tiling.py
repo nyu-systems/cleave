@@ -1076,9 +1076,9 @@ def refuse_unit_extents(main: Graph) -> None:
 
     Such a candidate used to be built and handed to TileLang, where it died at parse or in
     layout inference, each with whatever message the missing dim produced first. This is
-    the default build's check (``runtime.compile.build_candidate``), not ``apply_tiling``'s:
-    the paged path schedules step-1 tilings only to read them (``read_dense_combine``) and
-    emits its own kernels for them.
+    the default build's check (``schedule_kernel``), not ``apply_tiling``'s: the paged path
+    schedules step-1 tilings only to read them (``read_dense_combine``) and emits its own
+    kernels for them.
     """
     from ..ir.ops import Matmul
     from ..ir.ops.elementwise import BinaryElementwise, UnaryElementwise
@@ -1124,6 +1124,22 @@ def refuse_unit_extents(main: Graph) -> None:
                             f"{_stored_rank(tile)} dim(s); a matmul takes 2-D operands and "
                             "gives a 2-D result, so a single row or column has no kernel"
                         )
+
+
+def schedule_kernel(cand) -> Graph:
+    """``apply_tiling`` for a candidate the default build emits a kernel for.
+
+    The scheduled graph, or ``ScheduleRejected``: from ``apply_tiling`` itself (the
+    stabilization rewrite included), or because the kernel could not compile for a unit
+    extent (``refuse_unit_extents``). The default build (``runtime.compile.
+    build_candidate``) and the softmax accept filter (``stabilize.stabilize_accept``)
+    both schedule through here, so what the filter keeps is what the build schedules, by
+    construction. The paged path calls ``apply_tiling`` itself: it schedules step-1
+    tilings only to read them and emits its own kernels for them.
+    """
+    tiled = apply_tiling(cand)
+    refuse_unit_extents(tiled)
+    return tiled
 
 
 def apply_tiling(cand: List) -> List[Graph]:

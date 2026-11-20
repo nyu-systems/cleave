@@ -146,13 +146,11 @@ def build_candidate(cand, options: CompilerPassOptions | None = None):
     """
     from ..codegen import TilelangCodeGen
     from ..ir.graph import OutputNode
-    from ..schedule import apply_tiling
-    from ..schedule.tiling import refuse_unit_extents
+    from ..schedule.tiling import schedule_kernel
     from ..codegen import passes
 
     options = options or CompilerPassOptions()
-    sch_graph = apply_tiling(cand)
-    refuse_unit_extents(sch_graph)  # typed, instead of a kernel TileLang cannot take
+    sch_graph = schedule_kernel(cand)  # typed refusals, not kernels TileLang cannot take
     sch_graph = passes.annotate_args(sch_graph, is_main=True)
     sch_graph = passes.annotate_tinfo(sch_graph, is_main=True)
     if options.tc_awareness_pass:

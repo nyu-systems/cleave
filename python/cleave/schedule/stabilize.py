@@ -629,10 +629,12 @@ def _reason_key(error) -> str:
 def stabilize_accept(flat_graph):
     """``search_tiling(accept=...)`` filter for a graph with marked Exps, else ``None``.
 
-    A candidate is kept iff ``apply_tiling`` builds it, rewrite included: the filter is the
-    build, so the two cannot disagree. It runs before the top-k cut, because once the max is
-    gone from the searched graph the policy ranks tilings the rewrite has to refuse above
-    the ones it can serve, and they would fill the top-k.
+    A candidate is kept iff the default build schedules it (``tiling.schedule_kernel``:
+    ``apply_tiling``, rewrite included, and the refusal of unit extents no kernel compiles
+    for). The build calls the same function, so the two cannot disagree. It runs before
+    the top-k cut, because once the max is gone from the searched graph the policy ranks
+    tilings the rewrite has to refuse above the ones it can serve, and they would fill
+    the top-k.
 
     Only ``ScheduleRejected`` (``StabilizeRefused`` and the tiler's own typed refusals)
     drops a candidate; ``accept.reasons`` counts them by reason. Any other exception is a
@@ -640,11 +642,11 @@ def stabilize_accept(flat_graph):
     """
     if not annotated(flat_graph):
         return None
-    from .tiling import apply_tiling
+    from .tiling import schedule_kernel
 
     def accept(cand) -> bool:
         try:
-            apply_tiling(cand)
+            schedule_kernel(cand)
         except ScheduleRejected as e:
             accept.reasons[_reason_key(e)] += 1
             return False
