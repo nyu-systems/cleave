@@ -442,9 +442,6 @@ class PagedKernel(Kernel):
                 raise ValueError(f"{self.name}: page_size=1 reads no {p.name}; pass None")
             if p in kept and bound.get(p.name) is None:
                 raise TypeError(f"{self.name}: missing input {p.name!r}")
-        self.compile()
-        if self._slots is None:
-            self._slots = self._kernel_slots()
         sizes = {}
         for p in kept:
             if not p.is_scalar:
@@ -455,6 +452,19 @@ class PagedKernel(Kernel):
         outs = [torch.empty([sizes[d.name] if hasattr(d, "name") else int(d) for d in dims],
                             dtype=dt.torch, device=q.device)
                 for dims, dt in zip(self.attention.output_dims(), self.attention.output_dtypes())]
+        if any(bound[cache.name].numel() == 0 for cache in self.attention.caches):
+            # A cache without a row holds no key for any request, so every output row is
+            # what the operator defines for an empty window: 0, and -inf in the lse.
+            # Nothing is launched: the ragged and slab kernels address their caches through
+            # TMA descriptors, and one cannot be built for a zero-sized tensor (TileLang
+            # 0.1.13 raises "globalAddress must be non-null" before the kernel starts).
+            outs[0].zero_()
+            for lse in outs[1:]:
+                lse.fill_(float("-inf"))
+            return outs[0] if len(outs) == 1 else tuple(outs)
+        self.compile()
+        if self._slots is None:
+            self._slots = self._kernel_slots()
         self._compiled(*[bound[p.name] for p in self._slots], *outs)
         return outs[0] if len(outs) == 1 else tuple(outs)
 

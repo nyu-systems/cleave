@@ -370,3 +370,46 @@ def test_custom_workloads_are_not_extended_with_adversarial_ones(monkeypatch):
     validations = [(labels, keys) for stage, labels, keys in calls if stage == "validate"]
     assert validations == [
         (["solo kv=64", "solo kv=32", "pair S=4", "tuned kv=64 q=16"], ["mine_0", "mine_1"])]
+
+
+# ----------------------------------------------------------------- a cache with no row
+def test_a_cache_without_a_row_is_answered_without_a_launch():
+    """Every request of a batch may have no key, and the key tensors of a ragged batch then
+    have no row at all. The operator defines the answer -- 0, and -inf in the lse -- but the
+    kernel cannot be launched to give it: its caches are TMA sources, and a zero-sized tensor
+    has no descriptor (TileLang raises ``InternalError: Invalid TMA descriptor arguments ...
+    globalAddress must be non-null`` before the kernel starts). ``PagedKernel`` answers such
+    a call itself, and launches as usual as soon as a cache has a row."""
+    import torch
+
+    from cleave.pipeline.dynamic import PagedKernel
+    from demo.dynamic.gqa_ragged_prefill import build as build_ragged
+
+    fn, hints = build_ragged("kv8")
+    attention = trace_paged(fn, hints=hints).attention()
+    launched = []
+    kernel = PagedKernel(attention, attention.paging_spec(), "the kernel's source",
+                         compiled=lambda *args: launched.append(args))
+    kernel._slots = attention.inputs  # the stub is called in the traced order
+
+    q = torch.randn(13, 32, 128).to(torch.bfloat16)
+    qo_indptr = torch.tensor([0, 4, 4, 13], dtype=torch.int32)
+    kv_indptr = torch.zeros(4, dtype=torch.int32)  # three requests, no key in any
+    k = v = torch.empty(0, 8, 128, dtype=torch.bfloat16)
+    out, lse = kernel(q, k, v, qo_indptr, kv_indptr, 0.088)
+    assert not launched
+    assert out.shape == (13, 32, 128) and out.dtype == torch.bfloat16 and not out.any()
+    assert lse.shape == (13, 32) and lse.dtype == torch.float32
+    assert torch.isneginf(lse).all()
+    # by name as well, and with only one of the two caches empty
+    named = dict(q=q, k=k, v=torch.zeros(1, 8, 128, dtype=torch.bfloat16),
+                 qo_indptr=qo_indptr, kv_indptr=kv_indptr, sm_scale=0.088)
+    out, lse = kernel(**named)
+    assert not launched and not out.any() and torch.isneginf(lse).all()
+
+    # one spare row and the kernel is launched as before, on outputs it has to fill
+    k = v = torch.zeros(1, 8, 128, dtype=torch.bfloat16)
+    kernel(q, k, v, qo_indptr, kv_indptr, 0.088)
+    (args,) = launched
+    assert len(args) == 8 and args[1] is k and args[5] == 0.088
+    assert [tuple(t.shape) for t in args[6:]] == [(13, 32, 128), (13, 32)]
