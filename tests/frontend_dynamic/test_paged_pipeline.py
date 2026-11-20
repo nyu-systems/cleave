@@ -269,11 +269,11 @@ def _adversarial(keys):
     return [k for k in keys if "@" in k]
 
 
-def test_an_exact_operator_is_validated_on_its_adversarial_workloads(monkeypatch):
-    """The single kernels of the operator whose softmax is exact are held to its adversarial
-    workloads without being asked; an operator that is not exact yet is not."""
+def test_a_registry_operator_is_validated_on_its_adversarial_workloads(monkeypatch):
+    """A registry operator's kernels are held to its adversarial workloads without being
+    asked: the softmax of every paged layer is exact, so they are part of what it passes."""
     op = OPERATORS[CASES["kv8"]]
-    assert op.exact_softmax and len(op.adversarial) == 12
+    assert len(op.adversarial) == 12
     captured = len(op.workloads)
 
     kernel, calls = _recorded_compile(monkeypatch, "kv8", split=False, max_workloads=3)
@@ -294,72 +294,74 @@ def test_an_exact_operator_is_validated_on_its_adversarial_workloads(monkeypatch
     (_, _, timed), = [c for c in calls if c[0] == "time"]
     assert len(timed) == 3 and not _adversarial(timed)
 
+    # every registry operator, not one: the same pass for the kv4 program ...
     other = OPERATORS[CASES["kv4"]]
-    assert not other.exact_softmax and other.adversarial
+    assert len(other.adversarial) == 12
     _, calls = _recorded_compile(monkeypatch, "kv4", split=False)
-    assert [len(_adversarial(keys)) for _, _, keys in calls] == [0, 0]
-    # ... unless the caller asks for them
+    assert [(stage, len(_adversarial(keys))) for stage, _, keys in calls] == [
+        ("validate", 12), ("time", 0)]
+    # ... and asking for them by name changes nothing
     _, calls = _recorded_compile(monkeypatch, "kv4", split=False, adversarial=True)
-    assert [len(_adversarial(keys)) for _, _, keys in calls] == [12, 0]
+    assert [(stage, len(_adversarial(keys))) for stage, _, keys in calls] == [
+        ("validate", 12), ("time", 0)]
 
 
-def test_the_split_pairs_of_an_exact_operator_are_not_sent_its_adversarial_workloads(monkeypatch):
-    """A split-KV pair of the exact operator still builds the unshifted exp (its partial
-    does not hand a max to the combine yet), which overflows on the adversarial workloads by
-    construction. Until the pair is converted it is validated on the captured workloads, as
-    it was, so it stays eligible and the split/single dispatch is still calibrated."""
+def test_split_pairs_are_validated_on_the_adversarial_workloads_too(monkeypatch):
+    """A split-KV pair is exact like the single kernel -- its partial hands its running max
+    to the combine, which weighs the splits by it -- so it is held to the same workloads,
+    in the same single validation pass, and stays eligible for the split/single dispatch."""
     from cleave.dynamic.paging import CombineTiling, DenseAttention, build_split_decode
-    from cleave.ir.graph import GraphNode
+    from cleave.ir.graph import GraphNode, PlaceHolderNode
     from cleave.ir.ops import MaskedExp
 
     op = OPERATORS[CASES["kv8"]]
     captured = len(op.workloads)
-    # what the pipeline's two passes follow: the pair's partial is not exact, the single is
+    # what makes one pass right: the pair's partial is exact and the combine takes its max
     dense = DenseAttention(query_rows=16, kv_tile=64, head_dim=128, n_threads=128,
                            dtype="bfloat16", accum_dtype="float32", out_dtype="bfloat16")
-    partial, _ = build_split_decode(
+    partial, combine = build_split_decode(
         op.spec, dense, 4, CombineTiling(split=4, split_step=1, cols=128, n_threads=128))
     shifted = [n.shift for g in partial.nodes if isinstance(g, GraphNode)
                for n in g.graph.nodes if isinstance(n, MaskedExp)]
-    assert shifted == [False]
+    assert shifted == [True]
+    assert [n.name for n in combine.args if isinstance(n, PlaceHolderNode)] == [
+        "PlaceHolder_ROWSUM", "PlaceHolder_VALUE", "PlaceHolder_MAX"]
 
     split = cl.Split("kv_len", (4, 8))
+    everyone = ["solo kv=64", "solo kv=32", "pair S=4", "pair S=8", "tuned kv=64 q=16"]
     kernel, calls = _recorded_compile(monkeypatch, "kv8", split=split, max_workloads=3)
     validations = [(labels, keys) for stage, labels, keys in calls if stage == "validate"]
-    assert [labels for labels, _ in validations] == [
-        ["solo kv=64", "solo kv=32", "tuned kv=64 q=16"], ["pair S=4", "pair S=8"]]
-    (_, single_keys), (_, pair_keys) = validations
-    assert len(_adversarial(single_keys)) == 12 and len(single_keys) == captured + 12
-    assert not _adversarial(pair_keys) and len(pair_keys) == captured
-    assert pair_keys == single_keys[:captured]
-    # timed together, in candidate order, on captured workloads; the pair is eligible and
-    # the dispatch is calibrated on captured workloads only
+    # one pass over every candidate, in candidate order, on captured + adversarial
+    assert [labels for labels, _ in validations] == [everyone]
+    keys = validations[0][1]
+    assert len(keys) == captured + 12 and _adversarial(keys) == keys[captured:]
+    assert len(_adversarial(keys)) == 12
+    # timed together on captured workloads; the pair is eligible and the dispatch is
+    # calibrated on captured workloads only
     timings = [(labels, keys) for stage, labels, keys in calls if stage == "time"]
-    assert timings[0][0] == ["solo kv=64", "solo kv=32", "pair S=4", "pair S=8",
-                             "tuned kv=64 q=16"]
+    assert timings[0][0] == everyone
     assert all(not _adversarial(keys) for _, keys in timings)
     report = kernel.report
     assert report.best(split=True) is not None and report.best(split=False) is not None
     assert report.dispatch and report.dispatch["n_workloads"] == captured
     assert len(timings) == 2 and len(timings[1][1]) == captured  # the calibration
     assert set(kernel.dispatch_sources) == {"split", "single"}
-    # and the report does not count the pairs among what passed the adversarial workloads
-    assert report.validated_on() == (
-        f"{captured + 12} workloads (split pairs over {captured}: the captured ones)")
-    assert f"5 of 5 correct over {report.validated_on()}" in report.summary()
+    # every candidate passed the same workloads, and the report says so in one figure
+    assert {c.checked for c in report.correct} == {captured + 12}
+    assert report.n_workloads == captured + 12
+    summary = report.summary()
+    assert f"5 of 5 correct over {captured + 12} workloads" in summary
+    assert "split pairs over" not in summary
 
-    # asked for, the adversarial workloads go to every candidate in one pass (and the
-    # pairs then fail on a GPU, which is what the caller asked to see)
-    _, calls = _recorded_compile(monkeypatch, "kv8", split=split, adversarial=True)
-    validations = [(labels, keys) for stage, labels, keys in calls if stage == "validate"]
-    assert [labels for labels, _ in validations] == [
-        ["solo kv=64", "solo kv=32", "pair S=4", "pair S=8", "tuned kv=64 q=16"]]
-    assert len(_adversarial(validations[0][1])) == 12
+    # asking for the adversarial workloads by name is the same pass
+    _, again = _recorded_compile(monkeypatch, "kv8", split=split, max_workloads=3,
+                                 adversarial=True)
+    assert again == calls
 
 
 def test_custom_workloads_are_not_extended_with_adversarial_ones(monkeypatch):
     """The adversarial table belongs to the registry's captured workloads; a caller's own
-    workloads are validated as given, also for the exact operator."""
+    workloads are validated as given."""
     own = lambda: iter([("mine_0", (_Indptr(),), ()), ("mine_1", (_Indptr(),), ())])  # noqa: E731
     _, calls = _recorded_compile(monkeypatch, "kv8", split=False, workloads=own)
     assert [keys for _, _, keys in calls] == [["mine_0", "mine_1"]] * 2

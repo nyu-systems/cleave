@@ -27,7 +27,7 @@ OPERATOR = "gqa_paged_decode_h32_kv8_d128_ps1"
 def test_gqa_paged_decode_h32_kv8_d128_ps1_pipeline():
     dims = (32, 8, 128)  # num_qo_heads, num_kv_heads, head_dim
     num_qo_heads, num_kv_heads, _ = dims
-    assert OPERATORS[OPERATOR].exact_softmax and OPERATORS[OPERATOR].adversarial
+    assert len(OPERATORS[OPERATOR].adversarial) == 12
 
     graph = build_paged_graph(
         PagingSpec(num_qo_heads=num_qo_heads, num_kv_heads=num_kv_heads)

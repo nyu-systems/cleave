@@ -335,9 +335,9 @@ def _spread(axes, keep=3):
 
 # Adversarial softmax workloads, apart from the captured ``WORKLOADS``: ``(distribution, axes)``
 # per operator, the axes drawn from its captured ones (see ``reference.apply_distribution``).
-# An operator validates on these once its softmax is exact (``DynamicOperator.exact_softmax``);
-# for any other, ask for them (``keyed_workloads(adversarial=True)``,
-# ``cleave.compile(fn, adversarial=True)``). They are never timed: the latency gate, the
+# Every operator validates on these after its captured workloads
+# (``keyed_workloads(adversarial=True)``): the softmax of every paged layer is exact, so a
+# correct kernel holds at any logit scale. They are never timed: the latency gate, the
 # autotune timing and the split/single dispatch calibration see the captured workloads only.
 ADVERSARIAL_DISTRIBUTIONS = ("large_logits", "large_scale", "increasing", "dominant_last")
 ADVERSARIAL_WORKLOADS = {

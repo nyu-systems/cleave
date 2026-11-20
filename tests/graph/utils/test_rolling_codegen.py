@@ -15,6 +15,7 @@ pytest.importorskip("tvm")
 
 from cleave.codegen import TilelangCodeGen
 from cleave.codegen.kernel import emission_order
+from cleave.dynamic import OPERATORS
 from cleave.ir.graph_utils import find_topo_sort, graph_tiers
 
 from tests._lowering import lower_to_cuda
@@ -31,9 +32,10 @@ def _calls(code, macro):
     return [re.sub(r"\s+", " ", s).strip() for s in re.split(r"\n(?=    \S)", body) if s.strip()]
 
 
-# The hand-written cases whose loop declares a rolling softmax: the static one, and the
-# paged operators whose softmax is exact so far.
-ROLLING = {"mha_bhsd_rolling", "gqa_paged_decode_h32_kv8_d128_ps1"}
+# The hand-written cases whose loop declares a rolling softmax: the static one, and every
+# paged operator -- the softmax of every paged layer is exact.
+ROLLING = {"mha_bhsd_rolling", *OPERATORS}
+assert len(ROLLING) == 10 and ROLLING <= set(CASES)
 
 
 # ------------------------------------------------------------------------- emission order

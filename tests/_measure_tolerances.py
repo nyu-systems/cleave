@@ -12,8 +12,8 @@ unset) it runs
 
   demos     ``demo/<name>.py --preset fast --no-cache ...``, one GPU each;
   dynamic   ``python -m demo.dynamic <operator> --topk 4 --filter-before-topk``, one GPU each
-            (every candidate on every captured workload, and on the adversarial ones too
-            for an operator whose softmax is exact: they are part of what it validates on);
+            (every candidate on every captured workload and on every adversarial one: the
+            softmax of every paged layer is exact, so both are what an operator validates on);
   tests     the suites that validate kernels, one xdist worker per GPU. They are an ordinary
             pytest run and fail where a declared tolerance is exceeded -- that is a finding,
             the measurement itself is in the log either way.
@@ -275,7 +275,9 @@ def _test_operators():
         if path in ("tests/graph/handwritten/test_empty_request.py",
                     "tests/graph/handwritten/test_splitkv_decode.py",
                     "tests/graph/handwritten/test_paged_exact_softmax.py"):
-            return f"dynamic:{param or 'gqa_paged_decode_h32_kv8_d128_ps1'}"
+            # a second parameter (the combine step of a split pair) leads the id: "2-<name>"
+            name = re.sub(r"^\d+-", "", param or "")
+            return f"dynamic:{name or 'gqa_paged_decode_h32_kv8_d128_ps1'}"
         if path.endswith("test_gqa_paged_decode_h32_kv8_d128_ps1.py"):
             return "dynamic:gqa_paged_decode_h32_kv8_d128_ps1"
         if path == "tests/frontend_dynamic/test_paged_pipeline.py":

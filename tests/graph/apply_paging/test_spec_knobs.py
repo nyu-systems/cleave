@@ -255,7 +255,10 @@ def test_emit_lse_false_drops_the_second_output(kind):
     assert [n.name for n in graph.args if isinstance(n, OutputNode)] == ["OutputNode_0"]
     # Two node types, because the causal layers emit the row-predicated flavour of the same
     # epilogue node -- looking for only one of them would miss three of the six builders.
-    # And both again in the two-operand form a layer with an exact softmax emits instead.
+    # The lse is the two-operand ``log2(l) + m``; the plain log2 it replaced stays listed, so
+    # a layer falling back to it would be seen here too.
     assert not [n for n in graph.nodes if isinstance(n, (Log2, MaskedLog2, Lse2, MaskedLse2))]
-    # ... and it still emits: dropping an output must not leave the epilogue half-wired.
-    assert TilelangCodeGen().gen(graph)
+    # ... and it still emits: dropping an output must not leave the epilogue half-wired. The
+    # carried max then has no reader after the loop, and is still carried and filled.
+    source = TilelangCodeGen().gen(graph)
+    assert "lse2" not in source and "T.fill(t_exp_0_max, -3.4028234663852886e38)" in source

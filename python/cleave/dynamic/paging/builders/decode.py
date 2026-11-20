@@ -9,32 +9,20 @@ from ....ir.ops import RowGather
 from ....ir.graph_utils import gather_all_nodes, lock_graph
 from ..stages import (
     LOG2E,
+    _accumulators,
+    _declare_rolling,
     _decode_epilogue,
     _decode_grid,
-    _exp,
     _gqa_body,
     _index_input,
     _name_inputs,
     _paged_gathers,
     _passthrough,
     _run_passes,
-    _score,
     _split_range_scalars,
     _wire_gathers,
 )
 from ..tensor_maps import _build_tensor_maps
-
-# The exact (running-max) softmax reaches the paged operators one at a time, each held to
-# the latency gate (tests/perf) before the next. So far: the single-kernel layer of
-# gqa_paged_decode_h32_kv8_d128_ps1, named here by what its name fixes -- (query heads, kv
-# heads, head dim). Every other operator keeps the unshifted exp, and so does every
-# split-KV partial: a partial of an exact softmax has to hand its max to the combine.
-_EXACT_SOFTMAX = frozenset({(32, 8, 128)})
-
-
-def _exact_softmax(spec, dense, split) -> bool:
-    shape = (spec.num_qo_heads, spec.num_kv_heads, dense.head_dim)
-    return split is None and shape in _EXACT_SOFTMAX
 
 
 @dataclass
@@ -55,23 +43,23 @@ class _Built:
     exp: object
     rowsum: object
     value_mma: object
+    # The nodes of the softmax's rolling update (see ``stages._online_softmax``).
+    rolling: object
     div: object
-    log2: object
+    lse: object
     outputs: list
-    # Split-KV partial only: the number of splits and the two stores that replace the
+    # Split-KV partial only: the number of splits and the three stores that replace the
     # divide and the log-sum-exp. None/absent for the single-kernel layer.
     split: int = None
-    store_d: object = None
-    store_o: object = None
-    # Exact softmax only: the rolling update's nodes (see ``_gqa_body``).
-    rolling: object = None
+    stores: tuple = None
 
 
 def _build_paged_decode(spec, dense, split: int | None = None) -> Graph:
     """The paged decode layer, or with ``split`` the partial half of its split-KV form.
 
     A split block runs ``my_trip`` tiles from ``tile0``, prefetches no further than
-    ``split_end``, and stores raw fp32 accumulators for ``_build_decode_combine`` to sum.
+    ``split_end``, and stores its raw fp32 accumulators and the running max they are
+    relative to, for ``_build_decode_combine`` to weigh and sum.
     """
     mq, bn, head_dim = dense.query_rows, dense.kv_tile, dense.head_dim
     group = spec.group
@@ -80,28 +68,15 @@ def _build_paged_decode(spec, dense, split: int | None = None) -> Graph:
 
     # --- the loop tier: gather a KV tile, score it, accumulate ----------------------
     gather_k, gather_v = _paged_gathers(spec, dense, "head")
-    # One MaskedExp replaces the dense Mul(1/sqrt(D)) + Sub(max estimate) + Exp chain. In
-    # the exact form it subtracts the running row max of its masked, scaled operand; the
-    # layers not converted yet subtract nothing.
-    rolling = None
-    if _exact_softmax(spec, dense, split):
-        score_mma, exp, rowsum, value_mma, rolling = _gqa_body(
-            spec, dense, mq, lambda: _exp(dense, mq, shift=True),
-            make_score=lambda: _score(dense, mq),
-        )
-    else:
-        score_mma, exp, rowsum, value_mma = _gqa_body(spec, dense, mq, lambda: _exp(dense, mq))
+    # A masked score and a masked exp replace the dense Mul(1/sqrt(D)) + Sub(max estimate)
+    # + Exp chain: the exp subtracts the running row max of its masked, scaled operand.
+    score_mma, exp, rowsum, value_mma, rolling = _gqa_body(spec, dense, mq)
     ph_k, ph_v, ph_idx = _wire_gathers(gather_k, gather_v, score_mma, value_mma)
     ph_q = score_mma.inputs[0].src_node
     _name_inputs(spec, ph_q, ph_k, ph_v, ph_idx)
 
     inner = Graph(nodes=gather_all_nodes(rowsum, value_mma))
-    if rolling is not None:
-        # Declared before the GraphNode exists: the factor has no dataflow consumer, and
-        # must not be taken for an accumulator. Both accumulators are sums of exp2(s - m)
-        # terms, so both are rescaled when the max moves.
-        inner.lag_nodes = [rolling.max_prev]
-        inner.accum_scale = {rowsum: rolling.alpha, value_mma: rolling.alpha}
+    _declare_rolling(inner, rolling, rowsum, value_mma)
     # A serial loop with a runtime trip count never reads the static extent; the real
     # bound is loop_trip, which is per request.
     inner.extent = 1
@@ -146,13 +121,7 @@ def _build_paged_decode(spec, dense, split: int | None = None) -> Graph:
     lock_graph(inner)
 
     loop_node = GraphNode(name="GraphNode_0", graph=inner)
-    rowsum_id = inner.accum_nodes.index(rowsum)
-    value_id = inner.accum_nodes.index(value_mma)
-    # The max is read inside the loop, so it is carried by declaration; it is appended,
-    # which leaves the two indices above as they are.
-    row_max = None
-    if rolling is not None:
-        row_max = (rolling.row_max, loop_node.carry(rolling.row_max))
+    accumulators = _accumulators(loop_node, rowsum, value_mma, rolling)
     inner_q = inner.binding[ph_q.name]
     inner_idx = inner.binding[ph_idx.name]
 
@@ -172,9 +141,7 @@ def _build_paged_decode(spec, dense, split: int | None = None) -> Graph:
     q_tile.source_args = (ph_q.name,)
     inner_q.producer_op = q_tile
 
-    div, log2, store_d, store_o, outputs = _decode_epilogue(
-        spec, dense, loop_node, rowsum, rowsum_id, value_mma, value_id, split, row_max
-    )
+    div, lse, stores, outputs = _decode_epilogue(spec, dense, loop_node, *accumulators, split)
     ph_indptr = _index_input(spec.indptr_input)
 
     # Inputs lead the node list in the operator's declared order, both so the emitted
@@ -227,13 +194,12 @@ def _build_paged_decode(spec, dense, split: int | None = None) -> Graph:
         exp=exp,
         rowsum=rowsum,
         value_mma=value_mma,
+        rolling=rolling,
         div=div,
-        log2=log2,
+        lse=lse,
         outputs=outputs,
         split=split,
-        store_d=store_d,
-        store_o=store_o,
-        rolling=rolling,
+        stores=stores,
     )
     _build_tensor_maps(main, inner, spec, dense, built, grid)
     return _run_passes(main, inner, inner_idx)

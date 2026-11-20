@@ -44,8 +44,9 @@ def _tolerance(out_rtol, lse_rtol):
 
     ``lse_rtol`` is the next 1-2-5 step at or above 4x the largest row-relative error the
     operator's valid kernels measured over three seeds on everything they are validated on:
-    its captured workloads, its adversarial workloads once its softmax is exact, and the
-    hand-made requests of its tests. One kind of comparison is counted and is no input: an
+    its captured workloads, its adversarial workloads, and the hand-made requests of its
+    tests, single kernels and split-KV pairs alike. One kind of comparison is counted and is
+    no input: an
     lse output whose every entry is within ``LSE_ATOL``. It is inside the bound whatever
     the rtol, and its row-relative error is the floor's share of a row near 0, not an error
     that grows with the row (requests whose logits only fall along the keys: 5e-7 .. 7e-7
@@ -79,13 +80,11 @@ class DynamicOperator:
     reference: Callable = field(repr=False)
     # The declared (out, lse) validation bounds; every operator states its own.
     tolerance: tuple
-    # (distribution, axes) adversarial workloads; validated on only when asked for ...
+    # (distribution, axes) adversarial softmax workloads. The softmax of every layer is
+    # exact (a running max), so it holds at any logit scale, and every validation of the
+    # operator -- single kernel or split-KV pair -- runs these after the captured ones.
+    # They are never timed.
     adversarial: tuple = ()
-    # ... or always, once the operator's softmax is exact (a running max): it then holds at
-    # any logit scale, and every validation of its single kernel runs the adversarial
-    # workloads as well. Its split-KV pairs follow when they are exact too
-    # (``pipeline.dynamic._validation_passes``).
-    exact_softmax: bool = False
     page_size: int = 1
     scale: float | None = None
 
@@ -112,8 +111,7 @@ class DynamicOperator:
         return EXPECTED_KERNELS_DIR / f"{self.name}.py"
 
 
-def _operator(name, spec, tuned_tiling, dims, tolerance, page_size=1, scale=None,
-              exact_softmax=False) -> DynamicOperator:
+def _operator(name, spec, tuned_tiling, dims, tolerance, page_size=1, scale=None) -> DynamicOperator:
     return DynamicOperator(
         name=name,
         spec=spec,
@@ -123,7 +121,6 @@ def _operator(name, spec, tuned_tiling, dims, tolerance, page_size=1, scale=None
         reference=partial(_wl.case, name, dims=dims, page_size=page_size, scale=scale),
         tolerance=tolerance,
         adversarial=_wl.ADVERSARIAL_WORKLOADS[name],
-        exact_softmax=exact_softmax,
         page_size=page_size,
         scale=scale,
     )
@@ -141,8 +138,6 @@ OPERATORS: dict[str, DynamicOperator] = {
             _GQA,
             (32, 8, 128),
             _tolerance(out_rtol=2e-2, lse_rtol=2e-6),
-            # The first operator with a running max (builders/decode.py); the others follow.
-            exact_softmax=True,
         ),
         _operator(
             "gqa_paged_decode_h32_kv4_d128_ps1",

@@ -38,14 +38,17 @@ def _head_offsets(grid, group: int, cols: bool = False) -> tuple:
     return out, lse
 
 
-def _partial_output_maps(main, outputs, store_d, store_o, split, heads, group, head_dim,
-                         batch_dim, grid) -> None:
-    """``tmap``/``tinfo_map`` entries for a split-KV partial's two stores.
+def _partial_output_maps(main, outputs, stores, split, heads, group, head_dim, batch_dim,
+                         grid) -> None:
+    """``tmap``/``tinfo_map`` entries for a split-KV partial's three stores: the row sums,
+    the values, and the max both are relative to (``stages._partial_stores``).
 
     The partials are indexed by split first, so one split's contribution to every request
     is contiguous and the combine reads a request's splits at one stride. ``grid`` maps the
-    launch indices to ``(request, head block, split)``.
+    launch indices to ``(request, head block, split)``. The max is one value per row, like
+    the row sum, and has the row sum's tile.
     """
+    store_d, store_o, store_m = stores
 
     def _d_offset(*iters):
         b, h, s = grid(*iters)
@@ -55,41 +58,43 @@ def _partial_output_maps(main, outputs, store_d, store_o, split, heads, group, h
         b, h, s = grid(*iters)
         return (f"{s}", f"{b}", f"{group} * {h}", "0")
 
-    main.tmap[store_d] = Iterator(
-        _d_offset, shape=(split, batch_dim, heads), tile_size=(1, 1, group)
-    )
+    def _rows():
+        return Iterator(_d_offset, shape=(split, batch_dim, heads), tile_size=(1, 1, group))
+
+    main.tmap[store_d] = _rows()
     main.tmap[outputs[0]] = main.tmap[store_d]
     main.tmap[store_o] = Iterator(
         _o_offset, shape=(split, batch_dim, heads, head_dim), tile_size=(1, 1, group, head_dim)
     )
     main.tmap[outputs[1]] = main.tmap[store_o]
-    main.tinfo_map[store_d] = ("OutputNode_0", "g")
-    main.tinfo_map[outputs[0]] = ("OutputNode_0", "g")
-    main.tinfo_map[store_o] = ("OutputNode_1", "g")
-    main.tinfo_map[outputs[1]] = ("OutputNode_1", "g")
+    main.tmap[store_m] = _rows()
+    main.tmap[outputs[2]] = main.tmap[store_m]
+    for i, store in enumerate(stores):
+        main.tinfo_map[store] = (f"OutputNode_{i}", "g")
+        main.tinfo_map[outputs[i]] = (f"OutputNode_{i}", "g")
 
 
-def _output_maps(main, div, log2, outputs, out_iter, lse_iter, extra=()) -> None:
-    """Map the divide, the log2 and their outputs (and any ``extra`` producers of the same
+def _output_maps(main, div, lse, outputs, out_iter, lse_iter, extra=()) -> None:
+    """Map the divide, the lse and their outputs (and any ``extra`` producers of the same
     tiles, in ``(out, lse)`` order) to the two output tensors."""
     main.tmap[div] = out_iter
     main.tmap[outputs[0]] = out_iter
     if extra:
         main.tmap[extra[0]] = out_iter
-    if log2 is not None:
-        main.tmap[log2] = lse_iter
+    if lse is not None:
+        main.tmap[lse] = lse_iter
         main.tmap[outputs[1]] = lse_iter
         if extra:
             main.tmap[extra[1]] = lse_iter
 
 
-def _output_tinfo(main, div, log2, outputs, extra=()) -> None:
+def _output_tinfo(main, div, lse, outputs, extra=()) -> None:
     main.tinfo_map[div] = ("OutputNode_0", "g")
     for node in extra[:1]:
         main.tinfo_map[node] = ("OutputNode_0", "g")
     main.tinfo_map[outputs[0]] = ("OutputNode_0", "g")
-    if log2 is not None:
-        main.tinfo_map[log2] = ("OutputNode_1", "g")
+    if lse is not None:
+        main.tinfo_map[lse] = ("OutputNode_1", "g")
         for node in extra[1:2]:
             main.tinfo_map[node] = ("OutputNode_1", "g")
         main.tinfo_map[outputs[1]] = ("OutputNode_1", "g")
@@ -103,7 +108,7 @@ def _decode_output_maps(main, spec, head_dim, grid, n) -> None:
         _output_maps(
             main,
             n["div"],
-            n["log2"],
+            n["lse"],
             n["outputs"],
             Iterator(
                 out,
@@ -112,17 +117,24 @@ def _decode_output_maps(main, spec, head_dim, grid, n) -> None:
             ),
             Iterator(lse, shape=(spec.batch_dim, spec.num_qo_heads), tile_size=(1, group)),
         )
-        _output_tinfo(main, n["div"], n["log2"], n["outputs"])
+        _output_tinfo(main, n["div"], n["lse"], n["outputs"])
     else:
         _partial_output_maps(
-            main, n["outputs"], n["store_d"], n["store_o"], n["split"],
+            main, n["outputs"], n["stores"], n["split"],
             spec.num_qo_heads, group, head_dim, spec.batch_dim, grid,
         )
 
 
-def _accum_tiles(rows: int, cols: int) -> list:
-    """The loop node's two accumulator tiles: the row sum, then the value matmul."""
-    return [_whole((rows,)), _whole((rows, cols))]
+def _accum_tiles(rows: int, cols: int, denom_cols: int | None = None) -> list:
+    """The loop node's accumulator tiles, in the loop tier's own accumulator order: the
+    softmax denominator, the value matmul, and the carried max, which is appended behind
+    the automatic two (``GraphNode.carry``).
+
+    The denominator is the row sum, one value per row; a layer that accumulates it whole
+    and folds it after the loop (MLA) passes that tile's width as ``denom_cols``.
+    """
+    denom = (rows,) if denom_cols is None else (rows, denom_cols)
+    return [_whole(denom), _whole((rows, cols)), _whole((rows,))]
 
 
 def _build_tensor_maps(main, inner, spec, dense, built, grid) -> None:
@@ -179,21 +191,19 @@ def _build_tensor_maps(main, inner, spec, dense, built, grid) -> None:
         b.rowsum: ("t_rowsum_0", "r"),
         b.value_mma: ("t_mma_1", "r"),
     }
-    if b.rolling is not None:
-        _rolling_maps(main, inner, b.loop_node, b.score_mma, b.rolling, mq)
+    _rolling_maps(inner, b.score_mma, b.rolling, mq)
 
 
-def _rolling_maps(main, inner, loop_node, score_mma, rolling, rows: int) -> None:
-    """The tiles of an exact softmax's rolling update, on top of a layer's own maps.
+def _rolling_maps(inner, scores, rolling, rows: int) -> None:
+    """The tiles of the softmax's rolling update, on top of a layer's own maps.
 
-    The masked score has the score matmul's tile; the carried max, its snapshot, its step
-    and the rescale factor are one value per query row, register fragments like the row
-    sum. The loop node gains the max as its last accumulator tile.
+    The masked score has the tile of the raw ``scores`` it is taken from (and the exp's);
+    the carried max, its snapshot, its step and the rescale factor are one value per query
+    row, register fragments like the row sum.
     """
-    inner.tmap[rolling.score] = inner.tmap[score_mma]
+    inner.tmap[rolling.score] = inner.tmap[scores]
     for node in (rolling.row_max, rolling.max_prev, rolling.max_step, rolling.alpha):
         inner.tmap[node] = _whole((rows,))
-    main.tmap[loop_node] = [*main.tmap[loop_node], _whole((rows,))]
     inner.tinfo_map.update({
         rolling.score: ("t_score_0", "r"),
         rolling.row_max: ("t_exp_0_max", "r"),
@@ -279,6 +289,7 @@ def _slab_tensor_maps(main, inner, spec, dense, *, grid, nodes) -> None:
         n["rowsum"]: ("t_rowsum_0", "r"),
         n["value_mma"]: ("t_mma_1", "r"),
     }
+    _rolling_maps(inner, n["score_mma"], n["rolling"], mq)
 
 
 def _prefill_tensor_maps(main, inner, spec, dense, *, btok, q_abs, nodes) -> None:
@@ -300,7 +311,7 @@ def _prefill_tensor_maps(main, inner, spec, dense, *, btok, q_abs, nodes) -> Non
     _output_maps(
         main,
         n["div"],
-        n["log2"],
+        n["lse"],
         n["outputs"],
         Iterator(
             lambda i, h: (q_abs, f"{h} * {group}", "0"),
@@ -332,7 +343,7 @@ def _prefill_tensor_maps(main, inner, spec, dense, *, btok, q_abs, nodes) -> Non
         n[k]: (n[k].name, "g") for k in ("ph_q", "ph_k", "ph_v", "ph_idx", "ph_qo", "ph_kv")
     }
     main.tinfo_map[n["loop_node"]] = ("t_GraphNode_0", "r")
-    _output_tinfo(main, n["div"], n["log2"], n["outputs"], extra=n["fills"])
+    _output_tinfo(main, n["div"], n["lse"], n["outputs"], extra=n["fills"])
 
     inner.tinfo_map = {
         **{n[k]: (n[k].name, "g") for k in ("ph_q", "ph_k", "ph_v", "ph_idx")},
@@ -347,6 +358,7 @@ def _prefill_tensor_maps(main, inner, spec, dense, *, btok, q_abs, nodes) -> Non
         n["rowsum"]: ("t_rowsum_0", "r"),
         n["value_mma"]: ("t_mma_1", "r"),
     }
+    _rolling_maps(inner, n["score_mma"], n["rolling"], bm)
 
 
 def _mla_tensor_maps(
@@ -359,7 +371,7 @@ def _mla_tensor_maps(
     loop_node,
     rowsum,
     div,
-    log2,
+    lse,
     outputs,
     indptrs,
     q_shape_lead,
@@ -368,8 +380,7 @@ def _mla_tensor_maps(
     out_offset,
     lse_offset,
     split=None,
-    store_d=None,
-    store_o=None,
+    stores=None,
 ) -> None:
     """Fill both tiers' maps for either MLA layer.
 
@@ -406,14 +417,15 @@ def _mla_tensor_maps(
     main.tmap[ph_idx] = _whole((spec.index_dim,))
     for indptr in indptrs:
         main.tmap[indptr] = _whole((spec.indptr_dim,))
-    main.tmap[loop_node] = _accum_tiles(mq, ckv)
+    # The denominator is carried as the whole (M, N) tile here and folded after the loop.
+    main.tmap[loop_node] = _accum_tiles(mq, ckv, denom_cols=bn)
 
     main.tmap[rowsum] = _whole((mq,))
     if split is None:
         _output_maps(
             main,
             div,
-            log2,
+            lse,
             outputs,
             Iterator(
                 out_offset, shape=(q_shape_lead, heads, ckv), tile_size=(out_rows, heads, ckv)
@@ -453,11 +465,11 @@ def _mla_tensor_maps(
         rowsum: ("t_rowsum_0", "r"),
     }
     if split is None:
-        _output_tinfo(main, div, log2, outputs)
+        _output_tinfo(main, div, lse, outputs)
     else:
         # A decode grid of (request, split): the whole head block is the row tile.
         _partial_output_maps(
-            main, outputs, store_d, store_o, split, heads, heads, ckv, q_shape_lead,
+            main, outputs, stores, split, heads, heads, ckv, q_shape_lead,
             lambda i, s: (i, "0", s),
         )
 
@@ -482,3 +494,5 @@ def _mla_tensor_maps(
         psum: ("t_psum_0", "r"),
         value_mma: ("t_mma_1", "r"),
     }
+    # The softmax is taken of the summed score, so that is the masked score's tile.
+    _rolling_maps(inner, add, made["rolling"], mq)

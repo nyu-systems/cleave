@@ -443,19 +443,21 @@ def test_adversarial_inputs_need_softmax_scores_and_a_known_name():
         rt_inputs.check_distributions(())
 
 
-def test_adversarial_inputs_are_switched_on_per_operator():
-    """The generators exist; switching one on is a deliberate, per-operator change.
+def test_adversarial_inputs_are_switched_on_per_path():
+    """The generators exist; switching them on is a deliberate change, made per path.
 
-    Nothing asks for them by default. A dynamic operator declares that its softmax is exact
-    (``exact_softmax``), and from then on every validation of it includes its adversarial
-    workloads; one operator does so far. A dense program says so by what it records: the
+    Nothing asks for them by default. The paged path is switched on as a whole: the softmax
+    of every dynamic operator is exact, so every validation of a registry operator on the
+    registry's workloads includes its adversarial ones (``compile_dynamic``), with no
+    per-operator flag. Timing asks for the captured workloads only, which is why the
+    factories still default to them. A dense program says so by what it records: the
     request for the exact softmax (``Program._stable_exp``, what ``cl.softmax`` records),
     and the kernels of such a program are held to every adversarial case its inputs can be
     shaped into, whatever was asked for. A fixed-shift program, or an ``exp / sum`` written
     by hand, is validated on what was asked.
     """
-    assert {name for name, op in OPERATORS.items() if op.exact_softmax} == {
-        "gqa_paged_decode_h32_kv8_d128_ps1"}
+    assert all(len(op.adversarial) == 12 for op in OPERATORS.values())
+    assert not any(hasattr(op, "exact_softmax") for op in OPERATORS.values())
     assert EvalConfig().distributions == ("normal",)
     assert EvalConfig(distributions="increasing").distributions == ("increasing",)
     assert inspect.signature(rt.make_inputs).parameters["distribution"].default == "normal"

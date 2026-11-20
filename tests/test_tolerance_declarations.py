@@ -206,7 +206,7 @@ def test_the_measurement_counts_hand_made_requests_and_not_a_kernel_broken_on_pu
     name = "gqa_paged_decode_h32_kv8_d128_ps1"
     path = "tests/graph/handwritten/test_paged_exact_softmax.py"
 
-    def record(test, lse_rel, lse_abs, kind=None):
+    def record(test, lse_rel, lse_abs, kind=None, param=name):
         bad = kind is not None
         outputs = [
             dict(shape=[7, 32, 128], dtype="bfloat16", rtol=2e-2, atol=0.0, kind=kind,
@@ -214,7 +214,7 @@ def test_the_measurement_counts_hand_made_requests_and_not_a_kernel_broken_on_pu
             dict(shape=[7, 32], dtype="float32", rtol=2e-6, atol=1e-6, kind=kind,
                  rel=lse_rel, abs=lse_abs),
         ]
-        return json.dumps({"context": f"{path}::{test}[{name}] (call)", "what": "",
+        return json.dumps({"context": f"{path}::{test}[{param}] (call)", "what": "",
                            "kind": kind, "outputs": outputs})
 
     lines = [
@@ -232,6 +232,23 @@ def test_the_measurement_counts_hand_made_requests_and_not_a_kernel_broken_on_pu
     assert (out["validated"], lse["validated"]) == (2, 2)
     assert (lse["rel"], lse["abs"], lse["absolute"]) == (2.7e-7, 1.2e-4, True)
     assert out["rel"] == 7.8e-3 and not out["absolute"]
+
+    # The split-KV pair of an operator is that operator's kernel too, whatever the combine
+    # step its test id leads with; another operator's requests are another entry.
+    other = "mla_paged_decode_h16_ckv512_kpe64_ps1"
+    lines += [
+        record("test_exact_split_pair_on_hand_made_requests", 3.1e-7, 1.4e-4,
+               param=f"2-{name}"),
+        record("test_exact_split_pair_on_hand_made_requests", 1.1e-6, 9.0e-4,
+               param=f"1-{other}"),
+    ]
+    (tmp_path / "validation" / "tests__default.jsonl").write_text("\n".join(lines) + "\n")
+    table = load(tmp_path)
+    assert set(table) == {f"dynamic:{name}", f"dynamic:{other}"}
+    out, lse = measured_errors(table)[f"dynamic:{name}"]
+    assert (out["validated"], lse["validated"]) == (3, 3)
+    assert (lse["rel"], lse["abs"]) == (3.1e-7, 1.4e-4)
+    assert measured_errors(table)[f"dynamic:{other}"][1]["rel"] == 1.1e-6
 
 
 def test_the_measurement_leaves_out_the_kernels_built_without_the_exact_softmax(tmp_path):

@@ -4,10 +4,14 @@ The emitted text is pinned by ``tests/graph/apply_paging/test_split_decode.py``;
 the numeric half. Each pair is compiled through ``autotune._compiled`` -- which is what the
 demos and the benchmark use, and what hides the fp32 partial buffers behind the operator's
 own signature -- and checked, with the comparator and the tolerance every other validation
-of the operator uses, on a stratified sample of the captured workloads plus a hand-built one
-with an empty request in the middle. The empty request is the case the
-split arithmetic has to get right with no work at all: every split runs zero tiles, stores
-zero partials, and the combine has to turn 0/0 into the operator's defined 0 and -inf.
+of the operator uses, on a stratified sample of the captured workloads, on every adversarial
+workload of the operator, and on a hand-built one with an empty request in the middle. The
+empty request is the case the split arithmetic has to get right with no work at all: every
+split runs zero tiles and stores zero sums next to a max still at its finite start, and the
+combine has to turn that into the operator's defined 0 and -inf. The adversarial workloads
+are what the third partial is for: the splits of one request then differ in their maxima by
+more than ``exp2`` can represent, and only weighing each by its own max keeps the sum finite
+(``test_paged_exact_softmax.py`` adds hand-made requests, and trailing splits with no tile).
 """
 
 from __future__ import annotations
@@ -44,14 +48,21 @@ def _check(operator, kernel, inputs, reference):
 def test_split_pair_matches_the_reference(operator):
     kernel = _compiled(split_kernel_source(operator))
     assert getattr(kernel, "scratch_params", None), "a split pair carries partial buffers"
-    seen = 0
-    for _key, inputs, reference in keyed_workloads(operator, keep=KEEP)():
+    seen = []
+    for key, inputs, reference in keyed_workloads(operator, keep=KEEP, adversarial=True)():
         with _gpu_exec_guard():
-            _check(operator, kernel, inputs, reference)
-        seen += 1
+            try:
+                _check(operator, kernel, inputs, reference)
+            except AssertionError as error:
+                raise AssertionError(f"{operator} on {key}: {error}") from error
+        seen.append(key)
         del inputs, reference
         torch.cuda.empty_cache()
-    assert seen == KEEP
+    # the captured sample, then the operator's whole adversarial table
+    adversarial = [key for key in seen if "@" in key]
+    assert len(seen) == KEEP + 12 and adversarial == seen[KEEP:]
+    assert {key.partition("@")[2] for key in adversarial} == {
+        "large_logits", "large_scale", "increasing", "dominant_last"}
 
 
 def _empty_request_workload(operator):
@@ -83,7 +94,8 @@ def test_scratch_wrapper_reuses_one_allocation_per_shape():
     kernel = _compiled(split_kernel_source("gqa_paged_decode_h32_kv8_d128_ps1"))
     params = kernel.scratch_params
     assert [p[1] for p in params] == [
-        "Partial_ROWSUM", "Partial_ROWSUM", "Partial_VALUE", "Partial_VALUE"
+        "Partial_ROWSUM", "Partial_ROWSUM", "Partial_VALUE", "Partial_VALUE",
+        "Partial_MAX", "Partial_MAX",
     ]
     assert all(p[2] == torch.float32 for p in params)
     _key, inputs, reference = next(keyed_workloads("gqa_paged_decode_h32_kv8_d128_ps1", keep=1)())

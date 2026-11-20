@@ -34,7 +34,10 @@ from pathlib import Path
 # 13: a softmax over an axis that is not the last one takes its max in place wherever a
 #     tile holds that axis (in a loop that does not tile it, behind a squeezed unit dim):
 #     tilings that were refused now build, so a program's top-k and best kernel can change.
-SCHEMA = 13
+# 14: every paged layer builds the exact softmax, and a split-KV pair hands the partials'
+#     running max to its combine as a third partial: every paged program emits a different
+#     kernel, and every split pair a different parameter list.
+SCHEMA = 14
 # What "validated" means for a saved kernel. A kernel-cache hit returns without validating,
 # so bump this whenever the comparison or its inputs change: saved kernels are then rebuilt.
 # (The inputs include the adversarial cases a program with an exact softmax is held to,

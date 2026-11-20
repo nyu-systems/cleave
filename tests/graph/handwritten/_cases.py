@@ -77,10 +77,10 @@ def _fused(name, partial, combine, partial_dims, source):
 def _paged(name, dims, out_idx, **workload_kw):
     if name.startswith("mla"):
         workload_kw["scale"] = _schedule(name).SM_SCALE
-    # An operator whose softmax is exact also runs its adversarial workloads (logits x100
-    # through the queries and through the scale, increasing along the keys, one dominant
-    # key in the last tile), at the same declared tolerance.
-    workload_kw["adversarial"] = OPERATORS[name].exact_softmax
+    # Every operator's softmax is exact, so every one also runs its adversarial workloads
+    # (logits x100 through the queries and through the scale, increasing along the keys,
+    # one dominant key in the last tile), at the same declared tolerance.
+    workload_kw["adversarial"] = True
     return Case(
         name, ((name, dims),), OPERATORS[name].tolerance, out_idx=out_idx,
         workload_kw=workload_kw, dtype="bfloat16",

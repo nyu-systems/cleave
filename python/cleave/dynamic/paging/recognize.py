@@ -88,9 +88,9 @@ def _folded_scale(chain) -> float:
 
     A shift is dropped by the access layer, which is sound: softmax is shift-invariant,
     and the paged operator's log-sum-exp is defined without one. Whatever the dense body
-    subtracts, the layer builds its own softmax: where it is exact it subtracts the running
-    row max of its own masked scores and adds that max back in the log-sum-exp
-    (``stages._gqa_body``); the layers not converted yet subtract nothing.
+    subtracts, the layer builds its own, exact softmax: it subtracts the running row max of
+    its own masked, scaled scores and adds that max back in the log-sum-exp
+    (``stages._online_softmax``).
     """
     scale = 1.0
     for node in chain:

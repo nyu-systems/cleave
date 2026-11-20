@@ -201,25 +201,6 @@ def _registry_op(attention):
     return None
 
 
-def _validation_passes(cands, adversarial: bool, exact: bool) -> list:
-    """``(candidates, adversarial?)`` per validation pass over ``cands``.
-
-    ``adversarial`` is what the caller asked for and goes to every candidate. ``exact``: the
-    program is a registry operator whose softmax is exact, validated on the registry's
-    workloads; its kernels are then held to the adversarial workloads whether asked or not.
-    That is its single kernels so far. A split-KV pair of such an operator still builds the
-    unshifted exp (``paging.builders.decode._exact_softmax``: the partial of an exact
-    softmax has to hand its max to the combine, which does not take one yet), so it
-    overflows on those workloads by construction; until it is converted it is validated on
-    what the caller asked for, as before, and stays eligible.
-    """
-    if adversarial or not exact:
-        return [(list(cands), adversarial)]
-    single = [c for c in cands if not c.split]
-    pairs = [c for c in cands if c.split]
-    return [(group, hard) for group, hard in ((single, True), (pairs, False)) if group]
-
-
 def _tuned_reference(attention, spec, cands):
     """The registry's tuned kernel for ``spec``: a searched candidate if one has its source,
     else a reference-only (ineligible) one appended to ``cands``."""
@@ -320,25 +301,13 @@ class DynamicReport:
         """Per output, the largest error measured over the correct candidates' workloads."""
         return worst_measured(c.measured for c in self.correct)
 
-    def validated_on(self) -> str:
-        """What the correct candidates were checked on. The split pairs of an operator
-        whose softmax is exact are not sent its adversarial workloads yet
-        (``_validation_passes``); a line that counted them with the single kernels would
-        claim more than was checked."""
-        pairs = {c.checked for c in self.correct if c.split}
-        single = {c.checked for c in self.correct if not c.split}
-        text = f"{self.n_workloads} workloads"
-        if pairs and single and pairs != single:
-            text += f" (split pairs over {max(pairs)}: the captured ones)"
-        return text
-
     def summary(self) -> str:
         graphs, t = self.plans.graphs, self.timings
         rows = [("superoptimize", f"{len(graphs)} dense graph(s), "
                  f"{'cache hit' if graphs.from_cache else 'searched'}", t.get("superoptimize")),
                 ("schedule", self.plans.summary().replace("\n  ", "  "), t.get("schedule")),
                 ("validate", f"{len(self.correct)} of {len(self.candidates)} correct over "
-                 f"{self.validated_on()}"
+                 f"{self.n_workloads} workloads"
                  + (f"  max error {format_measured(self.measured_error(), self.tolerance)}"
                     if self.measured_error() else ""), t.get("validate"))]
         rows += [("", f"  {n}x {k}", None) for k, n in self.histogram().items()]
@@ -501,9 +470,10 @@ def compile_dynamic(fn, *, dtype=None, preset="default", superopt=None, schedule
     ``max_workloads`` of them. ``reference``: also measure the registry's tuned kernel (it
     cannot win). ``dispatch``: with split pairs, calibrate the split/single choice per workload.
     ``tolerance``: one ``cl.Tolerance`` per output (default: the registry operator's).
-    ``adversarial``: also validate on the registry operator's adversarial softmax workloads;
-    the single kernels of a registry operator whose softmax is exact are validated on them
-    regardless (``_validation_passes``)."""
+    A registry operator validated on the registry's workloads is validated on its
+    adversarial softmax workloads as well, single kernels and split pairs alike: the softmax
+    of every paged layer is exact, so they are part of what a correct kernel passes.
+    ``adversarial`` asks for them by name and is refused for a caller's own workloads."""
     from ..frontend.paged import trace_paged
     from ..dynamic.paging import SPLIT_KINDS
     from ..runtime.autotune import (benchmark_over_workloads, compile_and_validate_over_workloads,
@@ -550,14 +520,12 @@ def compile_dynamic(fn, *, dtype=None, preset="default", superopt=None, schedule
     cands = [c for c, _ in by_cand.values()]
     tuned = _tuned_reference(attention, spec, cands) if reference else None
     success, errors = [], []
-    op = _registry_op(attention)
-    exact = workloads is None and op is not None and op.exact_softmax
-    # Timing and the dispatch calibration below stay on the captured workloads.
-    for group, hard in _validation_passes(cands, adversarial, exact):
-        compile_and_validate_over_workloads(group, factory(0, hard), success, errors,
-                                            tolerance=tol)
-    order = {id(c): i for i, c in enumerate(cands)}
-    success.sort(key=lambda c: order[id(c)])  # as one pass leaves them: candidate order
+    # The registry's workloads include the operator's adversarial ones: every candidate,
+    # single kernel or split pair, is held to them. Timing and the dispatch calibration
+    # below stay on the captured workloads.
+    adversarial = adversarial or (workloads is None and _registry_op(attention) is not None)
+    compile_and_validate_over_workloads(cands, factory(0, adversarial), success, errors,
+                                        tolerance=tol)
     t3 = time.perf_counter()
     if any(c.eligible for c in success):
         benchmark_over_workloads(success, factory(max_workloads))
