@@ -159,9 +159,12 @@ def test_a_comparison_within_the_absolute_floor_does_not_feed_the_rtol():
 
     The numbers are gqa_paged_decode_h32_kv8_d128_ps1's. Its rows with an lse near 0
     (logits that only fall along the keys) are off by 3.7e-7 .. 4.8e-7, which is 5.0e-7 ..
-    6.8e-7 of a row max of 0.6; where the rtol is what bounds the output it measures
-    4.1e-7. Taken as an rtol input the first would declare 5e-6 for an operator whose
-    declared 2e-6 * rowmax + 1e-6 holds those very rows with 5x to spare.
+    6.8e-7 of a row max of 0.6; where the rtol is what bounds the output (logits x100) it
+    measures 4.1e-7. Taken as an rtol input the first would declare 5e-6 for an operator
+    whose declared 1e-6 * rowmax + 1e-6 holds those very rows with 3x to spare.
+    (Both are requests with transformed inputs, which are no input for that reason as
+    well: the last test of this file. The floor is what leaves out the comparisons on
+    normal inputs that have no entry over it, 430 of that operator's 798.)
     """
     from tests._measure_tolerances import feeds_rtol, measured_errors, rows
 
@@ -344,3 +347,96 @@ def test_a_dense_programs_adversarial_cases_are_held_to_its_bound_and_do_not_fee
                      record("some other inputs", 2.0e-3))
     assert [r["largest_valid"] for r in rows(table)] == [2.0e-3, 3.0e-3]
     assert not any(r["adversarial"] for r in rows(table))
+
+
+def test_a_paged_operators_adversarial_workloads_are_held_to_its_bound_and_do_not_feed_it(
+        tmp_path):
+    """A paged operator's softmax is exact, so its kernels are validated on adversarial
+    inputs too -- the registry's adversarial workloads and the hand-made requests that
+    transform the inputs -- at the bound it declares from its normal inputs. Those
+    comparisons are counted, and they are no input to the bound: it is never loosened for
+    an adversarial case.
+
+    The numbers are gqa_paged_decode_h32_kv4_d128_ps1's lse: 2.3e-7 on its captured
+    workloads, 4.2e-7 at logits x100. As an input the second would turn the declared 1e-6
+    into 2e-6. A workload is adversarial by its key, ``<workload>@<case>``, which every
+    validation of a paged kernel logs as ``what``.
+    """
+    from tests._measure_tolerances import (ADVERSARIAL_CASE, is_adversarial, load, markdown,
+                                           measured_errors, rows)
+
+    name = "gqa_paged_decode_h32_kv4_d128_ps1"
+    demo = f"dynamic:{name}"
+    hand_made = ("tests/graph/handwritten/test_paged_exact_softmax.py::"
+                 f"test_exact_softmax_on_hand_made_requests[{name}] (call)")
+    pair = ("tests/graph/handwritten/test_splitkv_decode.py::"
+            f"test_split_pair_matches_the_reference[{name}] (call)")
+
+    def record(context, what, lse_rel, lse_abs, kind=None):
+        bad = kind == "non_finite"
+        outputs = [
+            dict(shape=[16, 32, 128], dtype="bfloat16", rtol=2e-2, atol=0.0, kind=kind,
+                 rel=None if bad else 7.8e-3, abs=None if bad else 1.5e-2),
+            dict(shape=[16, 32], dtype="float32", rtol=1e-6, atol=1e-6, kind=kind,
+                 rel=lse_rel, abs=lse_abs),
+        ]
+        return json.dumps({"context": context, "what": what, "kind": kind, "outputs": outputs})
+
+    def table_of(*lines):
+        directory = tmp_path / f"run{len(list(tmp_path.iterdir()))}"
+        (directory / "validation").mkdir(parents=True)
+        (directory / "validation" / "x__default.jsonl").write_text("\n".join(lines) + "\n")
+        return load(directory)
+
+    assert is_adversarial(demo, "wl_16_1070_1020@large_logits")
+    assert is_adversarial(demo, "tile_edges@decreasing")
+    assert not is_adversarial(demo, "wl_16_1070_1020") and not is_adversarial(demo, "")
+    assert not is_adversarial("demo:mha_decode", "x@y")  # a dense program has no such key
+    assert recommend(2.313e-7, "float32") == 1e-6 and recommend(4.208e-7, "float32") == 2e-6
+
+    table = table_of(
+        record(demo, "wl_1_8_7", 1.9e-7, 2.4e-6),
+        record(demo, "wl_16_1070_1020", 2.313e-7, 2.86e-6),
+        record(demo, "wl_16_1070_1020@large_logits", 4.208e-7, 2.44e-4),
+        # the captured sample of a split pair, then one of its adversarial workloads
+        record(pair, "wl_64_28831_28815", 2.1e-7, 2.6e-6),
+        record(pair, "wl_64_28831_28815@increasing", 3.9e-7, 1.8e-4),
+        # hand-made requests: as generated, and transformed. The last is within the floor
+        # alone (an lse near 0): inside the bound whatever the rtol, as on normal inputs.
+        record(hand_made, "tile_edges", 2.2e-7, 1.9e-6),
+        record(hand_made, "tile_edges@dominant_last", 4.0e-7, 2.1e-4),
+        record(hand_made, "tile_edges@decreasing", 6.845e-7, 4.768e-7),
+        record(demo, "wl_1_8_7@large_scale", None, None, kind="non_finite"),
+    )
+    assert set(table) == {demo}
+    assert [e[4] for e in table[demo][1]] == [
+        None, None, ADVERSARIAL_CASE, None, ADVERSARIAL_CASE, None, ADVERSARIAL_CASE,
+        ADVERSARIAL_CASE, "non_finite"]
+    out, lse = rows(table)
+    assert (lse["n"], lse["adversarial"], lse["largest_adversarial"]) == (9, 4, 4.208e-7)
+    assert (lse["largest_valid"], lse["largest_valid_abs"]) == (2.313e-7, 2.86e-6)
+    assert (lse["rtol"], lse["atol"], lse["within_floor"]) == (1e-6, ATOL_FLOOR, 0)
+    assert (out["adversarial"], out["largest_valid"], out["rtol"]) == (4, 7.8e-3, 2e-2)
+    pinned = measured_errors(table)[demo]
+    assert (pinned[1]["rel"], pinned[1]["abs"], pinned[1]["validated"]) == (2.313e-7, 2.86e-6, 9)
+    assert expected_tolerances(pinned) == [Tolerance(rtol=2e-2), Tolerance(rtol=1e-6, atol=1e-6)]
+    assert expected_tolerances(pinned) == list(OPERATORS[name].tolerance)
+    assert "4 on adversarial inputs, largest 4.21e-07: held to the bound" in markdown(table)
+
+    # an adversarial comparison over the bound is no input either: it is a finding
+    table = table_of(record(demo, "wl_1_8_7", 2.313e-7, 2.86e-6),
+                     record(demo, "wl_1_8_7@increasing", 3.0e-6, 1.5e-3, kind="mismatch"))
+    _, lse = rows(table)
+    assert (lse["largest_valid"], lse["rtol"], lse["largest_adversarial"]) == (
+        2.313e-7, 1e-6, 3.0e-6)
+    assert "OVER THE BOUND" in markdown(table)
+
+    # only adversarial comparisons: nothing was measured for the bound
+    _, lse = rows(table_of(record(demo, "wl_1_8_7@increasing", 3.9e-7, 1.8e-4)))
+    assert lse["largest_valid"] is None and lse["rtol"] is None and lse["adversarial"] == 1
+
+    # without the key the comparison is an input like any other: what tells them apart
+    # is the workload a validation names, so every paged validation has to name it
+    _, lse = rows(table_of(record(demo, "wl_1_8_7", 2.313e-7, 2.86e-6),
+                           record(demo, "", 4.208e-7, 2.44e-4)))
+    assert (lse["largest_valid"], lse["rtol"], lse["adversarial"]) == (4.208e-7, 2e-6, 0)

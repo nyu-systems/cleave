@@ -13,17 +13,18 @@ unset) it runs
   demos     ``demo/<name>.py --preset fast --no-cache ...``, one GPU each;
   dynamic   ``python -m demo.dynamic <operator> --topk 4 --filter-before-topk``, one GPU each
             (every candidate on every captured workload and on every adversarial one: the
-            softmax of every paged layer is exact, so both are what an operator validates on);
+            softmax of every paged layer is exact, so an operator validates on both);
   tests     the suites that validate kernels, one xdist worker per GPU. They are an ordinary
             pytest run and fail where a declared tolerance is exceeded -- that is a finding,
             the measurement itself is in the log either way.
 
 The table has one row per operator and output: a histogram of the measured row-relative
 errors, the largest error of the candidates that are clearly valid, and the tolerance that
-follows from it by the rule in ``recommend``. For a dense program that is its error on the
-normal inputs: where its softmax is exact its kernels also run on the adversarial softmax
-inputs, at the same bound, and those comparisons are counted without feeding it
-(``ADVERSARIAL_CASE``). Declare that value (``demo/<name>.py``,
+follows from it by the rule in ``recommend``. That is the operator's error on its normal
+inputs. Where its softmax is exact (a dense program that records the request, every
+dynamic operator) its kernels also run on adversarial softmax inputs, at the same bound,
+and those comparisons are counted without feeding it (``ADVERSARIAL_CASE``).
+Declare that value (``demo/<name>.py``,
 ``cleave.dynamic.registry``, ``tests/_tolerances.py``); never one chosen to make a kernel pass.
 
 ``--pin`` writes the measurement to ``tests/measured_errors.json``.
@@ -145,7 +146,7 @@ def recommend(largest_valid: float, dtype: str) -> float:
 # row, not an error that grows with the row. Measured on gqa_paged_decode_h32_kv8_d128_ps1
 # with logits that only fall along the keys (the lse of a row is then close to 0): errors
 # of 3e-7 .. 4e-7 are 5e-7 .. 7e-7 of a row max of 0.6, which as an rtol input would ask
-# for 5e-6, while the declared 2e-6 * rowmax + 1e-6 holds those rows with 5x to spare.
+# for 5e-6, while the declared 1e-6 * rowmax + 1e-6 holds those rows with 3x to spare.
 # Such a comparison is counted and held to the declared bound like any other; it does not
 # feed ``largest valid`` (``feeds_rtol``). One entry over the floor and it feeds in full.
 ATOL_FLOOR = step125(SAFETY * ULP["float32"] / math.log(2))  # 1e-6
@@ -167,6 +168,23 @@ def feeds_rtol(absolute: bool, abs_error: float) -> bool:
 # Such a comparison is logged with the case in its ``what`` ("increasing inputs") and is
 # given this kind in the table, passed or not (a non-finite one stays non-finite: nothing
 # was measured). One that is over the bound is a finding, and the table says so.
+#
+# A dynamic operator's tolerance is declared from its error on its normal inputs: its
+# captured workloads and the hand-made requests that leave the inputs as generated. Its
+# softmax is exact, so its kernels are also validated on adversarial softmax inputs -- the
+# registry's adversarial workloads and the hand-made requests that transform the inputs --
+# at that same bound: those comparisons are counted and held to the declaration like any
+# other, and they are no input to it. A bound is never loosened for an adversarial case; a
+# kernel that needs more than the bound there fails.
+# (Measured on these operators: the lse of logits x100 or of a 128-unit ramp along the keys
+# is off by 4.1e-7 .. 6.9e-7 of the row max for the GQA layers and by 5.0e-6 for the MLA
+# prefill, where the float32 reference itself is 3.2e-6 from what the inputs allow; on
+# normal inputs the same kernels measure 2.3e-7 .. 5.7e-7 and 1.5e-6. As inputs the first
+# figures would turn six of the nine declared bounds into the next 1-2-5 step.)
+# Such a comparison is logged with its workload in ``what``, and the workload's key ends
+# in ``@<case>`` (``wl_16_1070_1020@large_logits``, ``tile_edges@decreasing``). It is given
+# this kind in the table, passed or not (a non-finite one stays non-finite: nothing was
+# measured). One that is over the bound is a finding, and the table says so.
 ADVERSARIAL_CASE = "adversarial"
 
 
@@ -174,6 +192,15 @@ def _adversarial_whats() -> frozenset:
     from cleave.runtime.inputs import ADVERSARIAL
 
     return frozenset(f"{name} inputs" for name in ADVERSARIAL)
+
+
+def is_adversarial(context: str, what: str) -> bool:
+    """Whether a logged comparison ran on adversarial softmax inputs: a dynamic operator on
+    an adversarial workload (by its key), a dense program on one of its adversarial cases
+    (by name)."""
+    if context.startswith("dynamic:"):
+        return "@" in what
+    return what in _adversarial_whats()
 
 
 def expected_tolerances(outputs) -> list:
@@ -302,7 +329,6 @@ def _test_operators():
 def load(out: Path) -> dict:
     """operator -> output index -> list of (dtype, absolute part?, rel, abs, kind, seed)."""
     operator_of = _test_operators()
-    adversarial = _adversarial_whats()
     table = defaultdict(lambda: defaultdict(list))
     for path in sorted((out / "validation").glob("*.jsonl")):
         seed = path.stem.rpartition("__")[2]
@@ -322,9 +348,9 @@ def load(out: Path) -> dict:
                     continue
                 context = "test:" + operator_of(node)
                 context = context.replace("test:dynamic:", "dynamic:")
-            # a dense program on one of its adversarial softmax cases (the dynamic operators
-            # name theirs by workload, and count them: see the table's docstring)
-            hard = not context.startswith("dynamic:") and record.get("what", "") in adversarial
+            # a dense program on one of its adversarial softmax cases, or a dynamic
+            # operator on one of its adversarial softmax workloads
+            hard = is_adversarial(context, record.get("what", ""))
             for i, o in enumerate(record["outputs"]):
                 # Every output is judged by its row-relative error, whatever bound it was
                 # validated at when this was logged; "absolute" only records that the
@@ -360,7 +386,10 @@ def rows(table):
             measured = [(rel, abs_, kind) for _, _, rel, abs_, kind, _ in entries
                         if rel is not None and kind != "non_finite"]
             limit = valid_limit(dtype)
-            hard = [rel for rel, _, kind in measured if kind == ADVERSARIAL_CASE]
+            # Adversarial comparisons the rtol has to cover: like any other, one within the
+            # floor alone is inside the bound whatever the rtol.
+            hard = [rel if feeds_rtol(absolute, abs_) else 0.0
+                    for rel, abs_, kind in measured if kind == ADVERSARIAL_CASE]
             measured = [(rel, abs_) for rel, abs_, kind in measured if kind != ADVERSARIAL_CASE]
             valid = [(rel, abs_) for rel, abs_ in measured if rel <= limit]
             feeding = [rel for rel, abs_ in valid if feeds_rtol(absolute, abs_)]
@@ -375,7 +404,7 @@ def rows(table):
                 "largest_valid_abs": max((abs_ for _, abs_ in valid), default=None),
                 "ambiguous": sorted(rel for rel, _ in measured if limit < rel < WRONG),
                 "within_floor": len(valid) - len(feeding),
-                # a dense program's passes on adversarial inputs: counted, no input to rtol
+                # an operator's passes on adversarial inputs: counted, no input to rtol
                 "adversarial": len(hard), "largest_adversarial": max(hard, default=None),
                 "rtol": None if largest is None else recommend(largest, dtype),
                 "atol": ATOL_FLOOR if absolute else 0.0,
@@ -387,8 +416,8 @@ def measured_errors(table) -> dict:
     clearly-valid error of each output, which is all the rule needs (``MEASURED``).
 
     ``rel`` is taken over the comparisons that feed the rtol (``feeds_rtol``, and for a
-    dense program the normal inputs only: ``ADVERSARIAL_CASE``); ``abs`` over the valid
-    comparisons on normal inputs and ``validated`` over all of them."""
+    dense program or a dynamic operator its normal inputs only: ``ADVERSARIAL_CASE``); ``abs``
+    over the valid comparisons on normal inputs and ``validated`` over all of them."""
     out = defaultdict(list)
     for r in rows(table):
         assert r["output"] == len(out[r["operator"]]), r

@@ -38,26 +38,36 @@ def _tolerance(out_rtol, lse_rtol):
     For the fp32 lse the row is the heads of one query row. Its error grows with its
     magnitude (measured per operator over |lse| of 2 .. 25 on the captured workloads and up
     to 3000 on the adversarial ones: the largest absolute error rises with the row max, from
-    3e-6 to 4e-3, the largest relative one stays level, between 4e-7 and 5e-6), so an
+    2e-6 to 4e-3, the largest relative one stays level, between 2e-7 and 5e-6), so an
     absolute bound sized on one logit scale is wrong on every other: at |lse| = 450 (logits
     x100) one fp32 ulp is already 3e-5. ``LSE_ATOL`` only keeps a row whose lse is 0 from
     demanding a bit-exact answer; an empty row's -inf is matched exactly either way.
 
     ``lse_rtol`` is the next 1-2-5 step at or above 4x the largest row-relative error the
-    operator's valid kernels measured over three seeds on everything they are validated on:
-    its captured workloads, its adversarial workloads, and the hand-made requests of its
-    tests, single kernels and split-KV pairs alike. One kind of comparison is counted and is
-    no input: an lse output whose every entry is within ``LSE_ATOL``. It is inside the bound
-    whatever the rtol, and its row-relative error is the floor's share of a row near 0, not
-    an error that grows with the row (requests whose logits only fall along the keys: 5e-7
-    .. 7e-7 of a row max of 0.6, held by the bound with 5x to spare).
+    operator's valid kernels measured over three seeds on its normal inputs: its captured
+    workloads and the hand-made requests of its tests that leave the inputs as generated,
+    single kernels and split-KV pairs alike. Two kinds of comparison are counted and are no
+    input to it.
 
-    The measured difference is not all the kernel's. The reference is float32 as well, and
-    on the adversarial ramps -- constant queries against constant key rows, every product of
-    a 576-term MLA score of one sign -- it is the reference that is off: against the value
-    those inputs allow to be formed with two roundings, the MLA prefill kernel is within
-    1e-7 and the reference 3e-6 away. That is what puts that operator's bound at the float32
-    ceiling.
+    One is an lse output whose every entry is within ``LSE_ATOL``. It is inside the bound
+    whatever the rtol, and its row-relative error is the floor's share of a row near 0, not
+    an error that grows with the row.
+
+    The other is a comparison on adversarial inputs: the operator's adversarial workloads
+    and the hand-made requests that transform the inputs (logits x100 through the queries
+    or the scale, a ramp or one dominant key along the keys, a mirrored scale). The softmax
+    of every layer is exact, so every kernel is validated on them too, at this same bound:
+    it is declared from the normal inputs and never loosened for an adversarial case, and a
+    kernel that needs more than it there fails. What they measure, next to the normal
+    inputs: 4.1e-7 .. 6.9e-7 against 2.3e-7 .. 5.7e-7 for the GQA layers, 1.1e-6 against
+    1.1e-6 for MLA decode and 5.0e-6 against 1.5e-6 for MLA prefill, each inside its bound
+    by a factor of 2 to 7.
+
+    The MLA prefill figure is not all the kernel's. The reference is float32 as well, and
+    where an adversarial workload makes the queries and a key row constant -- every product
+    of a 576-term MLA score of one sign -- it is the reference that is off: against the
+    value those inputs allow to be formed with two roundings, the kernel is within 1.1e-7
+    and the reference 3.2e-6 away.
 
     ``out`` follows the same rule at 2x: bf16 has 8 significand bits, so one ulp is 7.8e-3
     of the row max, every kernel measures 1 ulp (7.8e-3), and 4x would be the 5e-2 ceiling,
@@ -145,7 +155,7 @@ OPERATORS: dict[str, DynamicOperator] = {
             PagingSpec(num_qo_heads=32, num_kv_heads=8),
             _GQA,
             (32, 8, 128),
-            _tolerance(out_rtol=2e-2, lse_rtol=2e-6),
+            _tolerance(out_rtol=2e-2, lse_rtol=1e-6),
         ),
         _operator(
             "gqa_paged_decode_h32_kv4_d128_ps1",
@@ -153,7 +163,7 @@ OPERATORS: dict[str, DynamicOperator] = {
             PagingSpec(num_qo_heads=32, num_kv_heads=4, grid_order=("head", "batch")),
             _GQA,
             (32, 4, 128),
-            _tolerance(out_rtol=2e-2, lse_rtol=2e-6),
+            _tolerance(out_rtol=2e-2, lse_rtol=1e-6),
         ),
         _operator(
             "gqa_paged_decode_h32_kv8_d128_ps64",
@@ -180,14 +190,14 @@ OPERATORS: dict[str, DynamicOperator] = {
             # measured -- the captured requests' causal windows are a handful of tokens.
             _GQA_PREFILL,
             (32, 8, 128),
-            _tolerance(out_rtol=2e-2, lse_rtol=5e-6),
+            _tolerance(out_rtol=2e-2, lse_rtol=2e-6),
         ),
         _operator(
             "gqa_paged_prefill_causal_h32_kv4_d128_ps1",
             PagingSpec(num_qo_heads=32, num_kv_heads=4, kind=PAGED_PREFILL_CAUSAL, causal=True),
             _GQA_PREFILL,
             (32, 4, 128),
-            _tolerance(out_rtol=2e-2, lse_rtol=5e-6),
+            _tolerance(out_rtol=2e-2, lse_rtol=2e-6),
         ),
         _operator(
             "gqa_ragged_prefill_causal_h32_kv8_d128",
@@ -218,7 +228,7 @@ OPERATORS: dict[str, DynamicOperator] = {
             ),
             dict(query_rows=64, kv_tile=64, head_dim=128),
             (32, 4, 128),
-            _tolerance(out_rtol=2e-2, lse_rtol=5e-6),
+            _tolerance(out_rtol=2e-2, lse_rtol=2e-6),
         ),
         _operator(
             "mla_paged_decode_h16_ckv512_kpe64_ps1",
@@ -247,7 +257,7 @@ OPERATORS: dict[str, DynamicOperator] = {
             ),
             dict(query_rows=16, kv_tile=64, n_threads=128, ckv=512, kpe=64),
             (16, 512, 64),
-            _tolerance(out_rtol=2e-2, lse_rtol=2e-5),
+            _tolerance(out_rtol=2e-2, lse_rtol=1e-5),
             scale=_wl.MLA_SM_SCALE,
         ),
     )
