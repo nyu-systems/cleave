@@ -1080,6 +1080,7 @@ def apply_tiling(cand: List) -> List[Graph]:
             physical_shape = logical_shape
             physical_tile_size = logical_tile_size
             physical_coord_exprs = logical_coord_exprs
+            stored_axes = tuple(range(len(logical_shape)))
             split_axis = getattr(bound_node, "_split_axis", None)
             if (
                 len(main_output_nodes) > 1
@@ -1093,11 +1094,19 @@ def apply_tiling(cand: List) -> List[Graph]:
                 physical_shape = [logical_shape[axis] for axis in reorder]
                 physical_tile_size = [logical_tile_size[axis] for axis in reorder]
                 physical_coord_exprs = [logical_coord_exprs[axis] for axis in reorder]
+                stored_axes = tuple(reorder)
 
             while len(physical_shape) < len(canonical_output_binding.get_shape()):
                 physical_shape.append(1)
                 physical_tile_size.append(1)
                 physical_coord_exprs.append(None)
+
+            # The stored layout is decided here and nowhere else, so it is recorded here:
+            # no consumer has to recover it from the extents of the two shapes.
+            graphs["main"].stored_layouts[node.name] = (
+                stored_axes,
+                len(physical_shape) - len(logical_shape),
+            )
 
             num_args = (
                 len(graphs["main"].extent)
@@ -1115,6 +1124,8 @@ def apply_tiling(cand: List) -> List[Graph]:
 
         tile_size = _expand_tile_to_shape_rank(node, tile_size)
         shape = _get_schedule_shape_owner(node).get_shape()
+        if isinstance(node, OutputNode):  # stored as its producer computes it
+            graphs["main"].stored_layouts[node.name] = (tuple(range(len(shape))), 0)
         iter_dims = [i // j > 1 for i, j in zip(shape, tile_size)]
         num_args = (
             len(graphs["main"].extent)
