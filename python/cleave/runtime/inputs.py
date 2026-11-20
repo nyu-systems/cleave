@@ -1,8 +1,10 @@
 """Input distributions a kernel can be validated on: ``normal`` and the adversarial softmax cases.
 
 ``normal`` is what :func:`cleave.runtime.reference.make_inputs` samples. The adversarial ones
-rewrite that sample afterwards (so the normal stream never shifts), and only the operands of
-the *score* matmuls: the matmuls an ``Exp`` is reached from without crossing another matmul.
+rewrite that sample afterwards (so the normal stream never shifts), and only what the logits
+of a softmax are made of: the operands of the *score* matmuls (the matmuls an ``Exp`` is
+reached from without crossing another matmul), and an input that is the logits itself (a
+stabilized ``Exp`` that reads an input: ``cl.softmax(x)``).
 
 ``large_logits``  the query operand times 100, so every logit is 100 times larger;
 ``increasing``    logits that grow along the key axis for every query row, by more than
@@ -17,14 +19,18 @@ the *score* matmuls: the matmuls an ``Exp`` is reached from without crossing ano
 ``offset``        normal-sized logits (on a 1/8 grid, see ``OFFSET``) that all sit about
                   1e4 below zero: ``exp`` of any of them is 0, only the differences count.
 
+Logits that are an input get the same rows written into them directly, along the softmax
+axis of the ``Exp`` that reads them; their offset is ``LOGIT_OFFSET`` (what fp16 holds next
+to a normal-sized term).
+
 The first three are shared with the dynamic operators (``SHARED_DISTRIBUTIONS``); the others
 exist for the dense programs only.
 
 Each is requested explicitly (``EvalConfig.distributions`` for a program,
 ``make_inputs(..., distribution=...)`` for a graph); a program whose softmax is exact is
 validated on all of them (``ADVERSARIAL``, see ``cleave.pipeline.build``). A graph with no
-score matmul has no logits to shape, and asking for an adversarial distribution on it is an
-error.
+score matmul and no logit input has no logits to shape, and asking for an adversarial
+distribution on it is an error.
 """
 
 from __future__ import annotations
@@ -56,6 +62,9 @@ INCREASING_SPAN = 128.0
 OFFSET = 1.0e4
 OFFSET_QUERY = 256.0
 OFFSET_GRID = 0.125
+# ... and for logits that are an input: fp16 has no room for 1e4 next to a normal-sized term
+# (one ulp there is 8). At 512 it is 0.5, and ``exp(-512)`` is 0 in fp32 all the same.
+LOGIT_OFFSET = 512.0
 
 
 def check_distributions(distributions) -> tuple:
@@ -72,17 +81,18 @@ def check_distributions(distributions) -> tuple:
 def adversarial_cases(graph) -> tuple:
     """The adversarial cases ``graph``'s inputs can be shaped into, in ``ADVERSARIAL`` order.
 
-    All of them when every score matmul reads a query input and a separate key input; only
-    ``large_logits`` when one input is both; none when the graph has no score matmul or an
-    operand of one is computed (the logits of RMSNorm-ed operands are bounded, whatever the
-    inputs are).
+    All of them when every score matmul reads a query input and a separate key input, and
+    when the logits are an input themselves; only ``large_logits`` when one input is both
+    query and key; none when the graph has neither a score matmul nor a logit input, or an
+    operand of a score matmul is computed (the logits of RMSNorm-ed operands are bounded,
+    whatever the inputs are).
     """
     scores = score_matmuls(graph)
     try:
         operands = [(_operand(m, 0)[0], _operand(m, 1)[0]) for m in scores]
     except SpecError:
         return ()
-    if not operands:
+    if not operands and not logit_inputs(graph):
         return ()
     if {id(q) for q, _ in operands} & {id(k) for _, k in operands}:
         return ("large_logits",)
@@ -103,6 +113,27 @@ def score_matmuls(graph) -> list:
                 found.append(src)
             else:
                 stack.append(src)
+    return found
+
+
+def logit_inputs(graph) -> list:
+    """``(placeholder, softmax axis, sign)`` for every stabilized ``Exp`` whose logits are an
+    input: it reads a placeholder, directly or through constant scalings (``sign`` is
+    theirs). The softmax axis is the record's, which only a stabilized ``Exp`` has: a plain
+    ``exp(x)`` does not say what it is summed over.
+    """
+    found = []
+    for node in graph.nodes:
+        record = getattr(node, "stabilize", None)
+        if type(node) is not Exp or record is None or len(record.axes) != 1:
+            continue
+        src, sign = node.inputs[0].src_node, 1.0
+        while type(src) in (Mul, Div) and src.const is not None \
+                and not getattr(src, "const_on_left", False):
+            sign = -sign if float(src.const) < 0 else sign
+            src = src.inputs[0].src_node
+        if isinstance(src, PlaceHolderNode) and not any(src is p for p, _, _ in found):
+            found.append((src, record.axes[0] % len(src.get_shape(0)), sign))
     return found
 
 
@@ -176,15 +207,19 @@ def apply_distribution(graph, inputs, distribution):
     (distribution,) = check_distributions(distribution)
     if distribution == "normal":
         return tuple(inputs)
-    scores = score_matmuls(graph)
-    if not scores:
+    scores, logits = score_matmuls(graph), logit_inputs(graph)
+    if not scores and not logits:
         raise SpecError(
             f"the {distribution!r} inputs shape softmax logits, but this graph has no score "
-            "matmul (a Matmul feeding an Exp)"
+            "matmul (a Matmul feeding an Exp) and no stabilized Exp that reads an input"
         )
     placeholders = placeholder_order(graph)
     index = {id(p): i for i, p in enumerate(placeholders)}
     out = list(inputs)
+    for node, axis, sign in logits:
+        out[index[id(node)]] = _logits(inputs[index[id(node)]], axis, sign, distribution)
+    if not scores:
+        return tuple(out)
     queries, keys = {}, {}
     for matmul in scores:
         q_node, q_views, q_sign = _operand(matmul, 0)
@@ -240,6 +275,34 @@ def apply_distribution(graph, inputs, distribution):
                 ramp = ramp.flip(0)
         out[i] = (sign * INCREASING_SPAN * ramp).reshape(shape).expand_as(x).to(x.dtype).contiguous()
     return tuple(out)
+
+
+def _logits(x, axis, sign, distribution):
+    """A logit input in one of the adversarial cases: the rows the score operands are shaped
+    to produce, written along ``axis`` directly. ``sign`` is that of the constant scalings
+    between the input and the ``Exp``."""
+    import torch
+
+    xf, n = x.float(), x.shape[axis]
+    first = xf.narrow(axis, 0, 1)
+    top = sign * (first.abs() + 0.5) * INCREASING_SPAN  # a * 128, a >= 0.5, per row
+    if distribution == "large_logits":
+        out = xf * LARGE_LOGIT_FACTOR
+    elif distribution in ("increasing", "decreasing"):
+        shape = [1] * x.dim()
+        shape[axis] = n
+        ramp = torch.arange(n, device=x.device, dtype=torch.float32) / max(n - 1, 1)
+        if distribution == "decreasing":
+            ramp = ramp.flip(0)
+        out = top * ramp.reshape(shape)
+    elif distribution == "last_spike":
+        out = xf.clone()
+        out.narrow(axis, n - 1, 1).copy_(top)
+    elif distribution == "constant":
+        out = first.expand_as(xf)
+    else:  # offset: the input's own rounding puts the normal-sized term on its grid
+        out = xf - sign * LOGIT_OFFSET
+    return out.to(x.dtype).contiguous()
 
 
 def _first(x, contracted):

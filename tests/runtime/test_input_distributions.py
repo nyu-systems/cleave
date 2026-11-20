@@ -27,12 +27,12 @@ from cleave.pipeline import EvalConfig
 from cleave.runtime import inputs as rt_inputs
 from cleave.runtime import reference as rt
 from cleave.runtime.inputs import (
-    ADVERSARIAL as DENSE_ADVERSARIAL, DISTRIBUTIONS, INCREASING_SPAN, LARGE_LOGIT_FACTOR, OFFSET,
-    OFFSET_GRID, SHARED_DISTRIBUTIONS, adversarial_cases,
+    ADVERSARIAL as DENSE_ADVERSARIAL, DISTRIBUTIONS, INCREASING_SPAN, LARGE_LOGIT_FACTOR,
+    LOGIT_OFFSET, OFFSET, OFFSET_GRID, SHARED_DISTRIBUTIONS, adversarial_cases, logit_inputs,
 )
 
 from tests import _graphs as g
-from tests._softmax import exact_softmax
+from tests._softmax import exact_softmax, lowered
 from tests.frontend import _programs as programs
 
 DTYPE = "float16"
@@ -268,6 +268,87 @@ def test_adversarial_cases_are_what_the_inputs_of_a_graph_can_be_shaped_into():
             _inputs(graph, distribution)
 
 
+def softmax_rows(x: cl.Tensor["R", "C"]):
+    return exact_softmax(x, -1)
+
+
+def softmax_columns(x: cl.Tensor["C", "R"]):
+    return exact_softmax(x, 0)
+
+
+def softmax_of_negated_rows(x: cl.Tensor["R", "C"]):
+    return exact_softmax(x * -0.5, -1)
+
+
+# name -> (program, shapes, softmax axis of the input, the constant between input and exp)
+LOGITS = {
+    "rows": (softmax_rows, dict(R=8, C=96), 1, 1.0),
+    "columns": (softmax_columns, dict(R=8, C=96), 0, 1.0),
+    "negated_rows": (softmax_of_negated_rows, dict(R=8, C=96), 1, -0.5),
+}
+
+
+@pytest.mark.parametrize("name", sorted(LOGITS))
+def test_logits_that_are_an_input_are_shaped_along_their_softmax_axis(name):
+    """A standalone ``cl.softmax(x)`` has no score matmul: its logits are the input (times a
+    constant). The cases write the same rows into it, along the axis the Exp's record names."""
+    fn, shapes, axis, scale = LOGITS[name]
+    graph = lowered(fn, shapes)  # the flat graph the pipeline validates against: annotated
+    ((placeholder, found_axis, sign),) = logit_inputs(graph)
+    assert (found_axis, sign) == (axis, math.copysign(1.0, scale))
+    assert adversarial_cases(graph) == DENSE_ADVERSARIAL
+    span = INCREASING_SPAN * abs(scale)
+
+    def logits(distribution):
+        (inputs,) = [_inputs(graph, distribution)]
+        assert len(inputs) == 1 and inputs[0].dtype == torch.float16
+        assert torch.isfinite(inputs[0]).all()
+        (scores,) = _scores(graph, inputs)
+        return scores.movedim(axis, -1)  # the softmax axis last
+
+    base = logits("normal")
+    large = logits("large_logits")  # the input is rounded to fp16 again after scaling
+    assert torch.allclose(large, LARGE_LOGIT_FACTOR * base, rtol=1e-3, atol=1e-3)
+
+    up, down = logits("increasing"), logits("decreasing")
+    assert (up.diff(dim=-1) >= 0).all() and (up[..., 16:] > up[..., :-16]).all()
+    assert torch.equal(down, up.flip(-1))
+    rise = up[..., -1] - up[..., 0]
+    assert float(rise.min()) > 0.4 * span and float(rise.max()) > 88.7
+
+    spiked = logits("last_spike")
+    last, rest = spiked[..., -1], spiked[..., :-1]
+    assert torch.equal(rest, base[..., :-1]), "every key but the last is the normal one"
+    assert float(last.min()) > 0.4 * span and float(last.max()) > 88.7
+    assert float((last[..., None] - rest).min()) > 0.25 * span
+
+    constant = logits("constant")
+    assert (constant == constant[..., :1]).all()
+    assert constant[..., 0].unique().numel() > 1
+
+    shifted = logits("offset")
+    assert float(shifted.max()) < -0.9 * LOGIT_OFFSET * abs(scale)
+    assert (shifted.exp() == 0).all()
+    spread = shifted.amax(dim=-1) - shifted.amin(dim=-1)
+    assert 1.0 * abs(scale) < float(spread.min()) and float(spread.max()) < 40.0
+
+
+def test_a_plain_exp_of_an_input_names_no_softmax_axis():
+    """Without the record nothing says what the exp is summed over: no logit input, and the
+    adversarial cases are an error, as for any graph without logits to shape."""
+    from cleave.lower import to_ir
+
+    prog = programs.matmul.trace(M=8, N=8, K=16)
+    assert logit_inputs(to_ir(prog.to_graph_structure(), dtype=DTYPE, out_dtype=DTYPE)) == []
+    graph = lowered(softmax_rows, dict(R=8, C=96))
+    for node in graph.nodes:
+        if type(node) is Exp:
+            node.stabilize = None
+    assert logit_inputs(graph) == [] and adversarial_cases(graph) == ()
+    with pytest.raises(SpecError, match="no score matmul"):
+        _inputs(graph, "increasing")
+
+
 def test_lowered_frontend_attention_is_recognized():
     from cleave.lower import to_ir
 
@@ -339,8 +420,9 @@ def test_adversarial_inputs_are_switched_on_per_operator():
         seen.append(distributions)
         return "published"
 
-    def held_to(program, asked):
-        graph = to_ir(program.to_graph_structure(), dtype=DTYPE, out_dtype=DTYPE)
+    def held_to(program, asked, graph=None):
+        if graph is None:
+            graph = to_ir(program.to_graph_structure(), dtype=DTYPE, out_dtype=DTYPE)
         assert _reference_fn(asked, program, publish)("dir", graph, DTYPE) == "published"
         return seen[-1]
 
@@ -354,11 +436,18 @@ def test_adversarial_inputs_are_switched_on_per_operator():
     assert held_to(trace(by_hand, shapes, cl.f16), ("normal",)) == ("normal",)
     assert held_to(fixed, ("normal", "large_logits")) == ("normal", "large_logits")
 
-    def exact_softmax_alone(x: cl.Tensor["R", "C"]):
-        return exact_softmax(x)
+    # a softmax of an input: the logits are the input, and the lowered graph says along
+    # which axis (the Exp's record), so it is held to every case as well
+    alone = trace(softmax_rows, dict(R=4, C=32), cl.f16)
+    assert held_to(alone, ("normal",), lowered(softmax_rows, dict(R=4, C=32))) == (
+        "normal",) + DENSE_ADVERSARIAL
 
-    # no score matmul: there are no logits to shape, so nothing is added
-    assert held_to(trace(exact_softmax_alone, dict(R=4, C=32), cl.f16), ("normal",)) == ("normal",)
+    def exp_of_a_sum(x: cl.Tensor["R", "C"], y: cl.Tensor["R", "C"]):
+        return exact_softmax(x + y)
+
+    # logits that are neither a score matmul nor an input: nothing to shape, nothing added
+    summed = trace(exp_of_a_sum, dict(R=4, C=32), cl.f16)
+    assert held_to(summed, ("normal",), lowered(exp_of_a_sum, dict(R=4, C=32))) == ("normal",)
 
 
 # ----------------------------------------------------------------------------- dynamic
