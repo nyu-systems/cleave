@@ -94,10 +94,11 @@ def _work_behind_loops(order: List[Node]) -> List[Node]:
     axis, next to the loop of the row sum. TileLang (0.1.13) cannot take it in front. It
     lowers a tier with a pipelined loop by splitting the block's threads at the loop into
     a group that loads and a group that computes, and runs whatever stands in front of
-    the loop on both: the fragment is then filled for the wrong threads, and the kernel
-    does not return (the block's barriers never line up). Behind the loop the same
-    statement belongs to the computing group alone. A tier without such a node keeps its
-    order, and so its text.
+    the loop on both, without the thread offset it gives the computing group behind the
+    split (in the lowered CUDA the fragment is filled at ``threadIdx.x * 8`` in front and
+    stored at ``threadIdx.x * 8 - 1024`` behind). That kernel does not return: it spins
+    on the GPU until it is killed. Behind the loop the same statement belongs to the
+    computing group alone. A tier without such a node keeps its order, and so its text.
     """
     loops = [i for i, node in enumerate(order) if isinstance(node, GraphNode)]
     if not loops:

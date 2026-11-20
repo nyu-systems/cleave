@@ -634,12 +634,14 @@ def _normalize_main_reduction_axes(main: Graph):
             # A loop's accumulator: the buffer is the one the loop's own tier allocates.
             accum_node = getattr(edge, "accum_node", None)
             it = None if accum_node is None else edge.src_node.graph.tmap.get(accum_node)
+            if isinstance(it, Iterator):
+                rebase_reduction_axis(node, it)
+            else:
+                _rebase_reduction_axis(node, None)
         else:
-            it = main.tmap.get(edge.src_node)
-        if isinstance(it, Iterator):
-            rebase_reduction_axis(node, it)
-        else:
-            _rebase_reduction_axis(node, None)
+            # A tile of this tier is over the node's dims as it is. One of another rank
+            # (a unit dim that is not a batch dim has no tile) is left alone.
+            _rebase_reduction_axis(node, list(main.tmap[edge.src_node].tile_size))
 
 
 def _iterative_reductions(nodes, rstep_map):
