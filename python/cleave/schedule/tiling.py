@@ -602,6 +602,26 @@ def _normalize_inner_reduction_axes(graph_node: GraphNode, itile_map: dict):
         _rebase_reduction_axis(node, None if tile is None else list(tile))
 
 
+def _normalize_main_reduction_axes(main: Graph, itile_map: dict):
+    """Rebase the reduction axes of the main tier onto the block tiles they read.
+
+    A reduction that is not looped stays in the main tier, where a batch dim is a unit
+    extent of every tile and is squeezed like any other: without this, a sum over a
+    non-leading axis is emitted with its flat ``dim`` and reduces the next axis over.
+    """
+    for node in main.nodes:
+        if not isinstance(node, ReduceSum) or len(node.inputs) != 1:
+            continue
+        edge = node.inputs[0]
+        if isinstance(edge.src_node, GraphNode):
+            # A loop's accumulator: its buffer holds one iteration tile.
+            accum_node = getattr(edge, "accum_node", None)
+            tile = None if accum_node is None else itile_map.get(accum_node.name)
+        else:
+            tile = main.tmap[edge.src_node].tile_size
+        _rebase_reduction_axis(node, None if tile is None else list(tile))
+
+
 def _iterative_reductions(nodes, rstep_map):
     """The reductions of ``nodes`` that are stepped below their extent."""
     return [
@@ -1048,6 +1068,7 @@ def apply_tiling(cand: List) -> List[Graph]:
             shape=shape,
             tile_size=tile_size,
         )
+    _normalize_main_reduction_axes(graphs["main"], itile_map)
 
     if any(getattr(n, "stabilize", None) is not None for n in ordered_nodes):
         # A softmax exp the scale analysis marked gets its max here, where the tiers are

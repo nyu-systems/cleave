@@ -14,7 +14,8 @@ from pathlib import Path
 #    happen to agree), and a kernel's inputs are bound in the program's declaration order.
 # 4: an op that no output reads is not lowered (it used to hand its shape to the inputs it
 #    read), and a divisor over two unit axes is broadcast along the one the program names.
-SCHEMA = 4
+# 5: a reduction that is not looped reduces its own axis of the stored tile.
+SCHEMA = 5
 # What "validated" means for a saved kernel. A kernel-cache hit returns without validating,
 # so bump this whenever the comparison or its inputs change: saved kernels are then rebuilt.
 VALIDATION = 2
