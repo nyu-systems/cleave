@@ -1,7 +1,8 @@
+import weakref
 from collections import Counter
 from dataclasses import dataclass
 from math import prod
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, NamedTuple, Optional, Set
 from tilelang.carver.roller.node import Edge
 from ..core.errors import ScheduleRejected
 from ..ir.graph import (
@@ -690,6 +691,67 @@ def absorbed_reductions(nodes, rstep_map, ancestors=None):
     ]
 
 
+class _ScheduledAxes(NamedTuple):
+    """What the absorbed-reduction pin asks of a flat graph, whatever the candidate."""
+
+    structure: tuple  # ``_structure`` of the flat graph these were read from
+    nodes: list  # op nodes of the scheduled clone (split views removed)
+    out_tokens: dict  # ``build_output_axis_provenance`` of ``nodes``
+    red_tokens: dict  # ``build_reduction_axis_provenance`` of ``nodes``
+    ancestors: dict  # ``reduction_ancestors`` of ``nodes``
+
+
+# id(flat graph) -> (weak reference to it, its _ScheduledAxes). A ``Graph`` is a mutable
+# dataclass and so not hashable; the entry goes when the graph does.
+_SCHEDULED_AXES: dict = {}
+
+
+def _structure(flat_graph) -> tuple:
+    """The nodes of ``flat_graph`` and how they are wired, by name."""
+    return tuple(
+        (n.name, tuple((e.src_node.name, e.src_id) for e in n.inputs))
+        for n in flat_graph.nodes
+    )
+
+
+def _scheduled_axes(flat_graph) -> _ScheduledAxes:
+    """Axis provenance and reduction ancestors of ``flat_graph`` as ``apply_tiling`` sees it.
+
+    They depend on the flat graph only, and every candidate of a search shares one flat
+    graph, so they are read once per graph instead of once per candidate (it was two
+    thirds of ``apply_tiling``'s time on a candidate). They are read off a clone of
+    their own -- the one ``apply_tiling`` schedules is taken apart by it -- and are
+    indexed by node: nodes compare by name, so the nodes of any clone find their entry.
+    A graph that was rewired since (``_structure``) is read again.
+    """
+    structure = _structure(flat_graph)
+    entry = _SCHEDULED_AXES.get(id(flat_graph))
+    if entry is not None and entry[0]() is flat_graph and entry[1].structure == structure:
+        return entry[1]
+
+    _, pruned = _extract_split_extent(flat_graph)
+    ordered_nodes = [
+        n for n in pruned.nodes if not n.is_placeholder() and not n.is_output()
+    ]
+    out_tokens = build_output_axis_provenance(ordered_nodes)
+    axes = _ScheduledAxes(
+        structure,
+        ordered_nodes,
+        out_tokens,
+        build_reduction_axis_provenance(ordered_nodes, out_tokens),
+        reduction_ancestors(ordered_nodes),
+    )
+
+    key = id(flat_graph)
+
+    def forget(ref):
+        if _SCHEDULED_AXES.get(key, (None,))[0] is ref:
+            del _SCHEDULED_AXES[key]
+
+    _SCHEDULED_AXES[key] = (weakref.ref(flat_graph, forget), axes)
+    return axes
+
+
 def scheduled_reductions(flat_graph):
     """``(op nodes, reduction-axis provenance)`` of ``flat_graph`` as ``apply_tiling`` sees it.
 
@@ -699,12 +761,8 @@ def scheduled_reductions(flat_graph):
     provenance from here. Nodes compare by name, so a step map keyed by the nodes of
     ``flat_graph`` indexes the returned ones.
     """
-    _, pruned = _extract_split_extent(flat_graph)
-    ordered_nodes = [
-        n for n in pruned.nodes if not n.is_placeholder() and not n.is_output()
-    ]
-    out_tokens = build_output_axis_provenance(ordered_nodes)
-    return ordered_nodes, build_reduction_axis_provenance(ordered_nodes, out_tokens)
+    axes = _scheduled_axes(flat_graph)
+    return axes.nodes, axes.red_tokens
 
 
 def _held_axis_tokens(ordered_nodes, rstep_map, red_tokens, ancestors=None):
@@ -753,25 +811,26 @@ def absorbed_axis_conflict(ordered_nodes, rstep_map, red_tokens, ancestors=None)
     return None
 
 
-def _pin_absorbed_reduction_axes(ordered_nodes, rstep_map, tile_map, itile_map):
+def _pin_absorbed_reduction_axes(flat_graph, rstep_map, tile_map, itile_map):
     """Iteration tiles with every absorbed reduction axis kept at its block extent.
 
     Each tensor dim that carries the axis of an absorbed reduction (see
     ``absorbed_reductions``) keeps its block tile, so ``assign_tensor_map`` does not
     slice it with the counter of the loop the reduction was absorbed into.
+    ``flat_graph`` is the candidate's; what is asked of it is the same for every
+    candidate (``_scheduled_axes``).
 
     Raises ``ScheduleRejected`` for a tiling in which another reduction steps that same
     axis: its loop would have to advance an axis that has to stay whole.
     """
-    if not absorbed_reductions(ordered_nodes, rstep_map):
+    axes = _scheduled_axes(flat_graph)
+    if not absorbed_reductions(axes.nodes, rstep_map, axes.ancestors):
         return itile_map
 
-    out_tokens = build_output_axis_provenance(ordered_nodes)
-    red_tokens = build_reduction_axis_provenance(ordered_nodes, out_tokens)
-    pinned = _held_axis_tokens(ordered_nodes, rstep_map, red_tokens)
+    pinned = _held_axis_tokens(axes.nodes, rstep_map, axes.red_tokens, axes.ancestors)
 
     itile_map = dict(itile_map)
-    for (node, out_id), dim_tokens in out_tokens.items():
+    for (node, out_id), dim_tokens in axes.out_tokens.items():
         if out_id != 0 or node.name not in itile_map:
             continue
         tile, itile = tile_map[node.name], list(itile_map[node.name])
@@ -887,7 +946,7 @@ def apply_tiling(cand: List) -> List[Graph]:
     tile_map = {k.name: v for k, v in cand.tile_map.items()}
     itile_map = {k.name: v for k, v in cand.itile_map.items()}
     itile_map = _pin_absorbed_reduction_axes(
-        ordered_nodes, cand.rstep_map, tile_map, itile_map
+        cand.flat_graph, cand.rstep_map, tile_map, itile_map
     )
 
     # set top level threadblock extent and tmap based on the
