@@ -63,7 +63,17 @@ Graph *Graph::create_symbolic_graph(
   using namespace cleave_superoptimizer::symbolic;
 
   // Step 1: Grouping pass - traverse all operators and group dimensions
-  DimensionGrouper grouper;
+  type::GuidType first_guid = DTensor::FIRST_GUID;
+  bool has_tensor = false;
+  for (auto const &op : operators) {
+    for (auto const &tensor : op->output_tensors) {
+      if (!has_tensor || tensor.guid < first_guid) {
+        first_guid = tensor.guid;
+        has_tensor = true;
+      }
+    }
+  }
+  DimensionGrouper grouper(first_guid);
   for (auto const &op : operators) {
     GroupingRules::apply_grouping(op, grouper);
   }

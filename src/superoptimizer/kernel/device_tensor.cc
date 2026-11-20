@@ -59,7 +59,7 @@ DTensor::DTensor() {
   dtype = type::DT_UNKNOWN;
 }
 
-std::atomic<int64_t> DTensor::next_guid = 10000000;
+std::atomic<int64_t> DTensor::next_guid = DTensor::FIRST_GUID;
 
 void to_json(json &j, DTensor const &t) {
   j = json{{"num_dims", t.num_dims},
