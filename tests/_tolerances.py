@@ -44,13 +44,12 @@ TOLERANCES = {
     "matmul_matmul_bshd_graph": Tolerance(rtol=5e-3),
     "matmul_rowsum_graph": Tolerance(rtol=5e-3),
     "rowsum_graph": Tolerance(rtol=2e-3),
-    # Measured once, by running its deselected end2end case by hand (22 valid candidates).
+    # Measured once, by running its end2end case by hand while pytest.ini deselected it
+    # (22 valid candidates).
     "rowsum_div_graph": Tolerance(rtol=2e-2),
     "rmsnorm_matmul_graph": Tolerance(rtol=5e-3),
     "rmsnorm_matmul_split_partial_graph": Tolerance(rtol=5e-3),
-    # No kernel of this operator validates today (its tests are deselected: TileLang fails
-    # before one exists), so there is nothing to measure: the one-ulp floor until one does.
-    "rmsnorm_matmul_split_combine_graph": Tolerance(rtol=1e-3),
+    "rmsnorm_matmul_split_combine_graph": Tolerance(rtol=5e-3),
     "swiglu_graph": Tolerance(rtol=5e-3),
     "lora_graph": Tolerance(rtol=5e-3),
     "mha_bhsd_graph": Tolerance(rtol=5e-3),

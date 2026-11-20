@@ -70,13 +70,12 @@ def test_every_declared_tolerance_follows_from_the_pinned_measurement():
             assert all(o["seeds"] >= 3 for o in outputs), name
         else:
             assert tolerance == expected_tolerance(outputs), name
-    # No kernel of this operator validates (its tests are deselected), so there is nothing
-    # to measure: it declares the floor, one fp16 ulp of the row max.
-    assert unmeasured == {"rmsnorm_matmul_split_combine_graph"}
-    assert TOLERANCES["rmsnorm_matmul_split_combine_graph"] == Tolerance(
-        rtol=recommend(0.0, "float16"))
+    # Every declared operator has a measurement: none declares a bound nothing was
+    # measured for (the RMSNorm split-K combine did, the one-ulp floor, while no kernel of
+    # it validated).
+    assert unmeasured == set()
     measured_tests = {key.removeprefix("test:") for key in PINNED if key.startswith("test:")}
-    assert measured_tests == set(TOLERANCES) - unmeasured
+    assert measured_tests == set(TOLERANCES)
 
     for name, operator in OPERATORS.items():
         outputs = PINNED[f"dynamic:{name}"]

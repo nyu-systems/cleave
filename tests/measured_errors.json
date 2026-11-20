@@ -710,6 +710,16 @@
    "validated": 147
   }
  ],
+ "test:rmsnorm_matmul_split_combine_graph": [
+  {
+   "abs": 0.25,
+   "absolute": false,
+   "dtype": "float16",
+   "rel": 0.001183431944809854,
+   "seeds": 3,
+   "validated": 24
+  }
+ ],
  "test:rmsnorm_matmul_split_partial_graph": [
   {
    "abs": 1.0,

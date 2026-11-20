@@ -53,7 +53,9 @@ declaration tests.
 from __future__ import annotations
 
 import argparse
+import ast
 import concurrent.futures
+import importlib
 import json
 import math
 import os
@@ -67,6 +69,7 @@ from pathlib import Path
 
 from cleave.runtime.validate import Tolerance
 from tests._tolerances import CEILING, FP32_CEILING  # no operator may declare a looser bound
+from tests._tolerances import TOLERANCES
 
 ROOT = Path(__file__).resolve().parents[1]
 MEASURED = ROOT / "tests" / "measured_errors.json"  # what the declarations are pinned to
@@ -404,21 +407,47 @@ def _test_operators():
     from tests.schedule.end2end.test_end2end import CASES as end2end
 
     def builder_of(path, test, param):
-        """The graph builder a tiling test validates at: the one its file imports, or, in a
-        file that validates at several, the one that test passes to ``tolerance_for``."""
+        """The operator a test of ``tests/graph/apply_tiling`` or ``tests/reference``
+        validates at, or None.
+
+        A file listed in ``SEVERAL_BUILDERS`` validates at several builders and says there
+        which one each of its tests passes to ``tolerance_for``; a test of such a file that
+        is not listed is an error, not a guess. A file that imports one builder from
+        ``tests._graphs`` on a line of its own validates that operator. Any other says which
+        in the test itself: by naming it, ``tolerance_for(<builder>)`` or
+        ``tolerance_for("<program>")``, or by looking the builder up in a table of the
+        module under the test's parameter (``{id: (builder, ...)}`` or ``{id: ((builder,
+        dims), ...)}``). Such a file used to end the report with a ``TypeError`` as soon as
+        one of its tests had validated a kernel.
+        """
+        name = test.partition("[")[0]
         if path in SEVERAL_BUILDERS:
             tests = SEVERAL_BUILDERS[path]
-            name = test.partition("[")[0]
             assert name in tests, (
                 f"{path}::{name} logs a validation, and its file validates at several "
                 f"operators: say which one in SEVERAL_BUILDERS")
             builder = tests[name]
             return builder if isinstance(builder, str) else builder(param)
-        found = re.search(r"^from tests\._graphs import (\w+)$", (ROOT / path).read_text(), re.M)
-        assert found, (
-            f"{path} logs a validation and does not import one graph builder on a line of "
-            f"its own: say which operator each of its tests validates at in SEVERAL_BUILDERS")
-        return found[1]
+        text = (ROOT / path).read_text()
+        single = re.search(r"^from tests\._graphs import (\w+)$", text, re.M)
+        if single:
+            return single[1]
+        body = next((ast.get_source_segment(text, fn) for fn in ast.parse(text).body
+                     if isinstance(fn, ast.FunctionDef) and fn.name == name), "")
+        named = set(re.findall(r"tolerance_for\(\"?(\w+)\"?\)", body))
+        declared = named & set(TOLERANCES)
+        if len(declared) == 1:
+            return declared.pop()
+        module = importlib.import_module(path.removesuffix(".py").replace("/", "."))
+        for table in vars(module).values():
+            if not isinstance(table, dict) or param not in table:
+                continue
+            entry = table[param]
+            while isinstance(entry, tuple) and entry:
+                entry = entry[0]
+            if getattr(entry, "__name__", None) in TOLERANCES:
+                return entry.__name__
+        return None
 
     def operator(node):
         path, _, test = node.partition("::")
@@ -439,7 +468,7 @@ def _test_operators():
         if path == "tests/frontend_dynamic/test_paged_pipeline.py":
             return f"dynamic:gqa_paged_decode_h32_kv8_d128_ps{param}"
         if path.startswith(("tests/graph/apply_tiling/", "tests/reference/")):
-            return builder_of(path, test, param)
+            return builder_of(path, test, param) or node
         if path == "tests/runtime/test_run_candidates.py":
             return "matmul_graph"
         if path == "tests/pipeline_api/test_e2e.py":
