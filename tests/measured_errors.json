@@ -87,12 +87,12 @@
  ],
  "demo:mha_decode_exact": [
   {
-   "abs": 0.000244140625,
+   "abs": 6.103515625e-05,
    "absolute": false,
    "dtype": "float16",
-   "rel": 0.000961538462433964,
+   "rel": 0.0009765625,
    "seeds": 3,
-   "validated": 12
+   "validated": 168
   }
  ],
  "demo:mha_prefill": [
@@ -405,12 +405,12 @@
  ],
  "test:exact_attention": [
   {
-   "abs": 0.000244140625,
+   "abs": 0.00048828125,
    "absolute": false,
    "dtype": "float16",
-   "rel": 0.000939849647693336,
+   "rel": 0.0009756097570061684,
    "seeds": 3,
-   "validated": 12
+   "validated": 396
   }
  ],
  "test:flash_attention_sd_graph": [
@@ -679,12 +679,12 @@
  ],
  "test:softmax": [
   {
-   "abs": 3.814697265625e-06,
+   "abs": 1.9073486328125e-06,
    "absolute": false,
    "dtype": "float16",
-   "rel": 0.0003467406495474279,
+   "rel": 0.00013758943532593548,
    "seeds": 3,
-   "validated": 33
+   "validated": 84
   }
  ],
  "test:swiglu_graph": [
