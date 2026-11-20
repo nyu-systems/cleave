@@ -133,6 +133,77 @@ def test_every_validating_fixture_has_a_declared_operator():
             assert case.tolerance is OPERATORS[name].tolerance, name
 
 
+def _validating_tests():
+    """``(node id, operator named in the test)`` for every test of ``tests/graph/apply_tiling``
+    and ``tests/reference`` that validates a kernel at a declared tolerance: each function
+    that calls ``tolerance_for``, once per parameter set where it looks the operator up in
+    a table of its module."""
+    import ast
+    import importlib
+    import re
+
+    from tests._measure_tolerances import ROOT
+
+    found = []
+    for folder in ("tests/graph/apply_tiling", "tests/reference"):
+        for file in sorted((ROOT / folder).glob("test_*.py")):
+            path = file.relative_to(ROOT).as_posix()
+            text = file.read_text()
+            for fn in ast.parse(text).body:
+                if not isinstance(fn, ast.FunctionDef) or not fn.name.startswith("test_"):
+                    continue
+                named = re.findall(r"tolerance_for\(\"?(\w+)\"?\)", ast.get_source_segment(text, fn))
+                if not named:
+                    continue
+                (name,) = set(named)
+                if name in TOLERANCES:
+                    found.append((f"{path}::{fn.name}", name))
+                    continue
+                if name == "matmul_softmax_graph":
+                    # the one builder without a declared bound: pytest.ini ignores its file
+                    assert path == "tests/graph/apply_tiling/test_matmul_softmax.py"
+                    continue
+                # a builder looked up by the test's parameter: one node per table entry
+                module = importlib.import_module(path.removesuffix(".py").replace("/", "."))
+                (param,) = [a.arg for a in fn.args.args]
+                (mark,) = [d for d in fn.decorator_list
+                           if isinstance(d, ast.Call) and d.args and
+                           getattr(d.args[0], "value", None) == param]
+                ids = eval(compile(ast.Expression(mark.args[1]), path, "eval"), vars(module))
+                for key in ids:
+                    entry = next(t[key] for t in vars(module).values()
+                                 if isinstance(t, dict) and key in t)
+                    while isinstance(entry, tuple):
+                        entry = entry[0]
+                    found.append((f"{path}::{fn.name}[{key}]", entry.__name__))
+    return found
+
+
+def test_the_measuring_tool_knows_the_operator_of_every_validating_test():
+    """``tests._measure_tolerances`` files each logged comparison under the operator its
+    test validates at. It read that off the one builder a test file imports, and a file
+    that validates more than one operator -- or imports two builders in one statement, as
+    the RMSNorm split-K combine's does -- ended the report with ``TypeError``: no
+    re-measurement could be reported once such a test had validated a kernel."""
+    from tests._measure_tolerances import _test_operators
+
+    operator_of = _test_operators()
+    tests = _validating_tests()
+    files = {node.partition("::")[0] for node, _ in tests}
+    # files that validate at more than one operator, and the one with a two-name import
+    assert {"tests/graph/apply_tiling/test_reduction_axes.py",
+            "tests/graph/apply_tiling/test_unit_extents.py",
+            "tests/graph/apply_tiling/test_pipelined_slices.py",
+            "tests/graph/apply_tiling/test_warp_group_operands.py",
+            "tests/graph/apply_tiling/test_rmsnorm_matmul_split_combine.py"} <= files
+    for node, operator in tests:
+        assert operator in TOLERANCES, node
+        assert operator_of(node) == operator, node
+    # a test that validates nothing is left under its own name, not under an operator
+    plain = "tests/graph/apply_tiling/test_typed_refusals.py::test_grid_dim_without_one_launch_axis_is_a_typed_refusal"
+    assert operator_of(plain) == plain
+
+
 def test_the_rule_that_turns_a_measured_error_into_a_tolerance():
     assert [step125(x) for x in (9.0e-4, 1.0e-3, 1.1e-3, 2.0e-3, 3.9e-3, 5.1e-3, 0.0)] == [
         1e-3, 1e-3, 2e-3, 2e-3, 5e-3, 1e-2, 0.0]
