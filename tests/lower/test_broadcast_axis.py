@@ -7,7 +7,14 @@ the symbolic dims of the two tensors, else the axis the operand's producer reduc
 A reduction drops its axis from the value while the structure keeps it as a unit dim, so
 the axis of a second reduction has to be re-counted as well.
 The lowered graph is compared with ``Program.reference``, which never sees the IR.
+
+A binary op keeps the shape of its first operand and broadcasts the second along one of its
+last two axes. A program that asks for anything else is refused with the op and the reason:
+it used to lower to an op with an operand of another shape wired in, or -- where two extents
+happened to agree -- to an op on the wrong axis. An op that no output reads is not lowered.
 """
+
+import re
 
 import pytest
 
@@ -16,8 +23,10 @@ pytest.importorskip("tilelang")
 
 import cleave.lang as cl
 from cleave import pipeline as P
+from cleave.core.errors import LoweringRejected
 from cleave.frontend import trace
-from cleave.ir.ops import Div, Mul
+from cleave.ir.graph import OutputNode, PlaceHolderNode
+from cleave.ir.ops import Add, Div, Exp, Matmul, Mul, ReduceSum, Sub
 from cleave.lower.convert import to_ir
 from cleave.pipeline.plans import lower
 from cleave.pipeline.superopt import GraphSet
@@ -36,7 +45,26 @@ SHAPES = [
     (("B", "R", "C"), dict(B=3, R=16, C=16), 1, 1),  # off by 4.5x of the max before the fix
     (("B", "N", "N"), dict(B=3, N=16), 1, 1),
 ]
-IDS = [f"{''.join(dims)}_{'x'.join(str(s[d]) for d in dims)}_dim{dim}" for dims, s, dim, _ in SHAPES]
+UNIT_SHAPES = [
+    # One element along the softmax axis, the row axis or both: either index reads the same
+    # values, but the index still names the axis (the scale analysis maps the divisor's
+    # factor through it). The search drops a sum over a unit axis, so these are identity only.
+    (("R", "C"), dict(R=1, C=1), -1, 0),
+    (("R", "C"), dict(R=1, C=1), 0, 1),  # said 0 before: the two shapes cannot tell
+    (("B", "R", "C"), dict(B=4, R=1, C=1), -1, 0),
+    (("B", "R", "C"), dict(B=4, R=1, C=1), 1, 1),
+    (("R", "C"), dict(R=1, C=16), 0, 1),
+    (("R", "C"), dict(R=16, C=1), -1, 0),
+    (("R", "C"), dict(R=16, C=1), 0, 1),
+    (("R", "C"), dict(R=1, C=16), -1, 0),
+]
+
+
+def _ids(shapes):
+    return [f"{''.join(dims)}_{'x'.join(str(s[d]) for d in dims)}_dim{dim}" for dims, s, dim, _ in shapes]
+
+
+IDS = _ids(SHAPES)
 
 
 def _program(dims, sizes, dim):
@@ -59,7 +87,7 @@ def _check(ir, prog, dim, want_index):
     torch.testing.assert_close(got.reshape(want.shape), want, rtol=1e-5, atol=1e-6)
 
 
-@pytest.mark.parametrize("dims, sizes, dim, index", SHAPES, ids=IDS)
+@pytest.mark.parametrize("dims, sizes, dim, index", SHAPES + UNIT_SHAPES, ids=_ids(SHAPES + UNIT_SHAPES))
 def test_identity_graph_matches_program(dims, sizes, dim, index):
     prog = _program(dims, sizes, dim)
     (graph,) = GraphSet.identity(prog)
@@ -158,6 +186,66 @@ def test_undecidable_broadcast_is_refused_not_guessed():
     assert mul.broadcast == 1
 
 
+def test_unit_extents_leave_nothing_to_guess():
+    # (1, 1) * (1,) with nothing to go by: both indices read the one element
+    structure = [
+        {"op_type": "kn_input_op", "input_tensors": [], "output_tensors": [_t(1, (1, 1))]},
+        {"op_type": "kn_input_op", "input_tensors": [], "output_tensors": [_t(2, (1,))]},
+        {"op_type": "kn_mul_op", "input_tensors": [_t(1, (1, 1)), _t(2, (1,))],
+         "output_tensors": [_t(3, (1, 1))]},
+        {"op_type": "kn_output_op", "input_tensors": [_t(3, (1, 1))], "output_tensors": []},
+    ]
+    ir = to_ir(structure, dtype="float32", out_dtype="float32")
+    (mul,) = [n for n in ir.nodes if type(n) is Mul]
+    assert mul.broadcast == 0
+    (got,) = execute(ir, [torch.full(_shape(n), 3.0) for n in placeholder_order(ir)])
+    assert got.tolist() == [[9.0]]
+
+
+def _rowsum_then(rowsum, operand):
+    """``sum(x (16, 24), 1) / y`` with the row sums written as ``rowsum`` and ``y`` as
+    ``operand``: tensors of two ranks, so the dims do not line up position by position."""
+    return [
+        {"op_type": "kn_input_op", "input_tensors": [], "output_tensors": [_t(1, (16, 24))]},
+        {"op_type": "kn_input_op", "input_tensors": [], "output_tensors": [_t(2, operand)]},
+        {"op_type": "kn_reduce_sum_1_op", "input_tensors": [_t(1, (16, 24))],
+         "output_tensors": [_t(3, rowsum)]},
+        {"op_type": "kn_div_op", "input_tensors": [_t(3, rowsum), _t(2, operand)],
+         "output_tensors": [_t(4, rowsum)]},
+        {"op_type": "kn_output_op", "input_tensors": [_t(4, rowsum)], "output_tensors": []},
+    ]
+
+
+def test_input_with_the_first_operands_elements_takes_its_shape():
+    # row sums (16,) / an input (16, 1): wiring declares the input (16,), as it always did
+    ir = to_ir(_rowsum_then((16,), (16, 1)), dtype="float32", out_dtype="float32")
+    (div,) = [n for n in ir.nodes if type(n) is Div]
+    assert div.broadcast == -1
+    shapes = {n.input_index: _shape(n) for n in ir.nodes if isinstance(n, PlaceHolderNode)}
+    assert shapes == {0: (16, 24), 1: (16,)}
+    # ... but not an input with other elements
+    with pytest.raises(ValueError, match=r"kn_div_op at index 3: an operand of shape \(16, 24\) is "
+                                         r"neither the shape \(16,\) of the first operand nor that "
+                                         r"shape without one of its last two axes"):
+        to_ir(_rowsum_then((16,), (16, 24)), dtype="float32", out_dtype="float32")
+
+
+def test_dims_that_contradict_the_value_are_refused():
+    # the divide lists the column sums (24,) as a vector over the rows (symbol 4)
+    structure = [
+        {"op_type": "kn_input_op", "input_tensors": [], "output_tensors": [_t(1, (4, 8))]},
+        {"op_type": "kn_reduce_sum_0_op", "input_tensors": [_t(1, (4, 8))],
+         "output_tensors": [_t(2, (8,))]},
+        {"op_type": "kn_div_op", "input_tensors": [_t(1, (4, 8)), _t(2, (4,))],
+         "output_tensors": [_t(3, (4, 8))]},
+        {"op_type": "kn_output_op", "input_tensors": [_t(3, (4, 8))], "output_tensors": []},
+    ]
+    with pytest.raises(ValueError, match=r"kn_div_op at index 2: by its dims the operand \(24,\) is "
+                                         r"broadcast along axis 1 of \(16, 24\), where its shape "
+                                         r"does not fit"):
+        to_ir(structure, dtype="float32", out_dtype="float32", symbol_map={4: 16, 8: 24})
+
+
 def test_symbolic_rule_table():
     from cleave.lower.convert import _broadcast_from_symbols as rule
 
@@ -235,12 +323,284 @@ def test_second_reduction_reduces_the_axis_the_program_names(sizes, first, secon
 
 
 def test_reducing_an_axis_twice_is_refused():
-    from cleave.core.errors import LoweringRejected
-
     def fn(x: cl.Tensor["B", "R", "C"]):
         return cl.sum(cl.sum(x, 0, keepdim=True), 0, keepdim=True)
 
     prog = trace(fn, dict(B=4, R=6, C=8), cl.f32)
     (graph,) = GraphSet.identity(prog)
     with pytest.raises(LoweringRejected, match="axis 0 of .* was already reduced away"):
+        lower(graph)
+
+
+# ------------------------------------------------------------------ what a binary op cannot do
+
+def _shape(node, i=0):
+    return tuple(int(s) for s in node.get_shape(i))
+
+
+def _lower(fn, sizes):
+    prog = trace(fn, sizes, cl.f32)
+    (graph,) = GraphSet.identity(prog)
+    (ir,) = lower(graph)
+    return prog, ir
+
+
+def _run(ir, prog, inputs):
+    """The flat graph on the program's inputs, each in its placeholder's own layout: an
+    input is bound by declaration and viewed in the kernel's shape (``Kernel.__call__``)."""
+    by_index = {n.input_index: n for n in ir.nodes if isinstance(n, PlaceHolderNode)}
+    feed = {n.name: inputs[i].reshape(_shape(n)) for i, n in by_index.items()}
+    return execute(ir, [feed[n.name] for n in placeholder_order(ir)])
+
+
+def _assert_computes_the_program(ir, prog):
+    """Every binary op and reduction reads the operand shapes it declares, every input holds
+    the program's elements, and the result is the program's."""
+    for n in ir.nodes:
+        if type(n) in (Add, Sub, Mul, Div, ReduceSum):
+            for e in n.inputs:
+                declared = tuple(int(d) for d in n.input_buffers[e.dst_id].shape)
+                assert _shape(e.src_node, e.src_id) == declared, (n.name, e.dst_id)
+    torch.manual_seed(0)
+    inputs = [torch.rand(*s.shape) + 0.5 for s in prog.inputs]
+    (got,) = _run(ir, prog, inputs)
+    (want,) = prog.reference(*inputs)
+    assert got.numel() == want.numel()
+    torch.testing.assert_close(got.reshape(want.shape), want, rtol=1e-5, atol=1e-6)
+
+
+def unit_lhs(b: cl.Tensor["ONE", "N"], x: cl.Tensor["N", "M"]):
+    return b * cl.sum(x, -1, keepdim=True)  # (1, N) * (N, 1): an (N, N) result
+
+
+def outer(x: cl.Tensor["N", "M"], y: cl.Tensor["M", "N"]):
+    return cl.sum(x, 1, keepdim=True) * cl.sum(y, 0, keepdim=True)  # (N, 1) * (1, N)
+
+
+def reduced_batch_axis(x: cl.Tensor["B", "K", "K2", "N"]):
+    return x / cl.sum(x, 1, keepdim=True)  # (B, K, K, N) / (B, 1, K, N)
+
+
+def lhs_grows(x: cl.Tensor["R", "C"]):
+    return cl.sum(x, -1, keepdim=True) * x  # (R, 1) * (R, C)
+
+
+def batch_softmax(x: cl.Tensor["B", "R", "C"]):
+    e = cl.exp(x)
+    return e / cl.sum(e, 0, keepdim=True)
+
+
+def column_input(x: cl.Tensor["R", "C"], y: cl.Tensor["R", "ONE"]):
+    return x * y
+
+
+def row_input(x: cl.Tensor["R", "C"], y: cl.Tensor["ONE", "C"]):
+    return x + y
+
+
+def total(x: cl.Tensor["R", "C"]):
+    return x / cl.sum(cl.sum(x, -1, keepdim=True), 0, keepdim=True)
+
+
+def vector_total(x: cl.Tensor["C"]):
+    return x / cl.sum(x, 0, keepdim=True)
+
+
+def rows_of_rowsums(x: cl.Tensor["B", "R", "C"]):
+    l = cl.sum(x, -1, keepdim=True)
+    return l / cl.sum(l, 1, keepdim=True)
+
+
+def unit_op_output(x: cl.Tensor["R", "C"], y: cl.Tensor["R", "ONE"]):
+    return cl.sum(x, -1, keepdim=True) / (y * 2.0)
+
+
+def input_two_layouts(x: cl.Tensor["R", "ONE"]):
+    return cl.sum(x, -1, keepdim=True) - x
+
+
+RULE = ("; a binary op keeps the shape of its first operand and broadcasts the second along one "
+        "of its last two axes")
+SMALL = dict(R=4, C=6, ONE=1)
+# name: (fn, sizes, the reason after "graph 0: ValueError: ")
+REFUSED = {
+    # Lowered before, to an op that computes something else: equal extents hid it.
+    # (1, N) * rowsum(x (N, M)) was read as a product along the columns: (1, N) for (N, N)
+    "unit_lhs": (unit_lhs, dict(ONE=1, N=4, M=6),
+                 r"kn_mul_op at index 3: the operand \(4,\) has extent 4 where the first operand "
+                 r"\(1, 4\) has 1 \(dims \(1, 4\) and \(4, 1\)\)" + RULE),
+    # the outer product of a row sum and a column sum: elementwise, (N,) for (N, N)
+    "outer": (outer, dict(N=4, M=6),
+              r"kn_mul_op at index 4: the operand \(4,\) has extent 4 where the first operand "
+              r"\(4,\) has 1 \(dims \(4, 1\) and \(1, 4\)\)" + RULE),
+    # divided by the sums of another row: off by 0.44 of the max
+    "reduced_batch_axis": (reduced_batch_axis, dict(B=3, K=4, K2=4, N=6),
+                           r"kn_div_op at index 2: the operand \(3, 4, 6\) is broadcast along axis "
+                           r"1 of the first operand \(3, 4, 4, 6\) \(dims \(3, 4, 4, 6\) and "
+                           r"\(3, 1, 4, 6\)\)" + RULE),
+    # the (R, C) input was declared (R,)
+    "lhs_grows": (lhs_grows, dict(R=4, C=6),
+                  r"kn_mul_op at index 2: the operand \(4, 6\) has extent 6 where the first operand "
+                  r"\(4,\) has 1 \(dims \(4, 1\) and \(4, 6\)\)" + RULE),
+    # Lowered before, to an op with an operand of another shape wired in: no tiling builds.
+    "batch_softmax": (batch_softmax, dict(B=3, R=16, C=24),
+                      r"kn_div_op at index 3: the operand \(16, 24\) is broadcast along axis 0 of "
+                      r"the first operand \(3, 16, 24\) \(dims \(3, 16, 24\) and \(1, 16, 24\)\)"
+                      + RULE),
+    "column_input": (column_input, SMALL,
+                     r"kn_mul_op at index 2: the operand \(4, 1\) is broadcast along axis 1 of the "
+                     r"first operand \(4, 6\), which reads an operand of shape \(4,\) there "
+                     r"\(dims \(4, 6\) and \(4, 1\)\)"),
+    "row_input": (row_input, SMALL,
+                  r"kn_add_op at index 2: the operand \(1, 6\) is broadcast along axis 0 of the "
+                  r"first operand \(4, 6\), which reads an operand of shape \(6,\) there "
+                  r"\(dims \(4, 6\) and \(1, 6\)\)"),
+    "total": (total, dict(R=4, C=6),
+              r"kn_div_op at index 3: the operand \(\) is broadcast along axes 0, 1 of the first "
+              r"operand \(4, 6\) \(dims \(4, 6\) and \(1, 1\)\)" + RULE),
+    "vector_total": (vector_total, dict(C=6),
+                     r"kn_div_op at index 2: the operand \(\) is broadcast along axis 0 of the first "
+                     r"operand \(6,\) \(dims \(6,\) and \(1,\)\)" + RULE),
+    "rows_of_rowsums": (rows_of_rowsums, dict(B=3, R=4, C=6),
+                        r"kn_div_op at index 3: an operand of shape \(3,\) cannot be broadcast over "
+                        r"\(3, 4\), a value with 1 batch axes"),
+    "unit_op_output": (unit_op_output, SMALL,
+                       r"kn_div_op at index 4: the operand \(4, 1\) and the first operand \(4,\) hold "
+                       r"the same elements with different unit axes \(dims \(4, 1\) and \(4, 1\)\)"),
+    "input_two_layouts": (input_two_layouts, dict(R=4, ONE=1),
+                          r"input 1 is read as \(4, 1\) by reduction_1_1 and as \(4,\) by sub_2; an "
+                          r"input has one layout"),
+}
+
+
+@pytest.mark.parametrize("name", REFUSED)
+def test_operand_a_binary_op_cannot_read_is_refused(name):
+    fn, sizes, reason = REFUSED[name]
+    prog = trace(fn, sizes, cl.f32)
+    (graph,) = GraphSet.identity(prog)
+    with pytest.raises(LoweringRejected) as e:
+        lower(graph)
+    assert re.fullmatch("graph 0: ValueError: " + reason, str(e.value)), e.value
+
+
+def keepdim_input(x: cl.Tensor["R", "C"], y: cl.Tensor["R", "ONE"]):
+    return cl.sum(x, -1, keepdim=True) / y  # y has the row sums' elements: declared (R,)
+
+
+def keepdim_input_twice(a: cl.Tensor["R", "C"], b: cl.Tensor["R", "C"], y: cl.Tensor["R", "ONE"]):
+    return cl.sum(a, -1, keepdim=True) / y + cl.sum(b, -1, keepdim=True) / y
+
+
+def unit_column_lhs(y: cl.Tensor["R", "ONE"], x: cl.Tensor["R", "C"]):
+    return y * cl.sum(x, -1, keepdim=True)
+
+
+def unit_row_lhs(y: cl.Tensor["ONE", "C"], x: cl.Tensor["R", "C"]):
+    return y / cl.sum(x, 0, keepdim=True)
+
+
+def kept_and_dropped_unit(z: cl.Tensor["B", "ONE", "N"], x: cl.Tensor["B", "G", "ONE"]):
+    # the divisor (B, 1) has dropped the reduced axis and kept its own unit axis
+    return z / cl.sum(x, 1, keepdim=True)
+
+
+def same_shape(x: cl.Tensor["R", "C"], y: cl.Tensor["R", "C"]):
+    return (x - y) * y
+
+
+# name: (fn, sizes, broadcast of each tensor-tensor op in graph order, shape of each input)
+UNIT_AXES = {
+    "keepdim_input": (keepdim_input, SMALL, [-1], [(4, 6), (4,)]),
+    "keepdim_input_twice": (keepdim_input_twice, SMALL, [-1, -1, -1], [(4, 6), (4, 6), (4,)]),
+    "unit_column_lhs": (unit_column_lhs, SMALL, [0], [(4, 1), (4, 6)]),
+    "unit_row_lhs": (unit_row_lhs, SMALL, [1], [(1, 6), (4, 6)]),
+    "kept_and_dropped_unit": (kept_and_dropped_unit, dict(B=3, G=5, N=6, ONE=1), [0],
+                              [(3, 1, 6), (3, 5, 1)]),
+    "same_shape": (same_shape, dict(R=4, C=6), [-1, -1], [(4, 6), (4, 6)]),
+}
+
+
+@pytest.mark.parametrize("name", UNIT_AXES)
+def test_unit_axes_do_not_refuse_what_the_op_can_read(name):
+    """Unit axes are interchangeable: the same elements in the same order are the same operand."""
+    fn, sizes, broadcasts, input_shapes = UNIT_AXES[name]
+    prog, ir = _lower(fn, sizes)
+    ops = [n for n in ir.nodes if type(n) in (Add, Sub, Mul, Div) and n.const is None]
+    assert [n.broadcast for n in ops] == broadcasts
+    by_index = {n.input_index: _shape(n) for n in ir.nodes if isinstance(n, PlaceHolderNode)}
+    assert [by_index[i] for i in range(len(prog.inputs))] == input_shapes
+    _assert_computes_the_program(ir, prog)
+
+
+def test_matmul_operand_that_lost_a_matrix_axis_is_refused():
+    """``rowsum.mT @ rowsum`` per batch entry: the two (B, K) values were read as matrices and
+    contracted over the batch (2.4x of the max off the program)."""
+    def outer_per_batch(x: cl.Tensor["B", "M", "K"]):
+        l = cl.sum(x, 1, keepdim=True)
+        return l.mT @ l
+
+    prog = trace(outer_per_batch, dict(B=4, M=6, K=3), cl.f32)
+    (graph,) = GraphSet.identity(prog)
+    with pytest.raises(LoweringRejected, match=r"kn_matmul_op at index 2: the first operand \(4, 3\) "
+                                               r"has lost a matrix axis to a reduction "
+                                               r"\(dims \(4, 1, 3\)\)"):
+        lower(graph)
+
+
+def test_vector_operand_of_a_matmul_still_lowers():
+    """``x @ rowsum(w)``: a value of rank 1 is a vector, as the search of ``(x @ w).sum(-1)``
+    writes it (demo/matmul_rowsum.py)."""
+    def matvec(x: cl.Tensor["M", "K"], w: cl.Tensor["K", "N"]):
+        return x @ cl.sum(w, -1, keepdim=True)
+
+    prog, ir = _lower(matvec, dict(M=4, K=6, N=5))
+    (mma,) = [n for n in ir.nodes if type(n) is Matmul]
+    operands = [_shape(e.src_node, e.src_id) for e in sorted(mma.inputs, key=lambda e: e.dst_id)]
+    assert operands == [(4, 6), (6,)]
+    _assert_computes_the_program(ir, prog)
+
+
+# ------------------------------------------------------------------ ops no output reads
+
+def test_op_no_output_reads_does_not_reshape_a_live_input():
+    """``a + x`` is never used; built, it was wired last and declared ``x`` with its own
+    (1, 1): the live ``exp(x)`` was lowered on one element of a four-element input."""
+    def fn(a: cl.Tensor["ONE", "ONE"], x: cl.Tensor["R", "ONE"]):
+        a + x
+        return cl.exp(x)
+
+    prog, ir = _lower(fn, dict(R=4, ONE=1))
+    assert [type(n) for n in ir.nodes] == [PlaceHolderNode, Exp, OutputNode]
+    (ph,), (exp,) = ([n for n in ir.nodes if type(n) is kind] for kind in (PlaceHolderNode, Exp))
+    assert _shape(ph) == _shape(exp) == (4, 1) and ph.input_index == 1
+    assert [e.dst_node for e in ph.outputs] == [exp]  # no edge into an op that was dropped
+    torch.manual_seed(0)
+    x = torch.randn(4, 1)
+    (got,) = execute(ir, [x])
+    torch.testing.assert_close(got, prog.reference(torch.zeros(1, 1), x)[0], rtol=1e-6, atol=1e-6)
+
+
+def test_op_no_output_reads_cannot_refuse_the_graph():
+    """A reduction of an axis that is already gone, an operand no binary op can read and a
+    matmul of two batched row sums: none of them is part of what the program computes."""
+    def fn(x: cl.Tensor["B", "R", "C"], y: cl.Tensor["B", "R", "ONE"]):
+        l = cl.sum(x, 1, keepdim=True)
+        cl.sum(l, 1, keepdim=True)
+        x * y
+        l.mT @ l
+        return cl.exp(x)
+
+    prog, ir = _lower(fn, dict(B=3, R=4, C=4, ONE=1))
+    assert [type(n) for n in ir.nodes] == [PlaceHolderNode, Exp, OutputNode]
+    _assert_computes_the_program(ir, prog)
+
+
+def test_the_same_ops_refuse_the_graph_once_an_output_reads_them():
+    def fn(x: cl.Tensor["B", "R", "C"], y: cl.Tensor["B", "R", "ONE"]):
+        return cl.exp(x * y)
+
+    prog = trace(fn, dict(B=3, R=4, C=4, ONE=1), cl.f32)
+    (graph,) = GraphSet.identity(prog)
+    with pytest.raises(LoweringRejected, match=r"kn_mul_op at index 2: the operand \(3, 4, 1\) is "
+                                               r"broadcast along axis 2"):
         lower(graph)

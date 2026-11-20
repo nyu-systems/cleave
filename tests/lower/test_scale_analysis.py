@@ -124,8 +124,12 @@ ANNOTATED = {
     "last": (sm_last, RC, [((16, 24), (-1,), [ReduceSum], NEXT_TO.format(r"div_\d+", r"reduction_1_\d+"))]),
     "first": (sm_first, RC, [((16, 24), (-2,), [ReduceSum], NEXT_TO.format(r"div_\d+", r"reduction_0_\d+"))]),
     "first_square": (sm_first, dict(R=16, C=16), [((16, 16), (-2,), [ReduceSum], "next to")]),
+    # one element per trailing axis: the divide still names the axis its divisor spans
+    "first_unit": (sm_first, dict(R=1, C=1), [((1, 1), (-2,), [ReduceSum], "next to")]),
+    "last_unit": (sm_last, dict(R=1, C=1), [((1, 1), (-1,), [ReduceSum], "next to")]),
     "middle": (sm_middle, dict(B=3, R=16, C=24), [((3, 16, 24), (-2,), [ReduceSum], "next to")]),
     "middle_square": (sm_middle, dict(B=3, R=16, C=16), [((3, 16, 16), (-2,), [ReduceSum], "next to")]),
+    "middle_unit": (sm_middle, dict(B=4, R=1, C=1), [((4, 1, 1), (-2,), [ReduceSum], "next to")]),
     "batched_last": (sm_batched_last, dict(B=3, R=16, C=24), [((3, 16, 24), (-1,), [ReduceSum], "next to")]),
     "flash": (flash, RCD, [((16, 24), (-1,), [Matmul, ReduceSum], "")]),
     "reciprocal": (recip, RCD, [((16, 24), (-1,), [Matmul, ReduceSum], "")]),
@@ -167,9 +171,10 @@ def merged_with_exp(x: cl.Tensor["R", "C"]):
     return (e / cl.sum(e, -1, keepdim=True)) * e
 
 
-def two_axes(x: cl.Tensor["R", "C"]):
+def two_axes(x: cl.Tensor["R", "C"], w: cl.Tensor["R", "C"]):
     e = sexp(x, -1)
-    return e / cl.sum(cl.sum(e, -1, keepdim=True), -2, keepdim=True)
+    return (cl.sum(cl.sum(e * w, -1, keepdim=True), -2, keepdim=True)
+            / cl.sum(cl.sum(e, -1, keepdim=True), -2, keepdim=True))
 
 
 def cube(x: cl.Tensor["R", "C"]):
@@ -197,12 +202,38 @@ def inverse_sum(x: cl.Tensor["R", "C"]):
     return cl.sum(1.0 / e, -1, keepdim=True) * cl.sum(e, -1, keepdim=True)
 
 
-def vector(x: cl.Tensor["C"]):
+def vector(x: cl.Tensor["C"], w: cl.Tensor["C"]):
+    e = sexp(x, 0)
+    return cl.sum(e * w, 0, keepdim=True) / cl.sum(e, 0, keepdim=True)
+
+
+def batch_axis(x: cl.Tensor["B", "R", "C"], w: cl.Tensor["B", "R", "C"]):
+    e = sexp(x, 0)
+    return cl.sum(e * w, 0, keepdim=True) / cl.sum(e, 0, keepdim=True)
+
+
+# The plain softmax of the three shapes above divides by a value no binary op can read (a
+# divisor that is broadcast along two axes, along the only axis of a vector, along a batch
+# axis): the conversion refuses it before the analysis runs.
+
+def two_axes_softmax(x: cl.Tensor["R", "C"]):
+    e = sexp(x, -1)
+    return e / cl.sum(cl.sum(e, -1, keepdim=True), -2, keepdim=True)
+
+
+def vector_softmax(x: cl.Tensor["C"]):
     return softmax(x, 0)
 
 
-def batch_axis(x: cl.Tensor["B", "R", "C"]):
+def batch_axis_softmax(x: cl.Tensor["B", "R", "C"]):
     return softmax(x, 0)
+
+
+def unit_row(x: cl.Tensor["B", "F"], v: cl.Tensor["ONE", "F"]):
+    # out[i, j] = (v . e_j) / sum(e_i) keeps the factor; with B == 4 on both axes the divide
+    # used to lower as a product along the columns, where the factor cancels
+    e = sexp(x, -1)
+    return (v @ e.mT) / cl.sum(e, -1, keepdim=True)
 
 
 def kv_side(q: cl.Tensor["HQ", "S", "D"], k: cl.Tensor["HKV", "S", "D"]):
@@ -248,17 +279,16 @@ def one_request_recorded_twice(x: cl.Tensor["R", "C"]):
 REFUSED = {
     "exp_ratio": (exp_ratio, RC, r"exp_2: nothing sums it, so there is no softmax axis"),
     "softmax_times_its_exp": (merged_with_exp, RC, r"exp_1: output of mul_4 keeps degree 1 in its scale"),
-    "two_axes": (two_axes, RC, r"exp_1: the factor must be constant along axes \[0, 1\]; one softmax "
+    "two_axes": (two_axes, RC, r"exp_2: the factor must be constant along axes \[0, 1\]; one softmax "
                                "axis is supported"),
     "cube": (cube, RC, r"exp_1: output of div_4 keeps degree 1 in its scale"),
     "squares": (squares, RC, r"exp_1: reduction_1_4 accumulates a value of degree 2"),
     "squares_over_columns": (squares_over_columns, RC, r"exp_1: reduction_0_4 accumulates a value of degree 2"),
     "squares_first_axis": (squares_first_axis, RC, r"exp_1: reduction_0_4 accumulates a value of degree 2"),
     "inverse_sum": (inverse_sum, RC, r"exp_1: reduction_1_3 accumulates a value of degree -1"),
-    "vector": (vector, dict(C=24), r"exp_1: the exp has 1 non-batch axes; the softmax axis and one "
+    "vector": (vector, dict(C=24), r"exp_2: the exp has 1 non-batch axes; the softmax axis and one "
                                    "row axis are supported"),
-    "batch_axis": (batch_axis, dict(B=3, R=16, C=24),
-                   r"div_3: scaled operand 1 has shape \(16, 24\), Div takes \(3, 16, 24\)"),
+    "batch_axis": (batch_axis, dict(B=3, R=16, C=24), r"exp_2: softmax axis 0 is a batch axis of the exp"),
     "kv_side": (kv_side, dict(HQ=4, HKV=2, S=8, D=16),
                 r"mma_3: Matmul broadcasts its scaled operand 1 over the batch \(\(2,\) -> \(4,\)\)"),
     "gram": (gram, RC, r"mma_2: Matmul of two scaled values"),
@@ -276,6 +306,25 @@ REFUSED = {
                                  r"\(exp_5: nothing sums it, so there is no softmax axis\)"),
     "one_request_recorded_twice": (one_request_recorded_twice, RC,
                                    r"exp_4: nothing sums it, so there is no softmax axis"),
+}
+
+BINARY_RULE = ("; a binary op keeps the shape of its first operand and broadcasts the second "
+               "along one of its last two axes")
+# name: (fn, sizes, the reason after "graph 0: ValueError: "): refused by the conversion
+UNREADABLE = {
+    "two_axes_softmax": (two_axes_softmax, RC,
+                         r"kn_div_op at index 4: the operand \(\) is broadcast along axes 0, 1 of the "
+                         r"first operand \(16, 24\) \(dims \(16, 24\) and \(1, 1\)\)" + BINARY_RULE),
+    "vector_softmax": (vector_softmax, dict(C=24),
+                       r"kn_div_op at index 3: the operand \(\) is broadcast along axis 0 of the first "
+                       r"operand \(24,\) \(dims \(24,\) and \(1,\)\)" + BINARY_RULE),
+    "batch_axis_softmax": (batch_axis_softmax, dict(B=3, R=16, C=24),
+                           r"kn_div_op at index 3: the operand \(16, 24\) is broadcast along axis 0 of "
+                           r"the first operand \(3, 16, 24\) \(dims \(3, 16, 24\) and \(1, 16, 24\)\)"
+                           + BINARY_RULE),
+    "unit_row": (unit_row, dict(B=4, F=2, ONE=1),
+                 r"kn_div_op at index 5: the operand \(4,\) has extent 4 where the first operand "
+                 r"\(1, 4\) has 1 \(dims \(1, 4\) and \(4, 1\)\)" + BINARY_RULE),
 }
 
 
@@ -319,7 +368,19 @@ def test_other_exps_are_refused_with_the_node_that_breaks(name):
     (graph,) = GraphSet.identity(prog)
     with pytest.raises(LoweringRejected) as e:
         lower(graph)
-    assert re.fullmatch(r"graph 0: softmax cannot be stabilized: " + reason + ".*", str(e.value)), e.value
+    assert re.fullmatch(r"graph 0: softmax cannot be stabilized: " + reason, str(e.value)), e.value
+
+
+@pytest.mark.parametrize("name", UNREADABLE)
+def test_divisor_no_binary_op_can_read_is_refused_by_the_conversion(name):
+    """Not the analysis' call: such a graph used to reach it with an operand of another
+    shape wired into the divide (``unit_row`` even passed it, on the wrong axis)."""
+    fn, sizes, reason = UNREADABLE[name]
+    prog = trace(fn, sizes, cl.f32)
+    (graph,) = GraphSet.identity(prog)
+    with pytest.raises(LoweringRejected) as e:
+        lower(graph)
+    assert re.fullmatch(r"graph 0: ValueError: " + reason, str(e.value)), e.value
 
 
 def test_plain_exp_next_to_a_softmax_keeps_its_reason():
@@ -501,6 +562,21 @@ def test_softmax_over_a_batch_axis_is_refused():
     assert record_for(_self_ratio(exp, 2), exp).axes == (-1,)
 
 
+def test_scaled_operand_of_another_shape_is_refused():
+    """The axis maps hold for the operand an op declares. The conversion no longer wires any
+    other (``tests/lower/test_broadcast_axis.py``); a hand-built graph still can."""
+    exp = Exp((3, 16, 24), name="exp_0")
+    colsum = ReduceSum((3, 16, 24), axis=0, name="colsum_0")  # (16, 24)
+    div = Div((3, 16, 24), name="div_0")  # declares a (3, 16, 24) divisor
+    G._connect(exp, colsum, 0, 0)
+    G._connect(exp, div, 0, 0)
+    G._connect(colsum, div, 0, 1)
+    OutputNode(div, dtype="float32")
+    with pytest.raises(ScaleError, match=r"^div_0: scaled operand 1 has shape \(16, 24\), Div takes "
+                                         r"\(3, 16, 24\)$"):
+        record_for(G._finalize(div), exp)
+
+
 @pytest.mark.parametrize("dims, n_batch, count", [((2, 4, 16), 0, 3), ((2, 4, 16), 2, 1)])
 def test_exp_needs_the_softmax_axis_and_one_row_axis(dims, n_batch, count):
     exp = Exp(dims, name="exp_0", n_batch_dims=n_batch)
@@ -616,7 +692,7 @@ def test_split_partial_keeps_the_factor_in_both_outputs(build):
 
 # ------------------------------------------------------------------ false-cancel sweep
 
-SWEEP = {name: (fn, sizes) for name, (fn, sizes, _) in {**ANNOTATED, **REFUSED}.items()}
+SWEEP = {name: (fn, sizes) for name, (fn, sizes, _) in {**ANNOTATED, **REFUSED, **UNREADABLE}.items()}
 UNSCALED = {"b"}  # the operand of a hand-written exp: nothing keeps that one finite at x100
 
 
@@ -656,7 +732,7 @@ def test_no_false_cancel(name):
     try:
         (ir,) = lower(graph)
     except LoweringRejected:
-        assert name in REFUSED
+        assert name in REFUSED or name in UNREADABLE
         return
     assert name in ANNOTATED
     inputs = _inputs(prog, 1.0)

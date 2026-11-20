@@ -12,7 +12,9 @@ from pathlib import Path
 # 2: a reduction absorbed into another's loop is scheduled over its whole axis.
 # 3: lowering takes broadcast and reduction axes from the structure (not from extents that
 #    happen to agree), and a kernel's inputs are bound in the program's declaration order.
-SCHEMA = 3
+# 4: an op that no output reads is not lowered (it used to hand its shape to the inputs it
+#    read), and a divisor over two unit axes is broadcast along the one the program names.
+SCHEMA = 4
 # What "validated" means for a saved kernel. A kernel-cache hit returns without validating,
 # so bump this whenever the comparison or its inputs change: saved kernels are then rebuilt.
 VALIDATION = 2
