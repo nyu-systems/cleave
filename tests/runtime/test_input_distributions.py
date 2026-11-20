@@ -688,6 +688,40 @@ def test_keyed_cases_lead_with_the_key_the_registry_gives_the_workload():
     assert [key for key, *_ in captured] == keys[:-12] and not any("@" in k for k in keys[:-12])
 
 
+def test_a_workload_spec_keys_an_adversarial_distribution_like_the_registry(monkeypatch):
+    """``cl.workloads.paged_decode(distribution=...)``: its workloads carry the same
+    ``@<distribution>`` the registry's adversarial ones do, so a validation on them is
+    told from one on normal inputs wherever the key is read."""
+    import dataclasses
+
+    from cleave.frontend.paged import trace_paged
+    from demo.dynamic.gqa_paged_decode import build
+
+    seen = []
+    monkeypatch.setattr(dyn, "gqa_paged_decode_inputs",
+                        lambda dims, lens, page_size=1: ["inputs", dims])
+
+    def transformed(operator, inputs, distribution):
+        seen.append((operator, distribution))
+        return inputs
+
+    monkeypatch.setattr(dyn, "apply_distribution", transformed)
+    monkeypatch.setattr(dyn, "gqa_paged_decode_reference",
+                        lambda dims, lens, page_size=1: lambda *inputs: ("out", "lse"))
+    fn, hints = build("kv8")
+    attention = trace_paged(fn, hints=hints).attention()
+    spec = cl.workloads.paged_decode(batch=(1, 3), kv_len=(5, 300), samples=2)
+    keys = [key for key, *_ in spec.factory(attention)()]
+    assert keys == ["wl_1_5", "wl_1_300", "wl_3_5", "wl_3_300"]
+    assert seen == [("gqa_paged_decode", "normal")] * 4
+    hard = dataclasses.replace(spec, distribution="dominant_last")
+    assert [key for key, *_ in hard.factory(attention)()] == [
+        f"{key}@dominant_last" for key in keys]
+    assert seen[4:] == [("gqa_paged_decode", "dominant_last")] * 4
+    # a sample of them keeps the keys
+    assert [key for key, *_ in hard.factory(attention, keep=1)()] == ["wl_1_5@dominant_last"]
+
+
 def _keys(op, adversarial):
     """``op.keyed_workloads`` with the tensors stubbed out: the keys alone, on the CPU."""
     import dataclasses

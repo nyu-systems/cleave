@@ -578,7 +578,8 @@ class PagedDecodeWorkloads:
 
     ``distribution``: ``"normal"``, or an adversarial softmax case (``"large_logits"``,
     ``"large_scale"``, ``"increasing"``, ``"dominant_last"``; see
-    ``cleave.dynamic.reference.apply_distribution``)."""
+    ``cleave.dynamic.reference.apply_distribution``). Its workloads are then keyed
+    ``<workload>@<distribution>``, as the registry's adversarial ones are."""
 
     batch: tuple = (1, 7, 64)
     kv_len: tuple = (1, 8192)
@@ -616,7 +617,10 @@ class PagedDecodeWorkloads:
                     "gqa_paged_decode",
                     reference.gqa_paged_decode_inputs(dims, lens, page_size=page),
                     self.distribution)
-                yield workload_key((b, n)), inputs, reference.gqa_paged_decode_reference(
+                key = workload_key((b, n))
+                if self.distribution != "normal":
+                    key = f"{key}@{self.distribution}"
+                yield key, inputs, reference.gqa_paged_decode_reference(
                     dims, lens, page_size=page)(*inputs)
 
         return gen
