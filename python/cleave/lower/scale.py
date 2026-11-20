@@ -134,7 +134,11 @@ def _propagate(graph, exp, const, seeds):
     scales, outs, found, reds, pending = {}, {}, set(), [], []
     for n in graph.nodes:
         if isinstance(n, PlaceHolderNode):
-            seed = (seeds or {}).get(n.name, _zero(len(_shape(n))))
+            rank = len(_shape(n))
+            seed = (seeds or {}).get(n.name, _zero(rank))
+            if len(seed.ax) != rank:
+                raise ScaleError(f"{n.name}: seeded with the scale of a value of rank "
+                                 f"{len(seed.ax)}, the input has rank {rank}")
             scales[id(n)] = seed.restricted(const)
             continue
         edges = sorted(n.inputs, key=lambda e: e.dst_id)

@@ -234,6 +234,24 @@ def test_the_two_sides_are_paired_by_boundary_record_not_by_position():
         ("ReduceSum", 1, 1), ("ReduceSum", 1, 1)]
 
 
+def test_a_seed_is_the_scale_of_the_tensor_it_is_given_to():
+    """What pairing by position would do to this pair: the value partials seeded with the
+    scale of the row sums, a rank short. The analysis refuses a seed of another rank
+    instead of reading axes off it that the input does not have."""
+    partial, combine = _plain_pair(1)
+    exp, report, _ = analyse_split(partial, combine)
+    rowsum, value = report.outputs.values()
+    assert (len(rowsum.ax), len(value.ax)) == (3, 4)
+    inputs = [p for p in combine.nodes if isinstance(p, PlaceHolderNode)]
+    by_record = {p.name: (rowsum, value)[p.boundary.index] for p in inputs}
+    assert analyse(combine, None, by_record).const == (1,)
+    by_position = dict(zip((p.name for p in inputs), (rowsum, value)))
+    assert by_position != by_record
+    with pytest.raises(ScaleError, match=r"^PlaceHolder_input_\d+: seeded with the scale of a "
+                                         r"value of rank 3, the input has rank 4$"):
+        analyse(combine, None, by_position)
+
+
 def test_a_combine_that_reads_other_tensors_than_the_partial_writes_is_refused():
     partial, combine = _plain_pair(1)
     a, b = [p for p in combine.nodes if isinstance(p, PlaceHolderNode)]
