@@ -15,7 +15,7 @@ import tvm
 from tvm import te
 
 from ..core.schema import KernelGraph, KGOp, KGTensor, parse_op_type
-from ..ir.graph import Graph, OutputNode, PlaceHolderNode
+from ..ir.graph import Boundary, Graph, OutputNode, PlaceHolderNode
 from ..ir.ops import (Add, Div, Exp, Matmul, ReduceMax, Mul, ReduceSum, RSqrt, Silu, SplitView,
                    Sqrt, Sub)
 from ..ir.ops.base import wire_input
@@ -251,6 +251,7 @@ class _Ctx:
         # those a binary op takes with unit axes dropped (``broadcast_index``).
         self.read_as: Dict[int, List[Tuple[str, Tuple[int, ...]]]] = {}
         self.reshaped: set = set()
+        self.n_inputs = 0  # input ops converted so far
         for _, op in ops:
             for t in op.inputs:
                 if t.dtype is not None:
@@ -322,12 +323,14 @@ class _Ctx:
             return len(out_dims) - 1
         return None
 
-    def placeholder(self, t: KGTensor) -> PlaceHolderNode:
+    def placeholder(self, t: KGTensor, boundary: Optional[Boundary] = None) -> PlaceHolderNode:
+        """The placeholder for ``t``; ``boundary`` when an input op declares it."""
         node = PlaceHolderNode(name=f"input_{t.guid}")
         shape = self.shape(t)
         dtype = self.dtype if t.dtype is None else str(t.dtype)
         node.set_shape(shape)
         node.set_dtype(tvm.DataType(dtype))
+        node.boundary = boundary
         self.nodes[t.guid] = (node, 0)
         self.shapes[t.guid] = shape
         self.dtypes[t.guid] = dtype
@@ -498,8 +501,11 @@ Rule = Callable[[_Ctx, int, KGOp], Built]
 
 
 def _input(ctx: _Ctx, idx: int, op: KGOp) -> Built:
+    # The k-th input op is input k of the graph. A graph is rebuilt in discovery order
+    # from its outputs below, so this is the only place the declaration order is known.
     if op.outputs:
-        ctx.placeholder(op.outputs[0])
+        ctx.placeholder(op.outputs[0], Boundary(ctx.n_inputs))
+        ctx.n_inputs += 1
     return None, ()
 
 
@@ -508,7 +514,9 @@ def _output(ctx: _Ctx, idx: int, op: KGOp) -> Built:
         guid = op.inputs[0].guid
         if guid not in ctx.nodes:
             raise ValueError(f"Output tensor guid {guid} has no producer.")
-        ctx.outputs.append(OutputNode(ctx.producer(guid), dtype=ctx.dtypes.get(guid, ctx.out_dtype)))
+        node = OutputNode(ctx.producer(guid), dtype=ctx.dtypes.get(guid, ctx.out_dtype))
+        node.boundary = Boundary(len(ctx.outputs))  # the k-th output op is output k
+        ctx.outputs.append(node)
     return None, ()
 
 
