@@ -9,6 +9,8 @@ language, and stays limited to rows that fit one block.
 ``test_search_*`` run the superoptimizer, ``test_gpu_*`` compile kernels (root conftest marks).
 """
 
+import re
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -259,10 +261,22 @@ def test_gpu_exact_softmax_long_rows(cache_root):
     torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2)
 
 
+def _kernel_nans(error) -> int:
+    """How many NaN the comparator counted in the kernel's own output at x100, and that the
+    failure is about the ``large_logits`` case."""
+    found = re.search(r"large_logits inputs: output 0: (\d+) NaN in the kernel output", str(error))
+    assert found, str(error)[:300]
+    return int(found.group(1))
+
+
 def test_gpu_unstabilized_twin_is_caught_at_x100(cache_root):
     """The validation has teeth: the twin without the request is a fine kernel on normal
     inputs and fails on logits 100 times larger, classified as non-finite by the comparator.
-    The exact program is held to those inputs by the build itself, and passes."""
+
+    The twin's own reference is NaN there as well (a plain ``exp`` overflows in torch too),
+    and a NaN on either side is a non-finite failure. So the verdict alone would not tell a
+    kernel that overflows from one that does not: what is asserted is that the *kernel's*
+    output holds NaN."""
     _gpu()
     shapes = dict(H=32, SQ=64, SKV=256, D=64)
     so, sc = P.SuperoptConfig(max_ops=14), P.ScheduleConfig(topk=4)
@@ -274,14 +288,90 @@ def test_gpu_unstabilized_twin_is_caught_at_x100(cache_root):
     plans = P.schedule(P.superoptimize(twin, so), sc)
     normal = P.build(plans, config=ev)
     assert len(normal.correct) >= 1
+    assert all(r.cases == ("normal",) for r in normal)  # no claim, nothing added
     large = P.build(plans, config=ev.replace(distributions=("normal", "large_logits")))
     assert not large.correct
     for before, after in zip(normal.results, large.results):
         if before.ok:  # the same kernel: only the inputs changed
             assert after.stage == "validate" and after.error_type == "NonFiniteOutput", after
-            assert "large_logits inputs" in str(after.error)
+            assert _kernel_nans(after.error) > 0
 
+
+def _without_the_record(cand):
+    """``build_candidate`` of a tiling of an exact program with the ``Stabilize`` record
+    taken off for the build: the same schedule around a plain ``exp``. The flat graph keeps
+    its record, so the reference the kernel is held to stays the exact one."""
+    from cleave.runtime.compile import CompilerPassOptions, build_candidate
+    from cleave.schedule.stabilize import annotated
+
+    marks = [(exp, exp.stabilize) for _, _, exp in annotated(cand.flat_graph)]
+    assert marks
+    for exp, _ in marks:
+        exp.stabilize = None
+    try:
+        return build_candidate(cand, options=CompilerPassOptions())
+    finally:
+        for exp, record in marks:
+            exp.stabilize = record
+
+
+def test_gpu_unstabilized_kernel_fails_against_the_exact_reference(cache_root):
+    """The teeth at the level of one kernel: the exact program's own tilings, built without
+    the rewrite, held to the exact program's reference, which is finite at x100. Each such
+    kernel passes on normal inputs and is rejected at x100 for the NaN it returns, against
+    a reference that has none."""
+    _gpu()
+    import functools
+
+    from cleave.runtime.evaluate import run_candidates
+    from cleave.runtime.validate import publish_reference
+
+    shapes = dict(H=32, SQ=64, SKV=256, D=64)
     exact = trace(attention, shapes, cl.f16)
-    assert exact.stabilize_requests
-    built = P.build(P.schedule(P.superoptimize(exact, so), sc), config=ev)
+    plans = P.schedule(P.superoptimize(exact, P.SuperoptConfig(max_ops=14)),
+                       P.ScheduleConfig(topk=4))
+    assert len(plans) >= 1
+    runs = run_candidates(
+        [p.tile for p in plans], "float16", max_parallel=4,
+        tolerance=tolerance_for("exact_attention"), build_fn=_without_the_record,
+        reference_fn=functools.partial(publish_reference,
+                                       distributions=("normal", "large_logits")))
+    validated = [r for r in runs if r.ok or r.stage == "validate"]
+    assert validated, [(r.stage, str(r.error)[:200]) for r in runs]
+    for run in validated:
+        # the normal case comes first and passed: the failure names the second case
+        assert not run.ok and type(run.error).__name__ == "NonFiniteOutput", run
+        assert _kernel_nans(run.error) > 0
+        assert re.search(r"NaN in the kernel output, 0 in the reference", str(run.error))
+
+
+def test_gpu_exact_attention_is_held_to_every_adversarial_case(cache_root, tmp_path, monkeypatch,
+                                                              request):
+    """The exact program is held to the adversarial inputs by the build itself, whatever
+    was asked for, and passes: every kernel that is ok was compared on each case."""
+    _gpu()
+    import json
+    import os
+    from pathlib import Path
+
+    from cleave.runtime.inputs import ADVERSARIAL
+
+    log = os.environ.get("CLEAVE_VALIDATION_LOG")  # the session's own, when it keeps one
+    if not log:
+        log = str(tmp_path / "validation.jsonl")
+        monkeypatch.setenv("CLEAVE_VALIDATION_LOG", log)
+    shapes = dict(H=32, SQ=64, SKV=256, D=64)
+    ev = P.EvalConfig(warmup=2, iters=20, max_parallel=4,
+                      tolerance=tolerance_for("exact_attention"))
+    exact = trace(attention, shapes, cl.f16)
+    assert exact.stabilize_requests and ev.distributions == ("normal",)
+    built = P.build(P.schedule(P.superoptimize(exact, P.SuperoptConfig(max_ops=14)),
+                               P.ScheduleConfig(topk=4)), config=ev)
     assert len(built.correct) >= 1
+    assert all(r.cases == ("normal",) + ADVERSARIAL and not r.cases_note for r in built)
+    records = [json.loads(line) for line in Path(log).read_text().splitlines()]
+    mine = [r for r in records if request.node.name in r["context"]]
+    passed = {case: sum(1 for r in mine if r["what"] == case and r["kind"] is None)
+              for case in ["", *(f"{d} inputs" for d in ADVERSARIAL)]}
+    assert all(n >= len(built.correct) for n in passed.values()), passed
+    assert not [r for r in mine if r["kind"] == "non_finite"]

@@ -310,9 +310,11 @@ def load(out: Path) -> dict:
                 if not node.startswith("tests/") or "test_compare_outputs" in node \
                         or node.startswith("tests/test_runtime_tolerance.py") \
                         or "threaded_into_workers" in node \
-                        or "test_without_the_running_max" in node:
-                    # comparator unit tests and deliberate failures (the last one runs an
-                    # operator's kernel as it was before its softmax was exact)
+                        or "test_without_the_running_max" in node \
+                        or "test_gpu_unstabilized_" in node:
+                    # comparator unit tests and deliberate failures (the last two run
+                    # kernels without the exact softmax: an operator's kernel as it was
+                    # before, and a dense program's tilings around a plain exp)
                     continue
                 context = "test:" + operator_of(node)
                 context = context.replace("test:dynamic:", "dynamic:")

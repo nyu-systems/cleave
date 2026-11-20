@@ -234,6 +234,45 @@ def test_the_measurement_counts_hand_made_requests_and_not_a_kernel_broken_on_pu
     assert out["rel"] == 7.8e-3 and not out["absolute"]
 
 
+def test_the_measurement_leaves_out_the_kernels_built_without_the_exact_softmax(tmp_path):
+    """``tests/frontend/test_exact_softmax.py`` builds an attention without the stabilize
+    request, and the exact program's tilings without the rewrite, to show that validation
+    rejects them at x100. Those are no kernels of the operator: neither their passes on
+    normal inputs nor their deliberate non-finite failures are part of its measurement, so
+    a non-finite failure in its table is always a finding."""
+    from tests._measure_tolerances import load, measured_errors, rows
+
+    path = "tests/frontend/test_exact_softmax.py"
+
+    def record(test, what, rel, kind=None):
+        output = dict(shape=[32, 64, 64], dtype="float16", rtol=5e-3, atol=0.0, kind=kind,
+                      rel=rel, abs=None if rel is None else rel / 4)
+        return json.dumps({"context": f"{path}::{test} (call)", "what": what, "kind": kind,
+                           "outputs": [output]})
+
+    lines = [
+        record("test_gpu_exact_softmax_attention", "", 9.4e-4),
+        record("test_gpu_exact_attention_is_held_to_every_adversarial_case", "", 9.7e-4),
+        record("test_gpu_exact_attention_is_held_to_every_adversarial_case",
+               "large_logits inputs", 1.4e-3),
+        record("test_gpu_unstabilized_twin_is_caught_at_x100", "", 9.9e-4),
+        record("test_gpu_unstabilized_twin_is_caught_at_x100", "large_logits inputs", None,
+               kind="non_finite"),
+        record("test_gpu_unstabilized_kernel_fails_against_the_exact_reference", "", 9.8e-4),
+        record("test_gpu_unstabilized_kernel_fails_against_the_exact_reference",
+               "large_logits inputs", None, kind="non_finite"),
+    ]
+    (tmp_path / "validation").mkdir()
+    (tmp_path / "validation" / "tests__default.jsonl").write_text("\n".join(lines) + "\n")
+    table = load(tmp_path)
+    assert set(table) == {"test:exact_attention"}
+    (row,) = rows(table)
+    assert row["n"] == 3 and "non-finite" not in row["histogram"]
+    assert (row["largest_valid"], row["adversarial"]) == (9.7e-4, 1)
+    (entry,) = measured_errors(table)["test:exact_attention"]
+    assert (entry["rel"], entry["validated"]) == (9.7e-4, 3)
+
+
 def test_a_dense_programs_adversarial_cases_are_held_to_its_bound_and_do_not_feed_it(tmp_path):
     """A dense program whose softmax is exact is validated on the adversarial softmax inputs
     too, at the bound it declares from its normal inputs. Those comparisons are counted, and
