@@ -11,6 +11,7 @@ of a split-partial-shaped graph, the Exp that read storage, and every refusal.
 """
 
 import dataclasses
+import json
 import os
 import re
 import subprocess
@@ -491,6 +492,63 @@ def test_clone_generates_the_same_text(small, which):
     tiled = apply_tiling(getattr(small, which))
     clone = tiled.clone()
     assert _code(clone) == _code(tiled)
+
+
+_SEED_SCRIPT = """
+import hashlib, json
+from cleave.core.errors import ScheduleRejected
+from cleave.runtime.compile import build_candidate_code
+from cleave.schedule import search_tiling
+from tests import _softmax as S
+
+out = {}
+for name, fn, shapes, softmax in (
+    ("attention", S.flash_attention, dict(H=32, SQ=64, SKV=256, D=64), ()),
+    ("rows", S.flash_rows, dict(R=256, C=4096, D=64), ()),
+    ("softmax", S.softmax_rows, dict(R=64, C=1024),
+     (dict(rolling="div reads the exp next to the finished reduction"),)),
+):
+    for i, cand in enumerate(search_tiling(S.softmax_ir(fn, shapes, *softmax), topk=1000)):
+        try:
+            code = build_candidate_code(cand)
+        except ScheduleRejected as e:
+            out[f"{name} {i}"] = f"refused: {e}"
+            continue
+        kind = "rolling" if "ukernel_rescale" in code else "in-tile"
+        out[f"{name} {i}"] = kind + " " + hashlib.sha256(code.encode()).hexdigest()
+print(json.dumps(out))
+"""
+
+
+def test_text_does_not_depend_on_the_hash_seed(tmp_path):
+    """The pass edits a locked graph, whose node-keyed dicts hash placeholders and loop
+    nodes by structure: an edit that leaves one of them keyed by a stale hash loses the
+    entry, or not, depending on the process hash seed. Every candidate of three graphs --
+    an attention whose Exp reads a float32 tile, and two whose Exp read storage and is
+    replaced, one looped and one not -- generates the same text, or is refused alike,
+    under three seeds."""
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES="", CLEAVE_CACHE_ROOT=str(tmp_path))
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(ROOT), str(ROOT / "python"), env.get("PYTHONPATH", "")]
+    )
+    procs = [
+        subprocess.Popen([sys.executable, "-c", _SEED_SCRIPT], cwd=ROOT,
+                         env=dict(env, PYTHONHASHSEED=str(seed)),
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        for seed in (0, 1, 2)
+    ]
+    results = []
+    for proc in procs:
+        out, err = proc.communicate()
+        assert proc.returncode == 0, err[-2000:]
+        results.append(json.loads(out.strip().splitlines()[-1]))
+
+    first = results[0]
+    assert all(other == first for other in results[1:])
+    served = {"attention": {"rolling", "in-tile"}, "rows": {"rolling"}, "softmax": {"in-tile"}}
+    for graph, kinds in served.items():
+        got = {v.split()[0] for k, v in first.items() if k.startswith(graph)}
+        assert got - {"refused:"} == kinds, (graph, got)
 
 
 def test_parts_are_cloned_from_a_template_that_stays_untouched():
