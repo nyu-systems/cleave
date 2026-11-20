@@ -102,7 +102,9 @@ def test_cache_schema_retires_kernels_built_before_a_scheduler_fix(monkeypatch):
     cfgs = resolve_configs(prog)
     # 1: a reduction absorbed into another's loop was sliced with that loop's counter, and
     # demo/mha_prefill.py's saved winner was such a kernel.
-    assert cache.SCHEMA >= 2
+    # 2: `e / sum(e, 0)` on equal extents divided by the row sums, and a saved kernel fed two
+    # inputs of one shape in graph order (`b / a` computed `a / b`).
+    assert cache.SCHEMA >= 3
     key = _kernel_key(prog, *cfgs)
     monkeypatch.setattr(cache, "SCHEMA", 1)
     assert _kernel_key(prog, *cfgs) != key

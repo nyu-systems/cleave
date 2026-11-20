@@ -10,7 +10,9 @@ from pathlib import Path
 # In every key. Bump it when the layout changes, or when the same program and configs would
 # now build a different kernel: a kernel-cache hit returns the saved one as it is.
 # 2: a reduction absorbed into another's loop is scheduled over its whole axis.
-SCHEMA = 2
+# 3: lowering takes broadcast and reduction axes from the structure (not from extents that
+#    happen to agree), and a kernel's inputs are bound in the program's declaration order.
+SCHEMA = 3
 # What "validated" means for a saved kernel. A kernel-cache hit returns without validating,
 # so bump this whenever the comparison or its inputs change: saved kernels are then rebuilt.
 VALIDATION = 2
