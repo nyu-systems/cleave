@@ -341,12 +341,17 @@ def test_a_dense_programs_adversarial_cases_are_held_to_its_bound_and_do_not_fee
     (row,) = rows(table_of(record("increasing inputs", 1.0e-3)))
     assert row["largest_valid"] is None and row["rtol"] is None and row["adversarial"] == 1
 
-    # a dynamic operator names its adversarial workloads by key, not in ``what``, and counts
-    # them; a ``what`` that is no adversarial case of the dense programs feeds as before
+    # The name of a case marks a dense program's comparison only. A dynamic operator's
+    # adversarial workloads are told by their key (``<workload>@<case>``, the test below),
+    # so a dense case name in its ``what`` is an input like any other; so is a ``what``
+    # that is no adversarial case of the dense programs.
     table = table_of(record("increasing inputs", 3.0e-3, context="dynamic:op"),
                      record("some other inputs", 2.0e-3))
     assert [r["largest_valid"] for r in rows(table)] == [2.0e-3, 3.0e-3]
     assert not any(r["adversarial"] for r in rows(table))
+    # ... and the key of a dynamic workload marks nothing on a dense program
+    (row,) = rows(table_of(record("wl_1_8_7@increasing", 2.0e-3)))
+    assert (row["largest_valid"], row["adversarial"]) == (2.0e-3, 0)
 
 
 def test_a_paged_operators_adversarial_workloads_are_held_to_its_bound_and_do_not_feed_it(
