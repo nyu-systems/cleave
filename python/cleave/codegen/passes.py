@@ -1,4 +1,5 @@
 from ..ir.graph import (
+    AccumEdge,
     Graph,
     PlaceHolderNode,
     OutputNode,
@@ -7,7 +8,7 @@ from ..ir.graph import (
     ViewOpNode,
 )
 from ..ir.graph_utils import find_topo_sort
-from ..ir.ops import Div, Exp, Matmul, ReduceSum
+from ..ir.ops import Div, Exp, Matmul, Mul, ReduceSum
 
 
 # TODO: have all levels of the graph with OutputNode (this should make this function smoother)
@@ -161,6 +162,11 @@ def annotate_fragment_layout_conflicts(graph: Graph) -> Graph:
     layout to agree with. This holds wherever the scheduler put the two sums: both in one
     loop, each in a loop of its own, or either one in the same tier as the divide when
     its step is the whole split axis.
+
+    The same holds for a multiply, and for a second operand that is not the lower-rank
+    sum itself but computed from it elementwise: the RMSNorm split-K combine multiplies
+    the summed matmul partials by ``1 / sqrt(rowsum.sum(split) / K)``, a chain of three
+    ops that all keep the row sum's fragment layout.
     """
 
     def reset_graph(cur_graph: Graph) -> None:
@@ -176,7 +182,25 @@ def annotate_fragment_layout_conflicts(graph: Graph) -> Graph:
             return input_edge.src_node.graph.tinfo_map.get(accum_node, (None, None))[1]
         return cur_graph.tinfo_map.get(input_edge.src_node, (None, None))[1]
 
-    def is_independent_reduction_div(cur_node: Div, cur_graph: Graph) -> bool:
+    def through_elementwise_chain(edge):
+        """The edge that feeds the chain of one-operand, shape-keeping ops ``edge`` reads
+        the end of (``edge`` itself when it reads no such op): ``1 / sqrt(x / K)`` -> x."""
+        while not isinstance(edge, AccumEdge):
+            node = edge.src_node
+            if (
+                not isinstance(node, ComputeOpNode)
+                or isinstance(node, ReduceSum)
+                or len(node.inputs) != 1
+            ):
+                break
+            below = node.inputs[0]
+            source = getattr(below, "accum_node", None) or below.src_node
+            if tuple(source.get_shape(0)) != tuple(node.get_shape(0)):
+                break
+            edge = below
+        return edge
+
+    def is_independent_reduction_div(cur_node, cur_graph: Graph) -> bool:
         if cur_node.const is not None or cur_node.broadcast != 0:
             return False
         if len(cur_node.inputs) != 2:
@@ -184,9 +208,11 @@ def annotate_fragment_layout_conflicts(graph: Graph) -> Graph:
 
         lhs_edge, rhs_edge = cur_node.inputs
         # The node that produces each operand: a loop's accumulator, or a reduction of
-        # this tier (one whose step is its whole axis is not looped).
+        # this tier (one whose step is its whole axis is not looped). The second operand
+        # may come from its sum through ops that keep the sum's shape, and so its layout.
+        rhs_sum_edge = through_elementwise_chain(rhs_edge)
         lhs_accum = getattr(lhs_edge, "accum_node", None) or lhs_edge.src_node
-        rhs_accum = getattr(rhs_edge, "accum_node", None) or rhs_edge.src_node
+        rhs_accum = getattr(rhs_sum_edge, "accum_node", None) or rhs_sum_edge.src_node
 
         if not isinstance(lhs_accum, ReduceSum) or not isinstance(rhs_accum, ReduceSum):
             return False
@@ -229,7 +255,7 @@ def annotate_fragment_layout_conflicts(graph: Graph) -> Graph:
             if isinstance(cur_node, GraphNode):
                 annotate_graph(cur_node.graph)
                 continue
-            if isinstance(cur_node, Div) and is_independent_reduction_div(
+            if isinstance(cur_node, (Div, Mul)) and is_independent_reduction_div(
                 cur_node, cur_graph
             ):
                 cur_node.resolve_operand_layout = "rhs"

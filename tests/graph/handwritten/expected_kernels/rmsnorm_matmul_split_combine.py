@@ -88,9 +88,11 @@ def ukernel_div_const_1_0_const_on_left_1dims_rr(A, C):
 
 
 @T.macro
-def ukernel_mul_broadcast_0_2dims_rrr(A, B, C):
+def ukernel_mul_broadcast_0_resolve_rhs_layout_2dims_rrr(A, B, C):
+    B_ptr = T.alloc_shared(B.shape, "float32")
+    T.copy(B, B_ptr)
     for i0, i1 in T.Parallel(*C.shape):
-        C[i0, i1] = A[i0, i1] * B[i0]
+        C[i0, i1] = A[i0, i1] * B_ptr[i0]
 
 
 @T.macro
@@ -169,7 +171,7 @@ def main_kernel_iter(
         ),
         "float16",
     )
-    ukernel_mul_broadcast_0_2dims_rrr(t_mma_combine_0, t_div_1, t_mul_0)
+    ukernel_mul_broadcast_0_resolve_rhs_layout_2dims_rrr(t_mma_combine_0, t_div_1, t_mul_0)
     T.copy(t_mul_0, OutputNode)
 
 

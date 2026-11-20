@@ -47,7 +47,9 @@ from pathlib import Path
 # 18: a kernel takes its inputs first and its outputs last, also where an output is finished
 #     before a later input is read (un-looped split partials: they were launched with an
 #     input in the place of an output).
-SCHEMA = 18
+# 19: a factor (or divisor) computed elementwise from a sum of lower rank is staged through
+#     shared memory, as that sum itself already was (the RMSNorm split-K combine).
+SCHEMA = 19
 # What "validated" means for a saved kernel. A kernel-cache hit returns without validating,
 # so bump this whenever the comparison or its inputs change: saved kernels are then rebuilt.
 # (The inputs include the adversarial cases a program with an exact softmax is held to,
