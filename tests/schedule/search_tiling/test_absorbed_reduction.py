@@ -5,9 +5,12 @@ is absorbed into that descendant's loop: in attention, the ``Q K^T`` contraction
 up inside the ``S_KV`` loop. The loop has one counter, so it cannot advance a second axis.
 ``apply_tiling`` used to slice the absorbed axis with that counter anyway; the kernel then
 contracted one ``D`` block per ``S_KV`` step and read past the tile.
-"""
 
-import re
+The policy rates such a candidate as the kernel that is generated for it -- the absorbed
+reduction at its whole extent -- not as the steps it names: it used to emit candidates as
+valid whose kernel it rates over the shared-memory cap, and to emit step maps that
+``apply_tiling`` refuses.
+"""
 
 import pytest
 
@@ -62,6 +65,21 @@ def _absorbed(cand):
         if rstep and _step(n, cand) < int(n.raxis[0].dom.extent)
     ]
     return [a for a in active if any(r is not a and a in get_op_ancestors(r) for r in active)]
+
+
+def _verdict(cand):
+    """What the policy decides and ranks a candidate on."""
+    return (cand.valid, cand.smem_cost, cand.traffic, cand.grid_size, cand.block_per_SM, cand.num_wave)
+
+
+def _stepped(policy, **steps):
+    """An rstep map for ``policy``'s graph: ``steps`` by reduction name, ``{}`` elsewhere."""
+    by_name = {node.name: node for node in policy.ordered_nodes}
+    assert set(steps) <= set(by_name), f"no such node: {set(steps) - set(by_name)}"
+    return {
+        node: {node.raxis[0].var.name: steps[name]} if name in steps else {}
+        for name, node in by_name.items()
+    }
 
 
 def _mis_sliced(scheduled):
@@ -120,48 +138,170 @@ def test_absorbed_reduction_keeps_its_whole_axis(name, unformatted):
         if key not in siblings:
             sibling = policy.compute_tile_dict(list(cand.output_tile), whole)
             sibling.n_threads = cand.n_threads
-            siblings[key] = build_candidate_code(sibling)
-        assert build_candidate_code(cand) == siblings[key], label
+            siblings[key] = (sibling, build_candidate_code(sibling))
+        sibling, sibling_code = siblings[key]
+        assert build_candidate_code(cand) == sibling_code, label
+        # ... and it is rated as that kernel: a candidate is only proposed if its kernel
+        # fits, at the shared memory and the wave count (the rank) its kernel has.
+        assert cand.valid and sibling.valid, label
+        assert _verdict(cand) == _verdict(sibling), label
 
     assert n_absorbed, f"{name}: no candidate with an absorbed reduction; the case tests nothing"
 
 
-def test_refuses_to_step_an_axis_that_an_absorbed_reduction_holds_whole():
+@pytest.mark.parametrize(
+    "K",
+    [
+        pytest.param(4096, id="K4096_kernel_over_the_cap"),
+        pytest.param(1024, id="K1024_kernel_fits"),
+    ],
+)
+def test_refuses_to_step_an_axis_that_an_absorbed_reduction_holds_whole(K):
     """LoRA ``X @ W + (X @ A) @ B`` with all three matmuls stepped below their extents.
 
     ``X @ A`` is absorbed into the loop of ``(X @ A) @ B``, which walks the rank, so it needs
     the whole ``K`` of ``X`` in every iteration. ``X @ W`` steps that same ``K`` of the same
     ``X``. No tile of ``X`` serves both, so the tiling is refused -- with a typed error, which
     ``python -O`` cannot strip -- rather than scheduled into a kernel that slices ``X`` wrong.
+
+    The policy agrees: a step map with no kernel is not a valid candidate, and none is
+    proposed. (It used to propose all of these; ``apply_tiling`` refused them one by one,
+    126 of 256 candidates at ``K = 4096``.) At ``K = 4096`` the kernel that holds ``K``
+    whole would not fit the shared-memory cap either; at ``K = 1024`` it would, and the
+    shared axis is the only reason.
     """
     # Rank 128: at the end2end case's rank of 16 the up projection never iterates.
-    candidates = _policy(g.lora_graph(16, 4096, 4096, 128), False).emit_config(1000)
-
-    n_refused = n_built = 0
+    policy = _policy(g.lora_graph(16, 4096, K, 128), False)
+    candidates = policy.emit_config(1000)
+    assert candidates, "nothing is proposed; the case tests nothing"
+    n_built = 0
     for cand in candidates:
         label = f"tile={list(cand.output_tile)} rstep={cand.rstep_map}"
-        absorbed = [node.name for node in _absorbed(cand)]
-        if not absorbed:
-            # Nothing is held whole, so this rule refuses nothing. The tiling may still be
-            # refused for the other reason two matmuls cannot share ``X``: ``X @ W`` and
-            # ``X @ A`` stepped differently give a loop whose trip count is not the number
-            # of tiles of ``X``.
-            try:
-                apply_tiling(cand)
-                n_built += 1
-            except ScheduleRejected as e:
-                assert re.fullmatch(
-                    r"GraphNode_mma_down runs \d+ iterations but dim 1 of PlaceHolder_AA is "
-                    r"cut into \d+ tiles \(\d+ of 4096\)",
-                    str(e),
-                ), f"{label}: {e}"
-                steps = {n.name: next(iter(v.values())) for n, v in cand.rstep_map.items() if v}
-                assert steps["mma_base"] != steps["mma_down"], label
-            continue
-        assert absorbed == ["mma_down"], label
-        with pytest.raises(ScheduleRejected, match="mma_base is shared with an absorbed"):
+        assert not _absorbed(cand), label
+        # Nothing is held whole, so this rule refuses nothing. The tiling may still be
+        # refused for the other reason two matmuls cannot share ``X``: ``X @ W`` and
+        # ``X @ A`` stepped differently give a loop whose trip count is not the number
+        # of tiles of ``X``.
+        try:
             apply_tiling(cand)
-        n_refused += 1
-
-    assert n_refused, "no candidate steps all three matmuls; the case tests nothing"
+            n_built += 1
+        except ScheduleRejected as e:
+            steps = {n.name: next(iter(v.values())) for n, v in cand.rstep_map.items() if v}
+            # The loop is the down projection's while it steps ``K``; once it holds ``K``
+            # whole, ``X @ W`` rides the up projection's walk of the rank instead.
+            loop, runs = (
+                ("mma_down", K // steps["mma_down"])
+                if steps["mma_down"] < K
+                else ("mma_up", 128 // steps["mma_up"])
+            )
+            tile = steps["mma_base"]
+            assert str(e) == (
+                f"GraphNode_{loop} runs {runs} iterations but dim 1 of PlaceHolder_AA is "
+                f"cut into {K // tile} tiles ({tile} of {K})"
+            ), label
+            assert runs != K // tile, label
+            assert steps["mma_base"] != steps["mma_down"], label
     assert n_built, "no candidate without an absorbed reduction is built; the case tests nothing"
+
+    # The step maps the search walks through on its way to those: up projection and base
+    # matmul stepped together (they are one group), the down projection at any step.
+    n_refused = 0
+    for rows in (32, 64, 128, 256, 512, 1024):
+        for up in (32, 64):
+            for down in (32, 64, 128, 256, 512):
+                steps = _stepped(policy, mma_base=up, mma_down=down, mma_up=up)
+                cand = policy.compute_tile_dict([16, rows], steps)
+                label = f"tile={[16, rows]} base=up={up} down={down}"
+                assert [node.name for node in _absorbed(cand)] == ["mma_down"], label
+                assert not cand.valid, label
+                with pytest.raises(ScheduleRejected, match="mma_base is shared with an absorbed"):
+                    apply_tiling(cand)
+                n_refused += 1
+    assert n_refused == 60
+
+    if K == 1024:
+        # The shared axis alone: the kernel with ``K`` held whole is within the caps.
+        steps = _stepped(policy, mma_base=32, mma_down=32, mma_up=32)
+        whole = dict(steps)
+        (down,) = [node for node in steps if node.name == "mma_down"]
+        whole[down] = {down.raxis[0].var.name: K}
+        assert policy.compute_tile_dict([16, 32], whole).smem_cost <= current_target().arch.smem_cap
+        assert not policy.compute_tile_dict([16, 32], steps).valid
+
+
+def test_a_candidate_whose_kernel_does_not_fit_is_not_proposed():
+    """MLA decode at batch 2: the kernel of 192 of 444 proposed candidates did not fit.
+
+    ``Q K^T`` over the latent dim (and over the positional one) is absorbed into the
+    ``S_KV`` loop, so the kernel holds the whole 512-wide latent tile in every iteration.
+    Rated on the steps the candidate names (32 of 512) that is 73728 bytes of shared
+    memory; the kernel that is generated needs 196608, against a cap of 167936. Such
+    candidates were emitted as valid, ranked on the smaller figure, and failed to compile.
+    """
+    policy = _policy(g.mla_decode_bhsd_graph(2, 128, 4096, 512, 64), False)
+    cap = current_target().arch.smem_cap
+
+    # The candidate of the report, by hand: named steps fit, the kernel does not.
+    steps = _stepped(policy, mma_0=32, mma_pe=32, mma_1=128, rowsum_0=128)
+    named = policy.compute_tile_dict([1, 64, 32], steps)
+    assert sorted(node.name for node in _absorbed(named)) == ["mma_0", "mma_pe"]
+    kernel = policy.compute_tile_dict(
+        [1, 64, 32], _stepped(policy, mma_0=512, mma_pe=64, mma_1=128, rowsum_0=128)
+    )
+    assert not _absorbed(kernel) and not kernel.valid and kernel.smem_cost > cap
+    assert not named.valid and named.smem_cost == kernel.smem_cost
+
+    candidates = policy.emit_config(100000)
+    n_absorbed = 0
+    for cand in candidates:
+        label = f"tile={list(cand.output_tile)} rstep={cand.rstep_map}"
+        assert cand.valid and cand.smem_cost <= cap, label
+        absorbed = _absorbed(cand)
+        if not absorbed:
+            continue
+        n_absorbed += 1
+        whole = dict(cand.rstep_map)
+        for node in absorbed:
+            whole[node] = {node.raxis[0].var.name: int(node.raxis[0].dom.extent)}
+        kernel = policy.compute_tile_dict(list(cand.output_tile), whole)
+        assert _verdict(cand) == _verdict(kernel), label
+    # Absorbed candidates whose kernel fits are still proposed: they are not de-duplicated.
+    assert n_absorbed, "no candidate with an absorbed reduction is left; the case tests nothing"
+
+
+@pytest.mark.parametrize(
+    ("build", "dims", "expected"),
+    [
+        # (mma_0 iterates, mma_1 iterates) -> candidates. (True, False) is the family that
+        # pinning every ancestor reduction to its extent loses: mma_0 in a loop of its own.
+        pytest.param(
+            g.matmul_matmul_graph, (4096, 64, 64),
+            {(True, True): 16, (True, False): 12, (False, True): 16, (False, False): 12},
+            id="matmul_matmul_small_n",
+        ),
+    ],
+)
+def test_rating_the_kernel_leaves_the_walk_alone(build, dims, expected):
+    """The search still walks through every step map, absorbed or not.
+
+    A step map with an absorbed reduction is the way to the ones behind it: ``mma_0``
+    stops being absorbed once ``mma_1`` reaches its extent. Rating a state as its kernel
+    must not prune the walk there, or those candidates are never reached.
+    """
+    policy = _policy(build(*dims), False)
+    found = {}
+    for cand in policy.emit_config(1000):
+        iterates = tuple(
+            _step(node, cand) < int(node.raxis[0].dom.extent)
+            for node in cand.rstep_map
+            if node.name in ("mma_0", "mma_1")
+        )
+        found[iterates] = found.get(iterates, 0) + 1
+    assert found == expected
+
+
+def test_lora_proposes_what_it_did():
+    """The end2end LoRA case has no absorbed reduction: nothing about it may move."""
+    candidates = _policy(g.lora_graph(16, 4096, 4096, 16), False).emit_config(1000)
+    assert len(candidates) == 720
+    assert not any(_absorbed(cand) for cand in candidates)

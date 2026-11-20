@@ -651,6 +651,68 @@ def absorbed_reductions(nodes, rstep_map):
     ]
 
 
+def scheduled_reductions(flat_graph):
+    """``(op nodes, reduction-axis provenance)`` of ``flat_graph`` as ``apply_tiling`` sees it.
+
+    ``apply_tiling`` schedules a clone of the flat graph with its split views removed, and
+    decides what an absorbed reduction holds whole from the axis provenance of that clone.
+    Anything that has to agree with it (the policy's verdict on a candidate) reads the
+    provenance from here. Nodes compare by name, so a step map keyed by the nodes of
+    ``flat_graph`` indexes the returned ones.
+    """
+    _, pruned = _extract_split_extent(flat_graph)
+    ordered_nodes = [
+        n for n in pruned.nodes if not n.is_placeholder() and not n.is_output()
+    ]
+    out_tokens = build_output_axis_provenance(ordered_nodes)
+    return ordered_nodes, build_reduction_axis_provenance(ordered_nodes, out_tokens)
+
+
+def _held_axis_tokens(ordered_nodes, rstep_map, red_tokens):
+    """Provenance tokens of the axes that absorbed reductions hold whole.
+
+    Raises ``ScheduleRejected`` for a tiling no loop can serve: one in which another
+    reduction steps an axis that an absorbed reduction has to keep whole.
+    """
+
+    def axis_tokens(node):
+        tokens = red_tokens.get(node)
+        return tokens[0] if tokens else set()
+
+    absorbed = absorbed_reductions(ordered_nodes, rstep_map)
+    # These are refusals, not asserts: without them the tiling would be scheduled into
+    # a kernel that reads the wrong slices, and ``python -O`` drops an assert.
+    held = set()
+    for node in absorbed:
+        tokens = axis_tokens(node)
+        if not tokens:
+            raise ScheduleRejected(
+                f"No axis provenance for the reduction axis of {node.name}; cannot tell "
+                "which tensor dims it runs over."
+            )
+        held |= tokens
+    for node in _iterative_reductions(ordered_nodes, rstep_map):
+        # Keeping a loop's own axis at block extent would stop the loop from advancing.
+        if node not in absorbed and held & axis_tokens(node):
+            raise ScheduleRejected(
+                f"Reduction axis of {node.name} is shared with an absorbed ancestor "
+                "reduction; one loop cannot both advance it and hold it whole."
+            )
+    return held
+
+
+def absorbed_axis_conflict(ordered_nodes, rstep_map, red_tokens) -> Optional[str]:
+    """Why ``apply_tiling`` refuses ``rstep_map`` over its absorbed reductions, or ``None``.
+
+    ``ordered_nodes`` and ``red_tokens`` are those of ``scheduled_reductions``.
+    """
+    try:
+        _held_axis_tokens(ordered_nodes, rstep_map, red_tokens)
+    except ScheduleRejected as refusal:
+        return str(refusal)
+    return None
+
+
 def _pin_absorbed_reduction_axes(ordered_nodes, rstep_map, tile_map, itile_map):
     """Iteration tiles with every absorbed reduction axis kept at its block extent.
 
@@ -661,35 +723,12 @@ def _pin_absorbed_reduction_axes(ordered_nodes, rstep_map, tile_map, itile_map):
     Raises ``ScheduleRejected`` for a tiling in which another reduction steps that same
     axis: its loop would have to advance an axis that has to stay whole.
     """
-    absorbed = absorbed_reductions(ordered_nodes, rstep_map)
-    if not absorbed:
+    if not absorbed_reductions(ordered_nodes, rstep_map):
         return itile_map
 
     out_tokens = build_output_axis_provenance(ordered_nodes)
     red_tokens = build_reduction_axis_provenance(ordered_nodes, out_tokens)
-
-    def axis_tokens(node):
-        tokens = red_tokens.get(node)
-        return tokens[0] if tokens else set()
-
-    # These are refusals, not asserts: without them the tiling would be scheduled into
-    # a kernel that reads the wrong slices, and ``python -O`` drops an assert.
-    pinned = set()
-    for node in absorbed:
-        tokens = axis_tokens(node)
-        if not tokens:
-            raise ScheduleRejected(
-                f"No axis provenance for the reduction axis of {node.name}; cannot tell "
-                "which tensor dims it runs over."
-            )
-        pinned |= tokens
-    for node in _iterative_reductions(ordered_nodes, rstep_map):
-        # Keeping a loop's own axis at block extent would stop the loop from advancing.
-        if node not in absorbed and pinned & axis_tokens(node):
-            raise ScheduleRejected(
-                f"Reduction axis of {node.name} is shared with an absorbed ancestor "
-                "reduction; one loop cannot both advance it and hold it whole."
-            )
+    pinned = _held_axis_tokens(ordered_nodes, rstep_map, red_tokens)
 
     itile_map = dict(itile_map)
     for (node, out_id), dim_tokens in out_tokens.items():

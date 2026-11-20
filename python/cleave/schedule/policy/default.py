@@ -11,6 +11,7 @@ from ...ir.analysis import (
     build_output_axis_provenance,
     build_reduction_axis_provenance,
 )
+from ..tiling import absorbed_axis_conflict, absorbed_reductions, scheduled_reductions
 
 import copy
 import numpy as np
@@ -65,6 +66,7 @@ class DefaultPolicy:
         self.force_fusion = force_fusion
         self.flat_graph = flat_graph
         self.canonical_output_node = self._select_canonical_output_node()
+        self._scheduled_reductions = None  # built on first use, see _absorbed_conflict
 
     def _select_canonical_output_node(self):
         if not self.output_nodes:
@@ -753,7 +755,69 @@ class DefaultPolicy:
         assert len(block_map) == 0
         return allocator.limit, cached_tensors_map
 
+    def _kernel_rstep_map(self, rstep_map):
+        """The steps of the kernel ``apply_tiling`` generates for ``rstep_map``.
+
+        A reduction absorbed into a descendant's loop is scheduled over its whole axis,
+        whatever step the map gives it (``schedule.tiling.absorbed_reductions``). Returns
+        ``rstep_map`` itself when nothing is absorbed.
+        """
+        absorbed = absorbed_reductions(self.ordered_nodes, rstep_map)
+        if not absorbed:
+            return rstep_map
+        kernel_rstep_map = dict(rstep_map)
+        for node in absorbed:
+            steps = dict(rstep_map[node])
+            steps[node.raxis[0].var.name] = int(node.raxis[0].dom.extent)
+            kernel_rstep_map[node] = steps
+        return kernel_rstep_map
+
+    def _absorbed_conflict(self, rstep_map):
+        """Why ``apply_tiling`` would refuse ``rstep_map`` over an absorbed axis, or None."""
+        if self._scheduled_reductions is None:
+            own = (self.ordered_nodes, self.reduction_axis_provenance)
+            if self.flat_graph is None:
+                self._scheduled_reductions = own
+            else:
+                try:
+                    # The provenance apply_tiling itself decides on (split views removed).
+                    self._scheduled_reductions = scheduled_reductions(self.flat_graph)
+                except NotImplementedError:
+                    # A split apply_tiling cannot take apart: it refuses every candidate
+                    # of this graph for that reason, whatever is answered here.
+                    self._scheduled_reductions = own
+        ordered_nodes, red_tokens = self._scheduled_reductions
+        return absorbed_axis_conflict(ordered_nodes, rstep_map, red_tokens)
+
+    def _as_candidate(self, state: TileDict) -> TileDict:
+        """``state`` with the verdict of the kernel it generates.
+
+        ``_rate_steps`` rates a step map at face value. That is the kernel's rating
+        unless a reduction is absorbed: the kernel then holds that reduction's whole axis
+        in every iteration, so it needs more shared memory than the steps suggest, and
+        may not fit at all. Validity, shared memory and waves (hence rank) are taken from
+        the kernel's own steps; a step map ``apply_tiling`` refuses has no kernel and is
+        invalid. The tile maps stay those of the given steps: ``apply_tiling`` derives
+        the kernel's from them, pinning the absorbed axes itself.
+        """
+        kernel_rstep_map = self._kernel_rstep_map(state.rstep_map)
+        if kernel_rstep_map is state.rstep_map:
+            return state
+        kernel = self._rate_steps(state.output_tile, kernel_rstep_map)
+        cand = copy.copy(state)
+        cand.traffic, cand.smem_cost = kernel.traffic, kernel.smem_cost
+        cand.cached_tensors_map = kernel.cached_tensors_map
+        cand.grid_size, cand.block_per_SM = kernel.grid_size, kernel.block_per_SM
+        cand.num_wave = kernel.num_wave
+        cand.valid = kernel.valid and self._absorbed_conflict(state.rstep_map) is None
+        return cand
+
     def compute_tile_dict(self, output_tile: list[int], rstep_map):
+        """The candidate for ``(output_tile, rstep_map)``, rated as the kernel it generates."""
+        return self._as_candidate(self._rate_steps(output_tile, rstep_map))
+
+    def _rate_steps(self, output_tile: list[int], rstep_map):
+        """Tiles and cost of ``rstep_map`` at face value: every reduction at its own step."""
         td = TileDict(output_tile, rstep_map, flat_graph=self.flat_graph)
         td.n_threads = DEFAULT_N_THREADS
         td.traffic, td.tile_map, td.itile_map, irregular_fusion = (
@@ -826,7 +890,8 @@ class DefaultPolicy:
         def add_to_queue(tile):
             if tuple(tile) in visited_tiles:
                 return
-            td = self.compute_tile_dict(tile, rstep_map)
+            # Face value, as in expand_iterative_tiles: these tiles only seed that walk.
+            td = self._rate_steps(tile, rstep_map)
             visited_tiles[tuple(tile)] = td
             if td.valid:
                 queue.put(tile)
@@ -857,15 +922,19 @@ class DefaultPolicy:
                 tuple((k, tuple(v.items())) for k, v in rstep_map.items()),
             ) in visited_tiles:
                 return
-            td = self.compute_tile_dict(tile, rstep_map)
+            # The walk prunes on the steps at face value, which never cost more than the
+            # kernel does: a state whose kernel does not fit is still the way to the
+            # states behind it (an absorbed reduction stops being one once its
+            # descendant reaches its extent). What is emitted is rated as the kernel.
+            state = self._rate_steps(tile, rstep_map)
             visited_tiles[
                 (
                     tuple(tile),
                     tuple((k, tuple(v.items())) for k, v in rstep_map.items()),
                 )
-            ] = td
-            if td.valid:
-                queue.put((prio(td), tile_counter, (tile, rstep_map)))
+            ] = self._as_candidate(state)
+            if state.valid:
+                queue.put((prio(state), tile_counter, (tile, rstep_map)))
                 tile_counter += 1
 
         visited_tiles = {}
