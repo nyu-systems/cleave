@@ -585,6 +585,22 @@ def test_a_tensor_core_matmul_over_an_axis_no_multiple_of_16_divides_is_a_typed_
         assert cands and {_step(c, _one(cands[0].flat_graph, Matmul)) for c in cands} == {whole}
 
 
+def test_the_pipeline_reports_the_policys_refusal_as_it_is():
+    """``pipeline.plans._search`` names whatever the search raises in the refusal of the
+    graph ("ValueError: 16 is not in list"). A refusal the policy types itself is passed
+    through, with its reason and without the name of an exception in front."""
+    from cleave import pipeline as P
+
+    prog = trace(plain_matmul, dict(M=128, K=8, N=128), cl.f16)
+    plans = P.schedule(GraphSet.identity(prog), P.ScheduleConfig(topk=8))
+    assert not list(plans) and plans.refused
+    for refusal in plans.refused:
+        assert str(refusal.reason) == (
+            "ScheduleRejected: mma_2 contracts 8 float16 elements: a tensor-core matmul of "
+            "16-bit operands steps its reduction axis in multiples of 16, and none divides "
+            "that extent")
+
+
 @pytest.mark.parametrize("K", [8, 24, 40])
 def test_a_float32_matmul_over_such_an_axis_starts_at_a_step_it_has(K):
     """float32 operands are contracted in K blocks of 8, so these extents have kernels;
