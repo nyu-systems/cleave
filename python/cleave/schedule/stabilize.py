@@ -19,6 +19,11 @@ A rolling Exp whose accumulators are too wide for a thread's registers gets the 
 the max crosses a multiple of it, and the rescale is skipped while it does not
 (``cleave.ir.rolling.lazy_rolling_nodes``). Same softmax, far fewer multiplies.
 
+A rolling loop that multiplies a slice it loads into the softmax's output (the partials a
+split combine weights) is emitted as a plain loop instead of a pipelined one
+(``_weighted_slices``): in a pipeline such a slice can be overwritten while it is still in
+use.
+
 A tiling the pass cannot serve is refused with a reason that names the Exp; the candidate
 is dropped, not the program. A graph without a marked Exp never reaches this module: it is
 returned by ``apply_tiling`` as before, so every non-softmax kernel and every graph built
@@ -44,7 +49,7 @@ from ..core.target import current_target
 from ..ir.graph import AccumEdge, ComputeOpNode, Graph, Iterator
 from ..ir.graph_utils import edit_graph, graph_tiers, tmap_by_name
 from ..ir.offsets import TileOffset
-from ..ir.ops import NEG_FLT_MAX, Exp, ReduceMax, Sub, wire_input
+from ..ir.ops import NEG_FLT_MAX, Exp, Matmul, ReduceMax, Sub, wire_input
 from ..ir.rolling import STAT_DTYPE, lazy_rolling_nodes, rolling_nodes
 from .tiling import rebase_reduction_axis
 
@@ -287,6 +292,47 @@ def _descends(node, ancestor, tier) -> bool:
         seen.add(id(n))
         stack.extend(e.src_node for e in n.inputs if _is(e.src_node, tier.nodes))
     return False
+
+
+def _weighted_slices(tier, exp, accs) -> list:
+    """The slices the loop of ``tier`` loads that are multiplied into the softmax's output:
+    placeholders the loop cuts per iteration from which a rescaled accumulator of ``accs``
+    is computed without passing through ``exp``, read by something other than a matmul.
+
+    A pipelined loop keeps the slices of several iterations in one buffer and loads the
+    next ones while the body runs; the body says when it is done with a slice, and the
+    slot is loaded again. A matmul reads its slice in place, before that. Any other op
+    first copies the slice into registers, and what tells the loader that the slot is
+    free is not something the device compiler treats as touching memory: it may read the
+    slot later, where the values are used. Here they are used last by the sums over the
+    softmax axis, one cross-thread reduction per element, behind the running max and the
+    rescale. Measured on a split combine (8 partials, 64 value columns a thread, slots
+    reused after 3 iterations): columns 24 and up of every row came from a later
+    iteration's partials, a different count of them on every launch.
+
+    A plain loop loads one slice, waits for it and uses it; nothing is loaded behind its
+    back. The slices of the scores (which pass through the exp) and of a value matmul are
+    not in this list: every attention kernel keeps its pipeline.
+    """
+    tmaps = tmap_by_name(tier)
+    found, stack, seen = [], list(accs), set()
+    while stack:
+        node = stack.pop()
+        if id(node) in seen:
+            continue
+        seen.add(id(node))
+        for edge in node.inputs:
+            src = edge.src_node
+            if src is exp or not _is(src, tier.nodes):
+                continue
+            if not src.is_placeholder():
+                stack.append(src)
+                continue
+            it = tmaps[src.name]
+            cut = any(int(whole) != int(part) for whole, part in zip(it.shape, it.tile_size))
+            if cut and type(node) is not Matmul and not _is(src, found):
+                found.append(src)
+    return found
 
 
 def _exported_max(tier, where, exp, flat, *, carried: bool):
@@ -555,9 +601,11 @@ def _rewrite(tier, owner, exp, site: Site, taken: set, cache: bool = True):
     if rolling:
         owner.carry(m)  # appended after the existing accumulators; a no-op for an export
         tier.lag_nodes.append(parts["max_prev"])
-        for acc in tier.accum_nodes:
-            if acc.name in site.scaled:
-                tier.accum_scale[acc] = parts["alpha"]
+        accs = [acc for acc in tier.accum_nodes if acc.name in site.scaled]
+        for acc in accs:
+            tier.accum_scale[acc] = parts["alpha"]
+        if _weighted_slices(tier, exp, accs):
+            tier.loop_kind = "serial"
     # Served: the request is consumed on this (tiled) copy of the node, so running the pass
     # again is a no-op. The flat graph's node -- the one the reference reads -- is another
     # object and keeps its record.

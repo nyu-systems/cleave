@@ -67,7 +67,9 @@ from pathlib import Path
 #     combines' tilings on a few rows or columns have kernels.
 # 28: a loop whose slices a pipeline would load off their 128-byte boundary is a plain loop:
 #     the split combines' tilings on 8 or 16 rows (they faulted on launch) have kernels.
-SCHEMA = 28
+# 29: a loop with a running max that multiplies a slice it loads into the softmax's output
+#     is a plain loop (in a pipeline the slice could be overwritten while still in use).
+SCHEMA = 29
 # What "validated" means for a saved kernel. A kernel-cache hit returns without validating,
 # so bump this whenever the comparison or its inputs change: saved kernels are then rebuilt.
 # (The inputs include the adversarial cases a program with an exact softmax is held to,

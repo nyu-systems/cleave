@@ -145,7 +145,9 @@ def test_cache_schema_retires_kernels_built_before_a_scheduler_fix(monkeypatch):
     # 26: a loop that loads no slice wide enough to transfer was pipelined.
     # 27: a loop that loads a tensor tile off its 128-byte boundary was pipelined; such a
     # kernel faulted on launch.
-    assert cache.SCHEMA >= 28
+    # 28: a rolling softmax loop that weights a loaded slice in registers was pipelined; the
+    # slice could be reloaded before its last use.
+    assert cache.SCHEMA >= 29
     key = _kernel_key(prog, *cfgs)
     monkeypatch.setattr(cache, "SCHEMA", 1)
     assert _kernel_key(prog, *cfgs) != key
