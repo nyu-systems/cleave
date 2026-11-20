@@ -24,6 +24,14 @@ Four tilings the policy proposes and the tiler used to mishandle or mis-type:
 All four are per-candidate refusals now: callers that drop a candidate on
 ``ScheduleRejected`` (the pipeline's schedule stage, the softmax accept filter) can tell
 them from a bug.
+
+One more tiling was *built*, and is refused now:
+
+* an output next to the canonical one whose axis is not the canonical axis it is launched
+  on. Sibling outputs are paired with the canonical output's axes by position and extent;
+  with equal extents the column sums of ``w`` were stored by the row block of ``x @ w``,
+  and ``exp(x) * 2`` was cut along the columns of ``exp(x) @ b`` while ``exp(x)`` was held
+  whole. The kernels lowered and wrote wrong values.
 """
 
 import re
@@ -358,3 +366,124 @@ def test_a_consistent_loop_is_not_refused():
                                                [1, 64, 64], rstep))
     (loop,) = [tier for tier, owner in graph_tiers(tiled) if owner is not None]
     assert loop.extent == 4096 // 32 and len(loop.accum_nodes) == 2
+
+
+# ------------------------------------------------- outputs next to the canonical one
+
+
+def scaled_next_to_product(x: cl.Tensor["M", "K"], b: cl.Tensor["K", "N"]):
+    """exp(x) @ b and exp(x) * 2: the second output keeps the axis the first contracts."""
+    e = cl.exp(x)
+    return e @ b, e * 2.0
+
+
+def column_sums_next_to_product(x: cl.Tensor["M", "K"], w: cl.Tensor["K", "N"]):
+    """x @ w and the column sums of w: the second output runs along the columns."""
+    return x @ w, cl.sum(w, 0, keepdim=True)
+
+
+def row_sums_next_to_product(x: cl.Tensor["M", "K"], w: cl.Tensor["K", "N"]):
+    """x @ w and the row sums of x: the second output runs along the rows, as launched."""
+    return x @ w, cl.sum(x, -1, keepdim=True)
+
+
+SIBLING = re.compile(
+    r"(OutputNod\w+) is launched on the axes of the canonical output by extent, but dim (\d) "
+    r"of (\w+) is indexed by launch axes (\[[\d, ]*\]) for the canonical output and "
+    r"(\[[\d, ]*\]) for \1: the grid walks (\[[\d, ]*\]), where the two are not the same "
+    r"axis\."
+)
+
+
+def _grid(cand, shape):
+    """Blocks per axis of the canonical output for ``cand``."""
+    return tuple(extent // tile for extent, tile in zip(shape, cand.output_tile))
+
+
+def test_a_sibling_output_on_another_axis_is_refused_where_the_grid_walks_it():
+    """``exp(x) * 2`` next to ``exp(x) @ b`` with as many columns in ``b`` as in ``x``. The
+    second output is ``(M, K)``, and its ``K`` was paired with the ``N`` of the product
+    because the extents agree. ``exp(x)`` is the product's operand and holds ``K`` whole;
+    a grid that walks the columns of the product cut the second output into column blocks
+    and filled each from the *first* columns of ``exp(x)`` (0.7 of the row max off, in a
+    kernel that lowered). Such a tiling was refused before siblings were launched at all
+    ("... for iter dim 1, got []"); it is refused again, for the reason. While the grid
+    has one block of columns the two axes cannot be told apart and the kernel is right."""
+    ir = _identity_graph(scaled_next_to_product, dict(M=128, K=64, N=64))
+    matmul, exp = _one(ir, Matmul), _one(ir, Exp)
+    cands = [c for c in search_tiling(ir, topk=1000) if _step(c, matmul) == 64]  # not looped
+    assert {tuple(c.output_tile) for c in cands} == {(64, 32), (64, 64), (128, 32), (128, 64)}
+    built, refused = _outcomes(cands)
+    assert {tuple(c.output_tile) for c, _ in built} == {(64, 64), (128, 64)}
+    assert {tuple(c.output_tile) for c, _ in refused} == {(64, 32), (128, 32)}
+    for cand, text in refused:
+        sibling, dim, node, canonical, own, walked = SIBLING.fullmatch(text).groups()
+        assert (dim, node, canonical, own, walked) == ("1", exp.name, "[]", "[1]", "[1]"), text
+    for cand, tiled in built:
+        # one tile of exp(x), read whole by both outputs
+        tiles = {n.name: tuple(int(t) for t in it.tile_size) for n, it in tiled.tmap.items()}
+        (scaled,) = [n for n in ir.nodes if n.name.startswith("mul_")]
+        assert tiles[exp.name] == tiles[scaled.name] == (cand.output_tile[0], 64)
+
+
+def test_a_sibling_output_of_another_axis_is_built_in_one_block_only():
+    """The column sums of ``w`` next to ``x @ w``, square: ``(N,)`` was paired with the
+    rows of the product. ``w`` is sliced by the column block, so the sums of column block
+    ``i1`` were stored at row block ``i0`` -- several blocks wrote one slice, each its own
+    values. Looped or not; the un-looped ones were refused until siblings were launched,
+    the looped ones were always built. Only the single block is right."""
+    ir = _identity_graph(column_sums_next_to_product, dict(M=128, K=256, N=128))
+    (w,) = [n for n in ir.nodes if n.is_placeholder() and tuple(n.get_shape(0)) == (256, 128)]
+    cands = search_tiling(ir, topk=1000)
+    assert {_grid(c, (128, 128)) for c in cands} >= {(1, 1), (2, 1), (1, 2), (2, 2)}
+    built, refused = _outcomes(cands)
+    assert built and {_grid(c, (128, 128)) for c, _ in built} == {(1, 1)}
+    assert {_grid(c, (128, 128)) for c, _ in refused} == {
+        _grid(c, (128, 128)) for c in cands} - {(1, 1)}
+    for cand, text in refused:
+        sibling, dim, node, canonical, own, walked = SIBLING.fullmatch(text).groups()
+        assert (dim, node, canonical, own) == ("1", w.name, "[1]", "[0]"), text
+        rows, cols = _grid(cand, (128, 128))
+        assert walked == str([axis for axis, blocks in enumerate((rows, cols)) if blocks > 1])
+
+
+def test_a_sibling_output_on_its_own_axis_is_launched_as_before():
+    """What the refusal leaves alone: the row sums of ``x`` next to ``x @ w`` run along the
+    rows, the axis they are launched on. Every tiling is built, square or not."""
+    for sizes in (dict(M=128, K=256, N=128), dict(M=128, K=256, N=64)):
+        ir = _identity_graph(row_sums_next_to_product, sizes)
+        built, refused = _outcomes(search_tiling(ir, topk=1000))
+        assert built and not refused
+
+
+def test_the_canonical_view_of_a_shared_ancestor_is_kept_and_the_other_reported():
+    """``launch_axis_dependencies``: what the canonical output says of a node stands, and
+    each dim a sibling would have indexed otherwise is reported with both views."""
+    from cleave.ir.analysis import infer_output_axis_dependencies, launch_axis_dependencies
+
+    ir = _identity_graph(scaled_next_to_product, dict(M=128, K=64, N=64))
+    exp = _one(ir, Exp)
+    outputs = [n for n in ir.nodes if isinstance(n, OutputNode)]
+    canonical = tiling._select_canonical_output_node(outputs)
+    siblings = tiling._sibling_launch_axes(canonical, outputs)
+    ((sibling, axis_map),) = siblings
+    assert axis_map == [0, 1]  # paired by position and extent
+    alone = infer_output_axis_dependencies(canonical)
+    deps, disagreements = launch_axis_dependencies(canonical, siblings)
+    assert alone[exp.name] == deps[exp.name] == [{0}, set()]
+    assert infer_output_axis_dependencies(canonical, siblings) == deps
+    (x,) = [n for n in ir.nodes if n.is_placeholder() and tuple(n.get_shape(0)) == (128, 64)]
+    # the contracted axis, of exp(x) and of x under it: no launch axis for the product,
+    # the columns for the second output
+    assert sorted(tuple(d) for d in disagreements) == sorted(
+        (sibling.name, name, 1, frozenset(), frozenset({1})) for name in (exp.name, x.name))
+    # the sibling's own ops are seen from the sibling only
+    (scaled,) = [n for n in ir.nodes if n.name.startswith("mul_")]
+    assert scaled.name not in alone and deps[scaled.name] == [{0}, {1}]
+
+    # a sibling on its own axis disagrees with nothing
+    ir = _identity_graph(row_sums_next_to_product, dict(M=128, K=256, N=128))
+    outputs = [n for n in ir.nodes if isinstance(n, OutputNode)]
+    canonical = tiling._select_canonical_output_node(outputs)
+    assert launch_axis_dependencies(
+        canonical, tiling._sibling_launch_axes(canonical, outputs))[1] == []

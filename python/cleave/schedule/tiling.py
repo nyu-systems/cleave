@@ -19,7 +19,7 @@ from ..ir.offsets import OffsetTerm, TileOffset, get_offset_lambda
 from ..ir.analysis import (
     build_output_axis_provenance,
     build_reduction_axis_provenance,
-    infer_output_axis_dependencies,
+    launch_axis_dependencies,
 )
 from ..ir.graph_utils import (
     get_op_ancestors,
@@ -270,6 +270,10 @@ def _sibling_launch_axes(canonical_output, output_nodes):
     batch axes in order, the other axes onto the canonical output's leading non-batch axes.
     An output that has no such map is left out; its own ancestors then depend on no launch
     axis, and a tiling whose grid would have to walk them is refused as before.
+
+    The map pairs axes by position and extent, not by what indexes them: whether an axis
+    of a sibling really is the canonical axis it was paired with is checked against the
+    graph, per tiling, by ``_refuse_siblings_on_another_axis``.
     """
     canonical = _get_output_binding_node(canonical_output)
     siblings = []
@@ -284,6 +288,41 @@ def _sibling_launch_axes(canonical_output, output_nodes):
             continue
         siblings.append((output, axis_map))
     return siblings
+
+
+def _refuse_siblings_on_another_axis(disagreements, axis_coord_exprs):
+    """Refuse a grid that walks an axis on which a sibling output is wrongly launched.
+
+    A sibling output is launched and stored on the canonical axes its extents were paired
+    with (``_get_same_launch_output_axis_map``; the policy tiles it by the same pairing).
+    ``disagreements`` (``ir.analysis.launch_axis_dependencies``) are the dims of the
+    ancestors it shares with the canonical output that this pairing would have indexed by
+    other launch axes than the canonical output does. A tensor has one tile and one offset,
+    the canonical output's, so wherever the grid walks an axis the two views do not share,
+    the sibling's own ops are cut along an axis their operand is not cut along:
+    ``exp(x) * 2`` next to ``exp(x) @ b`` took its column block ``i1`` from the first
+    columns of an ``exp(x)`` held whole, and ``sum(w, 0)`` next to ``x @ w`` stored the
+    column sums of column block ``i1`` at row block ``i0`` -- kernels that were built,
+    lowered, and wrote wrong values (several blocks to one slice). While the grid stands
+    still on those axes, both views slice every tensor alike and the tiling is served.
+    """
+
+    def walked(axes):
+        return {
+            axis
+            for axis in axes
+            if axis in axis_coord_exprs and axis_coord_exprs[axis].expr != "0"
+        }
+
+    for sibling, node, dim, axes, sibling_axes in disagreements:
+        if walked(axes) != walked(sibling_axes):
+            raise ScheduleRejected(
+                f"{sibling} is launched on the axes of the canonical output by extent, but "
+                f"dim {dim} of {node} is indexed by launch axes {sorted(axes)} for the "
+                f"canonical output and {sorted(sibling_axes)} for {sibling}: the grid walks "
+                f"{sorted(walked(axes) ^ walked(sibling_axes))}, where the two are not the "
+                "same axis."
+            )
 
 
 def _build_group_axis_coord_expr(
@@ -1070,7 +1109,7 @@ def apply_tiling(cand: List) -> List[Graph]:
     # this needs to be called before any graph modifications
     # to correctly infer output axis dependencies for the
     # original output node
-    output_axis_deps = infer_output_axis_dependencies(
+    output_axis_deps, sibling_disagreements = launch_axis_dependencies(
         output_node, _sibling_launch_axes(output_node, output_nodes)
     )
 
@@ -1130,6 +1169,7 @@ def apply_tiling(cand: List) -> List[Graph]:
 
     launch_axis_plan = _build_launch_axis_plan(output_node, dshape)
     graphs["main"].extent = launch_axis_plan.extent
+    _refuse_siblings_on_another_axis(sibling_disagreements, launch_axis_plan.axis_coord_exprs)
 
     for node in reversed(ordered_nodes):
         if (

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, FrozenSet, List, NamedTuple, Optional, Set, Tuple
 
 from .graph import OutputNode
 from tvm import tirx  # after ..graph: tilelang puts tvm on sys.path
@@ -189,18 +189,57 @@ def infer_output_axis_dependencies(
     ancestor of the canonical output and has no dependency on it otherwise. What the
     canonical output gives a node is never changed by a sibling.
     """
+    return launch_axis_dependencies(output_node, siblings)[0]
+
+
+class AxisDisagreement(NamedTuple):
+    """A dim that a sibling output and the view in force do not index by the same axes."""
+
+    sibling: str  # the output whose launch axes are in question
+    node: str  # an ancestor it shares with an output that came before it
+    dim: int
+    axes: FrozenSet[int]  # the launch axes that index the dim, as the grid is built
+    sibling_axes: FrozenSet[int]  # the ones that would, were the sibling right
+
+
+def launch_axis_dependencies(
+    output_node: OutputNode, siblings=()
+) -> Tuple[Dict[str, List[Set[int]]], List[AxisDisagreement]]:
+    """``infer_output_axis_dependencies`` and where the siblings contradict it.
+
+    A sibling is launched on canonical axes that were chosen for it by position and extent
+    (``schedule.tiling._get_same_launch_output_axis_map``), which says nothing about what
+    its data is indexed by. Followed back from the sibling, those axes give every one of
+    its ancestors a view of its own; an ancestor that the canonical output (or an earlier
+    sibling) also has keeps the view it had, and each dim on which the two differ is
+    reported. ``sum(w, 0)`` next to ``x @ w`` with as many rows as columns is launched on
+    the rows while ``w`` is sliced by the columns; ``exp(x) * 2`` next to ``exp(x) @ b``
+    is launched on the columns of the product while ``exp(x)`` holds the contracted axis
+    whole. Whether that is a wrong kernel depends on the grid: see
+    ``schedule.tiling._refuse_siblings_on_another_axis``.
+    """
     if len(output_node.inputs) == 0:
-        return {}
+        return {}, []
     output_src = output_node.inputs[0].src_node
     output_rank = len(output_src.get_shape(output_node.inputs[0].src_id))
     deps = _axis_dependencies(output_node, [{axis} for axis in range(output_rank)])
+    disagreements: List[AxisDisagreement] = []
     for sibling, axis_map in siblings:
         if len(sibling.inputs) == 0:
             continue
         seen_from_sibling = _axis_dependencies(sibling, [{axis} for axis in axis_map])
         for name, node_deps in seen_from_sibling.items():
-            deps.setdefault(name, node_deps)
-    return deps
+            in_force = deps.setdefault(name, node_deps)
+            if in_force is node_deps:
+                continue
+            for dim, (axes, sibling_axes) in enumerate(zip(in_force, node_deps)):
+                if axes != sibling_axes:
+                    disagreements.append(
+                        AxisDisagreement(
+                            sibling.name, name, dim, frozenset(axes), frozenset(sibling_axes)
+                        )
+                    )
+    return deps, disagreements
 
 
 def _axis_dependencies(output_node: OutputNode, axes: List[Set[int]]) -> Dict[str, List[Set[int]]]:
