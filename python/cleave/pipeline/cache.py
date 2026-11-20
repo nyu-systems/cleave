@@ -17,7 +17,9 @@ from pathlib import Path
 # 5: a reduction that is not looped reduces its own axis of the stored tile.
 # 6: a candidate with an absorbed reduction is rated (and cut at top-k) as its kernel.
 # 7: a loop tier carries the dims its block stores (single-row loop kernels now build).
-SCHEMA = 7
+# 8: a split combine builds wherever its two sums are placed; work no loop reads is
+#    emitted behind the loops.
+SCHEMA = 8
 # What "validated" means for a saved kernel. A kernel-cache hit returns without validating,
 # so bump this whenever the comparison or its inputs change: saved kernels are then rebuilt.
 VALIDATION = 2

@@ -51,7 +51,7 @@ def emission_order(graph) -> List[Node]:
     dependency), and a rescale factor is emitted before the accumulator it multiplies.
     """
     if not graph.lag_nodes and not graph.accum_scale:
-        return find_topo_sort(graph.nodes)
+        return _work_behind_loops(find_topo_sort(graph.nodes))
     lag_ids = {id(n) for n in graph.lag_nodes}
     lags_of = {}
     for lag in graph.lag_nodes:
@@ -83,7 +83,42 @@ def emission_order(graph) -> List[Node]:
 
     for node in graph.nodes:
         visit(node)
-    return order
+    return _work_behind_loops(order)
+
+
+def _work_behind_loops(order: List[Node]) -> List[Node]:
+    """``order`` with every compute node that no loop reads moved behind the last loop.
+
+    Dataflow leaves a node that neither feeds a loop nor reads one free to be emitted on
+    either side of it: the value sum of a split combine whose step is the whole split
+    axis, next to the loop of the row sum. TileLang (0.1.13) cannot take it in front. It
+    lowers a tier with a pipelined loop by splitting the block's threads at the loop into
+    a group that loads and a group that computes, and runs whatever stands in front of
+    the loop on both: the fragment is then filled for the wrong threads, and the kernel
+    does not return (the block's barriers never line up). Behind the loop the same
+    statement belongs to the computing group alone. A tier without such a node keeps its
+    order, and so its text.
+    """
+    loops = [i for i, node in enumerate(order) if isinstance(node, GraphNode)]
+    if not loops:
+        return order
+    read_by_a_loop, stack = set(), [order[i] for i in loops]
+    while stack:
+        for edge in stack.pop().inputs:
+            if id(edge.src_node) not in read_by_a_loop:
+                read_by_a_loop.add(id(edge.src_node))
+                stack.append(edge.src_node)
+    moved = set()
+    for node in order[: loops[-1]]:
+        if isinstance(node, ComputeOpNode) and id(node) not in read_by_a_loop:
+            moved.add(id(node))
+        elif isinstance(node, OutputNode) and id(node.inputs[0].src_node) in moved:
+            moved.add(id(node))  # the store of a moved node goes with it
+    if not moved:
+        return order
+    front = [node for node in order[: loops[-1] + 1] if id(node) not in moved]
+    behind = [node for node in order[: loops[-1]] if id(node) in moved]
+    return front + behind + order[loops[-1] + 1 :]
 
 
 class KernelEmitter:

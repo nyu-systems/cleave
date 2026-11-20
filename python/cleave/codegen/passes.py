@@ -142,6 +142,17 @@ def annotate_tc_layout(graph: Graph) -> Graph:
 
 
 def annotate_fragment_layout_conflicts(graph: Graph) -> Graph:
+    """Stage the divisor of a ``sum / sum`` divide through shared memory.
+
+    ``value.sum(split) / rowsum.sum(split)`` -- the split-KV combine -- divides one
+    reduced fragment by another that was reduced from a tensor of lower rank. TileLang
+    lays each of them out from its own input, and no layout of the two serves the divide
+    (``no available layout found``). Read from shared memory, the divisor has no fragment
+    layout to agree with. This holds wherever the scheduler put the two sums: both in one
+    loop, each in a loop of its own, or either one in the same tier as the divide when
+    its step is the whole split axis.
+    """
+
     def reset_graph(cur_graph: Graph) -> None:
         for cur_node in cur_graph.nodes:
             if hasattr(cur_node, "resolve_operand_layout"):
@@ -162,14 +173,12 @@ def annotate_fragment_layout_conflicts(graph: Graph) -> Graph:
             return False
 
         lhs_edge, rhs_edge = cur_node.inputs
-        lhs_accum = getattr(lhs_edge, "accum_node", None)
-        rhs_accum = getattr(rhs_edge, "accum_node", None)
+        # The node that produces each operand: a loop's accumulator, or a reduction of
+        # this tier (one whose step is its whole axis is not looped).
+        lhs_accum = getattr(lhs_edge, "accum_node", None) or lhs_edge.src_node
+        rhs_accum = getattr(rhs_edge, "accum_node", None) or rhs_edge.src_node
 
         if not isinstance(lhs_accum, ReduceSum) or not isinstance(rhs_accum, ReduceSum):
-            return False
-        if lhs_edge.src_node is not rhs_edge.src_node:
-            return False
-        if not isinstance(lhs_edge.src_node, GraphNode):
             return False
         if get_input_scope(cur_graph, rhs_edge) != "r":
             return False
