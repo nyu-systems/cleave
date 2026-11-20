@@ -34,7 +34,9 @@ SCHEMA = 11
 # so bump this whenever the comparison or its inputs change: saved kernels are then rebuilt.
 # (The inputs include the adversarial cases a program with an exact softmax is held to,
 # cleave.runtime.inputs.ADVERSARIAL, which are not in the key by name.)
-VALIDATION = 2
+# 3: the adversarial cases shape the logits of the exact softmax only; the operands of a
+#    plain exp written next to it are left alone (its reference overflowed on them).
+VALIDATION = 3
 
 
 @functools.lru_cache(maxsize=None)

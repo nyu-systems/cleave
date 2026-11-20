@@ -186,7 +186,7 @@ def test_kernel_cache_key_covers_validation():
     assert key(declared) != key(ev.replace(tolerance=cl.Tolerance(rtol=1e-3, atol=1e-6)))
     assert key(declared) != key(declared.replace(distributions=("normal", "large_logits")))
     assert key(declared) == key(declared.replace(max_parallel=2, timeout_s=5.0))
-    assert cache.VALIDATION >= 2  # 1: elementwise assert_close with a 0.5/0.5 default
+    assert cache.VALIDATION >= 3  # 1: elementwise assert_close with a 0.5/0.5 default
     before = key(declared)
     cache.VALIDATION += 1
     try:
