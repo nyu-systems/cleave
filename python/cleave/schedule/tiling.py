@@ -992,6 +992,30 @@ def _refuse_loops_that_miscount_their_tiles(main: Graph):
             )
 
 
+def _pipeline_one_loop(main: Graph):
+    """Leave ``T.Pipelined`` to the first loop of a kernel; emit the others as plain loops.
+
+    A loop tier is emitted as ``T.Pipelined``, which lets TileLang turn the copies of the
+    slices each iteration loads into asynchronous bulk transfers. The vendored TileLang
+    does that for one loop per kernel: the loop variable of a second pipelined loop is
+    left behind outside the loop, and the kernel fails at the very end of lowering ("In
+    PrimFunc main_kernel variables (i0,) are used, but are not passed in as API
+    arguments"). Two sums looped with different steps (a split combine), or two matmuls
+    that share no operand, each get a loop of their own; every such kernel died there.
+
+    The second loop computes the same thing as a plain loop, and with it the kernel
+    lowers. The first keeps its pipeline: with the first serial and the second pipelined
+    TileLang lowers some kernels and not others. ``main.nodes`` is in emission order.
+    """
+    pipelined = False
+    for tier, owner in graph_tiers(main):
+        if owner is None or tier.loop_kind != "pipelined":
+            continue
+        if pipelined:
+            tier.loop_kind = "serial"
+        pipelined = True
+
+
 def _refuse_tile_that_misses_dims(node, shape, tile, expanded_tile):
     """Refuse a tiling whose tile has fewer dims than the tensor it tiles.
 
@@ -1305,6 +1329,7 @@ def apply_tiling(cand: List) -> List[Graph]:
     lock_graph(graphs["main"])  # graph structure is fixed after this point
 
     graphs["main"].nodes = find_topo_sort(main_output_nodes)
+    _pipeline_one_loop(graphs["main"])
     canonical_output_binding = _get_output_binding_node(output_node)
     for node in graphs["main"].nodes:
         tile_size = []

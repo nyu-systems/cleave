@@ -20,6 +20,11 @@ The pass that asks for the staging also recognised the two sums by ``ReduceSum.a
 which is the place of the split axis in the stored tile only for an axis named from the
 front: named from the end (``axis=-2`` / ``-3``, the same axis) it stays the built axis, 1
 behind the head dim, and no placement of such a combine got the staging.
+
+One placement was left to TileLang's own limits: each sum in a loop of its own (two steps
+below the split count). The vendored TileLang pipelines one loop per kernel -- the loop
+variable of a second ``T.Pipelined`` loop is left behind outside the loop -- so the tiler
+emits every loop after the first as a plain one.
 """
 
 import re
@@ -55,7 +60,7 @@ PLACEMENTS = {
 }
 
 
-def _candidate(value_step, rowsum_step, split=SPLIT, from_end=False):
+def _candidate(value_step, rowsum_step, split=SPLIT, from_end=False, rows=128):
     graph = mha_split_combine_graph(32, split, 4096, 64, from_end=from_end)
     steps = {"value_combine_0": value_step, "rowsum_combine_0": rowsum_step}
     rstep = {
@@ -63,7 +68,13 @@ def _candidate(value_step, rowsum_step, split=SPLIT, from_end=False):
         for node in graph.nodes
         if not node.is_placeholder() and not node.is_output()
     }
-    return build_tiled_candidate(graph, [1, 128, 64], rstep)
+    return build_tiled_candidate(graph, [1, rows, 64], rstep)
+
+
+def _loops(code):
+    """``(loop, kind)`` of every loop of the kernel, in the order they are emitted."""
+    return re.findall(r"def (GraphNode_\w+)\((?:(?!\ndef ).)*?for i0 in T\.(\w+)\(", code,
+                      flags=re.S)
 
 
 def _main_tier_calls(code):
@@ -117,13 +128,35 @@ def test_work_no_loop_reads_is_emitted_behind_the_loops(placement):
     assert [c.startswith("GraphNode_") for c in calls[:n_loops]] == [True] * n_loops, calls
 
 
-def test_each_sum_in_a_loop_of_its_own_gets_the_staging_too():
+@pytest.mark.parametrize("steps", [(2, 4), (4, 2)], ids=["value_2_rowsum_4", "value_4_rowsum_2"])
+def test_each_sum_in_a_loop_of_its_own_gets_the_staging_too(steps):
     """Split 8 with steps 2 and 4: two loops over the split axis with different trip
-    counts. TileLang 0.1.13 does not lower two pipelined loops in one kernel (its own
-    limit), but the divide is the one of every other placement."""
-    calls = _main_tier_calls(build_candidate_code(_candidate(2, 4, split=8)))
+    counts. The divide is the one of every other placement. TileLang 0.1.13 does not
+    lower two pipelined loops in one kernel ("variables (i0,) are used, but are not
+    passed in as API arguments": 13 of this combine's tilings at split 8), so the second
+    loop is emitted as a plain one, and the kernel lowers."""
+    code = build_candidate_code(_candidate(*steps, split=8))
+    calls = _main_tier_calls(code)
     assert [c.startswith("GraphNode_") for c in calls] == [True, True, False], calls
     assert calls[-1] == "ukernel_div_broadcast_0_resolve_rhs_layout_2dims_rrr"
+    assert [kind for _, kind in _loops(code)] == ["Pipelined", "serial"]
+    assert [name for name, _ in _loops(code)] == [c for c in calls if c.startswith("GraphNode_")]
+    assert "main_kernel" in lower_to_cuda(code)
+
+
+@pytest.mark.parametrize("placement", sorted(PLACEMENTS))
+def test_a_kernel_with_one_loop_keeps_its_pipeline(placement):
+    """What that leaves alone: a kernel with one loop, whichever sum is in it."""
+    steps, loops = PLACEMENTS[placement]
+    code = build_candidate_code(_candidate(*steps))
+    assert _loops(code) == [(name, "Pipelined") for name in loops]
+
+
+@pytest.mark.parametrize("steps", [(2, 4), (4, 2)], ids=["value_2_rowsum_4", "value_4_rowsum_2"])
+def test_a_split_combine_with_two_loops_validates(steps):
+    """GPU: the kernels that exist because the second loop is emitted serially."""
+    assert_candidate_compiles_and_runs(_candidate(*steps, split=8),
+                                       tolerance_for(mha_split_combine_graph))
 
 
 @pytest.mark.parametrize("placement", ["neither_looped", "value_looped", "rowsum_looped"])

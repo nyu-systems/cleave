@@ -57,7 +57,9 @@ from pathlib import Path
 #     one that a reduction left in a fragment is staged through shared memory.
 # 23: a tile of unit extents only is allocated 1-D, as its slices and parameters spell it:
 #     single-row tilings of a rank-1 value have kernels.
-SCHEMA = 23
+# 24: the second and later loops of a kernel are emitted as plain loops (TileLang pipelines
+#     one loop per kernel): a split combine with each sum in a loop of its own has a kernel.
+SCHEMA = 24
 # What "validated" means for a saved kernel. A kernel-cache hit returns without validating,
 # so bump this whenever the comparison or its inputs change: saved kernels are then rebuilt.
 # (The inputs include the adversarial cases a program with an exact softmax is held to,
