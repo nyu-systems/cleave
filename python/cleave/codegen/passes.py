@@ -12,17 +12,27 @@ from ..ir.ops import Div, Exp, Matmul, ReduceSum
 
 # TODO: have all levels of the graph with OutputNode (this should make this function smoother)
 def annotate_args(graph: Graph, is_main: bool = False) -> Graph:
+    """The kernel's parameter list: its inputs in topological order, then its outputs.
+
+    Outputs go last whatever the topological order says. With several outputs it can put
+    one in front of an input -- the row sum of an un-looped split partial is finished
+    before the value matmul's ``V`` is reached -- and everything that launches a kernel
+    takes the trailing arguments for its outputs (``runtime.reference.graph_out_indices``,
+    ``placeholder_order``): such a kernel was handed ``V`` for its row-sum buffer.
+    """
+    outputs = []
     for node in find_topo_sort(graph.nodes):
         if is_main:
             if isinstance(node, PlaceHolderNode):
                 graph.args.append(node)
             elif isinstance(node, OutputNode):
-                graph.args.append(node)
+                outputs.append(node)
         if isinstance(node, GraphNode):
             in_args = [i.src_node for i in node.inputs]
             # TODO: output nodes
             node.graph.args.extend(in_args)
             annotate_args(node.graph, is_main=False)
+    graph.args.extend(outputs)
 
     return graph
 

@@ -926,18 +926,31 @@ def _refuse_loops_that_miscount_their_tiles(main: Graph):
     cut into a different number of tiles ("the existing inner graph extent wins"). The
     loop then runs past the end of those dims, or stops short of it: 4096 iterations over
     128 tiles of 32. Such a kernel reads memory it does not own or drops part of the sum.
+
+    A loop that cuts nothing at all is the same miscount at its extreme: every iteration
+    reads the whole of every tensor, and the sum is taken once per iteration. It comes
+    from a step map that names a reduction axis the node does not have: the trip count
+    is read off the map's only value, the tiles off the node's own axis, which then has
+    no step.
     """
     for tier, owner in graph_tiers(main):
         if owner is None:
             continue
+        cut = False
         for node, it in tier.tmap.items():
             for dim, (extent, step) in enumerate(zip(it.shape, it.tile_size)):
                 tiles = int(extent) // int(step)
+                cut = cut or tiles > 1
                 if tiles > 1 and tiles != tier.extent:
                     raise ScheduleRejected(
                         f"{owner.name} runs {tier.extent} iterations but dim {dim} of "
                         f"{node.name} is cut into {tiles} tiles ({step} of {extent})"
                     )
+        if not cut and isinstance(tier.extent, int) and tier.extent > 1:
+            raise ScheduleRejected(
+                f"{owner.name} runs {tier.extent} iterations but cuts none of its tensors "
+                "into tiles: every iteration would read the same slice"
+            )
 
 
 def _refuse_tile_that_misses_dims(node, shape, tile, expanded_tile):

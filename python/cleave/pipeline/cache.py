@@ -44,7 +44,10 @@ from pathlib import Path
 #     best partial can be one of those.
 # 17: sibling reductions over one axis start at one step, so the loop they share counts its
 #     tiles: a float32 flash-form softmax now has tilings (every one was refused).
-SCHEMA = 17
+# 18: a kernel takes its inputs first and its outputs last, also where an output is finished
+#     before a later input is read (un-looped split partials: they were launched with an
+#     input in the place of an output).
+SCHEMA = 18
 # What "validated" means for a saved kernel. A kernel-cache hit returns without validating,
 # so bump this whenever the comparison or its inputs change: saved kernels are then rebuilt.
 # (The inputs include the adversarial cases a program with an exact softmax is held to,
