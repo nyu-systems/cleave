@@ -103,7 +103,13 @@ def test_search_split_records_on_searched_graphs(kind, cache_root):
                 int(s) for s in scheduled.tmap[out].shape), plan.label
         try:
             code, layouts = build_candidate(plan.tile)
-        except ScheduleRejected:  # a tiling the build refuses (a unit extent) has no kernel
+        except ScheduleRejected as refusal:
+            # Only a combine tiling, and only for a unit extent: one partial per step, or
+            # a single row per block. A partial that apply_tiling schedules has a kernel.
+            assert plan.role == "combine", (plan.label, str(refusal))
+            assert ("is handed one element of the axis it reduces per step" in str(refusal)
+                    or "a unit extent that is not a batch dim is squeezed out of the tile"
+                    in str(refusal)), (plan.label, str(refusal))
             continue
         layouts_seen.setdefault((plan.split_factor, plan.role), set()).add(layouts)
         built.setdefault((plan.variant, plan.role), (plan, CandidateResult(
@@ -143,17 +149,17 @@ def test_search_split_records_on_searched_graphs(kind, cache_root):
 SMALL = dict(H=4, SQ=64, SKV=1024, D=64)
 
 
-def _whole_split_plans(prog, factors=(4, 8)):
+def _whole_split_plans(prog, factors=(4, 8), skv=SMALL["SKV"], topk=32):
     """The combines, and the partial plans of one split graph whose row sum and value
     matmul both take the whole per-split KV extent in one step: neither is looped."""
     graphs = P.superoptimize(prog, SPLIT)
     plans = P.schedule(graphs.filter(lambda g: g.is_split),
-                       P.ScheduleConfig(topk=32, split_k=factors))
+                       P.ScheduleConfig(topk=topk, split_k=factors))
     first = min(p.graph_index for p in plans if p.role == "partial")
 
     def whole(plan):
         steps = sorted(int(x) for v in plan.tile.rstep_map.values() for x in v.values())
-        return steps[-2:] == [SMALL["SKV"] // plan.split_factor] * 2
+        return steps[-2:] == [skv // plan.split_factor] * 2
 
     return plans.filter(lambda p: p.role == "combine" or (p.graph_index == first and whole(p)))
 
@@ -294,3 +300,59 @@ def test_gpu_partials_that_take_a_whole_split_in_one_step_validate_and_chain(cac
             (measured,) = compare_outputs([kernel(q, k, v)], prog.reference(q, k, v), TOLERANCE,
                                           what=f"chained {variant} seed {seed}")
             assert 0 < measured.rel <= TOLERANCE.rtol
+
+
+# The decode shapes of demo/{mha,gqa,mqa}_decode.py with 64 queries: S_KV = 4096 in 16 or
+# 32 splits, so a split of 256 or 128 keys fits a block whole.
+DECODE = {
+    "mha": (mha, dict(H=32, SQ=64, SKV=4096, D=64)),
+    "gqa": (programs.attention, dict(HQ=32, HKV=8, SQ=64, SKV=4096, D=64)),
+    "mqa": (programs.attention, dict(HQ=32, HKV=1, SQ=64, SKV=4096, D=64)),
+}
+
+
+@pytest.mark.parametrize("kind", sorted(DECODE))
+def test_search_partials_that_take_a_whole_split_in_one_step_exist_at_decode_shapes(kind, cache_root):
+    """CPU: with grouped or shared key heads the un-looped partial is launched the same
+    way -- the row sum on the canonical output's head and row axes -- and builds."""
+    fn, shapes = DECODE[kind]
+    prog = trace(fn, shapes, cl.f16)
+    plans = _whole_split_plans(prog, factors=(16, 32), skv=shapes["SKV"], topk=1000)
+    for factor in (16, 32):
+        partials = [p for p in plans if p.role == "partial" and p.split_factor == factor]
+        assert partials, (kind, factor)
+        for plan in partials:
+            _, layouts = build_candidate(plan.tile)
+            assert layouts == UNLOOPED  # neither sum comes out of a loop
+
+
+@pytest.mark.parametrize("kind", sorted(DECODE))
+def test_gpu_partials_that_take_a_whole_split_in_one_step_validate_at_decode_shapes(kind, cache_root):
+    """GPU: those partials for MHA, GQA and MQA, in the layout they are stored in. (The
+    small MHA shape above is the only one that was run when they first built.)"""
+    _gpu()
+    fn, shapes = DECODE[kind]
+    prog = trace(fn, shapes, cl.f16)
+    plans = _whole_split_plans(prog, factors=(16, 32), skv=shapes["SKV"], topk=1000).filter(
+        lambda p: p.role == "partial")
+    # one thread count's worth of each factor's tilings is enough to run
+    keep = {}
+    for plan in plans:
+        keep.setdefault(plan.split_factor, []).append(plan)
+    chosen = {id(p) for group in keep.values() for p in group[:8]}
+    report = P.evaluate(plans.filter(lambda p: id(p) in chosen),
+                        P.EvalConfig(warmup=2, iters=20, max_parallel=4, tolerance=TOLERANCE))
+    heads = shapes.get("HQ", shapes.get("H"))
+    for factor in (16, 32):
+        partials = [r for r in report if r.variant == f"split-k={factor}"]
+        assert partials
+        failed = [(r.label, r.error_type, validation_kind(r.error))
+                  for r in partials if not r.ok and r.stage == "validate"]
+        assert not failed, failed
+        ok = [r for r in partials if r.ok]
+        assert ok, [(r.label, r.stage, r.error_type) for r in partials]
+        for r in ok:
+            assert len(r.measured) == 2 and r.run.stored_layouts == UNLOOPED
+            assert all(m.rel <= TOLERANCE.rtol for m in r.measured)
+            assert [p.dims for p in r.kernel.outputs] == [(heads, factor, 64), (heads, factor, 64, 64)]
+
