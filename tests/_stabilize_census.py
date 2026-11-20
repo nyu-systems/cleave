@@ -10,24 +10,42 @@ top-k cut) it checks what unit tests cannot afford to:
                            (``build_candidate_code``) produces a kernel for it;
   (b) typed refusals       ``apply_tiling`` raises nothing but ``ScheduleRejected``;
   (c) lowering parity      for accepted candidates (``--lower N`` evenly spread ones plus
-                           the ones a job singles out, or
-                           ``all``): ``tilelang.lower`` for an offline sm_90a target gives
-                           the same verdict for the stabilized kernel and for its plain
-                           twin, the same tiling with the record taken off;
+                           the ones a job singles out, or ``all``): ``tilelang.lower`` for
+                           an offline sm_90a target gives the same verdict for the
+                           stabilized kernel and for its plain twin, the same tiling with
+                           the record taken off;
   (d) device compile       ``--nvcc``: the job's named kernel also passes the device
                            compile (set ``TILELANG_CACHE_DIR`` to an empty directory, or a
                            cached binary is returned without running nvcc);
   (e) staging              with ``mla_decode_pass`` the value matmul still stages the exp
                            through shared memory, as in the plain twin.
 
-Jobs come from two sources. ``fixture`` jobs run today: the written-out programs of
-``tests/_softmax.py`` and the attention fixtures of ``tests/_graphs.py`` (the end2end
-cases), with the ``Stabilize`` record put on the Exp by hand. ``demo`` jobs take a demo's
-own program and configs through ``superoptimize`` and ``plans.lower`` and need the record
-lowering writes: they report ``no record`` on a tree whose frontend does not request
-stabilization yet.
+Jobs come from two sources.
 
-Writes ``<outdir>/<job>.json`` and prints a summary; exits 1 if any check failed.
+``fixture`` jobs: the written-out programs of ``tests/_softmax.py`` and the attention
+fixtures of ``tests/_graphs.py`` (the end2end cases), with the ``Stabilize`` record put on
+the Exp by hand (checked against lowering's own where the tree's lowering writes one).
+
+``demo:`` jobs: a demo's own program and configs through ``superoptimize`` and
+``plans.lower``, i.e. the *searched* graphs. The demo is traced with ``cl.softmax`` replaced
+by the form the frontend will record (``tests/_softmax.py::exact_softmax``: the requested
+exp, its sum, the division; the demos' ``shift=`` is dropped), so the search sees the
+shift-free program. The records are the ones lowering writes. On a tree whose frontend
+cannot make the request (no ``Program._stable_exp``) lowering writes none, and they are set
+by hand instead (``tests/_softmax.py::hand_record``); the summary says which.
+
+Exit status, also the last line printed:
+
+  0  ``ok``           every check the job is there for ran, and passed;
+  1  ``FAILED``       a check failed (lines marked ``PROBLEM``);
+  2  ``NOT CHECKED``  nothing failed, but something was not checked (lines marked
+                      ``NOT CHECKED``): a graph without a record, a graph refused at
+                      lowering, a job that censused no graph or accepted no candidate, or
+                      ``--nvcc`` on a job whose named kernel is not among the accepted
+                      candidates. A job is never reported ``ok`` for having had nothing
+                      to look at.
+
+Writes ``<outdir>/<job>.json``.
 """
 
 from __future__ import annotations
@@ -38,9 +56,10 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 ROOT = Path(__file__).resolve().parents[1]
-sys.path[:0] = [str(ROOT), str(ROOT / "python"), str(ROOT / "demo")]
+if __name__ == "__main__":  # run as a script: no GPU, and this tree first on the path
+    os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+    sys.path[:0] = [str(ROOT), str(ROOT / "python")]
 
 import tilelang  # noqa: E402,F401  (puts its bundled tvm on sys.path)
 
@@ -111,15 +130,38 @@ FIXTURES = {
     "raw_statistics": (lambda: [S.raw_statistics_graph(32, 64, 4096, 64)], {}, None,
                        lambda c: c.n_threads == 128),
 }
-DEMOS = ("mha_prefill", "gqa_prefill", "mqa_prefill", "mla_prefill", "mla_decode", "qknorm",
-         "mha_decode_exact")
+def _whole_head_dim(c):
+    """mla_decode: the block holds all 512 head dims and the softmax loop steps 32 keys
+    (the shape of the only tilings of this operator that validate on a GPU)."""
+    return (list(c.output_tile) == [1, 64, 512] and c.n_threads == 128
+            and _rsteps(c)[-2:] == [32, 32])
+
+
+# name -> (compiler pass options, selector of the +nvcc kernel)
+DEMOS = {
+    "mha_prefill": (None, None),
+    "gqa_prefill": (None, None),
+    "mqa_prefill": (None, None),
+    "mla_prefill": (None, None),
+    "mla_decode": (MLA, _whole_head_dim),
+    "qknorm": (None, lambda c: c.n_threads == 128),
+    "mha_decode_exact": (None, None),
+}
 
 
 def _demo_graphs(name):
-    """The solo graphs a demo's own program lowers to (``plans.lower``, records included)."""
+    """``(graphs, search options, notes)`` for one demo.
+
+    ``graphs`` are the solo graphs the demo's own program lowers to, each as ``(label, ir,
+    where its records come from)``; ``notes`` say why a graph of the search is not among
+    them. The program is the demo's, traced with ``cl.softmax`` as the frontend will
+    record it (see the module docstring).
+    """
     import runpy
 
     import cleave.examples as examples
+    import cleave.lang as cl
+    from cleave.frontend.tensor import Tensor
     from cleave.pipeline import superoptimize
     from cleave.pipeline.plans import lower
 
@@ -132,22 +174,55 @@ def _demo_graphs(name):
         seen.update(program=program, so=superopt, sc=schedule)
         raise Stop
 
+    real_softmax = cl.softmax
+
+    def requested_softmax(x, dim=-1, shift=None, **paged):
+        if paged or not isinstance(x, Tensor):
+            return real_softmax(x, dim, shift, **paged)
+        return S.exact_softmax(x, dim)
+
+    real_compile, real_target, argv = examples._compile, examples._target, sys.argv
     examples._compile, examples._target = fake_compile, lambda: "cpu"
+    cl.softmax = requested_softmax
     sys.argv = [str(ROOT / "demo" / f"{name}.py")]
+    sys.path.insert(0, str(ROOT / "demo"))  # the demos import each other by bare name
     try:
         runpy.run_path(sys.argv[0], run_name="__main__")
     except Stop:
         pass
-    graphs = superoptimize(seen["program"], seen["so"].replace(split=()))
-    irs = []
-    for g in graphs:
-        if not g.is_split and not g.invalid_split:
-            try:
-                irs.extend(lower(g))
-            except Exception as e:  # noqa: BLE001 - a refused graph is reported, not hidden
-                print(f"  graph {g.index}: {type(e).__name__}: {str(e)[:200]}")
+    finally:
+        examples._compile, examples._target = real_compile, real_target
+        cl.softmax, sys.argv = real_softmax, argv
+        sys.path.remove(str(ROOT / "demo"))
+    program = seen["program"]
+    requests = getattr(program, "stabilize_requests", None)
+    graphs, notes = [], []
+    for g in superoptimize(program, seen["so"].replace(split=())):
+        if g.is_split or g.invalid_split:
+            continue
+        try:
+            irs = lower(g)
+        except Exception as e:  # noqa: BLE001 - a refused graph is reported, not hidden
+            notes.append(f"graph g{g.index}: refused at lowering: {_first(e)}")
+            continue
+        for k, ir in enumerate(irs):
+            label = f"g{g.index}" if len(irs) == 1 else f"g{g.index}.{k}"
+            if annotated(ir):
+                graphs.append((label, ir, "lowering"))
+            elif requests is not None:
+                notes.append(f"graph {label}: no record (lowering marked no exp of it; the "
+                             f"program makes {len(requests)} request(s))")
+            else:  # this tree's frontend cannot make the request: records by hand
+                found = [(exp, S.hand_record(exp)) for exp in S.exps(ir)]
+                if not found or any(record is None for _, record in found):
+                    notes.append(f"graph {label}: no record (no request in this tree, and "
+                                 "the by-hand rule does not cover this graph)")
+                    continue
+                for exp, record in found:
+                    exp.stabilize = record
+                graphs.append((label, ir, "by hand"))
     options = {"force_fusion": True} if seen["sc"].fusion == "force" else {}
-    return irs, options
+    return graphs, options, notes
 
 
 def _first(e):
@@ -273,13 +348,14 @@ def census(ir, search, options, n_lower, nvcc, focus=None):
     return [r for _, r in rows], problems
 
 
-def summarize(name, rows, problems, with_nvcc):
+def summarize(name, rows, problems, records=None):
     tiling = Counter(r["tiling"] for r in rows)
     lowered = [r for r in rows if "lower" in r]
     verdicts = Counter((r["lower"].split(":")[0], r["plain_lower"].split(":")[0]) for r in lowered)
     over = sorted(r["overhead_bytes"] for r in rows if "overhead_bytes" in r)
     print(f"{name}: {len(rows)} raw candidates, {sum(r['accepted'] for r in rows)} accepted, "
-          f"{sum(r['build'] == 'ok' for r in rows)} build")
+          f"{sum(r['build'] == 'ok' for r in rows)} build"
+          + (f"  [records: {records}]" if records else ""))
     for text, n in tiling.most_common():
         print(f"    {n:4d} x {text[:150]}")
     if over:
@@ -294,10 +370,50 @@ def summarize(name, rows, problems, with_nvcc):
     for r in rows:
         if "nvcc" in r:
             print(f"    +nvcc {r['label']}: {r['nvcc']}")
-    if with_nvcc and not any("nvcc" in r for r in rows):
-        print("    +nvcc: the job names no kernel, or it was not accepted")
     for line in problems[:20]:
         print("    PROBLEM", line[:300])
+
+
+def run(job, n_lower="8", with_nvcc=False):
+    """Census one job: ``(rows, problems, unchecked)``.
+
+    ``problems`` are checks that failed; ``unchecked`` is what the job was there to check
+    and could not: neither list empty means the job is not ``ok``.
+    """
+    unchecked = []
+    if job.startswith("demo:"):
+        graphs, search, notes = _demo_graphs(job[5:])
+        options, nvcc = DEMOS[job[5:]]
+        focus = None
+        unchecked += notes
+    else:
+        build, search, options, nvcc, focus = (FIXTURES[job] + (None,))[:5]
+        irs = build()
+        graphs = [("" if len(irs) == 1 else str(k), ir, "by hand, or lowering's checked "
+                   "against the expectation") for k, ir in enumerate(irs)]
+    all_rows, all_problems = [], []
+    for label, ir, records in graphs:
+        name = f"{job}[{label}]" if label else job
+        if not annotated(ir):
+            unchecked.append(f"graph {name}: no record on any exp")
+            continue
+        rows, problems = census(ir, dict(search), options, n_lower,
+                                nvcc if with_nvcc else None, focus)
+        summarize(name, rows, problems, records)
+        all_rows += [dict(r, graph=label) for r in rows]
+        all_problems += problems
+    if not all_rows:
+        unchecked.append("no candidate of any graph was censused")
+    elif not any(r["accepted"] for r in all_rows):
+        unchecked.append(f"none of the {len(all_rows)} candidates was accepted: lowering "
+                         "parity, device compile and staging had nothing to look at")
+    if with_nvcc:
+        if nvcc is None:
+            print("    +nvcc: this job names no kernel (the device compile is not part of it)")
+        elif not any("nvcc" in r for r in all_rows):
+            unchecked.append("(d) --nvcc: the kernel this job names is not among the "
+                             "accepted candidates; nothing went through the device compile")
+    return all_rows, all_problems, unchecked
 
 
 def main(argv):
@@ -306,32 +422,23 @@ def main(argv):
         print("\n".join(list(FIXTURES) + [f"demo:{d}" for d in DEMOS]))
         return 0
     n_lower = argv[argv.index("--lower") + 1] if "--lower" in argv else "8"
-    with_nvcc = "--nvcc" in argv
-    out.mkdir(parents=True, exist_ok=True)
-    if job.startswith("demo:"):
-        irs, search = _demo_graphs(job[5:])
-        options, nvcc = (MLA if job == "demo:mla_decode" else None), None
-        focus = None
-    else:
-        graphs, search, options, nvcc, focus = (FIXTURES[job] + (None,))[:5]
-        irs = graphs()
-    all_rows, all_problems = [], []
-    for k, ir in enumerate(irs):
-        name = job if len(irs) == 1 else f"{job}[{k}]"
-        if not annotated(ir):
-            print(f"{name}: no record (lowering marked no exp of this graph)")
-            continue
-        rows, problems = census(ir, dict(search), options, n_lower,
-                                nvcc if with_nvcc else None, focus)
-        summarize(name, rows, problems, with_nvcc)
-        all_rows += [dict(r, graph=k) for r in rows]
-        all_problems += problems
-    for r in all_rows:
+    rows, problems, unchecked = run(job, n_lower, "--nvcc" in argv)
+    for line in unchecked:
+        print("    NOT CHECKED", line[:300])
+    for r in rows:
         r.pop("code", None), r.pop("plain_code", None)
+    out.mkdir(parents=True, exist_ok=True)
     (out / f"{job.replace(':', '_')}.json").write_text(
-        json.dumps(dict(rows=all_rows, problems=all_problems), indent=1) + "\n")
-    print(f"{job}: {'FAILED, ' + str(len(all_problems)) + ' problem(s)' if all_problems else 'ok'}")
-    return 1 if all_problems else 0
+        json.dumps(dict(rows=rows, problems=problems, unchecked=unchecked), indent=1) + "\n")
+    if problems:
+        print(f"{job}: FAILED, {len(problems)} problem(s)"
+              + (f", {len(unchecked)} item(s) not checked" if unchecked else ""))
+        return 1
+    if unchecked:
+        print(f"{job}: NOT CHECKED, {len(unchecked)} item(s)")
+        return 2
+    print(f"{job}: ok")
+    return 0
 
 
 if __name__ == "__main__":

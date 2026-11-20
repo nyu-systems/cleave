@@ -35,6 +35,8 @@ def stable_exp(x, dim: int = -1):
 
 
 def exact_softmax(x, dim: int = -1):
+    """``softmax(x, dim)`` as the frontend will record it: the requested exp, its sum, the
+    division. No max and no shift."""
     e = stable_exp(x, dim)
     return e / cl.sum(e, dim, keepdim=True)
 
@@ -162,6 +164,67 @@ def scaled_reductions(exp) -> tuple:
             else:
                 stack.append(dst)
     return tuple((name, 1) for name in found)
+
+
+def hand_record(exp):
+    """The record of a softmax Exp of a *searched* graph, read off the graph by hand, or
+    ``None`` where this rule cannot tell.
+
+    For a tree whose lowering does not run the scale analysis: the census of the demos'
+    searched graphs needs a record on every softmax Exp, and no test spells one out for a
+    graph the search produced. The rule covers a softmax over the LAST axis of the Exp:
+
+    * ``scaled``: :func:`scaled_reductions`; each of them has to consume the Exp's last
+      axis (a ``ReduceSum`` / ``ReduceMax`` over the last axis, or a ``Matmul`` whose left
+      operand it is);
+    * ``rolling``: the one obstacle searched softmax graphs have, the Exp read next to one
+      of its own finished reductions (traced order: ``exp / sum(exp)`` before the value
+      matmul).
+
+    The census checks hold for any record (the pass has to be safe on a hand-set one); a
+    plausible record makes it exercise the paths the analysis's records will.
+    """
+    scaled = scaled_reductions(exp)
+    if not scaled:
+        return None
+    names = {name for name, _ in scaled}
+    last = len(exp.get_shape()) - 1
+    reducers, stack, seen = [], [exp], {id(exp)}
+    while stack:
+        node = stack.pop()
+        for edge in node.outputs:
+            dst = edge.dst_node
+            if isinstance(dst, OutputNode):
+                continue
+            if dst.name in names:
+                if isinstance(dst, Matmul):
+                    over_last = edge.dst_id == 0 and not getattr(dst, "transpose_A", False)
+                else:
+                    over_last = dst.axis_arg in (-1, last)
+                over_last = over_last and tuple(edge.src_node.get_shape()) == tuple(exp.get_shape())
+                if not over_last:
+                    return None
+                if not any(dst is r for r in reducers):
+                    reducers.append(dst)
+            elif id(dst) not in seen:
+                seen.add(id(dst))
+                stack.append(dst)
+    rolling = ""
+    stack, seen = [exp], {id(exp)}
+    while stack and not rolling:
+        node = stack.pop()
+        for edge in node.outputs:
+            dst = edge.dst_node
+            if isinstance(dst, OutputNode) or dst.name in names or id(dst) in seen:
+                continue
+            seen.add(id(dst))
+            finished = next((r for r in reducers if _computed_from(dst, r)), None)
+            if finished is not None:
+                rolling = (f"{dst.name} reads the exp next to the finished reduction "
+                           f"{finished.name}")
+                break
+            stack.append(dst)
+    return Stabilize(axes=(-1,), scaled=scaled, rolling=rolling)
 
 
 def softmax_ir(fn, shapes, *softmax, dtype=cl.f16):
