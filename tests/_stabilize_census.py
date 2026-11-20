@@ -18,9 +18,13 @@ top-k cut) it checks what unit tests cannot afford to:
                            compile (set ``TILELANG_CACHE_DIR`` to an empty directory, or a
                            cached binary is returned without running nvcc);
   (e) staging              with ``mla_decode_pass`` the value matmul still stages the exp
-                           through shared memory, as in the plain twin.
+                           through shared memory, as in the plain twin;
+  (f) split                a split job's partial serves its softmax with the max it exports
+                           (no second max, never the lazy form) and builds no fewer tilings
+                           than the two-output partial of the cut; its combine has no max in
+                           the flat graph and loops over the split axis in a plain loop.
 
-Jobs come from two sources.
+Jobs come from three sources.
 
 ``fixture`` jobs: the written-out programs of ``tests/_softmax.py``, whose records are
 lowering's own, checked against the expectation the job spells out, and the attention
@@ -32,6 +36,10 @@ the ``Stabilize`` record put on the Exp by hand.
 ``cl.softmax`` dropped, so that it records the exact softmax (the requested exp, its sum,
 the division) and the search sees the shift-free program. The records are the ones lowering
 writes; a graph it leaves without one is reported as not checked.
+
+``split:`` jobs: a decode demo's program, traced the same way, searched with the demo's own
+split and lowered at one factor (``split:mha_decode@16``): the partial of every split graph
+that lowers to a different partial, and the combine.
 
 Exit status, also the last line printed:
 
@@ -64,7 +72,7 @@ import tilelang  # noqa: E402,F401  (puts its bundled tvm on sys.path)
 
 from cleave.codegen import TilelangCodeGen, passes  # noqa: E402
 from cleave.core.errors import ScheduleRejected  # noqa: E402
-from cleave.ir.ops import Exp, Matmul, Stabilize  # noqa: E402
+from cleave.ir.ops import NEG_FLT_MAX, Exp, Matmul, ReduceMax, Stabilize  # noqa: E402
 from cleave.ir.graph_utils import graph_tiers  # noqa: E402
 from cleave.runtime.compile import CompilerPassOptions, build_candidate_code  # noqa: E402
 from cleave.schedule import apply_tiling, search_tiling  # noqa: E402
@@ -154,21 +162,23 @@ DEMOS = {
 DEMO_ARGV = {"mha_decode_exact@256": ("mha_decode_exact", ["--SKV", "256"])}
 
 
-def _demo_graphs(name):
-    """``(graphs, search options, notes)`` for one demo.
+# job -> (demo, split factor): the decode demos at the factors they split their keys by
+SPLITS = {
+    f"{demo}@{factor}": (demo, factor)
+    for demo, factors in (("mha_decode", (16, 32)), ("gqa_decode", (4, 8, 16)),
+                          ("mqa_decode", (4, 8, 16)))
+    for factor in factors
+}
 
-    ``graphs`` are the solo graphs the demo's own program lowers to, each as ``(label, ir,
-    where its records come from)``; ``notes`` say why a graph of the search is not among
-    them. The program is the demo's, traced with ``cl.softmax`` as the frontend will
-    record it (see the module docstring).
-    """
+
+def _traced_demo(name, flags=()):
+    """``(program, superopt config, schedule config)`` of a demo, its program traced with
+    ``cl.softmax`` as the frontend will record it (see the module docstring)."""
     import runpy
 
     import cleave.examples as examples
     import cleave.lang as cl
     from cleave.frontend.tensor import Tensor
-    from cleave.pipeline import superoptimize
-    from cleave.pipeline.plans import lower
 
     seen = {}
 
@@ -186,7 +196,6 @@ def _demo_graphs(name):
             return real_softmax(x, dim, shift, **paged)
         return real_softmax(x, dim)  # the demo's ``shift=`` dropped: the exact softmax
 
-    name, flags = DEMO_ARGV.get(name, (name, []))
     real_compile, real_target, argv = examples._compile, examples._target, sys.argv
     examples._compile, examples._target = fake_compile, lambda: "cpu"
     cl.softmax = requested_softmax
@@ -200,10 +209,23 @@ def _demo_graphs(name):
         examples._compile, examples._target = real_compile, real_target
         cl.softmax, sys.argv = real_softmax, argv
         sys.path.remove(str(ROOT / "demo"))
-    program = seen["program"]
+    return seen["program"], seen["so"], seen["sc"]
+
+
+def _demo_graphs(name):
+    """``(graphs, search options, notes)`` for one demo.
+
+    ``graphs`` are the solo graphs the demo's own program lowers to, each as ``(label, ir,
+    where its records come from)``; ``notes`` say why a graph of the search is not among
+    them.
+    """
+    from cleave.pipeline import superoptimize
+    from cleave.pipeline.plans import lower
+
+    program, so, sc = _traced_demo(*DEMO_ARGV.get(name, (name, [])))
     requests = program.stabilize_requests
     graphs, notes = [], []
-    for g in superoptimize(program, seen["so"].replace(split=())):
+    for g in superoptimize(program, so.replace(split=())):
         if g.is_split or g.invalid_split:
             continue
         try:
@@ -218,8 +240,110 @@ def _demo_graphs(name):
             else:
                 notes.append(f"graph {label}: no record (lowering marked no exp of it; the "
                              f"program makes {len(requests)} request(s))")
-    options = {"force_fusion": True} if seen["sc"].fusion == "force" else {}
+    options = {"force_fusion": True} if sc.fusion == "force" else {}
     return graphs, options, notes
+
+
+def _shape_of(ir):
+    return tuple((type(n).__name__, n.name, tuple(int(x) for x in n.get_shape(0)))
+                 for n in ir.nodes)
+
+
+def _split_graphs(name):
+    """``(graphs, search options, notes)`` for one split job: the partial of every split
+    graph of the demo's search that lowers to a different partial, and the combine (the
+    pipeline searches one per factor), each as ``(label, ir, where its records come from,
+    check)``. ``check`` is what a tiled graph of it has to look like (``census``)."""
+    from cleave.lower.process import to_bundles
+    from cleave.pipeline import superoptimize
+    from cleave.pipeline.plans import lower
+
+    demo, factor = SPLITS[name]
+    program, so, sc = _traced_demo(demo)
+    graphs, notes, partials, combines = [], [], {}, {}
+    for g in superoptimize(program, so):
+        if g.invalid_split or not g.is_split:
+            continue
+        try:
+            partial, combine = lower(g, factor)
+        except Exception as e:  # noqa: BLE001 - a refused graph is reported, not hidden
+            notes.append(f"graph g{g.index}: refused at lowering: {_first(e)}")
+            continue
+        # the pair as the cut hands it over: the same graphs without the request
+        ((plain, _),) = to_bundles([g.structure], symbol_map=g.symbol_map,
+                                   split_factors=[factor], dtype=g.dtype, out_dtype=g.dtype)
+        if _shape_of(partial) not in partials:
+            partials[_shape_of(partial)] = g.index
+            graphs.append((f"g{g.index}.partial", partial, "lowering",
+                           _partial_check(partial, plain)))
+        if _shape_of(combine) not in combines:
+            combines[_shape_of(combine)] = g.index
+            graphs.append((f"g{g.index}.combine", combine, "lowering", _combine_check(combine)))
+    if not partials:
+        notes.append("the search found no split graph that lowers to a partial and a combine")
+    return graphs, {}, notes
+
+
+def _partial_check(partial, plain):
+    """Check (f) for a partial: every tiling serves the softmax with the exported max, and
+    no fewer tilings build than for ``plain``, the two-output partial of the cut."""
+    ((_, _, exp),) = annotated(partial)
+    export = exp.stabilize.export
+
+    def tiled_check(tiled):
+        (site,) = sites(tiled)
+        tiers = {("main" if owner is None else owner.name): tier
+                 for tier, owner in graph_tiers(tiled)}
+        names = [n.name for tier in tiers.values() for n in tier.nodes]
+        if f"{exp.name}_max" in names:
+            return f"a second max {exp.name}_max next to the exported {export}"
+        tier = tiers[site.tier]
+        maxes = [n for n in tier.nodes if n.name == export]
+        if len(maxes) != 1 or type(maxes[0]) is not ReduceMax:
+            return f"the exported max {export} is not in {site.tier}, the tier of the exp"
+        if site.lazy:
+            return "the lazy form, with an exported max"
+        if site.case == "rolling" and not (
+                any(maxes[0] is a for a in tier.accum_nodes)
+                and maxes[0].accum_init == NEG_FLT_MAX):
+            return f"the exported max {export} is not the carried max of {site.tier}"
+        return None
+
+    def graph_check(rows):
+        cands = list(search_tiling(plain, topk=1000))
+        built = 0
+        for cand in cands:
+            try:
+                build_candidate_code(cand)
+                built += 1
+            except Exception:  # noqa: BLE001 - counted, not classified
+                pass
+        mine = sum(r["build"] == "ok" for r in rows)
+        print(f"    the two-output partial of the cut: {len(cands)} raw candidates, "
+              f"{built} build; with the exported max: {len(rows)} raw, {mine} build")
+        return [] if mine >= built else [
+            f"(f) {mine} tilings build with the exported max, {built} without it"]
+
+    return tiled_check, graph_check
+
+
+def _combine_check(combine):
+    """Check (f) for a combine: shift-free flat graph; the loop over the split axis is a
+    plain loop (it weights the partials it loads in registers)."""
+    flat_max = [n.name for n in combine.nodes if type(n) is ReduceMax]
+
+    def tiled_check(tiled):
+        if flat_max:
+            return f"a max ahead of the sums in the flat graph: {flat_max}"
+        (site,) = sites(tiled)
+        if site.case != "rolling":
+            return None
+        tiers = {owner.name: tier for tier, owner in graph_tiers(tiled) if owner is not None}
+        if tiers[site.tier].loop_kind != "serial":
+            return f"the loop {site.tier} over the split axis is {tiers[site.tier].loop_kind}"
+        return None
+
+    return tiled_check, lambda rows: []
 
 
 def _first(e):
@@ -269,8 +393,9 @@ def _lower(code, device_compile=False):
         return _first(e)
 
 
-def census(ir, search, options, n_lower, nvcc, focus=None):
+def census(ir, search, options, n_lower, nvcc, focus=None, check=None):
     options = options or CompilerPassOptions()
+    tiled_check, graph_check = check or (None, None)
     problems, rows = [], []
     force = search.get("force_fusion", False)
     cands = list(search_tiling(ir, **{"topk": 1000, **search}))
@@ -287,6 +412,9 @@ def census(ir, search, options, n_lower, nvcc, focus=None):
             tiled = apply_tiling(cand)
             row["tiling"] = "+".join(sorted(s.case for s in sites(tiled)))
             row["overhead_bytes"] = overhead_bytes(tiled)
+            wrong = None if tiled_check is None else tiled_check(tiled)  # (f)
+            if wrong:
+                problems.append(f"(f) {label}: {wrong}")
         except ScheduleRejected as e:
             row["tiling"] = "refused: " + _reason_key(e)
         except Exception as e:  # noqa: BLE001
@@ -342,6 +470,8 @@ def census(ir, search, options, n_lower, nvcc, focus=None):
         row["nvcc"] = _lower(row["code"], device_compile=True)
         if row["nvcc"] != "ok":
             problems.append(f"(d) {row['label']}: device compile: {row['nvcc']}")
+    if graph_check is not None:  # (f)
+        problems += graph_check([r for _, r in rows])
     return [r for _, r in rows], problems
 
 
@@ -378,7 +508,11 @@ def run(job, n_lower="8", with_nvcc=False):
     and could not: neither list empty means the job is not ``ok``.
     """
     unchecked = []
-    if job.startswith("demo:"):
+    if job.startswith("split:"):
+        graphs, search, notes = _split_graphs(job[6:])
+        options, nvcc, focus = None, None, None
+        unchecked += notes
+    elif job.startswith("demo:"):
         graphs, search, notes = _demo_graphs(job[5:])
         options, nvcc, focus = DEMOS[job[5:]]
         unchecked += notes
@@ -389,13 +523,13 @@ def run(job, n_lower="8", with_nvcc=False):
                    "against the expectation, or by hand on hand-built IR")
                   for k, ir in enumerate(irs)]
     all_rows, all_problems = [], []
-    for label, ir, records in graphs:
+    for label, ir, records, *check in graphs:
         name = f"{job}[{label}]" if label else job
         if not annotated(ir):
             unchecked.append(f"graph {name}: no record on any exp")
             continue
         rows, problems = census(ir, dict(search), options, n_lower,
-                                nvcc if with_nvcc else None, focus)
+                                nvcc if with_nvcc else None, focus, *check)
         summarize(name, rows, problems, records)
         all_rows += [dict(r, graph=label) for r in rows]
         all_problems += problems
@@ -416,7 +550,8 @@ def run(job, n_lower="8", with_nvcc=False):
 def main(argv):
     out, job = Path(argv[1]), argv[2]
     if job == "list":
-        print("\n".join(list(FIXTURES) + [f"demo:{d}" for d in DEMOS]))
+        print("\n".join(list(FIXTURES) + [f"demo:{d}" for d in DEMOS]
+                        + [f"split:{d}" for d in SPLITS]))
         return 0
     n_lower = argv[argv.index("--lower") + 1] if "--lower" in argv else "8"
     rows, problems, unchecked = run(job, n_lower, "--nvcc" in argv)

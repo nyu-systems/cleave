@@ -239,3 +239,88 @@ def test_no_record_by_hand_off_the_last_axis(fn, shapes):
     (exp,) = S.exps(S.lowered(fn, shapes))
     assert S.hand_record(exp) is None
     assert exp.stabilize is not None and exp.stabilize.axes == (-2,)
+
+
+# ------------------------------------------------------------------------------ split jobs
+
+def test_a_split_job_censuses_the_partial_and_the_combine(monkeypatch, tmp_path, capsys):
+    """The real thing: the decode demo's program with the exact softmax, searched with the
+    demo's own split and lowered at 32 splits of 128 keys. Every tiling of the partial is
+    served with the max it exports (the looped ones carry it, the ones that take a split
+    in one step take it in place) and as many build as for the two-output partial of the
+    cut; the combine is served where a step holds two partials or more."""
+    monkeypatch.setenv("CLEAVE_CACHE_ROOT", str(tmp_path / "cache"))
+    status, lines, report = _run(tmp_path, capsys, "split:mha_decode@32")
+    assert status == 0 and lines[-1] == "split:mha_decode@32: ok", lines[-8:]
+    assert not report["unchecked"] and not report["problems"]
+
+    by_graph = {}
+    for row in report["rows"]:
+        by_graph.setdefault(row["graph"].partition(".")[2], []).append(row)
+    assert sorted(by_graph) == ["combine", "partial"]
+
+    def counts(rows):
+        return (len(rows), sum(r["accepted"] for r in rows),
+                sum(r["tiling"] == "rolling" for r in rows),
+                sum(r["tiling"] == "in-tile" for r in rows))
+
+    assert counts(by_graph["partial"]) == (24, 24, 16, 8)
+    assert counts(by_graph["combine"]) == (36, 24, 21, 3)
+    assert ("    the two-output partial of the cut: 24 raw candidates, 24 build; with the "
+            "exported max: 24 raw, 24 build") in lines
+    assert tool.SPLITS["mha_decode@32"] == ("mha_decode", 32)
+
+
+def _split_pair():
+    from tests.lower.test_split_softmax import _exact_pair
+
+    return _exact_pair(1)
+
+
+def _a_tiling(ir, case):
+    from cleave.core.errors import ScheduleRejected
+    from cleave.schedule import apply_tiling, search_tiling
+    from cleave.schedule.stabilize import sites
+
+    for cand in search_tiling(ir, topk=1000):
+        try:
+            tiled = apply_tiling(cand)
+        except ScheduleRejected:
+            continue
+        if sites(tiled)[0].case == case:
+            return cand, tiled
+    raise AssertionError(f"no {case} tiling")
+
+
+def test_the_partial_check_fails_a_tiling_that_takes_a_second_max():
+    """Check (f) on what the pass builds for a partial whose record does not name the max
+    it exports: a second max next to the exported one."""
+    import dataclasses
+
+    partial, _ = _split_pair()
+    ((_, _, exp),) = tool.annotated(partial)
+    tiled_check, _ = tool._partial_check(partial, partial)
+    for case in ("rolling", "in-tile"):
+        assert tiled_check(_a_tiling(partial, case)[1]) is None
+    record = exp.stabilize
+    exp.stabilize = dataclasses.replace(record, export=None)
+    try:
+        wrong = _a_tiling(partial, "rolling")[1]
+    finally:
+        exp.stabilize = record
+    assert tiled_check(wrong) == (
+        f"a second max {exp.name}_max next to the exported {record.export}")
+
+
+def test_the_combine_check_fails_a_pipelined_loop_over_the_split_axis():
+    from cleave.ir.graph_utils import edit_graph, graph_tiers
+
+    _, combine = _split_pair()
+    tiled_check, _ = tool._combine_check(combine)
+    for case in ("rolling", "in-tile"):
+        assert tiled_check(_a_tiling(combine, case)[1]) is None
+    _, tiled = _a_tiling(combine, "rolling")
+    with edit_graph(tiled):
+        (loop,) = [tier for tier, owner in graph_tiers(tiled) if owner is not None]
+        loop.loop_kind = "pipelined"
+    assert tiled_check(tiled) == "the loop GraphNode_reduction_1_2 over the split axis is pipelined"
