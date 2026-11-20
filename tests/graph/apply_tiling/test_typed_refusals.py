@@ -12,8 +12,8 @@ Four tilings the policy proposes and the tiler used to mishandle or mis-type:
   *built*, with a loop that ran past the end of its tiles: ``for i0 in T.Pipelined(1024)``
   over 32 tiles of 128.
 
-* a grid dim that no launch axis indexes. The tiler always refused it on purpose, but
-  with ``ValueError``.
+* a grid dim that no single launch axis indexes. The tiler always refused it on purpose,
+  but with ``ValueError``.
 * a tile with fewer dims than its tensor. The output of ``x @ column`` is ``(M, 1)`` and
   its tile ``[m]``: the unit dim is not a batch dim, so nothing puts it back. The grid was
   then planned for a rank-1 tensor and every candidate of such a graph died, with
@@ -154,24 +154,56 @@ def test_merged_reductions_with_different_steps_are_a_typed_refusal(monkeypatch)
         ), text
 
 
-def test_grid_dim_without_a_launch_axis_is_a_typed_refusal():
-    """A multi-output graph with every reduction un-looped: the outputs next to the
-    canonical one are not its ancestors, so no launch axis is derived for their dims. The
-    tiler has always refused such a tiling, with ``ValueError``."""
+def gram(x: cl.Tensor["M", "K"]):
+    """x @ x.mT: one input read as both operands, its rows on both axes of the output."""
+    return x @ x.mT
+
+
+def test_grid_dim_without_one_launch_axis_is_a_typed_refusal():
+    """A dim that two launch axes index: the rows of ``x`` are the rows of ``x @ x.mT`` and
+    its columns, and a kernel has one tile of each input. The tiler has always refused a
+    tiling that walks such a dim, but with ``ValueError``. One that holds the dim whole
+    while the grid walks one of the two axes was built -- with the tile of whichever
+    operand was propagated last -- and died in TileLang ("T.gemm M shape check failed:
+    M_A = 128, M_C = 64")."""
+    ir = _identity_graph(gram, dict(M=128, K=256))
+    cands = search_tiling(ir, topk=1000)
+    built, refused = _outcomes(cands)
+    # Only a block that holds every row and every column serves both readers.
+    assert built and all(list(cand.output_tile) == [128, 128] for cand, _ in built)
+    reasons = {}
+    for cand, text in refused:
+        reasons.setdefault(text, set()).add(tuple(cand.output_tile))
+    assert reasons == {
+        "Expected exactly one launch-axis mapping for iter dim 0, got [0, 1].": {
+            (64, 32), (64, 64), (128, 32), (128, 64)},
+        "Dim 0 is held whole but launch axes [0, 1] index it and the grid walks [0]: one "
+        "tile cannot be a slice and the whole.": {(64, 128)},
+    }
+
+
+def test_outputs_next_to_the_canonical_one_have_launch_axes():
+    """A multi-output graph with every reduction un-looped. The outputs next to the
+    canonical one are not its ancestors, so no launch axis used to be derived for their
+    dims and such a tiling was refused ("... for iter dim 0, got []"). They are launched
+    on the canonical output's axes, as the outputs of a loop always were."""
     from tests._softmax import exps, raw_statistics_graph
     from tests.graph.apply_tiling._test_utils import build_tiled_candidate
 
     ir = raw_statistics_graph(32, 64, 256, 64)
     for exp in exps(ir):
-        exp.stabilize = None  # the refusal is the tiler's own, softmax or not
+        exp.stabilize = None  # the tiler's own business, softmax or not
     rstep = {"mma_0": {"v3": 64}, "mul_0": {}, "exp_0": {}, "rowsum_0": {"v2": 256},
              "mma_1": {"v3": 256}, "reduce_max_2_exp_0": {"v2": 256}}
-    cand = build_tiled_candidate(ir, [1, 32, 32], rstep)
-    with pytest.raises(
-        ScheduleRejected,
-        match=r"^Expected exactly one launch-axis mapping for iter dim 0, got \[\]\.$",
-    ):
-        apply_tiling(cand)
+    tiled = apply_tiling(build_tiled_candidate(ir, [1, 32, 32], rstep))
+    assert not [owner for _, owner in graph_tiers(tiled) if owner is not None]
+    assert tiled.extent == (32, 2, 2)  # heads, rows, value columns
+    offsets = {node.name: it.offset("i0", "i1", "i2") for node, it in tiled.tmap.items()}
+    for name in ("rowsum_0", "OutputNode_0", "reduce_max_2_exp_0", "OutputNode_2"):
+        assert offsets[name] == ("1 * i0", "32 * i1"), name  # the head and the row block
+    assert offsets["OutputNode_1"] == ("1 * i0", "32 * i1", "32 * i2")
+    assert tiled.stored_layouts == {
+        "OutputNode_0": ((0, 1), 0), "OutputNode_1": ((0, 1, 2), 0), "OutputNode_2": ((0, 1), 0)}
 
 
 def test_tile_that_misses_a_unit_dim_is_a_typed_refusal():

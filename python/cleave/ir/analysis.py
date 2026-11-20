@@ -176,16 +176,40 @@ def _map_input_axes_to_consumer_axes(
     return mapper(consumer, input_id, producer_rank, consumer_rank)
 
 
-def infer_output_axis_dependencies(output_node: OutputNode) -> Dict[int, List[Set[int]]]:
+def infer_output_axis_dependencies(
+    output_node: OutputNode, siblings=()
+) -> Dict[str, List[Set[int]]]:
+    """For every node, the axes of ``output_node`` that each of its dims is indexed by.
+
+    The grid is launched over the axes of one output (the canonical one), so this is what
+    says which launch coordinate walks which dim of a tensor. ``siblings`` are the graph's
+    other outputs, each with the canonical axis its own axes are launched on
+    (``(output node, [canonical axis per axis])``): a node that only they descend from --
+    the row sum next to the value matmul of a split-attention partial -- is not an
+    ancestor of the canonical output and has no dependency on it otherwise. What the
+    canonical output gives a node is never changed by a sibling.
+    """
     if len(output_node.inputs) == 0:
         return {}
     output_src = output_node.inputs[0].src_node
     output_rank = len(output_src.get_shape(output_node.inputs[0].src_id))
-    output_identity = [{axis} for axis in range(output_rank)]
+    deps = _axis_dependencies(output_node, [{axis} for axis in range(output_rank)])
+    for sibling, axis_map in siblings:
+        if len(sibling.inputs) == 0:
+            continue
+        seen_from_sibling = _axis_dependencies(sibling, [{axis} for axis in axis_map])
+        for name, node_deps in seen_from_sibling.items():
+            deps.setdefault(name, node_deps)
+    return deps
 
-    deps: Dict[int, List[Set[int]]] = {
-        output_node.name: [set(s) for s in output_identity],
-        output_src.name: [set(s) for s in output_identity],
+
+def _axis_dependencies(output_node: OutputNode, axes: List[Set[int]]) -> Dict[str, List[Set[int]]]:
+    """The dims of every ancestor of ``output_node`` in terms of ``axes``, the launch axes
+    that index the dims of ``output_node`` itself."""
+    output_src = output_node.inputs[0].src_node
+    deps: Dict[str, List[Set[int]]] = {
+        output_node.name: [set(s) for s in axes],
+        output_src.name: [set(s) for s in axes],
     }
     worklist = [output_src]
 

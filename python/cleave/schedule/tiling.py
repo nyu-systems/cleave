@@ -263,6 +263,29 @@ def _get_same_launch_output_axis_map(canonical_node, output_node):
     return axis_map
 
 
+def _sibling_launch_axes(canonical_output, output_nodes):
+    """``(output, [canonical axis per axis of it])`` for the outputs next to the canonical one.
+
+    The same map the outputs of a loop are stored by (``_get_same_launch_output_axis_map``):
+    batch axes in order, the other axes onto the canonical output's leading non-batch axes.
+    An output that has no such map is left out; its own ancestors then depend on no launch
+    axis, and a tiling whose grid would have to walk them is refused as before.
+    """
+    canonical = _get_output_binding_node(canonical_output)
+    siblings = []
+    for output in output_nodes:
+        if output is canonical_output:
+            continue
+        try:
+            axis_map = _get_same_launch_output_axis_map(
+                canonical, _get_output_binding_node(output)
+            )
+        except NotImplementedError:
+            continue
+        siblings.append((output, axis_map))
+    return siblings
+
+
 def _build_group_axis_coord_expr(
     arg_name: str, group_extents: List[int], axis_pos: int
 ) -> _OutputAxisCoordExpr:
@@ -330,6 +353,28 @@ def _resolve_iter_coord_exprs(
     coord_exprs: List[Optional[_OutputAxisCoordExpr]] = [None] * len(iter_dims)
     for dim_idx, is_iter in enumerate(iter_dims):
         if not is_iter:
+            # The block holds this dim whole. That serves every reader only while the
+            # grid stands still on the launch axes that index it: a dim that two launch
+            # axes index has two readers (``x @ x.mT`` reads the rows of ``x`` as rows and
+            # as columns of the output), and when the grid walks one of them that reader
+            # needs a slice while the other needs the whole. A tensor has one tile, the
+            # last reader's; the kernel was built and failed TileLang's gemm shape check.
+            dep_axes = (
+                sorted(node_axis_deps[dim_idx])
+                if node_axis_deps is not None and dim_idx < len(node_axis_deps)
+                else []
+            )
+            walked = [
+                axis
+                for axis in dep_axes
+                if axis in output_axis_coord_exprs
+                and output_axis_coord_exprs[axis].expr != "0"
+            ]
+            if len(dep_axes) > 1 and walked:
+                raise ScheduleRejected(
+                    f"Dim {dim_idx} is held whole but launch axes {dep_axes} index it and "
+                    f"the grid walks {walked}: one tile cannot be a slice and the whole."
+                )
             continue
 
         dep_axes = []
@@ -926,7 +971,9 @@ def apply_tiling(cand: List) -> List[Graph]:
     # this needs to be called before any graph modifications
     # to correctly infer output axis dependencies for the
     # original output node
-    output_axis_deps = infer_output_axis_dependencies(output_node)
+    output_axis_deps = infer_output_axis_dependencies(
+        output_node, _sibling_launch_axes(output_node, output_nodes)
+    )
 
     # remove the split ops and extract the split extent if applicable
     split_extent, flat_graph = _extract_split_extent(cand.flat_graph)

@@ -39,7 +39,10 @@ from pathlib import Path
 #     kernel, and every split pair a different parameter list.
 # 15: an input the graph declares without its unit axes is bound to its program input (the
 #     Kernel saved for such a program could not be called).
-SCHEMA = 15
+# 16: the outputs next to the canonical one are launched on its axes: a split partial whose sums
+#     take the whole per-split extent in one step now builds (it was refused), so a program's
+#     best partial can be one of those.
+SCHEMA = 16
 # What "validated" means for a saved kernel. A kernel-cache hit returns without validating,
 # so bump this whenever the comparison or its inputs change: saved kernels are then rebuilt.
 # (The inputs include the adversarial cases a program with an exact softmax is held to,

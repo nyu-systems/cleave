@@ -3,8 +3,10 @@ import pytest
 pytest.importorskip("tilelang")
 pytest.importorskip("tvm")
 
-from cleave.ir.graph import GraphNode
+from cleave.ir.analysis import infer_output_axis_dependencies
+from cleave.ir.graph import GraphNode, OutputNode
 from cleave.schedule import apply_tiling
+from cleave.schedule import tiling
 
 from tests._graphs import mha_split_partial_graph
 from tests._tolerances import tolerance_for
@@ -103,5 +105,78 @@ def test_apply_tiling_mha_split_partial(
         if node.name in expected_output_shapes:
             assert iterator.shape == expected_output_shapes[node.name]
             assert iterator.tile_size == expected_output_tiles[node.name]
+
+    assert_candidate_compiles_and_runs(cand, tolerance_for(mha_split_partial_graph))
+
+
+# A partial whose two sums take the whole per-split KV extent in one step: neither is looped,
+# so the row sum stays in the main tier next to the value matmul. It is not an ancestor of the
+# canonical (value) output, and until the outputs next to the canonical one were given launch
+# axes too, ``apply_tiling`` refused every such tiling ("Expected exactly one launch-axis
+# mapping for iter dim 0, got []"): 40 of 160 partial plans of a split attention at factor 4.
+WHOLE_SPLIT_DIMS = (1, 4, 4, 64, 256, 64)  # B, H, SPLIT_K, S_Q, S_KV_PARTIAL, D
+WHOLE_SPLIT_RSTEP = {
+    "split_k": {},
+    "split_v": {},
+    "mma_0": {"v4": 32},
+    "div_0": {},
+    "add_0": {},
+    "exp_0": {},
+    "rowsum_0": {"v3": 256},
+    "mma_1": {"v3": 256},
+}
+
+
+def test_nodes_that_feed_only_a_sibling_output_depend_on_the_launch_axes():
+    graph = mha_split_partial_graph(*WHOLE_SPLIT_DIMS)
+    outputs = {n.name: n for n in graph.nodes if isinstance(n, OutputNode)}
+    rowsum, value = outputs["OutputNode_0"], outputs["OutputNode_1"]
+    assert tiling._select_canonical_output_node(list(outputs.values())) is value
+
+    alone = infer_output_axis_dependencies(value)
+    # The defect: nothing says which launch axis walks the row sum, or its output.
+    assert "rowsum_0" not in alone and "OutputNode_0" not in alone
+
+    siblings = tiling._sibling_launch_axes(value, list(outputs.values()))
+    assert [(out.name, axes) for out, axes in siblings] == [("OutputNode_0", [0, 1, 2])]
+    deps = infer_output_axis_dependencies(value, siblings)
+    assert deps["rowsum_0"] == deps["OutputNode_0"] == [{0}, {1}, {2}]
+    # What the canonical output says about a node is what it said before.
+    assert {name: deps[name] for name in alone} == alone
+
+
+def test_apply_tiling_mha_split_partial_whole_split_in_one_step():
+    main_graph = mha_split_partial_graph(*WHOLE_SPLIT_DIMS)
+    cand = build_tiled_candidate(main_graph, [1, 64, 32], WHOLE_SPLIT_RSTEP)
+    scheduled_graph = apply_tiling(cand)
+
+    # Only Q K^T is looped (over D); both sums are computed in the main tier.
+    (loop,) = [n for n in scheduled_graph.nodes if isinstance(n, GraphNode)]
+    assert loop.name == "GraphNode_mma_0" and loop.graph.extent == 2
+    assert {"rowsum_0", "mma_1"} <= {n.name for n in scheduled_graph.nodes}
+    assert scheduled_graph.extent == (16, 2)
+
+    expected = {  # name: (offsets, shape, tile)
+        "PlaceHolder_A": (("1 * (i0 // 4)", "0", "0"), (4, 64, 64), (1, 64, 64)),
+        "PlaceHolder_B": (("1 * (i0 // 4)", "256 * (i0 % 4)", "0"), (4, 1024, 64), (1, 256, 64)),
+        "PlaceHolder_C": (("1 * (i0 // 4)", "256 * (i0 % 4)", "32 * i1"), (4, 1024, 64),
+                          (1, 256, 32)),
+        # the head and the split index, as for the value: every block of a row writes it
+        "rowsum_0": (("1 * (i0 // 4)", "(i0 % 4)", "0"), (4, 4, 64), (1, 1, 64)),
+        "OutputNode_0": (("1 * (i0 // 4)", "(i0 % 4)", "0"), (4, 4, 64), (1, 1, 64)),
+        "mma_1": (("1 * (i0 // 4)", "(i0 % 4)", "0", "32 * i1"), (4, 4, 64, 64), (1, 1, 64, 32)),
+        "OutputNode_1": (("1 * (i0 // 4)", "(i0 % 4)", "0", "32 * i1"), (4, 4, 64, 64),
+                         (1, 1, 64, 32)),
+    }
+    seen = {}
+    for node, iterator in scheduled_graph.tmap.items():
+        seen[node.name] = (iterator.offset("i0", "i1"), tuple(iterator.shape),
+                           tuple(iterator.tile_size))
+    assert {name: seen[name] for name in expected} == expected
+    # Neither output comes out of a loop: both are stored as their producers compute them.
+    assert scheduled_graph.stored_layouts == {
+        "OutputNode_0": ((0, 1, 2), 0),
+        "OutputNode_1": ((0, 1, 2, 3), 0),
+    }
 
     assert_candidate_compiles_and_runs(cand, tolerance_for(mha_split_partial_graph))
