@@ -7,6 +7,7 @@ from .common import (
 from .bestfit import BestFit
 from ...core.errors import ScheduleRejected
 from .hint import TileDict, Stride
+from ...core.errors import ScheduleRejected
 from ...ir.graph import ViewOpNode
 from ...ir.analysis import (
     build_output_axis_provenance,
@@ -1197,9 +1198,21 @@ class TCPolicy(DefaultPolicy):
                 # the fused reduction is correct (never a partial-axis slice).
                 result[iter_name] = int(iter_dom)
             elif iter_dom % 16 > 0:
-                result[iter_name] = (
-                    16 if iter_dom < basic else basic
-                )  # for the case of padding
+                # No multiple of 16 divides this extent. 16 (or ``basic``) was given here
+                # "for the case of padding": a step that is none of the axis's candidates,
+                # and the walk over the candidates then died on it (``ValueError: 16 is not
+                # in list``; K = 8, 24, 40: the graph had no tiling, and no reason).
+                if reduce_input_dtype.bits <= 16:
+                    # TileLang's gemm takes 16-bit operands in K blocks of a multiple of
+                    # 16. Every step of this axis is something else: it asserts on 24 or
+                    # 40, and for 8 it emits a kernel that computes something else.
+                    raise ScheduleRejected(
+                        f"{node.name} contracts {int(iter_dom)} {reduce_input_dtype} "
+                        "elements: a tensor-core matmul of 16-bit operands steps its "
+                        "reduction axis in multiples of 16, and none divides that extent"
+                    )
+                # A wider operand (float32: K blocks of 8) is stepped like any reduction.
+                return super()._assign_reduce_step(node)
             elif iter_dom % basic == 0:
                 result[iter_name] = basic
             else:

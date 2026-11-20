@@ -543,3 +543,53 @@ def test_the_canonical_view_of_a_shared_ancestor_is_kept_and_the_other_reported(
     canonical = tiling._select_canonical_output_node(outputs)
     assert launch_axis_dependencies(
         canonical, tiling._sibling_launch_axes(canonical, outputs))[1] == []
+
+
+# --------------------------------------------- tensor-core matmuls over a short axis
+
+
+def plain_matmul(x: cl.Tensor["M", "K"], w: cl.Tensor["K", "N"]):
+    return x @ w
+
+
+@pytest.mark.parametrize("K", [8, 24, 40])
+def test_a_tensor_core_matmul_over_an_axis_no_multiple_of_16_divides_is_a_typed_refusal(K):
+    """``TCPolicy._assign_reduce_step`` started such an axis at 16 (or at the transaction
+    size) "for the case of padding": a step that does not divide the extent and is none of
+    the axis's step candidates. The walk over the candidates then died on it, ``ValueError:
+    16 is not in list``, for the whole graph. With 16-bit operands there is no kernel to
+    find: TileLang's gemm asserts on a K block of 24 or 40, and the kernel it emits for a
+    block of 8 is wrong (measured on a GPU: every entry off, by the row maximum). The
+    graph is refused, with the reason."""
+    from tests._graphs import matmul_graph, mha_bhsd_graph
+
+    with pytest.raises(ScheduleRejected) as refusal:
+        search_tiling(matmul_graph(128, 128, K), topk=1000)
+    assert str(refusal.value) == (
+        f"mma_0 contracts {K} float16 elements: a tensor-core matmul of 16-bit operands "
+        "steps its reduction axis in multiples of 16, and none divides that extent")
+    # attention over that many keys: the value matmul contracts them
+    with pytest.raises(ScheduleRejected, match=rf"mma_1 contracts {K} float16 elements"):
+        search_tiling(mha_bhsd_graph(1, 32, 64, K, 64), topk=1000)
+    # the neighbours: 48 and 80 keys are stepped as ever
+    for whole in (48, 80):
+        cands = search_tiling(matmul_graph(128, 128, whole), topk=1000)
+        assert cands and {_step(c, _one(cands[0].flat_graph, Matmul)) for c in cands} == {whole}
+
+
+@pytest.mark.parametrize("K", [8, 24, 40])
+def test_a_float32_matmul_over_such_an_axis_starts_at_a_step_it_has(K):
+    """float32 operands are contracted in K blocks of 8, so these extents have kernels;
+    they had no tiling for the same ``ValueError``. The first step is one of the axis's
+    own candidates, picked like any other reduction's."""
+    ir = _identity_graph(plain_matmul, dict(M=128, K=K, N=128), cl.f32)
+    matmul = _one(ir, Matmul)
+    policy = TCPolicy([n for n in ir.nodes if isinstance(n, OutputNode)], get_arch("cuda"),
+                      flat_graph=ir)
+    (node,) = [n for n in policy.ordered_nodes if n.name == matmul.name]
+    (name,) = [it.var.name for it in node.raxis]
+    assert policy._assign_reduce_step(node)[name] in policy.get_node_reduce_step_candidates(node)[name]
+    cands = search_tiling(ir, topk=1000)
+    assert cands and all(K % _step(c, matmul) == 0 for c in cands)
+    built, refused = _outcomes(cands)
+    assert len(built) == len(cands) and not refused
