@@ -93,11 +93,56 @@ def graph_tiers(graph):
     return tiers
 
 
+def boundary_order(nodes):
+    """``nodes`` sorted by their ``Boundary.index``; None when none of them carries one.
+
+    For a partial's outputs or a combine's placeholders this is the order of the tensors
+    crossing the cut. A hand-built graph has no records and gets None: its caller falls
+    back to whatever it did before the record existed. Records on only some of the nodes,
+    or one index used twice, mean a rewrite added a tensor without saying which one it
+    is; that is an error here, not a reason to guess.
+    """
+    nodes = list(nodes)
+    records = [getattr(node, "boundary", None) for node in nodes]
+    if all(record is None for record in records):
+        return None
+    names = [node.name for node in nodes]
+    if any(record is None for record in records):
+        raise ValueError(
+            f"boundary records on only some of {names}: "
+            f"{[None if r is None else tuple(r) for r in records]}"
+        )
+    indices = [record.index for record in records]
+    if len(set(indices)) != len(indices):
+        raise ValueError(f"boundary index used twice among {names}: {indices}")
+    return [node for _, node in sorted(zip(indices, nodes), key=lambda pair: pair[0])]
+
+
+def boundary_signature(nodes):
+    """``((index, role, logical shape, dtype), ...)`` by index, or None without records.
+
+    Two sides of a cut -- a partial's outputs and a combine's placeholders -- carry the
+    same tensors exactly when their signatures are equal.
+    """
+    ordered = boundary_order(nodes)
+    if ordered is None:
+        return None
+    return tuple(
+        (
+            node.boundary.index,
+            node.boundary.role,
+            tuple(int(extent) for extent in node.get_shape(0)),
+            str(node.get_dtype(0)),
+        )
+        for node in ordered
+    )
+
+
 # Every dict-typed ``Graph`` field is in exactly one of these two lists (a test checks it).
 # Node-keyed dicts have to be rebuilt after a structural edit (see ``rekey_graph``);
 # name-keyed ones need nothing.
 _NODE_KEYED_FIELDS = ("tmap", "tinfo_map", "tlayout_map", "accum_scale")
-_NAME_KEYED_FIELDS = ("binding", "smap", "pass_configs")
+_NAME_KEYED_FIELDS = ("binding", "smap", "pass_configs", "stored_layouts")
 
 
 def rekey_graph(graph):

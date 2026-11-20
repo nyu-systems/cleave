@@ -1,6 +1,6 @@
 import copy
 from dataclasses import dataclass, field, fields, replace
-from typing import Callable, List, Union, Dict, Tuple, Optional
+from typing import Callable, List, NamedTuple, Union, Dict, Tuple, Optional
 
 from tilelang.carver.roller.node import (
     Edge,
@@ -245,6 +245,16 @@ class Graph:
     # softmax: every accumulator downstream of `exp(s - m)` is rescaled by
     # `alpha = exp(m_prev - m)` when the running max moves. With both fields empty the
     # emitted text is exactly what it is without them.
+    stored_layouts: dict[str, tuple] = field(
+        default_factory=dict
+    )  # output name -> (axes, pad): how the kernel stores that output. `axes[p]` is the
+    # logical axis kept at stored position `p` and `pad` the number of unit dims appended,
+    # so stored_shape == tuple(logical[a] for a in axes) + (1,) * pad. Written by
+    # `apply_tiling` for every output of the main graph: a split partial with several
+    # outputs stores each with the split axis first, and a lower-rank sibling of the
+    # widest output is padded to its rank. It depends on the tiling, not only on the flat
+    # graph, and it never reaches the generated source: validation and the partial ->
+    # combine hand-off are given it next to the source (`cleave.runtime.reference`).
 
     def clone(self) -> "Graph":
         """Copy every field, node and edge (nested graphs included).
@@ -329,9 +339,32 @@ def _remap(value, memo):
     return value
 
 
+class Boundary(NamedTuple):
+    """Which tensor of a lowered graph a placeholder or an output is, by declaration.
+
+    ``to_ir`` gives every ``PlaceHolderNode`` the position of its input op among the
+    structure's input ops and every ``OutputNode`` the position of its output op among
+    the output ops. A graph's node list is rebuilt in discovery order from its outputs,
+    so neither position can be read back from the graph afterwards.
+
+    For a split pair this is the identity of a tensor crossing the cut: the partial's
+    output ``k`` and the combine's input ``k`` are the same tensor, whatever order or
+    names the two graphs give their nodes. Pair them with
+    :func:`cleave.ir.graph_utils.boundary_signature`, never by position, extent or
+    element count.
+
+    ``role`` is ``""`` for a tensor the cut produced; a tensor a later rewrite adds to
+    the cut names what it carries, so that it cannot be taken for one of the others.
+    """
+
+    index: int
+    role: str = ""
+
+
 class PlaceHolderNode(Node):
     index_only = False  # read for values only (an indptr); takes no tile
     producer_op = None  # op that fills this inner placeholder's tile (see codegen)
+    boundary: Optional[Boundary] = None  # set by ``to_ir``; None on a hand-built graph
 
     def __init__(self, name=""):
         super().__init__(name="PlaceHolder_" + name)
@@ -841,6 +874,8 @@ class ViewOpNode(TensorOp):
 
 
 class OutputNode(Node):
+    boundary: Optional[Boundary] = None  # set by ``to_ir``; None on a hand-built graph
+
     def __init__(self, node, dtype, id=0):
         # connect node and output node
         super().__init__(name="OutputNode")
