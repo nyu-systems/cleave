@@ -1,6 +1,6 @@
 """``apply_tiling`` refuses a tiling it cannot build with ``ScheduleRejected`` (CPU).
 
-Three tilings the policy proposes and the tiler used to mishandle or mis-type:
+Four tilings the policy proposes and the tiler used to mishandle or mis-type:
 
 * a value computed inside a loop and also read outside it. The loop's inner placeholders
   then leaked into the main graph and the candidate died with ``KeyError:
@@ -14,8 +14,12 @@ Three tilings the policy proposes and the tiler used to mishandle or mis-type:
 
 * a grid dim that no launch axis indexes. The tiler always refused it on purpose, but
   with ``ValueError``.
+* a tile with fewer dims than its tensor. The output of ``x @ column`` is ``(M, 1)`` and
+  its tile ``[m]``: the unit dim is not a batch dim, so nothing puts it back. The grid was
+  then planned for a rank-1 tensor and every candidate of such a graph died, with
+  ``KeyError: 1`` when the matmul was looped and on an assert when it was not.
 
-All three are per-candidate refusals now: callers that drop a candidate on
+All four are per-candidate refusals now: callers that drop a candidate on
 ``ScheduleRejected`` (the pipeline's schedule stage, the softmax accept filter) can tell
 them from a bug.
 """
@@ -51,8 +55,13 @@ def column_weighted(v: cl.Tensor["M", "K"], x: cl.Tensor["K", "N"]):
     return (v @ e) / cl.sum(e, 0, keepdim=True)
 
 
-def _identity_graph(fn, shapes):
-    (graph,) = list(GraphSet.identity(trace(fn, shapes, cl.f16)))
+def matmul_of_rowsum(x: cl.Tensor["M", "K"], w: cl.Tensor["K", "N"]):
+    """x @ rowsum(w), the form the search finds for rowsum(x @ w): a matmul with a column."""
+    return x @ w.sum(-1, keepdim=True)
+
+
+def _identity_graph(fn, shapes, dtype=cl.f16):
+    (graph,) = list(GraphSet.identity(trace(fn, shapes, dtype)))
     (ir,) = lower(graph)
     return ir
 
@@ -157,6 +166,26 @@ def test_grid_dim_without_a_launch_axis_is_a_typed_refusal():
         match=r"^Expected exactly one launch-axis mapping for iter dim 0, got \[\]\.$",
     ):
         apply_tiling(cand)
+
+
+def test_tile_that_misses_a_unit_dim_is_a_typed_refusal():
+    ir = _identity_graph(matmul_of_rowsum, dict(M=4096, K=64, N=4096))
+    matmul = _one(ir, Matmul)
+    assert tuple(int(s) for s in matmul.get_shape()) == (4096, 1)
+    cands = search_tiling(ir, topk=1000)
+    # Both spellings of the old failure are among them: the matmul looped over K
+    # (KeyError: 1 at the output's offsets) and not (the assert on iter_repeat_factors).
+    assert {_step(c, matmul) < 64 for c in cands} == {True, False}
+
+    # Anything but ScheduleRejected propagates out of here.
+    built, refused = _outcomes(cands)
+    assert not built and len(refused) == len(cands)
+    for cand, text in refused:
+        assert len(cand.output_tile) == 1  # one extent for a tensor of two dims
+        assert text == (
+            f"{matmul.name}: tile {list(cand.output_tile)} does not cover the 2 dims of its "
+            "tensor (4096, 1); a unit dim that is not a batch dim has no tile"
+        )
 
 
 def test_a_consistent_loop_is_not_refused():

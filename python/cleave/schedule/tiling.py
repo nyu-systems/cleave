@@ -729,6 +729,25 @@ def _refuse_loops_that_miscount_their_tiles(main: Graph):
                     )
 
 
+def _refuse_tile_that_misses_dims(node, shape, tile, expanded_tile):
+    """Refuse a tiling whose tile has fewer dims than the tensor it tiles.
+
+    The policy gives a tile one extent per axis the op iterates. A dim of extent 1 is not
+    iterated, so it has no extent in the tile; ``_expand_tile_to_shape_rank`` puts it back
+    when it is a batch dim. A unit dim that is not a batch dim stays missing: the output
+    of ``x @ column`` (a ``Matmul`` with N = 1) is ``(M, 1)`` with the tile ``[m]``. The
+    grid extent would then be taken from the dims the tile happens to cover, and the
+    launch-axis plan and the offsets built for a tensor of lower rank (it used to end in
+    ``KeyError: 1`` or an assert on ``iter_repeat_factors``, depending on the loop).
+    """
+    if len(expanded_tile) != len(shape):
+        raise ScheduleRejected(
+            f"{node.name}: tile {list(tile)} does not cover the {len(shape)} dims of its "
+            f"tensor {tuple(int(s) for s in shape)}; a unit dim that is not a batch dim "
+            "has no tile"
+        )
+
+
 def apply_tiling(cand: List) -> List[Graph]:
     output_nodes = [n for n in cand.flat_graph.nodes if n.is_output()]
     output_node = _select_canonical_output_node(output_nodes)
@@ -776,6 +795,7 @@ def apply_tiling(cand: List) -> List[Graph]:
             _get_output_binding_node(node).name if node.is_output() else node.name
         ]
         expanded_tile = _expand_tile_to_shape_rank(node, tile)
+        _refuse_tile_that_misses_dims(node, shape_owner.get_shape(), tile, expanded_tile)
         threadblock_extent_map[node.name] = tuple(
             i // j for i, j in zip(shape_owner.get_shape(), expanded_tile)
         )
