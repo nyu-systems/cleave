@@ -20,6 +20,7 @@ _MARKERS = {
         "tests/test_runtime_tolerance.py",
         "tests/frontend_dynamic/test_paged_pipeline.py::test_compile_end_to_end",
         "tests/pipeline_api/test_e2e.py",
+        "tests/pipeline_api/test_split_attention.py::test_gpu_",
         "tests/runtime/test_run_candidates.py",
         "tests/runtime/test_stored_layout.py::test_gpu_",
         "tests/frontend/test_exact_softmax.py::test_gpu_",
@@ -40,6 +41,8 @@ _MARKERS = {
         "tests/lower/test_broadcast_axis.py::test_search_",
         "tests/pipeline_api/test_bind_inputs.py::test_search_",
         "tests/pipeline_api/test_softmax_lowering.py::test_search_",
+        "tests/pipeline_api/test_split_attention.py::test_search_",
+        "tests/pipeline_api/test_split_attention.py::test_gpu_",
     ),
     "slow": (
         "tests/schedule/end2end/",

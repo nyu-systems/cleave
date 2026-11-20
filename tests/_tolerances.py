@@ -67,6 +67,8 @@ TOLERANCES = {
     "matmul": Tolerance(rtol=5e-3),
     "softmax": Tolerance(rtol=2e-3),
     "exact_attention": Tolerance(rtol=5e-3),
+    # the fixed-shift attention, split: partials, combines and the chained Kernel
+    "attention": Tolerance(rtol=5e-3),
 }
 
 

@@ -355,6 +355,24 @@
    "validated": 459
   }
  ],
+ "test:attention": [
+  {
+   "abs": 0.00048828125,
+   "absolute": false,
+   "dtype": "float16",
+   "rel": 0.0009765625,
+   "seeds": 3,
+   "validated": 78
+  },
+  {
+   "abs": 0.00048828125,
+   "absolute": false,
+   "dtype": "float16",
+   "rel": 0.0011370097054168582,
+   "seeds": 3,
+   "validated": 48
+  }
+ ],
  "test:batched_matmul_graph": [
   {
    "abs": 0.125,
