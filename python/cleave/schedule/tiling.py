@@ -351,7 +351,9 @@ def _resolve_iter_coord_exprs(
             coord_expr = output_axis_coord_exprs[output_split_axis]
 
         if coord_expr is None or coord_expr.expr == "0":
-            raise ValueError(
+            # A refusal of this tiling, not a bug: the grid would have to walk a dim that
+            # no launch axis (or more than one) indexes.
+            raise ScheduleRejected(
                 f"Expected exactly one launch-axis mapping for iter dim {dim_idx}, got {dep_axes}."
             )
         coord_exprs[dim_idx] = coord_expr

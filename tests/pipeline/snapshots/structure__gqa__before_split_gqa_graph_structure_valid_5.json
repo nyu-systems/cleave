@@ -9,10 +9,10 @@
      "e0adf27461e33ec3784af1f2921a42ae1ca2fd04f564ba34aa4b035b77be2e1c",
      "e389630f6b11b074fbdd5233b9ee0691290e1de67451c24e58ee78705119381b",
      "e0adf27461e33ec3784af1f2921a42ae1ca2fd04f564ba34aa4b035b77be2e1c",
-     "error:ValueError",
-     "error:ValueError",
-     "error:ValueError",
-     "error:ValueError"
+     "error:ScheduleRejected",
+     "error:ScheduleRejected",
+     "error:ScheduleRejected",
+     "error:ScheduleRejected"
     ]
    },
    {

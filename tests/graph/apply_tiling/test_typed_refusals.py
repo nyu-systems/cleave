@@ -1,6 +1,6 @@
 """``apply_tiling`` refuses a tiling it cannot build with ``ScheduleRejected`` (CPU).
 
-Two tilings the policy proposes and the tiler used to mishandle:
+Three tilings the policy proposes and the tiler used to mishandle or mis-type:
 
 * a value computed inside a loop and also read outside it. The loop's inner placeholders
   then leaked into the main graph and the candidate died with ``KeyError:
@@ -12,8 +12,12 @@ Two tilings the policy proposes and the tiler used to mishandle:
   *built*, with a loop that ran past the end of its tiles: ``for i0 in T.Pipelined(1024)``
   over 32 tiles of 128.
 
-Both are per-candidate refusals now: callers that drop a candidate on ``ScheduleRejected``
-(the pipeline's schedule stage, the softmax accept filter) can tell them from a bug.
+* a grid dim that no launch axis indexes. The tiler always refused it on purpose, but
+  with ``ValueError``.
+
+All three are per-candidate refusals now: callers that drop a candidate on
+``ScheduleRejected`` (the pipeline's schedule stage, the softmax accept filter) can tell
+them from a bug.
 """
 
 import re
@@ -133,6 +137,26 @@ def test_merged_reductions_with_different_steps_are_a_typed_refusal(monkeypatch)
             rf"into {tiles} tiles \({_step(cand, matmul)} of 4096\)",
             text,
         ), text
+
+
+def test_grid_dim_without_a_launch_axis_is_a_typed_refusal():
+    """A multi-output graph with every reduction un-looped: the outputs next to the
+    canonical one are not its ancestors, so no launch axis is derived for their dims. The
+    tiler has always refused such a tiling, with ``ValueError``."""
+    from tests._softmax import exps, raw_statistics_graph
+    from tests.graph.apply_tiling._test_utils import build_tiled_candidate
+
+    ir = raw_statistics_graph(32, 64, 256, 64)
+    for exp in exps(ir):
+        exp.stabilize = None  # the refusal is the tiler's own, softmax or not
+    rstep = {"mma_0": {"v3": 64}, "mul_0": {}, "exp_0": {}, "rowsum_0": {"v2": 256},
+             "mma_1": {"v3": 256}, "reduce_max_2_exp_0": {"v2": 256}}
+    cand = build_tiled_candidate(ir, [1, 32, 32], rstep)
+    with pytest.raises(
+        ScheduleRejected,
+        match=r"^Expected exactly one launch-axis mapping for iter dim 0, got \[\]\.$",
+    ):
+        apply_tiling(cand)
 
 
 def test_a_consistent_loop_is_not_refused():
