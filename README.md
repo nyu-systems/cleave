@@ -129,7 +129,9 @@ the reference has, and shapes and dtypes must agree.
 
 There is no default tolerance. Each operator declares its own `cl.Tolerance(rtol=..., atol=...)`
 (one, or one per output when every plan has that many: a program with split plans declares
-one, because a split partial has more outputs than its combine), set from its measured error
+one, because a split partial has more outputs than its combine; where its softmax is exact
+the partials also return their float32 shift, and the program declares one bound per boundary
+role, `{"": cl.Tolerance(...), "shift": cl.Tolerance(...)}`), set from its measured error
 (the next 1-2-5 step at or above 4x the largest error of its valid kernels, 2x for a bf16
 output, whose single ulp is already 0.8% of the row max; valid kernels sit within a few ulp of
 the reference, wrong kernels above 10% of the row max): `cleave.compile(..., tolerance=...)`,

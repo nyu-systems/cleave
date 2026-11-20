@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
@@ -19,12 +20,34 @@ def validation_kind(error) -> str:
                 "other")
 
 
-def tolerance_dicts(tolerance) -> list | None:
-    """``[{"rtol", "atol"}, ...]`` for a Tolerance or a sequence of them (None stays None)."""
+def tolerance_dicts(tolerance) -> list | dict | None:
+    """``[{"rtol", "atol"}, ...]`` for a Tolerance or a sequence of them, ``{role: {"rtol",
+    "atol"}}`` for a declaration keyed by boundary role (None stays None, also as an entry
+    of a sequence: an output no single bound governs)."""
+    def entry(t):
+        return None if t is None else {"rtol": t.rtol, "atol": t.atol}
+
     if tolerance is None:
         return None
+    if isinstance(tolerance, Mapping):
+        return {role: entry(t) for role, t in tolerance.items()}
     items = tolerance if isinstance(tolerance, (tuple, list)) else (tolerance,)
-    return [{"rtol": t.rtol, "atol": t.atol} for t in items]
+    return [entry(t) for t in items]
+
+
+def bounds_by_output(tolerance, roles_of_results):
+    """What governs each output index of a report: ``tolerance`` itself, or for a
+    declaration keyed by role one entry per output index -- the bound of the role that
+    output has in the plans measured (``roles_of_results``: the output roles of each), None
+    where plans disagree on it."""
+    if not isinstance(tolerance, Mapping):
+        return tolerance
+    at = {}
+    for roles in roles_of_results:
+        for i, role in enumerate(roles):
+            at.setdefault(i, set()).add(role)
+    return [tolerance.get(next(iter(roles))) if len(roles) == 1 else None
+            for _, roles in sorted(at.items())]
 
 
 def worst_measured(measurements) -> list | None:
@@ -49,6 +72,8 @@ def format_measured(worst, tolerance=None) -> str:
     it has both terms: neither error alone is then a fraction of its term."""
     if not worst:
         return ""
+    if isinstance(tolerance, Mapping):  # by role: which output has which is not known here
+        tolerance = None
     bounds = tolerance_dicts(tolerance) or [None] * len(worst)
     if len(bounds) == 1:
         bounds = bounds * len(worst)
@@ -272,6 +297,13 @@ class Report(_Results):
         """Per output, the largest error measured over the candidates that passed."""
         return worst_measured(r.measured for r in self.correct)
 
+    def _bounds(self):
+        """The bound beside each entry of ``measured_error()``."""
+        from ..runtime.reference import output_roles
+
+        return bounds_by_output(self.tolerance, (
+            output_roles(r.plan.tile.flat_graph) for r in self.correct if r.measured is not None))
+
     def to_dict(self) -> dict:
         variants = self.variants()
         return {
@@ -337,7 +369,7 @@ class Report(_Results):
         rows.append(("build", text + (f"  [{build_fail}]" if build_fail else ""), self.timings.get("build")))
         val_fail = Failures(r for r in self.results if not r.ok and r.stage == "validate")
         n_val = len(self) - len(build_fail)
-        worst = format_measured(self.measured_error(), self.tolerance)
+        worst = format_measured(self.measured_error(), self._bounds())
         rows.append(("validate", f"{n_val - len(val_fail)} ok / {len(val_fail)} failed"
                      + (f"  [{val_fail}]" if val_fail else "")
                      + (f"  max error {worst}" if worst else "") + self._inputs_text(), None))

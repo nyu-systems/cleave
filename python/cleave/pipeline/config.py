@@ -65,8 +65,11 @@ class EvalConfig(_Replace):
     iters: int = 1000
     # The operator's declared bound: a cleave.lang.Tolerance for every output, or one per
     # output when every plan has that many (a split partial has more outputs than its combine
-    # and the solo plans, so a split program declares one). There is no default; building
-    # kernels without one is an error.
+    # and the solo plans, so a split program declares one), or a mapping from boundary role
+    # to Tolerance: {"": ..., "shift": ...} for a program with an exact softmax and split
+    # plans, whose partials return their float32 shift next to their sums
+    # (cleave.runtime.validate.tolerances_of). There is no default; building kernels without
+    # one is an error.
     tolerance: Any = None
     max_parallel: int = 8
     timeout_s: float | None = None  # None -> Settings.compile_timeout_secs

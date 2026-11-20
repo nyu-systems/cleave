@@ -79,6 +79,14 @@ def output_order(graph):
     return [n for n in find_topo_sort(graph.nodes) if isinstance(n, OutputNode)]
 
 
+def output_roles(graph):
+    """The boundary role of each output, in :func:`output_order`: ``""`` for an output the
+    program or its cut defines (and for one without a record), else what a rewrite named
+    the tensor it added to the cut (``"shift"``)."""
+    return tuple(getattr(getattr(node, "boundary", None), "role", "") or ""
+                 for node in output_order(graph))
+
+
 def graph_out_indices(graph):
     """``out_idx`` for ``tl.compile``: the trailing ``n_out`` kernel arguments."""
     n_out = len(output_order(graph))

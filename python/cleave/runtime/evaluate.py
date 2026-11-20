@@ -23,6 +23,7 @@ from ..core.errors import (
     NonFiniteOutput,
     OutputMismatch,
     SmemExceeded,
+    SpecError,
     ValidationError,
     WorkerCrash,
 )
@@ -40,9 +41,10 @@ from .reference import (
     make_inputs,
     order_inputs_for_kernel,
     output_order,
+    output_roles,
     with_hand_off,
 )
-from .validate import BenchOptions, benchmark_compiled_kernel, publish_reference
+from .validate import BenchOptions, benchmark_compiled_kernel, publish_reference, tolerances_of
 from .workers import WorkerPool
 
 
@@ -177,8 +179,10 @@ def run_candidates(
     ``build_fn`` returns the source, or ``(source, stored layouts)`` like the default
     ``build_candidate``; the layouts go to ``check_fn`` and onto the result.
 
-    ``tolerance`` is the operator's declared bound (a ``Tolerance`` or one per output),
-    handed to ``check_fn``; the default ``check_code`` fails a candidate without one.
+    ``tolerance`` is the operator's declared bound (a ``Tolerance``, one per output, or
+    one per boundary role: ``validate.tolerances_of``). ``check_fn`` is handed what it comes
+    to for the candidate's own outputs; the default ``check_code`` fails a candidate
+    without a bound, and so does a declaration that leaves one of its outputs without.
     """
     if not candidates:
         return []
@@ -264,6 +268,13 @@ def run_candidates(
             raise reference
         return reference
 
+    def declared_for(cand):
+        """The declaration as it applies to this candidate's outputs (their roles are only
+        known for a candidate that comes with its lowered graph)."""
+        graph = cand.flat_graph
+        known = tolerance is not None and getattr(graph, "nodes", None) is not None
+        return tolerances_of(tolerance, output_roles(graph) if known else None)
+
     def finish(job, result, pbar):
         results[job["idx"] - 1] = result
         pbar.update(1)
@@ -299,10 +310,16 @@ def run_candidates(
                 continue
             code_str, stored_layouts = built if isinstance(built, tuple) else (built, None)
             job["stored_layouts"] = stored_layouts
+            try:
+                declared = declared_for(cand)
+            except SpecError as exc:
+                error = _parent_error(ValidationError, label, "tolerance", exc)
+                fail(job, "validate", error, pbar, code_str)
+                continue
 
             task = {
                 "check_fn": check_fn, "code_str": code_str, "out_idx": cand_out_idx,
-                "reference_cache_dir": cand_ref_dir, "tolerance": tolerance,
+                "reference_cache_dir": cand_ref_dir, "tolerance": declared,
                 "benchmark": benchmark, "stored_layouts": stored_layouts,
             }
             worker = None

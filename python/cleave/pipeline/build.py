@@ -207,18 +207,36 @@ def _reference_fn(distributions, program, publish):
 
 
 def _check_tolerance_fits(plan_list, tolerance) -> None:
-    """Refuse a per-output ``tolerance`` that does not fit every plan, before any runs.
+    """Refuse a ``tolerance`` that leaves an output of some plan without a bound, or that
+    does not fit every plan, before any runs.
 
-    One ``Tolerance`` covers every output of every plan. A sequence is one per output, and
-    the plans of one program need not have the same outputs: a split partial has more than
-    its combine and than the solo plans. All candidates share the declaration, so a sequence
-    is only valid when every plan has exactly that many outputs.
+    One ``Tolerance`` covers every output the program or its cut defines. An output that a
+    rewrite added to the cut carries a boundary role (the float32 shift a split partial of
+    an exact softmax returns), and is only covered by a declaration keyed by role: a mapping
+    from role to ``Tolerance``, which fits every plan. A sequence is one per output, by
+    position, and the plans of one program need not have the same outputs: a split partial
+    has more than its combine and than the solo plans. All candidates share the
+    declaration, so a sequence is only valid when every plan has exactly that many outputs.
     """
-    from ..runtime import reference
-    from ..runtime.validate import Tolerance, tolerances_for
+    from collections.abc import Mapping
 
-    if not plan_list or isinstance(tolerance, Tolerance):
-        return  # nothing to validate, or one bound for every output
+    from ..runtime import reference
+    from ..runtime.validate import Tolerance, tolerances_for, tolerances_of
+
+    if not plan_list:
+        return  # nothing to validate
+    if isinstance(tolerance, (Tolerance, Mapping)):
+        checked = set()
+        for plan in plan_list:
+            graph = plan.tile.flat_graph
+            if id(graph) in checked:
+                continue
+            checked.add(id(graph))
+            try:
+                tolerances_of(tolerance, reference.output_roles(graph))
+            except SpecError as error:
+                raise SpecError(f"build(): plan {plan.label!r} ({plan.role}): {error}") from None
+        return
     try:
         declared = len(tuple(tolerance))
     except TypeError:
@@ -234,7 +252,8 @@ def _check_tolerance_fits(plan_list, tolerance) -> None:
                 f"build(): {declared} tolerances were declared, but plan {plan.label!r} "
                 f"({plan.role}) has {counted[id(graph)]} output(s). A per-output tolerance "
                 "must fit every plan, and a split partial has more outputs than its combine "
-                "and the solo plans; declare one Tolerance for all outputs")
+                "and the solo plans; declare one Tolerance for all outputs, or one per "
+                "boundary role")
 
 
 def build(plans: PlanSet | Sequence[Plan], workers: int | None = None, *,
@@ -243,7 +262,8 @@ def build(plans: PlanSet | Sequence[Plan], workers: int | None = None, *,
 
     Parallelism: ``workers``, else the active ``Session.max_parallel``, else ``config``.
     ``config.tolerance`` is required as soon as there is a plan to validate: one
-    ``Tolerance`` for every output, or one per output when every plan has that many.
+    ``Tolerance`` for every output, one per boundary role, or one per output when every
+    plan has that many (``_check_tolerance_fits``).
     """
     from ..core.session import current_session
     from ..runtime.inputs import check_distributions

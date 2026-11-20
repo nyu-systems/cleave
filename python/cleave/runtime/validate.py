@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 import contextlib
 from dataclasses import dataclass
 import json
@@ -33,7 +34,8 @@ class Tolerance:
     zeros is a legitimate value that cannot be reproduced bit for bit (a log-sum-exp of 0).
 
     There is no default bound anywhere: every operator declares its own, from a measured
-    error (see :func:`compare_outputs`). A sequence of tolerances declares one per output.
+    error (see :func:`compare_outputs`). A sequence of tolerances declares one per output; a
+    mapping declares one per boundary role (:func:`tolerances_of`).
     """
 
     rtol: float
@@ -81,6 +83,52 @@ def require_tolerance(tolerance, what="this kernel"):
             "tolerance=Tolerance(rtol=..., atol=...) (one, or one per output), set from the "
             "operator's measured error"
         )
+    return tolerance
+
+
+def tolerances_of(tolerance, roles):
+    """The declaration ``tolerance`` as it applies to one kernel, whose outputs carry
+    ``roles``: what to hand to :func:`compare_outputs` for that kernel.
+
+    ``roles`` is the boundary role of each output in the order the kernel returns them
+    (``cleave.runtime.reference.output_roles``): ``""`` for an output the program or its
+    cut defines, a name for a tensor a rewrite added to the cut. Today that is ``"shift"``,
+    the max a split partial of an exact softmax returns next to its sums: a float32
+    statistic, with an error of its own, next to outputs in the program's dtype. ``None``
+    when the outputs are not known (a kernel without a graph).
+
+    * A mapping from role to ``Tolerance`` declares one bound per role, whatever the plan:
+      each output takes the bound of its role. A role without an entry is an error, like a
+      kernel without a tolerance: there is no default bound.
+    * One ``Tolerance`` covers the outputs that carry no role. A kernel with an output that
+      does has no bound for it, which is an error too: the program declares its tolerance
+      by role.
+    * A sequence is one bound per output, by position, and is returned as it is.
+    """
+    if tolerance is None or roles is None and not isinstance(tolerance, Mapping):
+        return tolerance
+    if isinstance(tolerance, Mapping):
+        wrong = {role: bound for role, bound in tolerance.items()
+                 if not isinstance(role, str) or not isinstance(bound, Tolerance)}
+        if wrong:
+            raise SpecError("a tolerance keyed by role maps each boundary role (a string) to "
+                            f"one Tolerance, got {wrong!r}")
+        if roles is None:
+            raise SpecError("a tolerance keyed by role needs the roles of the kernel's "
+                            "outputs, and this kernel comes without its graph")
+        missing = sorted({role for role in roles if role not in tolerance})
+        if missing:
+            raise SpecError(
+                f"no validation tolerance declared for the outputs of role {missing} (the "
+                f"declaration has {sorted(tolerance)}); there is no default bound")
+        return tuple(tolerance[role] for role in roles)
+    named = sorted({role for role in roles if role})
+    if named and isinstance(tolerance, Tolerance):
+        raise SpecError(
+            f"one Tolerance covers the outputs a program or its cut defines, and this kernel "
+            f"also returns outputs of role {named} (a split partial returns its float32 "
+            "shift): declare the tolerance by role, tolerance={'': Tolerance(...), "
+            + ", ".join(f"{role!r}: Tolerance(...)" for role in named) + "}")
     return tolerance
 
 
