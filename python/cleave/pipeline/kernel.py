@@ -19,6 +19,11 @@ class Param:
     source: str  # "input" | "stage"
     index: int
     shape: tuple[int, ...]
+    # For a "stage" param, how the previous stage's kernel stores that output: the
+    # ``(axes, pad)`` its tiling recorded (``Graph.stored_layouts``). ``shape`` is the
+    # logical shape this kernel reads, so the tensor is brought back with ``to_logical``.
+    # None when nothing was recorded: the two then differ by unit axes at most.
+    layout: tuple | None = None
 
 
 @dataclass
@@ -93,7 +98,7 @@ class Kernel:
         return self
 
     def __call__(self, *args, **named):
-        from ..runtime.reference import order_inputs_for_kernel
+        from ..runtime.reference import order_inputs_for_kernel, to_logical
 
         inputs = self._bind(args, named)
         self.compile()
@@ -102,7 +107,10 @@ class Kernel:
             feed = {}
             for p in stage.params:
                 x = inputs[p.index] if p.source == "input" else outs[p.index]
-                feed[p.name] = _fit(x, p.shape)
+                # A partial stores its outputs split axis first; the combine reads them in
+                # the logical layout. That is a transposition, which a reshape scrambles.
+                feed[p.name] = (_fit(x, p.shape) if p.layout is None
+                                else to_logical(x, p.layout, p.shape))
             res = kernel(*order_inputs_for_kernel(feed, kernel))
             outs = list(res) if isinstance(res, (list, tuple)) else [res]
         if self.output_shapes is not None:
@@ -146,7 +154,8 @@ def load(path) -> Kernel:
 
     stages = []
     for d in m["stages"]:
-        params = [Param(q["name"], q["source"], q["index"], tuple(q["shape"])) for q in d["params"]]
+        params = [Param(q["name"], q["source"], q["index"], tuple(q["shape"]),
+                        _as_layout(q.get("layout"))) for q in d["params"]]
         source = (p / d["file"]).read_text()
         built = None if "kernel" not in d else BuiltKernel.from_dict(d["kernel"], source)
         stages.append(Stage(d["role"], source, list(d["out_idx"]), params,
@@ -165,12 +174,81 @@ def _fit(x, shape):
     return x.reshape(shape)
 
 
+def _as_layout(value):
+    """A stored layout read back from JSON: ``(axes, pad)`` with ``axes`` a tuple again."""
+    return None if value is None else (tuple(int(a) for a in value[0]), int(value[1]))
+
+
+def boundary_of(plan):
+    """What a split plan passes across the cut: ``boundary_signature`` of a partial's
+    outputs or of a combine's placeholders. None for any other plan, and for a graph
+    that carries no boundary records (a hand-built one)."""
+    from ..ir.graph_utils import boundary_signature
+    from ..runtime.reference import output_order, placeholder_order
+
+    graph = getattr(getattr(plan, "tile", None), "flat_graph", None)
+    order = {"partial": output_order, "combine": placeholder_order}.get(plan.role)
+    return None if graph is None or order is None else boundary_signature(order(graph))
+
+
+def _combine_params(plan, phs, partial_plan, partial_layouts):
+    """``(params, problem)`` for a combine: each placeholder fed from the partial output
+    that is the same boundary tensor, with that output's stored layout."""
+    from ..runtime.reference import output_order
+
+    outputs = output_order(partial_plan.tile.flat_graph)  # as the partial kernel returns them
+    want, have = boundary_of(plan), boundary_of(partial_plan)
+    if want is None or have is None:
+        return _combine_params_by_position(plan, phs, outputs)
+    problem = None
+    if want != have:
+        # Index, role, logical shape and dtype of every tensor, compared exactly: two
+        # tensors of one shape are told apart by index and role, never by position.
+        problem = (f"{plan.label}: the combine reads {_describe(want)} but the partial kernel "
+                   f"{partial_plan.label} writes {_describe(have)}")
+    position = {o.boundary.index: i for i, o in enumerate(outputs)}
+    params = []
+    for ph in phs:
+        i = position.get(ph.boundary.index, -1)
+        layout = None if partial_layouts is None or i < 0 else partial_layouts[i]
+        params.append(Param(ph.name, "stage", i, _shape(ph), layout))
+    return params, problem
+
+
+def _combine_params_by_position(plan, phs, outputs):
+    """The pairing for graphs without boundary records: the combine's placeholders, in the
+    order its node list has them, against the partial's outputs; guarded by element count."""
+    graph = plan.tile.flat_graph
+    ids = {id(ph) for ph in phs}
+    decl = [n for n in graph.nodes if id(n) in ids]
+    pos = {ph.name: i for i, ph in enumerate(decl)}
+    prev_outputs = [_shape(o) for o in outputs]
+    params, problem = [], None
+    for ph in phs:
+        i = pos[ph.name]
+        if i >= len(prev_outputs) or math.prod(prev_outputs[i]) != math.prod(_shape(ph)):
+            problem = problem or (f"{plan.label}: combine inputs do not line up with "
+                                  "the partial kernel's outputs")
+        params.append(Param(ph.name, "stage", i, _shape(ph)))
+    return params, problem
+
+
+def _describe(signature) -> str:
+    return "[" + ", ".join(f"#{i}{':' + role if role else ''} {shape} {dtype}"
+                           for i, role, shape, dtype in signature) + "]"
+
+
 def stages_for(plans_and_results, program) -> tuple[list[Stage], str | None]:
-    """Call stages from ``[(plan, result[, BuiltKernel])]`` (one solo, or partial then combine)."""
-    from ..runtime.reference import graph_out_indices, output_order, placeholder_order
+    """Call stages from ``[(plan, result[, BuiltKernel])]`` (one solo, or partial then combine).
+
+    A combine's placeholders are paired with the partial's outputs by boundary record
+    (``Boundary``: index and role, with logical shape and dtype compared exactly), and each
+    takes the stored layout the partial's result carries, so ``Kernel.__call__`` can undo it.
+    """
+    from ..runtime.reference import graph_out_indices, placeholder_order
 
     stages, problem = [], None
-    prev_outputs: list[tuple] = []
+    prev_plan, prev_layouts = None, None
     for plan, res, *built in plans_and_results:
         built = built[0] if built else None
         graph = plan.tile.flat_graph
@@ -185,17 +263,12 @@ def stages_for(plans_and_results, program) -> tuple[list[Stage], str | None]:
                 bind = {name: i for i, name in enumerate(plan.inputs)}
             for ph in phs:
                 params.append(Param(ph.name, "input", bind.get(ph.name, -1), _shape(ph)))
-        else:  # combine: its placeholders, in declaration order, are the partial's outputs
-            ids = {id(ph) for ph in phs}
-            decl = [n for n in graph.nodes if id(n) in ids]
-            pos = {ph.name: i for i, ph in enumerate(decl)}
-            for ph in phs:
-                i = pos[ph.name]
-                if i >= len(prev_outputs) or math.prod(prev_outputs[i]) != math.prod(_shape(ph)):
-                    problem = problem or (f"{plan.label}: combine inputs do not line up with "
-                                          "the partial kernel's outputs")
-                params.append(Param(ph.name, "stage", i, _shape(ph)))
-        prev_outputs = [_shape(o) for o in output_order(graph)]
+        elif prev_plan is None:
+            problem = problem or f"{plan.label}: a combine needs the partial stage before it"
+        else:
+            params, mismatch = _combine_params(plan, phs, prev_plan, prev_layouts)
+            problem = problem or mismatch
+        prev_plan, prev_layouts = plan, getattr(res, "stored_layouts", None)
         lat = None if res is None or res.latency_ms is None else res.latency_ms * 1e3
         source = built.source if built is not None else res.code if res is not None else ""
         stages.append(Stage(plan.role, source, graph_out_indices(graph), params, plan.label, lat,

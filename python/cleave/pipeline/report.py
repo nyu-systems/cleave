@@ -193,17 +193,18 @@ class Report(_Results):
         return [r for r in self.results if r.ok and r.latency_ms is not None]
 
     def variants(self) -> dict[str, VariantResult]:
-        """Best latency per variant: solo = best main; split-k=N = best partial + best combine."""
-        best: dict[tuple[str, str], Result] = {}
+        """Best latency per variant: solo = best main; split-k=N = the fastest partial +
+        combine pair that pass the same tensors across the cut."""
+        timed: dict[str, dict[str, list[Result]]] = {}
         for r in self.timed:
-            key = (r.variant, r.role)
-            if key not in best or r.latency_ms < best[key].latency_ms:
-                best[key] = r
+            timed.setdefault(r.variant, {}).setdefault(r.role, []).append(r)
         out = {}
-        for variant in dict.fromkeys(v for v, _ in best):
-            roles = ("main",) if (variant, "main") in best else ("partial", "combine")
-            if all((variant, role) in best for role in roles):
-                members = [best[(variant, role)] for role in roles]
+        for variant, roles in timed.items():
+            if "main" in roles:
+                members = [_fastest(roles["main"])]
+            else:
+                members = _fastest_pair(roles.get("partial", ()), roles.get("combine", ()))
+            if members:
                 out[variant] = VariantResult(variant, sum(m.latency_us for m in members), members)
         return out
 
@@ -308,6 +309,39 @@ class Report(_Results):
     def __str__(self):
         return (f"Report: {len(self)} candidates, {len(self.correct)} correct, "
                 f"failures: {self.failures}")
+
+
+def _fastest(results) -> Result:
+    return min(results, key=lambda r: r.latency_ms)
+
+
+def _fastest_pair(partials, combines) -> list[Result] | None:
+    """``[partial, combine]`` with the lowest total latency among the pairs whose boundary
+    signatures are equal, or None when no partial matches any combine.
+
+    The combine of a factor is searched once and shared by every split graph of the program,
+    so the fastest partial and the fastest combine need not come from the same cut. Each is
+    validated alone, on its own random inputs: only the boundary records can tell that a
+    partial writes what a combine reads. Plans without records all compare equal (None),
+    which is the pairing there was before the records.
+    """
+    from .kernel import boundary_of
+
+    signatures: dict[int, object] = {}  # plans of one lowered graph share the answer
+
+    def signature(result):
+        graph = getattr(getattr(result.plan, "tile", None), "flat_graph", None)
+        if id(graph) not in signatures:
+            signatures[id(graph)] = boundary_of(result.plan)
+        return signatures[id(graph)]
+
+    sides: dict[object, dict[str, list[Result]]] = {}
+    for role, results in (("partial", partials), ("combine", combines)):
+        for r in results:
+            sides.setdefault(signature(r), {}).setdefault(role, []).append(r)
+    pairs = [[_fastest(side["partial"]), _fastest(side["combine"])]
+             for side in sides.values() if len(side) == 2]
+    return min(pairs, key=lambda pair: sum(m.latency_ms for m in pair), default=None)
 
 
 def _hist(counter) -> str:

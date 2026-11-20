@@ -45,8 +45,12 @@ class BuiltKernel:
         return [p for p in self.params if p.role == "output"]
 
     @classmethod
-    def from_plan(cls, plan, source: str, signature=None) -> "BuiltKernel":
+    def from_plan(cls, plan, source: str, signature=None, stored_layouts=None) -> "BuiltKernel":
+        """``stored_layouts`` (``CandidateResult.stored_layouts``) gives the outputs the dims
+        the kernel declares; without it they keep the lowered graph's logical dims."""
         params, out_idx, dyn = signature or _signature(plan.tile.flat_graph)
+        if stored_layouts is not None:
+            params = _stored_output_dims(params, stored_layouts)
         return cls(source, ENTRY, params, out_idx, pass_configs_of(source), dyn, plan)
 
     def to_dict(self) -> dict:
@@ -109,8 +113,25 @@ def _signature(graph):
     return params, tuple(graph_out_indices(graph)), dyn
 
 
+def _stored_output_dims(params, stored_layouts):
+    """``params`` with each output's dims as the kernel stores them (one layout per output,
+    in order): the signature of a lowered graph has them in the graph's logical layout."""
+    layouts = list(stored_layouts)
+    if len(layouts) != sum(p.role == "output" for p in params):
+        raise ValueError(f"{len(layouts)} stored layouts for the outputs of "
+                         f"{[p.name for p in params if p.role == 'output']}")
+    out = []
+    for p in params:
+        if p.role == "output":
+            axes, pad = layouts.pop(0)
+            p = KernelParam(p.name, p.dtype, tuple(p.dims[a] for a in axes) + (1,) * pad, p.role)
+        out.append(p)
+    return tuple(out)
+
+
 def built_kernels(plans: Sequence[Plan], runs) -> list[BuiltKernel | None]:
-    """A ``BuiltKernel`` per run that produced source (signatures shared per lowered graph)."""
+    """A ``BuiltKernel`` per run that produced source (signatures shared per lowered graph;
+    the output dims are each candidate's own, since tilings store outputs differently)."""
     sigs: dict[int, tuple] = {}
     out = []
     for plan, run in zip(plans, runs):
@@ -120,7 +141,8 @@ def built_kernels(plans: Sequence[Plan], runs) -> list[BuiltKernel | None]:
         graph = plan.tile.flat_graph
         if id(graph) not in sigs:
             sigs[id(graph)] = _signature(graph)
-        out.append(BuiltKernel.from_plan(plan, run.code, sigs[id(graph)]))
+        out.append(BuiltKernel.from_plan(plan, run.code, sigs[id(graph)],
+                                         getattr(run, "stored_layouts", None)))
     return out
 
 
