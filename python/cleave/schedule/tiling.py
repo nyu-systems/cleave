@@ -1022,4 +1022,10 @@ def apply_tiling(cand: List) -> List[Graph]:
             tile_size=tile_size,
         )
 
+    if any(getattr(n, "stabilize", None) is not None for n in ordered_nodes):
+        # A softmax exp the scale analysis marked gets its max here, where the tiers are
+        # final. Lazy: the pass is not even imported for a graph without one.
+        from .stabilize import stabilize
+
+        return stabilize(graphs["main"])
     return graphs["main"]
