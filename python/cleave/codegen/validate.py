@@ -34,9 +34,10 @@ class GraphValidator:
             if isinstance(arg, OutputNode):
                 seen_output = True
             elif graph.scalar_params:
-                # Only load-bearing when scalars are emitted at the input/output boundary;
-                # `annotate_args` appends in topological order, so a legitimate
-                # multi-output graph can interleave and must not be rejected for it.
+                # Only load-bearing when scalars are emitted at the input/output boundary.
+                # `annotate_args` puts a main graph's outputs last; `args` filled any other
+                # way (a hand-built graph launched with an explicit `out_idx`) may still
+                # interleave and is not rejected for it.
                 assert not seen_output, (
                     f"{where}: input {arg.name!r} comes after an output in `args`. The "
                     "emitted signature keeps this order, and scalar params are inserted "
