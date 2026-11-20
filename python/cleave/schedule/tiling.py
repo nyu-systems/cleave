@@ -10,6 +10,7 @@ from ..ir.graph import (
     GraphNode,
     PlaceHolderNode,
     Iterator,
+    TensorOp,
     ViewOpNode,
 )
 from ..ir.ops import ReduceSum
@@ -24,6 +25,7 @@ from ..ir.graph_utils import (
     gather_all_nodes,
     find_topo_sort,
     clone_graph,
+    graph_tiers,
     lock_graph,
     unlock_graph,
 )
@@ -676,6 +678,32 @@ def _pin_absorbed_reduction_axes(ordered_nodes, rstep_map, tile_map, itile_map):
     return itile_map
 
 
+def _refuse_per_iteration_values_read_outside(main: Graph):
+    """Refuse a loop whose per-iteration value is also read by a node outside the loop.
+
+    A reduction that iterates takes its ancestors into its loop. An ancestor that has a
+    second reader which did not come along -- ``exp`` under a looped row sum, also read by
+    the ``div`` that normalizes it -- then exists once per iteration, and only as that
+    iteration's slice: the reader outside has nothing to read. Only an accumulator leaves a
+    loop. Checked once every merge is done, because a later reduction may still take the
+    reader into the loop.
+    """
+    for tier, owner in graph_tiers(main):
+        if owner is None:
+            continue
+        inside = {id(n) for n in tier.nodes}
+        carried = {id(n) for n in tier.accum_nodes}
+        for node in tier.nodes:
+            if not isinstance(node, TensorOp) or id(node) in carried:
+                continue
+            for edge in node.outputs:
+                if id(edge.dst_node) not in inside:
+                    raise ScheduleRejected(
+                        f"{node.name} is computed per iteration of {owner.name} but also "
+                        f"read by {edge.dst_node.name} outside it"
+                    )
+
+
 def apply_tiling(cand: List) -> List[Graph]:
     output_nodes = [n for n in cand.flat_graph.nodes if n.is_output()]
     output_node = _select_canonical_output_node(output_nodes)
@@ -870,6 +898,7 @@ def apply_tiling(cand: List) -> List[Graph]:
                 parent_graph_name,
             )
             _normalize_inner_reduction_axes(graph_node, itile_map)
+    _refuse_per_iteration_values_read_outside(graphs["main"])
     lock_graph(graphs["main"])  # graph structure is fixed after this point
 
     graphs["main"].nodes = find_topo_sort(main_output_nodes)
