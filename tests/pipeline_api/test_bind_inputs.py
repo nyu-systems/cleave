@@ -173,3 +173,62 @@ def test_graphs_without_the_record_bind_by_shape_or_not_at_all():
         for n in phs:
             del n.input_index
         assert bind_inputs(ir, prog) == (want if bound else None)
+
+
+def rowsum_by_column(x: cl.Tensor["R", "C"], y: cl.Tensor["R", "ONE"]):
+    """An input written in keepdim form next to a reduced value: the Div keeps the shape
+    of its first operand, ``(R,)``, and lowering declares ``y`` the way the Div reads it."""
+    return cl.sum(x, -1, keepdim=True) / y
+
+
+def rowsum_by_column3(x: cl.Tensor["B", "R", "C"], y: cl.Tensor["B", "R", "ONE"]):
+    return cl.sum(x, -1, keepdim=True) * y
+
+
+KEEPDIM = [(rowsum_by_column, dict(R=64, C=128, ONE=1), (64,)),
+           (rowsum_by_column3, dict(B=4, R=64, C=128, ONE=1), (4, 64))]
+
+
+@pytest.mark.parametrize("fn, sizes, declared", KEEPDIM, ids=[fn.__name__ for fn, *_ in KEEPDIM])
+def test_input_declared_without_its_unit_axis_is_bound(fn, sizes, declared):
+    """``bind_inputs`` compared shapes exactly and returned None for such a graph: every
+    plan of it built (13 of 16 lower) into a Kernel that could not be called."""
+    prog = trace(fn, sizes, cl.f32)
+    (graph,) = GraphSet.identity(prog)
+    (ir,) = lower(graph)
+    phs = {n.input_index: n for n in ir.nodes if isinstance(n, PlaceHolderNode)}
+    # The case: the graph declares ``y`` without the unit axis the program gives it.
+    assert tuple(prog.inputs[1].shape) == declared + (1,)
+    assert tuple(int(s) for s in phs[1].get_shape(0)) == declared
+
+    names = bind_inputs(ir, prog)
+    assert names == (phs[0].name, phs[1].name)
+
+    # ... and the bound Kernel computes the program on the program's own inputs.
+    plan = Plan(graph.index, "solo", "main", _Tile(ir), "g0 solo main #0", 0, None, graph, names)
+    stages, problem = stages_for([(plan, None)], prog)
+    assert problem is None
+    assert [(p.source, p.index) for p in stages[0].params] == [
+        ("input", n.input_index) for n in placeholder_order(ir)]
+    ins = _inputs(prog)
+    (got,) = _call(stages, (ir,), ins)
+    (want,) = prog.reference(*ins)
+    assert got.numel() == want.numel()
+    torch.testing.assert_close(got.reshape(want.shape), want, rtol=1e-5, atol=1e-6)
+
+
+def test_a_recorded_position_is_only_followed_where_the_elements_line_up():
+    """The record binds layouts that differ by unit axes, nothing else: two inputs of one
+    element count and different extents are not taken for each other."""
+    def product(a: cl.Tensor["R", "C"], w: cl.Tensor["C", "R"]):
+        return a @ w
+
+    prog = trace(product, dict(R=4, C=8), cl.f32)
+    (graph,) = GraphSet.identity(prog)
+    (ir,) = lower(graph)
+    want = bind_inputs(ir, prog)
+    phs = {n.input_index: n for n in ir.nodes if isinstance(n, PlaceHolderNode)}
+    assert want == (phs[0].name, phs[1].name)
+    # A wrong record: (4, 8) and (8, 4) hold 32 elements each. The unique shapes decide.
+    phs[0].input_index, phs[1].input_index = 1, 0
+    assert bind_inputs(ir, prog) == want

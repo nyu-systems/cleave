@@ -143,6 +143,12 @@ def bind_inputs(ir_graph, program) -> tuple[str, ...] | None:
     structure declares its inputs in the program's order). ``ir_graph.nodes`` is a
     topological order, so two inputs of one shape may come the other way round there;
     a graph without the record is only bound where the shapes leave no choice.
+
+    A recorded input is bound when the graph declares it with the program's shape give
+    or take unit axes: lowering declares an input written in keepdim form next to a
+    reduced value (``rowsum(x) / y`` with ``y`` of shape ``(R, 1)``) the way its consumer
+    reads it, ``(R,)``. Those are the same elements in the same order, and
+    ``Kernel.__call__`` views each input as its placeholder's shape.
     """
     from ..ir.graph import PlaceHolderNode
 
@@ -155,7 +161,8 @@ def bind_inputs(ir_graph, program) -> tuple[str, ...] | None:
     declared = [getattr(n, "input_index", None) for n in phs]
     if None not in declared and sorted(declared) == list(range(len(phs))):
         phs = [n for _, n in sorted(zip(declared, phs), key=lambda pair: pair[0])]
-        if [_shape(n) for n in phs] == want:
+        if all(_without_units(_shape(n)) == _without_units(shape)
+               for n, shape in zip(phs, want)):
             return tuple(n.name for n in phs)
     ph_shapes = [_shape(n) for n in phs]
     taken, names = set(), []
@@ -170,6 +177,12 @@ def bind_inputs(ir_graph, program) -> tuple[str, ...] | None:
 
 def _shape(node) -> tuple[int, ...]:
     return tuple(int(s) for s in node.get_shape(0))
+
+
+def _without_units(shape) -> tuple[int, ...]:
+    """``shape`` without its unit axes: equal for two layouts of the same elements in the
+    same order."""
+    return tuple(s for s in shape if s != 1)
 
 
 def describe_tile(t) -> str:
