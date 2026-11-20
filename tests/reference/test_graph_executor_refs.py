@@ -7,11 +7,17 @@ tvm = pytest.importorskip("tvm")
 from cleave.ir.graph import Graph, OutputNode, PlaceHolderNode
 from cleave.ir.ops import (
     Accumulate,
+    CausalMaskedScore,
     Copy,
     Div,
+    Exp2,
     Log2,
+    Lse2,
     MaskedDiv,
+    MaskedExp,
     MaskedLog2,
+    MaskedLse2,
+    MaskedScore,
     wire_input,
 )
 from cleave.ir.graph_utils import find_topo_sort, gather_all_nodes
@@ -72,3 +78,45 @@ def test_masked_div_is_refused_not_unmasked():
 def test_masked_log2_is_refused_not_plain_log2():
     with pytest.raises(NotImplementedError, match="MaskedLog2"):
         _run(MaskedLog2(SHAPE), _rand(positive=True))
+
+
+def test_exp2():
+    x = _rand()
+    torch.testing.assert_close(_run(Exp2(SHAPE), x), torch.exp2(x))
+
+
+def test_lse2_is_the_log2_of_the_first_operand_plus_the_second():
+    """``log2(l) + m``: with ``l = sum exp2(s - m)`` this is the base-2 log-sum-exp of ``s``."""
+    ln2 = 0.6931471805599453
+    scores = _rand() * 40.0  # far apart: the plain sum of exp2 would overflow float32
+    m = scores.amax(dim=-1)
+    l = torch.exp2(scores - m[:, None]).sum(dim=-1)
+    out = _run(Lse2((SHAPE[0],)), l, m)
+    torch.testing.assert_close(out, torch.log2(l) + m)
+    # the same quantity by torch's own (max-subtracting) float32 logsumexp
+    stable = torch.logsumexp(scores * ln2, dim=-1) / ln2
+    torch.testing.assert_close(out, stable, rtol=1e-5, atol=1e-5)
+    # an empty row: l = 0 and the max still at its finite start value give -inf, not NaN
+    empty = _run(Lse2((2,)), torch.zeros(2), torch.full((2,), -3.4028234663852886e38))
+    assert torch.isneginf(empty).all()
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda: MaskedLse2((SHAPE[0],)),
+        lambda: MaskedScore(SHAPE),
+        lambda: CausalMaskedScore(SHAPE),
+        lambda: MaskedExp(SHAPE, None, shift=True),
+    ],
+    ids=["MaskedLse2", "MaskedScore", "CausalMaskedScore", "MaskedExp_shift"],
+)
+def test_masked_softmax_ops_are_refused_not_unmasked(build):
+    """Their semantics depend on schedule scalars (the mask, the runtime scale): the
+    executor refuses them rather than evaluating the unmasked stand-in."""
+    node = build()
+    inputs = [torch.rand(tuple(int(d) for d in e.src_node.get_shape(0))) + 0.5
+              for e in node.inputs]
+    with pytest.raises(NotImplementedError, match=type(node).__name__):
+        _run(node, *inputs)
+
