@@ -143,7 +143,9 @@ def test_cache_schema_retires_kernels_built_before_a_scheduler_fix(monkeypatch):
     # reason (float16), or no tiling at all (float32).
     # 25: the softmax accept filter kept tilings the build then refused for a unit extent.
     # 26: a loop that loads no slice wide enough to transfer was pipelined.
-    assert cache.SCHEMA >= 27
+    # 27: a loop that loads a tensor tile off its 128-byte boundary was pipelined; such a
+    # kernel faulted on launch.
+    assert cache.SCHEMA >= 28
     key = _kernel_key(prog, *cfgs)
     monkeypatch.setattr(cache, "SCHEMA", 1)
     assert _kernel_key(prog, *cfgs) != key

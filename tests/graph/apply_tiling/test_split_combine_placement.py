@@ -25,6 +25,12 @@ One placement was left to TileLang's own limits: each sum in a loop of its own (
 below the split count). The vendored TileLang pipelines one loop per kernel -- the loop
 variable of a second ``T.Pipelined`` loop, and of one that loads nothing wide enough to
 transfer, is left behind outside the loop -- so the tiler emits those loops as plain ones.
+
+A third kind of loop lowered and then faulted on the GPU ("CUDA error: misaligned
+address"): one that transfers a slice which is not a whole number of 128-byte units and is
+not one run of consecutive elements (two partials of 8 or 16 float16 row sums). A pipeline
+keeps the slices of several iterations side by side, and such a slice is loaded as a tensor
+tile, which needs its destination on a 128-byte boundary. Those loops are plain ones too.
 """
 
 import re
@@ -152,18 +158,71 @@ def test_a_kernel_with_one_loop_keeps_its_pipeline(placement):
     assert _loops(code) == [(name, "Pipelined") for name in loops]
 
 
-@pytest.mark.parametrize("rows, kind", [(2, "serial"), (4, "serial"), (8, "Pipelined"),
+@pytest.mark.parametrize("rows, kind", [(2, "serial"), (4, "serial"), (32, "Pipelined"),
                                         (128, "Pipelined")])
 def test_a_loop_with_nothing_to_transfer_is_not_pipelined(rows, kind):
     """Only the row sum looped, on blocks of a few rows: each iteration loads two partials
     of ``rows`` float16 row sums. Under 16 bytes a row, TileLang has nothing to transfer
     in a pipeline and loses the loop variable (2 of this combine's tilings at split 4, 1 of
     the RMSNorm combine's, 24 of each matmul split-K combine's); such a loop is emitted as
-    a plain one. From 16 bytes on it is pipelined as ever."""
+    a plain one. Two partials of 32 row sums and more are pipelined as ever."""
     steps, _ = PLACEMENTS["rowsum_looped"]
     code = build_candidate_code(_candidate(*steps, rows=rows))
     assert _loops(code) == [("GraphNode_rowsum_combine_0", kind)]
     assert "main_kernel" in lower_to_cuda(code)
+
+
+# Where a tensor tile is loaded to in the buffer of a pipelined loop: stage ``k`` of it, at
+# ``k`` times the elements of one slice (``i0`` itself where no stage is used twice).
+_TILE_STAGE = re.compile(
+    r"tl::tma_load\(\w+_desc, mbarrier\[[^;]*?\], \(&\(\(\(half_t\*\)\w+\)"
+    r"\[\((?:\(\w+ % \d+\)|\w+) \* (\d+)\)\]\)\)")
+
+
+@pytest.mark.parametrize("placement", ["rowsum_looped", "one_loop_for_both"])
+@pytest.mark.parametrize("rows, kind", [(8, "serial"), (16, "serial"), (32, "Pipelined")])
+def test_a_loop_whose_slices_would_miss_their_boundary_is_not_pipelined(placement, rows, kind):
+    """Two partials of 8 or 16 float16 row sums are 32 or 64 bytes, cut out of rows of
+    4096: a tensor tile, loaded to stage ``k`` of the loop's buffer at ``k`` times that
+    size, off the 128-byte boundary such a load needs. The kernel lowered and faulted on
+    launch (4 of this combine's tilings at split 4, 3 of each matmul split-K combine's).
+    The loop is emitted as a plain one, which keeps a single slice at the start of its
+    buffer. From 128 bytes on -- two partials of 32 -- the stages are on the boundary and
+    the loop keeps its pipeline, and so does a loop that only loads wider slices."""
+    steps, _ = PLACEMENTS[placement]
+    code = build_candidate_code(_candidate(*steps, rows=rows))
+    assert _loops(code) == [("GraphNode_rowsum_combine_0", kind)]
+    stages = [2 * int(elements) for elements in _TILE_STAGE.findall(lower_to_cuda(code))]
+    # float16: the bytes between two stages of every tile the kernel still transfers
+    assert all(size % 128 == 0 for size in stages), stages
+    assert bool(stages) == (kind == "Pipelined")
+
+
+def test_a_slice_that_is_one_run_of_its_tensor_keeps_the_pipeline():
+    """The same 64 bytes as one run of consecutive elements -- two partials of 16 row sums
+    out of rows that are 16 long -- are loaded as a flat range, which only needs the 16
+    bytes every transferred slice is a multiple of. That loop stays pipelined."""
+    from cleave.schedule.tiling import _is_one_run
+
+    assert _is_one_run([1, 2, 16], [32, 4, 16]) and _is_one_run([1, 1, 8], [32, 4, 16])
+    assert _is_one_run([2, 4, 16], [32, 4, 16]) and not _is_one_run([1, 2, 8], [32, 4, 16])
+    assert not _is_one_run([2, 2, 16], [32, 4, 16])
+    code = build_candidate_code(_whole_rows_candidate())
+    assert _loops(code) == [("GraphNode_rowsum_combine_0", "Pipelined")]
+    cuda = lower_to_cuda(code)
+    assert not _TILE_STAGE.findall(cuda) and "tl::tma_load(" in cuda  # a flat range
+
+
+def _whole_rows_candidate():
+    """Only the row sum looped, on blocks that hold all 16 rows of a 16-row combine."""
+    graph = mha_split_combine_graph(32, SPLIT, 16, 64)
+    steps = {"value_combine_0": SPLIT, "rowsum_combine_0": 2}
+    rstep = {
+        node.name: {node.raxis[0].var.name: steps[node.name]} if node.name in steps else {}
+        for node in graph.nodes
+        if not node.is_placeholder() and not node.is_output()
+    }
+    return build_tiled_candidate(graph, [1, 16, 64], rstep)
 
 
 def test_one_loop_stays_pipelined_whatever_else_it_loads():
@@ -175,15 +234,30 @@ def test_one_loop_stays_pipelined_whatever_else_it_loads():
     assert "main_kernel" in lower_to_cuda(code)
 
 
-@pytest.mark.parametrize("case", ["two_loops", "two_loops_swapped", "four_rows", "two_rows"])
+@pytest.mark.parametrize("case", ["two_loops", "two_loops_swapped", "four_rows", "two_rows",
+                                  "eight_rows", "sixteen_rows", "eight_rows_one_loop",
+                                  "sixteen_rows_one_loop"])
 def test_a_split_combine_with_a_serial_loop_validates(case):
-    """GPU: the kernels that exist because a loop is emitted serially."""
+    """GPU: the kernels that exist because a loop is emitted serially. The last four
+    faulted on launch ("misaligned address") while their loop was pipelined."""
     cand = {
         "two_loops": lambda: _candidate(2, 4, split=8),
         "two_loops_swapped": lambda: _candidate(4, 2, split=8),
         "four_rows": lambda: _candidate(*PLACEMENTS["rowsum_looped"][0], rows=4),
         "two_rows": lambda: _candidate(*PLACEMENTS["rowsum_looped"][0], rows=2),
+        "eight_rows": lambda: _candidate(*PLACEMENTS["rowsum_looped"][0], rows=8),
+        "sixteen_rows": lambda: _candidate(*PLACEMENTS["rowsum_looped"][0], rows=16),
+        "eight_rows_one_loop": lambda: _candidate(*PLACEMENTS["one_loop_for_both"][0], rows=8),
+        "sixteen_rows_one_loop": lambda: _candidate(*PLACEMENTS["one_loop_for_both"][0],
+                                                    rows=16),
     }[case]()
+    assert_candidate_compiles_and_runs(cand, tolerance_for(mha_split_combine_graph))
+
+
+def test_a_pipelined_loop_over_flat_ranges_of_64_bytes_validates():
+    """GPU: what the third case leaves alone. Slices of 64 bytes that are one run of their
+    tensor stay in a pipeline, two stages 64 bytes apart, and the kernel is right."""
+    cand = _whole_rows_candidate()
     assert_candidate_compiles_and_runs(cand, tolerance_for(mha_split_combine_graph))
 
 

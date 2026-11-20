@@ -65,7 +65,9 @@ from pathlib import Path
 #     top-k of a program with a marked softmax holds no tiling the build refuses.
 # 27: a loop that loads no slice wide enough to transfer is a plain loop too: the split
 #     combines' tilings on a few rows or columns have kernels.
-SCHEMA = 27
+# 28: a loop whose slices a pipeline would load off their 128-byte boundary is a plain loop:
+#     the split combines' tilings on 8 or 16 rows (they faulted on launch) have kernels.
+SCHEMA = 28
 # What "validated" means for a saved kernel. A kernel-cache hit returns without validating,
 # so bump this whenever the comparison or its inputs change: saved kernels are then rebuilt.
 # (The inputs include the adversarial cases a program with an exact softmax is held to,

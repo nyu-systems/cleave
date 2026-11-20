@@ -994,6 +994,18 @@ def _refuse_loops_that_miscount_their_tiles(main: Graph):
 
 # The narrowest innermost extent, in bytes, of a slice TileLang transfers in a pipeline.
 _PIPELINED_SLICE_BYTES = 16
+# The boundary, in bytes, a bulk tensor transfer needs its destination on.
+_TRANSFER_ALIGNMENT_BYTES = 128
+
+
+def _is_one_run(region, shape) -> bool:
+    """Whether ``region`` (an extent per dim) of a row-major tensor of ``shape`` is one run
+    of consecutive elements: whole dims behind at most one partial dim, single elements in
+    front of it."""
+    inner = len(shape)
+    while inner > 0 and int(region[inner - 1]) == int(shape[inner - 1]):
+        inner -= 1
+    return all(int(extent) == 1 for extent in region[: max(inner - 1, 0)])
 
 
 def _pipeline_one_loop(main: Graph, tile_map: dict, itile_map: dict, top_bind_node: dict):
@@ -1013,13 +1025,28 @@ def _pipeline_one_loop(main: Graph, tile_map: dict, itile_map: dict, top_bind_no
       combine with only that sum looped; one, two or four columns of a matmul's
       partials). A loop that also loads one wider slice lowers as it is.
 
-    Both lower as a plain loop, which computes the same thing: a loop with nothing to
-    transfer has nothing to overlap. Of two loops the first keeps its pipeline (with the
-    first serial and the second pipelined TileLang lowers some kernels and not others).
-    ``main.nodes`` is in emission order.
+    In a third case the kernel lowers and then faults on the device ("CUDA error:
+    misaligned address"):
+
+    * the loop transfers a slice that is not a whole number of 128-byte units and is not
+      one run of consecutive elements of its tensor (two partials of 8 or 16 float16 row
+      sums out of a longer row). A pipeline keeps several iterations' slices in one
+      buffer, the slice of stage ``k`` at ``k`` times the slice's size, and a slice that
+      is not one run is loaded as a tensor tile, which needs its destination on a
+      128-byte boundary: stage 1 of a 32- or 64-byte slice is not on one. (A slice that
+      is one run is loaded as a flat range, for which the 16 bytes every transferred
+      slice is a multiple of are enough.)
+
+    All three lower as a plain loop, which computes the same thing: a loop with nothing to
+    transfer has nothing to overlap, and a plain loop keeps one slice at the start of its
+    buffer. Of two loops the first keeps its pipeline (with the first serial and the
+    second pipelined TileLang lowers some kernels and not others). ``main.nodes`` is in
+    emission order.
     """
 
-    def loads_a_slice_to_transfer(tier: Graph) -> bool:
+    def slices_loaded(tier: Graph):
+        """``(tensor, extents, bytes of an element)`` of every region the loop loads per
+        iteration."""
         for node in tier.nodes:
             if not isinstance(node, PlaceHolderNode) or node.name not in top_bind_node:
                 continue
@@ -1029,15 +1056,26 @@ def _pipeline_one_loop(main: Graph, tile_map: dict, itile_map: dict, top_bind_no
                 continue
             if not any(int(b) // int(t) > 1 for b, t in zip(block, step)):
                 continue  # handed down whole: the parent loads it once
-            if int(step[-1]) * ((int(bound.get_dtype(0).bits) + 7) // 8) >= _PIPELINED_SLICE_BYTES:
-                return True
-        return False
+            yield bound, [int(t) for t in step], (int(bound.get_dtype(0).bits) + 7) // 8
+
+    def lands_off_its_boundary(bound, step, width) -> bool:
+        """A slice loaded as a tensor tile whose later stages miss the boundary."""
+        if step[-1] * width < _PIPELINED_SLICE_BYTES or step[-1] * width % 16:
+            return False  # not transferred: copied element by element
+        size = width
+        for extent in step:
+            size *= extent
+        shape = [int(extent) for extent in bound.get_shape(0)]
+        return size % _TRANSFER_ALIGNMENT_BYTES != 0 and not (
+            len(shape) == len(step) and _is_one_run(step, shape))
 
     pipelined = False
     for tier, owner in graph_tiers(main):
         if owner is None or tier.loop_kind != "pipelined":
             continue
-        if pipelined or not loads_a_slice_to_transfer(tier):
+        slices = list(slices_loaded(tier))
+        transfers = any(step[-1] * width >= _PIPELINED_SLICE_BYTES for _, step, width in slices)
+        if pipelined or not transfers or any(lands_off_its_boundary(*s) for s in slices):
             tier.loop_kind = "serial"
         pipelined = True  # a later loop is not the first, whatever this one became
 
