@@ -215,6 +215,10 @@ class ReduceSum(ComputeOpNode):
         self.axis_arg = axis
         self.axis = axis if axis >= 0 else len(dims) + axis
         assert 0 <= self.axis < len(dims), f"Invalid reduction axis {axis} for {dims}"
+        # The axis as built, over the node's full ``dims``. ``axis`` / ``axis_arg`` are
+        # what the macro emits, and the tiler points them at the tile the input is stored
+        # in (unit extents squeezed); it derives them from these two, which never change.
+        self.flat_axis, self.flat_axis_arg = self.axis, axis
         self.output_dims = dims[: self.axis] + dims[self.axis + 1 :]
         input_batch_flags = [False] * len(dims)
         for i in range(max(0, len(dims) - 2)):

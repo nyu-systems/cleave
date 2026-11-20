@@ -565,36 +565,41 @@ def assign_tensor_map(
         )
 
 
+def _is_unit(extent) -> bool:
+    """Whether codegen squeezes ``extent`` out of a stored tile (its ``kept_extents``)."""
+    return isinstance(extent, int) and extent <= 1
+
+
+def _rebase_reduction_axis(node: ReduceSum, tile):
+    """Point the ``dim`` that ``node`` emits at its reduced axis in the stored input tile.
+
+    ``tile`` is the tile of the node's input over the node's full ``dims``. A kernel
+    stores a tile without its unit extents, so the reduced axis has as many dims in
+    front of it as ``tile`` has non-unit extents there; an axis given from the end is
+    kept in that form and counted from the end. The answer is derived from the axis the
+    node was built with (``flat_axis``), never from an earlier answer: a loop's nodes
+    are visited again on every merge into that loop.
+    """
+    axis = node.flat_axis
+    node.axis, node.axis_arg = axis, node.flat_axis_arg
+    if tile is None or len(tile) != len(node.dims) or _is_unit(tile[axis]):
+        # A unit extent on the reduced axis itself leaves the tile without that axis.
+        return
+    if node.flat_axis_arg < 0:
+        node.axis_arg = -1 - sum(1 for extent in tile[axis + 1 :] if not _is_unit(extent))
+    else:
+        node.axis = node.axis_arg = sum(1 for extent in tile[:axis] if not _is_unit(extent))
+
+
 def _normalize_inner_reduction_axes(graph_node: GraphNode, itile_map: dict):
+    """Rebase the reduction axes of a loop tier onto the iteration tiles they read."""
     for node in graph_node.graph.nodes:
-        if (
-            not isinstance(node, ReduceSum)
-            or len(node.inputs) != 1
-            # Negative axes remain stable when leading batch dims are dropped.
-            # Positive axes need to be rebased onto the visible tiled input rank.
-            or getattr(node, "axis_arg", -1) < 0
-        ):
+        if not isinstance(node, ReduceSum) or len(node.inputs) != 1:
             continue
-
-        input_edge = node.inputs[0]
-        src_node = input_edge.src_node
+        src_node = node.inputs[0].src_node
         bind_node = graph_node.graph.binding.get(src_node.name, src_node)
-        full_tile = itile_map.get(bind_node.name)
-        batch_flags = list(getattr(src_node, "is_batch_dim", []) or [])
-        if full_tile is None or len(batch_flags) != len(full_tile):
-            continue
-
-        visible_axes = [
-            axis
-            for axis, (is_batch_dim, tile_extent) in enumerate(zip(batch_flags, full_tile))
-            if not is_batch_dim or tile_extent > 1
-        ]
-        if node.axis not in visible_axes:
-            continue
-
-        visible_axis = visible_axes.index(node.axis)
-        node.axis = visible_axis
-        node.axis_arg = visible_axis
+        tile = itile_map.get(bind_node.name)
+        _rebase_reduction_axis(node, None if tile is None else list(tile))
 
 
 def _iterative_reductions(nodes, rstep_map):
