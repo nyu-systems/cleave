@@ -6,7 +6,7 @@
    "dtype": "float16",
    "rel": 0.0009756097570061684,
    "seeds": 3,
-   "validated": 253
+   "validated": 387
   },
   {
    "abs": 0.001953125,
@@ -14,7 +14,7 @@
    "dtype": "float16",
    "rel": 0.0015936255222186446,
    "seeds": 3,
-   "validated": 235
+   "validated": 360
   }
  ],
  "demo:gqa_prefill": [
@@ -74,15 +74,15 @@
    "dtype": "float16",
    "rel": 0.0009551098337396979,
    "seeds": 3,
-   "validated": 67
+   "validated": 138
   },
   {
-   "abs": null,
+   "abs": 0.00048828125,
    "absolute": false,
    "dtype": "float16",
-   "rel": null,
+   "rel": 0.0011370097054168582,
    "seeds": 3,
-   "validated": 55
+   "validated": 120
   }
  ],
  "demo:mha_decode_exact": [
@@ -132,7 +132,7 @@
    "dtype": "float16",
    "rel": 0.0009765625,
    "seeds": 3,
-   "validated": 324
+   "validated": 387
   },
   {
    "abs": 0.001953125,
@@ -140,7 +140,7 @@
    "dtype": "float16",
    "rel": 0.0013422819320112467,
    "seeds": 3,
-   "validated": 306
+   "validated": 360
   }
  ],
  "demo:mqa_prefill": [
