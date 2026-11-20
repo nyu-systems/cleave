@@ -150,13 +150,13 @@ def test_absorbed_reduction_keeps_its_whole_axis(name, unformatted):
 
 
 @pytest.mark.parametrize(
-    "K",
+    ("K", "proposed"),
     [
-        pytest.param(4096, id="K4096_kernel_over_the_cap"),
-        pytest.param(1024, id="K1024_kernel_fits"),
+        pytest.param(4096, 130, id="K4096_kernel_over_the_cap"),
+        pytest.param(1024, 146, id="K1024_kernel_fits"),
     ],
 )
-def test_refuses_to_step_an_axis_that_an_absorbed_reduction_holds_whole(K):
+def test_refuses_to_step_an_axis_that_an_absorbed_reduction_holds_whole(K, proposed):
     """LoRA ``X @ W + (X @ A) @ B`` with all three matmuls stepped below their extents.
 
     ``X @ A`` is absorbed into the loop of ``(X @ A) @ B``, which walks the rank, so it needs
@@ -169,11 +169,18 @@ def test_refuses_to_step_an_axis_that_an_absorbed_reduction_holds_whole(K):
     126 of 256 candidates at ``K = 4096``.) At ``K = 4096`` the kernel that holds ``K``
     whole would not fit the shared-memory cap either; at ``K = 1024`` it would, and the
     shared axis is the only reason.
+
+    What is proposed is every candidate behind those step maps, and their number is
+    pinned: the search has to walk *through* a step map that has no kernel to reach them
+    (the down projection stops being absorbed once the up projection is at its extent),
+    so it prunes on the steps at face value and only what it emits is rated as its kernel.
+    Pruning the walk on the kernel's rating proposes nothing at ``K = 4096`` and 96 of
+    the 146 at ``K = 1024``.
     """
     # Rank 128: at the end2end case's rank of 16 the up projection never iterates.
     policy = _policy(g.lora_graph(16, 4096, K, 128), False)
     candidates = policy.emit_config(1000)
-    assert candidates, "nothing is proposed; the case tests nothing"
+    assert len(candidates) == proposed
     n_built = 0
     for cand in candidates:
         label = f"tile={list(cand.output_tile)} rstep={cand.rstep_map}"
@@ -282,12 +289,17 @@ def test_a_candidate_whose_kernel_does_not_fit_is_not_proposed():
         ),
     ],
 )
-def test_rating_the_kernel_leaves_the_walk_alone(build, dims, expected):
-    """The search still walks through every step map, absorbed or not.
+def test_an_ancestor_reduction_may_still_loop_on_its_own(build, dims, expected):
+    """An absorbed reduction is held whole by the tiler, per tiling; the policy does not
+    pin every reduction that *could* be absorbed to its extent.
 
-    A step map with an absorbed reduction is the way to the ones behind it: ``mma_0``
-    stops being absorbed once ``mma_1`` reaches its extent. Rating a state as its kernel
-    must not prune the walk there, or those candidates are never reached.
+    ``mma_0`` is absorbed only while ``mma_1`` iterates too. Pinning it for the whole
+    search (in ``_full_extent_reduction_axis_ids``) would lose the family in which it
+    loops on its own, ``(True, False)``, and with it every LoRA candidate.
+
+    This is not the guard for where the search walk is pruned: these counts do not move
+    when the walk is pruned on the kernel's rating. The LoRA counts pinned in
+    ``test_refuses_to_step_an_axis_that_an_absorbed_reduction_holds_whole`` do.
     """
     policy = _policy(build(*dims), False)
     found = {}
@@ -306,3 +318,34 @@ def test_lora_proposes_what_it_did():
     candidates = _policy(g.lora_graph(16, 4096, 4096, 16), False).emit_config(1000)
     assert len(candidates) == 720
     assert not any(_absorbed(cand) for cand in candidates)
+
+
+@pytest.mark.parametrize(
+    ("build", "dims"),
+    [
+        # Without the memo: 31 step maps rated three times (the kernel of two absorbed
+        # states each), 166 ratings in all instead of 135.
+        pytest.param(g.mla_prefill_bhsd_graph, (1, 128, 4096, 4096, 192, 128), id="mla_prefill_bhsd"),
+        # ... and 12 step maps rated six times, 232 ratings instead of 184.
+        pytest.param(g.lora_graph, (16, 4096, 1024, 128), id="lora_rank128"),
+    ],
+)
+def test_the_search_rates_a_kernel_once(build, dims):
+    """Rating a candidate as its kernel costs one rating per kernel, not one per candidate.
+
+    Every state of the walk that differs only in the steps of its absorbed reductions has
+    the same kernel. A step map is therefore rated at most twice in one search: as a state
+    of the walk, and as the kernel of the states that map to it. (Rating it once per such
+    state doubled the search time of the attention graphs.)
+    """
+    policy = _policy(build(*dims), False)
+    rate, rated = policy._rate_steps, {}
+
+    def counting(output_tile, rstep_map):
+        key = (tuple(output_tile), tuple((n.name, tuple(r.items())) for n, r in rstep_map.items()))
+        rated[key] = rated.get(key, 0) + 1
+        return rate(output_tile, rstep_map)
+
+    policy._rate_steps = counting
+    assert policy.emit_config(100000)
+    assert max(rated.values()) == 2, sorted(set(rated.values()))

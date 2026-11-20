@@ -11,7 +11,12 @@ from ...ir.analysis import (
     build_output_axis_provenance,
     build_reduction_axis_provenance,
 )
-from ..tiling import absorbed_axis_conflict, absorbed_reductions, scheduled_reductions
+from ..tiling import (
+    absorbed_axis_conflict,
+    absorbed_reductions,
+    reduction_ancestors,
+    scheduled_reductions,
+)
 
 import copy
 import numpy as np
@@ -62,11 +67,15 @@ class DefaultPolicy:
             self._full_extent_reduction_axis_ids.setdefault(desc, set()).update(
                 desc_ax for (_anc_ax, desc_ax) in axis_pairs
             )
+        # Asked for every pair of reductions of every step map the search rates (see
+        # _kernel_rstep_map); it does not depend on the steps, so it is built once.
+        self._reduction_ancestors = reduction_ancestors(self.ordered_nodes)
         self.compatible_reduction_groups = self._get_compatible_reduction_groups()
         self.force_fusion = force_fusion
         self.flat_graph = flat_graph
         self.canonical_output_node = self._select_canonical_output_node()
         self._scheduled_reductions = None  # built on first use, see _absorbed_conflict
+        self._kernel_ratings = {}  # (output tile, kernel steps) -> its rating, see _rate_kernel
 
     def _select_canonical_output_node(self):
         if not self.output_nodes:
@@ -762,7 +771,9 @@ class DefaultPolicy:
         whatever step the map gives it (``schedule.tiling.absorbed_reductions``). Returns
         ``rstep_map`` itself when nothing is absorbed.
         """
-        absorbed = absorbed_reductions(self.ordered_nodes, rstep_map)
+        absorbed = absorbed_reductions(
+            self.ordered_nodes, rstep_map, self._reduction_ancestors
+        )
         if not absorbed:
             return rstep_map
         kernel_rstep_map = dict(rstep_map)
@@ -775,19 +786,35 @@ class DefaultPolicy:
     def _absorbed_conflict(self, rstep_map):
         """Why ``apply_tiling`` would refuse ``rstep_map`` over an absorbed axis, or None."""
         if self._scheduled_reductions is None:
-            own = (self.ordered_nodes, self.reduction_axis_provenance)
-            if self.flat_graph is None:
-                self._scheduled_reductions = own
-            else:
+            scheduled = (self.ordered_nodes, self.reduction_axis_provenance)
+            if self.flat_graph is not None:
                 try:
                     # The provenance apply_tiling itself decides on (split views removed).
-                    self._scheduled_reductions = scheduled_reductions(self.flat_graph)
+                    scheduled = scheduled_reductions(self.flat_graph)
                 except NotImplementedError:
                     # A split apply_tiling cannot take apart: it refuses every candidate
                     # of this graph for that reason, whatever is answered here.
-                    self._scheduled_reductions = own
-        ordered_nodes, red_tokens = self._scheduled_reductions
-        return absorbed_axis_conflict(ordered_nodes, rstep_map, red_tokens)
+                    pass
+            self._scheduled_reductions = (*scheduled, reduction_ancestors(scheduled[0]))
+        ordered_nodes, red_tokens, ancestors = self._scheduled_reductions
+        return absorbed_axis_conflict(ordered_nodes, rstep_map, red_tokens, ancestors)
+
+    def _rate_kernel(self, output_tile, kernel_rstep_map):
+        """``_rate_steps`` of a kernel's own steps, rated once per search.
+
+        Every state of the walk that differs only in the steps of its absorbed
+        reductions has the same kernel, and a walk visits many of them.
+        """
+        key = (
+            tuple(output_tile),
+            tuple((k, tuple(v.items())) for k, v in kernel_rstep_map.items()),
+        )
+        kernel = self._kernel_ratings.get(key)
+        if kernel is None:
+            kernel = self._kernel_ratings[key] = self._rate_steps(
+                output_tile, kernel_rstep_map
+            )
+        return kernel
 
     def _as_candidate(self, state: TileDict) -> TileDict:
         """``state`` with the verdict of the kernel it generates.
@@ -803,7 +830,7 @@ class DefaultPolicy:
         kernel_rstep_map = self._kernel_rstep_map(state.rstep_map)
         if kernel_rstep_map is state.rstep_map:
             return state
-        kernel = self._rate_steps(state.output_tile, kernel_rstep_map)
+        kernel = self._rate_kernel(state.output_tile, kernel_rstep_map)
         cand = copy.copy(state)
         cand.traffic, cand.smem_cost = kernel.traffic, kernel.smem_cost
         cand.cached_tensors_map = kernel.cached_tensors_map
@@ -1024,11 +1051,9 @@ class DefaultPolicy:
         return candidates
 
     def _get_compatible_reduction_groups(self):
-        from ...ir.graph_utils import get_op_ancestors
-
         reduction_nodes = [n for n in self.ordered_nodes if n.raxis]
 
-        memo_ancestors = {n: set(get_op_ancestors(n)) for n in reduction_nodes}
+        memo_ancestors = self._reduction_ancestors
 
         def get_descendant_reduction_nodes(node):
             from ...ir.graph_utils import gather_all_nodes

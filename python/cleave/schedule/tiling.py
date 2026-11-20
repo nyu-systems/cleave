@@ -635,7 +635,18 @@ def _iterative_reductions(nodes, rstep_map):
     ]
 
 
-def absorbed_reductions(nodes, rstep_map):
+def reduction_ancestors(nodes):
+    """``{reduction: its op ancestors}`` for the reductions of ``nodes``.
+
+    What ``absorbed_reductions`` asks of the graph. It does not depend on the steps, so
+    a caller that rates many step maps of one graph (the policy's search walk) builds it
+    once and passes it in, instead of walking the graph for every pair of reductions of
+    every step map.
+    """
+    return {n: frozenset(get_op_ancestors(n)) for n in nodes if len(n.raxis) > 0}
+
+
+def absorbed_reductions(nodes, rstep_map, ancestors=None):
     """The reductions of ``nodes`` that ``apply_tiling`` schedules inside another's loop.
 
     A reduction that iterates (step < extent) while one of its descendant reductions
@@ -644,12 +655,18 @@ def absorbed_reductions(nodes, rstep_map):
     axis; it cannot also advance the absorbed reduction's axis. An absorbed reduction
     is therefore computed over its whole axis in every iteration, whatever its step:
     the tiling is the kernel of the one that steps it at its extent.
+
+    ``ancestors`` is ``reduction_ancestors(nodes)`` when the caller already has it.
     """
     active = _iterative_reductions(nodes, rstep_map)
+    if len(active) < 2:
+        return []
+    if ancestors is None:
+        ancestors = reduction_ancestors(active)
     return [
         a
         for a in active
-        if any(r is not a and a in get_op_ancestors(r) for r in active)
+        if any(r is not a and a in ancestors[r] for r in active)
     ]
 
 
@@ -670,7 +687,7 @@ def scheduled_reductions(flat_graph):
     return ordered_nodes, build_reduction_axis_provenance(ordered_nodes, out_tokens)
 
 
-def _held_axis_tokens(ordered_nodes, rstep_map, red_tokens):
+def _held_axis_tokens(ordered_nodes, rstep_map, red_tokens, ancestors=None):
     """Provenance tokens of the axes that absorbed reductions hold whole.
 
     Raises ``ScheduleRejected`` for a tiling no loop can serve: one in which another
@@ -681,7 +698,7 @@ def _held_axis_tokens(ordered_nodes, rstep_map, red_tokens):
         tokens = red_tokens.get(node)
         return tokens[0] if tokens else set()
 
-    absorbed = absorbed_reductions(ordered_nodes, rstep_map)
+    absorbed = absorbed_reductions(ordered_nodes, rstep_map, ancestors)
     # These are refusals, not asserts: without them the tiling would be scheduled into
     # a kernel that reads the wrong slices, and ``python -O`` drops an assert.
     held = set()
@@ -703,13 +720,14 @@ def _held_axis_tokens(ordered_nodes, rstep_map, red_tokens):
     return held
 
 
-def absorbed_axis_conflict(ordered_nodes, rstep_map, red_tokens) -> Optional[str]:
+def absorbed_axis_conflict(ordered_nodes, rstep_map, red_tokens, ancestors=None) -> Optional[str]:
     """Why ``apply_tiling`` refuses ``rstep_map`` over its absorbed reductions, or ``None``.
 
-    ``ordered_nodes`` and ``red_tokens`` are those of ``scheduled_reductions``.
+    ``ordered_nodes`` and ``red_tokens`` are those of ``scheduled_reductions``;
+    ``ancestors`` is ``reduction_ancestors(ordered_nodes)`` when the caller has it.
     """
     try:
-        _held_axis_tokens(ordered_nodes, rstep_map, red_tokens)
+        _held_axis_tokens(ordered_nodes, rstep_map, red_tokens, ancestors)
     except ScheduleRejected as refusal:
         return str(refusal)
     return None
