@@ -1079,7 +1079,7 @@ def mha_split_partial_graph(B, H, SPLIT_K, S_Q, S_KV_PARTIAL, D):
     return gqa_split_partial_graph(B, H, H, SPLIT_K, S_Q, S_KV_PARTIAL, D)
 
 
-def mha_split_combine_graph(H_Q, SPLIT_K, S_Q, D):
+def mha_split_combine_graph(H_Q, SPLIT_K, S_Q, D, *, from_end=False):
     """Split-KV flash-attention combine. Kernel params: rowsum-partials
     ``PlaceHolder_A`` (H_Q,SPLIT_K,S_Q) and value-partials ``PlaceHolder_B``
     (H_Q,SPLIT_K,S_Q,D).
@@ -1087,17 +1087,20 @@ def mha_split_combine_graph(H_Q, SPLIT_K, S_Q, D):
     Sums the per-split rowsum and value partials over the split axis, then divides
     the combined value by the combined rowsum. Mirrors
     the ``mha_split_combine`` case of ``tests/schedule/end2end/test_end2end.py``.
+
+    ``from_end`` names the split axis of both sums from the end (``-2`` and ``-3``): the
+    same axis, which a hand-built graph is free to write that way.
     """
     rowsum_combine_0 = ReduceSum(
         (H_Q, SPLIT_K, S_Q),
-        axis=1,
+        axis=-2 if from_end else 1,
         dtype=DTYPE,
         out_dtype=ACCUM_DTYPE,
         name="rowsum_combine_0",
     )
     value_combine_0 = ReduceSum(
         (H_Q, SPLIT_K, S_Q, D),
-        axis=1,
+        axis=-3 if from_end else 1,
         dtype=DTYPE,
         out_dtype=ACCUM_DTYPE,
         name="value_combine_0",

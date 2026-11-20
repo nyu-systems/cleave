@@ -15,6 +15,11 @@ placement used to give a kernel -- both sums in one loop -- for two reasons:
 
 Both are fixed in codegen: the staging is asked for whatever the placement, and work that
 no loop reads is emitted behind the loops.
+
+The pass that asks for the staging also recognised the two sums by ``ReduceSum.axis == 0``,
+which is the place of the split axis in the stored tile only for an axis named from the
+front: named from the end (``axis=-2`` / ``-3``, the same axis) it stays the built axis, 1
+behind the head dim, and no placement of such a combine got the staging.
 """
 
 import re
@@ -27,6 +32,8 @@ pytest.importorskip("tvm")
 from cleave.codegen import passes
 from cleave.codegen.kernel import emission_order
 from cleave.ir.graph import GraphNode
+from cleave.ir.graph_utils import graph_tiers
+from cleave.ir.ops import ReduceSum
 from cleave.runtime.compile import build_candidate_code
 from cleave.schedule import apply_tiling
 
@@ -48,8 +55,8 @@ PLACEMENTS = {
 }
 
 
-def _candidate(value_step, rowsum_step, split=SPLIT):
-    graph = mha_split_combine_graph(32, split, 4096, 64)
+def _candidate(value_step, rowsum_step, split=SPLIT, from_end=False):
+    graph = mha_split_combine_graph(32, split, 4096, 64, from_end=from_end)
     steps = {"value_combine_0": value_step, "rowsum_combine_0": rowsum_step}
     rstep = {
         node.name: {node.raxis[0].var.name: steps[node.name]} if node.name in steps else {}
@@ -65,11 +72,23 @@ def _main_tier_calls(code):
     return re.findall(r"^    (ukernel_\w+|GraphNode_\w+)\(", body, flags=re.M)
 
 
+@pytest.mark.parametrize("from_end", [False, True], ids=["from_front", "from_end"])
 @pytest.mark.parametrize("placement", sorted(PLACEMENTS))
-def test_the_divisor_is_staged_wherever_the_sums_are_placed(placement):
+def test_the_divisor_is_staged_wherever_the_sums_are_placed(placement, from_end):
     steps, loops = PLACEMENTS[placement]
-    code = build_candidate_code(_candidate(*steps))
+    cand = _candidate(*steps, from_end=from_end)
+    code = build_candidate_code(cand)
     calls = _main_tier_calls(code)
+
+    # Both sums run over the leading axis of the tensor they are stored in, whichever end
+    # their axis was named from; only what is emitted follows the naming.
+    sums = [n for tier, _ in graph_tiers(apply_tiling(cand)) for n in tier.nodes
+            if isinstance(n, ReduceSum)]
+    assert sorted((n.name, n.flat_axis, n.stored_axis) for n in sums) == [
+        ("rowsum_combine_0", 1, 0), ("value_combine_0", 1, 0)]
+    assert sorted((n.name, n.axis, n.axis_arg) for n in sums) == (
+        [("rowsum_combine_0", 1, -2), ("value_combine_0", 1, -3)] if from_end
+        else [("rowsum_combine_0", 0, 0), ("value_combine_0", 0, 0)])
 
     assert [c for c in calls if c.startswith("GraphNode_")] == loops
     (divide,) = [c for c in calls if c.startswith("ukernel_div_")]
@@ -113,3 +132,12 @@ def test_a_split_combine_validates_wherever_its_sums_are_placed(placement):
     with its value sum in front of the loop."""
     steps, _ = PLACEMENTS[placement]
     assert_candidate_compiles_and_runs(_candidate(*steps), tolerance_for(mha_split_combine_graph))
+
+
+@pytest.mark.parametrize("placement", sorted(PLACEMENTS))
+def test_a_split_combine_named_from_the_end_validates(placement):
+    """GPU: the same combine with its split axis named from the end. None of its
+    placements had a kernel ("no available layout found")."""
+    steps, _ = PLACEMENTS[placement]
+    assert_candidate_compiles_and_runs(_candidate(*steps, from_end=True),
+                                       tolerance_for(mha_split_combine_graph))

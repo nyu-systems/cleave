@@ -209,6 +209,11 @@ class ReduceSum(ComputeOpNode):
       built axis. ``apply_tiling`` sets both for every reduction it schedules; a reduction
       added to a scheduled graph afterwards is given them by
       ``cleave.schedule.tiling.rebase_reduction_axis``.
+    * ``stored_axis``: the reduced axis counted from the front of that stored buffer,
+      however the axis was named. It is set together with the emitted pair and never
+      emitted. Anything that asks *where in the tile* a scheduled reduction reduces ("the
+      leading stored axis") reads this: ``axis`` answers that for an axis built from the
+      front only, since for one built from the end it stays the built axis.
     """
 
     _macro_attrs = ("axis", "axis_arg", "dtype")
@@ -238,6 +243,7 @@ class ReduceSum(ComputeOpNode):
         # The axis as built (see the class docstring): the tiler derives ``axis`` /
         # ``axis_arg`` from these two, which never change.
         self.flat_axis, self.flat_axis_arg = self.axis, axis
+        self.stored_axis = self.axis  # a flat graph stores a tensor as it is
         self.output_dims = dims[: self.axis] + dims[self.axis + 1 :]
         input_batch_flags = [False] * len(dims)
         for i in range(max(0, len(dims) - 2)):

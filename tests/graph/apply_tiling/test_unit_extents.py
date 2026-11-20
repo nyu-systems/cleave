@@ -158,13 +158,14 @@ def test_a_loop_over_a_single_row_block_validates(name):
 
 
 # ------------------------------------------------- a split axis walked one partial at a time
-def _dense_combine_graph(split, rows, cols):
+def _dense_combine_graph(split, rows, cols, from_end=False):
     """The combine the paged path reads: ``(split, rows)`` and ``(split, rows, cols)``
-    partials summed over the split axis, then divided."""
-    rowsum = ReduceSum((split, rows), axis=0, dtype="float32", out_dtype="float32",
-                       name="rowsum_combine_0")
-    value = ReduceSum((split, rows, cols), axis=0, dtype="float32", out_dtype="float32",
-                      name="value_combine_0")
+    partials summed over the split axis, then divided. ``from_end`` names that axis from
+    the end (``-2`` and ``-3``)."""
+    rowsum = ReduceSum((split, rows), axis=-2 if from_end else 0, dtype="float32",
+                       out_dtype="float32", name="rowsum_combine_0")
+    value = ReduceSum((split, rows, cols), axis=-3 if from_end else 0, dtype="float32",
+                      out_dtype="float32", name="value_combine_0")
     div = Div((rows, cols), broadcast=0, dtype="float32", out_dtype="float32", name="div_0")
     wire_input(value, div, 0)
     wire_input(rowsum, div, 1)
@@ -173,13 +174,42 @@ def _dense_combine_graph(split, rows, cols):
     return Graph(nodes=find_topo_sort([n for n in nodes if n.is_output()]))
 
 
+@pytest.mark.parametrize("from_end", [False, True], ids=["from_front", "from_end"])
 @pytest.mark.parametrize("rows", [1, 2, 4, 16])
 @pytest.mark.parametrize("step", [1, 2, 4])
-def test_the_recognizer_reads_the_split_step_off_the_split_axis(rows, step):
+def test_the_recognizer_reads_the_split_step_off_the_split_axis(rows, step, from_end):
     """``read_dense_combine`` takes the value sum's step from the leading extent of its
     operand's tier tile. At step 1 the tier used to drop the split dim, so that extent was
     the row tile: 2, 4 and 4 for row tiles 2, 4 and 16 (capped at the split count)."""
-    graph = _dense_combine_graph(4, 16, 64)
+    graph = _dense_combine_graph(4, 16, 64, from_end=from_end)
     cand = _candidate(graph, [rows, 64], value_combine_0=step, rowsum_combine_0=step)
     comb = read_dense_combine(apply_tiling(cand))
     assert (comb.split, comb.split_step) == (4, step)
+
+
+def test_the_recognizer_asks_which_axis_a_sum_was_built_to_reduce():
+    """Sums over the *rows* of each partial, not over the split axis: per-split
+    normalisation, not a split combine. With one partial per block the split dim is a unit
+    extent of every tile, so the emitted ``dim`` of both sums is 0 -- the first axis of
+    the stored tile -- and the recognizer, which tested the emitted axis, took the graph
+    for a combine over the split axis."""
+    from cleave.dynamic.paging.recognize import NotDenseAttention
+
+    split, rows, cols = 4, 16, 64
+    rowsum = ReduceSum((split, rows), axis=1, dtype="float32", out_dtype="float32",
+                       name="rowsum_combine_0")
+    value = ReduceSum((split, rows, cols), axis=1, dtype="float32", out_dtype="float32",
+                      name="value_combine_0")
+    div = Div((split, cols), broadcast=0, dtype="float32", out_dtype="float32", name="div_0")
+    wire_input(value, div, 0)
+    wire_input(rowsum, div, 1)
+    OutputNode(div, dtype="float16")
+    nodes = gather_all_nodes(rowsum, value, div)
+    graph = Graph(nodes=find_topo_sort([n for n in nodes if n.is_output()]))
+
+    tiled = apply_tiling(_candidate(graph, [1, 64], value_combine_0=rows, rowsum_combine_0=rows))
+    sums = {n.name: n for n in tiled.nodes if isinstance(n, ReduceSum)}
+    assert {(n.flat_axis, n.axis, n.stored_axis) for n in sums.values()} == {(1, 0, 0)}
+    with pytest.raises(NotDenseAttention, match=r"expected two reductions over the leading "
+                                                r"\(split\) axis, got .*'rowsum_combine_0', 1"):
+        read_dense_combine(tiled)

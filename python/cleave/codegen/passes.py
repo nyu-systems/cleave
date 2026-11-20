@@ -190,7 +190,10 @@ def annotate_fragment_layout_conflicts(graph: Graph) -> Graph:
         if lhs_shape[:-1] != rhs_shape:
             return False
 
-        if lhs_accum.axis != rhs_accum.axis or rhs_accum.axis != 0:
+        # Both sums run over the leading axis of the tensor they are stored in (the split
+        # axis, behind batch dims the block holds one element of). ``stored_axis``, not
+        # ``axis``: for an axis named from the end ``axis`` stays the built one.
+        if lhs_accum.stored_axis != 0 or rhs_accum.stored_axis != 0:
             return False
         if len(lhs_accum.inputs) != 1 or len(rhs_accum.inputs) != 1:
             return False
