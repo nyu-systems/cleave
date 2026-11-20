@@ -195,6 +195,44 @@ def test_tile_that_misses_a_unit_dim_is_a_typed_refusal():
         )
 
 
+def batched_matmul_of_column(x: cl.Tensor["B", "M", "K"], v: cl.Tensor["ONE", "K", "ONE2"]):
+    """x @ column for every batch entry: the output is (B, M, 1)."""
+    return x @ v
+
+
+def test_tile_that_misses_a_unit_dim_next_to_batch_dims_is_a_typed_refusal():
+    """The same missing extent with a batch dim in front: the policy tiles ``(B, M, 1)`` as
+    ``[b, m]``, and with the batch dim put back the tile has the tensor's rank -- ``[1, b,
+    m]``, the extents on the wrong dims. Every candidate was refused, by the launch-axis
+    plan and for a reason that says nothing ("for iter dim 1, got []")."""
+    ir = _identity_graph(batched_matmul_of_column, dict(B=4, M=64, K=128, ONE=1, ONE2=1), cl.f32)
+    matmul = _one(ir, Matmul)
+    assert tuple(int(s) for s in matmul.get_shape()) == (4, 64, 1)
+    cands = search_tiling(ir, topk=1000)
+    assert cands
+
+    built, refused = _outcomes(cands)
+    assert not built and len(refused) == len(cands)
+    for cand, text in refused:
+        assert len(cand.output_tile) == 2  # two extents for a tensor of three dims
+        assert text == (
+            f"{matmul.name}: tile {list(cand.output_tile)} does not cover the 3 dims of its "
+            "tensor (4, 64, 1); a unit dim that is not a batch dim has no tile"
+        )
+
+
+def test_matmul_operand_with_a_unit_batch_dim_is_tiled():
+    """The neighbour that works, so that the refusals do not grow over it: an operand
+    broadcast over the batch through a unit batch dim builds for every candidate."""
+    def broadcast_b(x: cl.Tensor["B", "M", "K"], w: cl.Tensor["ONE", "K", "N"]):
+        return x @ cl.exp(w)
+
+    ir = _identity_graph(broadcast_b, dict(B=4, M=64, K=128, N=32, ONE=1), cl.f32)
+    cands = search_tiling(ir, topk=1000)
+    built, refused = _outcomes(cands)
+    assert built and not refused
+
+
 def test_float32_siblings_are_refused_rather_than_miscounted():
     """A limit that holds today, pinned so that its fix has a case that flips.
 

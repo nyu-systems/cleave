@@ -902,8 +902,16 @@ def _refuse_tile_that_misses_dims(node, shape, tile, expanded_tile):
     grid extent would then be taken from the dims the tile happens to cover, and the
     launch-axis plan and the offsets built for a tensor of lower rank (it used to end in
     ``KeyError: 1`` or an assert on ``iter_repeat_factors``, depending on the loop).
+
+    Next to batch dims the tile has the tensor's rank after all, with its extents on the
+    wrong dims: for ``(B, M, 1)`` the policy tiles ``(B, M)`` as ``[b, m]`` and the
+    expansion reads that as ``[1, b, m]``, ``m`` rows of the unit dim. Same defect, same
+    refusal (it used to end in whichever guard the nonsense tripped first).
     """
-    if len(expanded_tile) != len(shape):
+    misplaced = len(tile) != len(shape) and any(
+        int(extent) == 1 and int(step) > 1 for extent, step in zip(shape, expanded_tile)
+    )
+    if len(expanded_tile) != len(shape) or misplaced:
         raise ScheduleRejected(
             f"{node.name}: tile {list(tile)} does not cover the {len(shape)} dims of its "
             f"tensor {tuple(int(s) for s in shape)}; a unit dim that is not a batch dim "

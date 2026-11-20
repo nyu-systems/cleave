@@ -569,9 +569,31 @@ def _matmul(ctx: _Ctx, idx: int, op: KGOp) -> Built:
                 f"{op.op_type} at index {idx}: the {which} operand {tuple(ctx.known_shape(t))} "
                 f"has lost a matrix axis to a reduction (dims {tuple(_dims(t))}); only a "
                 "vector without batch axes can stand in for a matrix")
+    shapes = {"first": tuple(ctx.known_shape(a)), "second": tuple(ctx.known_shape(b))}
+    for (which, shape), (_, other) in zip(shapes.items(), reversed(shapes.items())):
+        # A vector stands in for a one-row or one-column matrix. Next to a batched matrix it
+        # would be that row for every batch entry, which the config below declares as a
+        # vector per batch entry: an operand of B times its size, which nothing can run.
+        if len(shape) == 1 and len(other) > 2:
+            raise ValueError(
+                f"{op.op_type} at index {idx}: the {which} operand is a vector {shape} and "
+                f"the other a batched matrix {other} (dims {tuple(_dims(a))} and "
+                f"{tuple(_dims(b))}); only a matmul without batch axes takes a vector")
     dims, ta, tb, a_batch, b_batch = _infer_matmul_config(
-        ctx.known_shape(a), ctx.known_shape(b), ctx.shape(op.outputs[0]),
+        shapes["first"], shapes["second"], ctx.shape(op.outputs[0]),
         bool(op.attrs.get("trans_A", False)), bool(op.attrs.get("trans_B", False)))
+    for (which, shape), t in zip(shapes.items(), (a, b)):
+        # The op declares both operands with the batch axes of its output. An input takes
+        # the declared shape (unit extents where it has no batch axis); a computed value
+        # keeps its own, and one that has fewer axes -- it lost a batch axis to a reduction
+        # -- is tiled as the matmul reads it, not as it is stored: no tiling of such a
+        # graph builds.
+        if len(shape) >= 2 and len(shape) != len(dims) - 1 and not ctx.is_input(t):
+            raise ValueError(
+                f"{op.op_type} at index {idx}: the {which} operand {shape} is computed "
+                f"without the batch axes of its matmul, whose output is {tuple(dims[:-1])} "
+                f"(dims {tuple(_dims(t))}); only an input is read over batch axes it does "
+                "not have")
     node = Matmul(dims, input_batch_dims_A=a_batch, input_batch_dims_B=b_batch, name=f"mma_{idx}",
                   transpose_A=ta, transpose_B=tb, warp_policy="rows", dtype=ctx.dtype,
                   out_dtype=ctx.accum_dtype)

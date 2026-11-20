@@ -562,6 +562,100 @@ def test_vector_operand_of_a_matmul_still_lowers():
     _assert_computes_the_program(ir, prog)
 
 
+def a_lost_its_batch_axis(x: cl.Tensor["B", "M", "K"]):
+    return cl.sum(x, 0, keepdim=True) @ x.mT
+
+
+def a_lost_its_batch_axis_two_inputs(x: cl.Tensor["B", "M", "K"], y: cl.Tensor["B", "N", "K"]):
+    return cl.sum(x, 0, keepdim=True) @ y.mT
+
+
+def b_lost_its_batch_axis(x: cl.Tensor["B", "M", "K"], y: cl.Tensor["B", "K", "N"]):
+    return x @ cl.sum(y, 0, keepdim=True)
+
+
+# name: (fn, sizes, which operand, its value shape, the matmul's output, the operand's dims)
+LOST_BATCH_AXIS = {
+    "a": (a_lost_its_batch_axis, dict(B=4, M=6, K=3), "first", (6, 3), (4, 6, 6), (1, 6, 3)),
+    "a_two_inputs": (a_lost_its_batch_axis_two_inputs, dict(B=4, M=6, K=3, N=5),
+                     "first", (6, 3), (4, 6, 5), (1, 6, 3)),
+    "b": (b_lost_its_batch_axis, dict(B=4, M=6, K=3, N=5), "second", (3, 5), (4, 6, 5), (1, 3, 5)),
+}
+
+
+@pytest.mark.parametrize("name", LOST_BATCH_AXIS)
+def test_matmul_operand_computed_without_its_batch_axes_is_refused(name):
+    """``sum(x, 0) @ x.mT``: the flat graph is right, but the matmul declares the operand
+    with a unit batch axis the value does not have, and the tiling policy tiles the value as
+    the matmul reads it. None of the 16 plans of such a graph built, each dying in whichever
+    guard its tiles tripped first ("runs 8 iterations but dim 0 ... is cut into 4 tiles",
+    "Expected exactly one launch-axis mapping")."""
+    fn, sizes, which, shape, out, dims = LOST_BATCH_AXIS[name]
+    prog = trace(fn, sizes, cl.f32)
+    (graph,) = GraphSet.identity(prog)
+    with pytest.raises(LoweringRejected) as refusal:
+        lower(graph)
+    assert str(refusal.value).endswith(
+        f": the {which} operand {shape} is computed without the batch axes of its matmul, "
+        f"whose output is {out} (dims {dims}); only an input is read over batch axes it "
+        "does not have")
+    assert "kn_matmul_op at index " in str(refusal.value)
+
+
+def unit_batch_input_b(x: cl.Tensor["B", "M", "K"], w: cl.Tensor["ONE", "K", "N"]):
+    return x @ w
+
+
+def unit_batch_input_a(w: cl.Tensor["ONE", "M", "K"], y: cl.Tensor["B", "K", "N"]):
+    return w @ y
+
+
+def unit_batch_value_a(w: cl.Tensor["ONE", "M", "K"], y: cl.Tensor["B", "K", "N"]):
+    return cl.exp(w) @ y
+
+
+def unit_batch_value_b(x: cl.Tensor["B", "M", "K"], w: cl.Tensor["ONE", "K", "N"]):
+    return x @ cl.exp(w)
+
+
+UNIT_BATCH = [unit_batch_input_a, unit_batch_input_b, unit_batch_value_a, unit_batch_value_b]
+
+
+@pytest.mark.parametrize("fn", UNIT_BATCH, ids=[fn.__name__ for fn in UNIT_BATCH])
+def test_matmul_operand_with_a_unit_batch_axis_still_lowers(fn):
+    """What the refusal above leaves alone: an operand that has every axis the matmul
+    declares, with extent 1 where it is broadcast over the batch -- input or computed."""
+    prog, ir = _lower(fn, dict(B=4, M=6, K=3, N=5, ONE=1))
+    (mma,) = [n for n in ir.nodes if type(n) is Matmul]
+    operands = [_shape(e.src_node, e.src_id) for e in sorted(mma.inputs, key=lambda e: e.dst_id)]
+    assert sorted(len(shape) for shape in operands) == [3, 3]
+    assert sorted(shape[0] for shape in operands) == [1, 4]
+    _assert_computes_the_program(ir, prog)
+
+
+def test_vector_against_a_batched_matrix_is_refused():
+    """``x(B, M, K) @ v`` with ``v`` a vector of K: the Matmul declared the vector with the
+    batch, ``(B, 1, K)`` for K elements, so not even the reference executor could run the
+    flat graph, and no plan built."""
+    def batched_matvec(x: cl.Tensor["B", "M", "K"]):
+        v = cl.sum(cl.sum(x, 1, keepdim=True), 0, keepdim=True)
+        return x @ v.mT
+
+    def batched_vecmat(x: cl.Tensor["B", "K", "N"]):
+        v = cl.sum(cl.sum(x, 2, keepdim=True), 0, keepdim=True)
+        return v.mT @ x
+
+    for fn, sizes, which, other in ((batched_matvec, dict(B=4, M=6, K=3), "second", (4, 6, 3)),
+                                    (batched_vecmat, dict(B=4, K=3, N=5), "first", (4, 3, 5))):
+        prog = trace(fn, sizes, cl.f32)
+        (graph,) = GraphSet.identity(prog)
+        with pytest.raises(LoweringRejected, match=(
+                rf"kn_matmul_op at index 3: the {which} operand is a vector \(3,\) and the "
+                rf"other a batched matrix {re.escape(str(other))} .*; only a matmul without "
+                r"batch axes takes a vector$")):
+            lower(graph)
+
+
 # ------------------------------------------------------------------ ops no output reads
 
 def test_op_no_output_reads_does_not_reshape_a_live_input():
