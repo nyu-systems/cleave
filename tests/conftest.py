@@ -21,6 +21,7 @@ _MARKERS = {
         "tests/frontend_dynamic/test_paged_pipeline.py::test_compile_end_to_end",
         "tests/pipeline_api/test_e2e.py",
         "tests/runtime/test_run_candidates.py",
+        "tests/runtime/test_stored_layout.py::test_gpu_",
         "tests/frontend/test_exact_softmax.py::test_gpu_",
     ),
     "expected": (

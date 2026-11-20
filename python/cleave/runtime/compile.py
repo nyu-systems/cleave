@@ -133,9 +133,16 @@ def compile_and_run_prim_func(
     )
 
 
-def build_candidate_code(cand, options: CompilerPassOptions | None = None):
-    """Tilelang source for one tiling candidate: the default ``build_fn``."""
+def build_candidate(cand, options: CompilerPassOptions | None = None):
+    """``(source, stored layouts)`` for one tiling candidate: the default ``build_fn``.
+
+    The stored layouts are what ``apply_tiling`` recorded for the candidate's outputs
+    (``Graph.stored_layouts``), one ``(axes, pad)`` per output in the order the kernel
+    returns them. They are not in the source; whoever compares or forwards the kernel's
+    outputs is handed them next to it.
+    """
     from ..codegen import TilelangCodeGen
+    from ..ir.graph import OutputNode
     from ..schedule import apply_tiling
     from ..codegen import passes
 
@@ -148,12 +155,22 @@ def build_candidate_code(cand, options: CompilerPassOptions | None = None):
     sch_graph = passes.annotate_fragment_layout_conflicts(sch_graph)
     if options.mla_decode_pass:
         sch_graph = passes.annotate_mla_accumulation_layout_conflict(sch_graph)
-    return TilelangCodeGen().gen(sch_graph)
+    code = TilelangCodeGen().gen(sch_graph)
+    # `args` is the kernel's parameter list, so this is the order of its outputs.
+    layouts = tuple(
+        sch_graph.stored_layouts[arg.name] for arg in sch_graph.args if isinstance(arg, OutputNode)
+    )
+    return code, layouts
+
+
+def build_candidate_code(cand, options: CompilerPassOptions | None = None):
+    """Tilelang source for one tiling candidate."""
+    return build_candidate(cand, options)[0]
 
 
 def check_code(
     code_str, *, graph=None, dtype=None, out_idx=None, reference_cache_dir=None,
-    tolerance=None, benchmark: BenchOptions | None = None,
+    tolerance=None, benchmark: BenchOptions | None = None, stored_layouts=None,
 ):
     """``(cuda_src, latency_ms | None, measured)``: compile, validate and optionally time
     one kernel; ``measured`` is the error per output the comparison found.
@@ -162,6 +179,8 @@ def check_code(
     parent built the reference); standalone callers pass ``graph`` + ``dtype``.
     ``tolerance`` is the operator's declared bound and has no default: a kernel nobody
     declared a tolerance for fails here, before it is compiled.
+    ``stored_layouts`` is the second half of :func:`build_candidate`'s result: how the
+    kernel stores each output. Without it the reference is laid out by matching extents.
     """
     with _stage("validate"):
         require_tolerance(tolerance)
@@ -176,6 +195,6 @@ def check_code(
 
     measured, latency_ms = _check_kernel(
         kernel, graph=graph, dtype=dtype, reference_cache_dir=reference_cache_dir,
-        tolerance=tolerance, benchmark=benchmark,
+        tolerance=tolerance, benchmark=benchmark, stored_layouts=stored_layouts,
     )
     return kernel.get_kernel_source(), latency_ms, measured

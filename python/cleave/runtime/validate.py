@@ -370,21 +370,31 @@ def _as_list(reference):
     return list(reference) if isinstance(reference, (tuple, list)) else [reference]
 
 
-def _validate_kernel_outputs(kernel, inputs, reference, *, tolerance, what: str = ""):
+def _validate_kernel_outputs(
+    kernel, inputs, reference, *, tolerance, what: str = "", stored_layouts=None,
+):
     """Run ``kernel(*inputs)`` and hold it to ``reference``; the measured error per output.
 
     Shared comparison core: reconciles each reference to the kernel's physical output
     shape and compares with :func:`compare_outputs` at the operator's declared
-    ``tolerance`` (there is no default). Must run inside a ``_gpu_exec_guard``.
+    ``tolerance`` (there is no default). ``stored_layouts`` is the layout ``apply_tiling``
+    recorded for each output, in the kernel's output order; without it (a hand-written
+    kernel) the layout is recovered from the extents. Must run inside a ``_gpu_exec_guard``.
     """
     import torch
 
     require_tolerance(tolerance)
     actual = _as_list(launch(kernel, inputs))
     if len(actual) == len(reference):
+        layouts = [None] * len(actual) if stored_layouts is None else list(stored_layouts)
+        if len(layouts) != len(actual):
+            raise ValueError(
+                f"{len(layouts)} stored layouts were recorded for a kernel that returns "
+                f"{len(actual)} outputs"
+            )
         reference = [
-            reconcile_output_layout(ref, act.shape)
-            for ref, act in zip(reference, actual)
+            reconcile_output_layout(ref, act.shape, layout)
+            for ref, act, layout in zip(reference, actual, layouts)
         ]
     measured = compare_outputs(actual, reference, tolerance, what=what)
     del actual, reference
@@ -396,12 +406,14 @@ def _validate_kernel_outputs(kernel, inputs, reference, *, tolerance, what: str 
 def _check_kernel(
     kernel, *, graph=None, dtype=None, reference_cache_dir=None,
     tolerance=None, benchmark: BenchOptions | None = None, distributions=("normal",),
+    stored_layouts=None,
 ):
     """Validate ``kernel`` against the graph reference, then optionally time it.
 
     Either ``reference_cache_dir`` (worker mode: load the parent-built tensors) or
     ``graph`` + ``dtype`` (standalone mode: build the reference in-process, one case per
     name in ``distributions``) must be provided. A missing ``tolerance`` is an error.
+    ``stored_layouts``: how the kernel stores each output (``_validate_kernel_outputs``).
     Timing happens under the same GPU lock hold as validation, on the first case's inputs.
     Returns ``(measured error per output, mean latency in ms or None)``.
     """
@@ -422,6 +434,7 @@ def _check_kernel(
                 measured = worst(measured, _validate_kernel_outputs(
                     kernel, inputs, reference, tolerance=tolerance,
                     what="" if distribution == "normal" else f"{distribution} inputs",
+                    stored_layouts=stored_layouts,
                 ))
         if benchmark is None:
             return measured, None

@@ -31,7 +31,7 @@ from .compile import (
     CompilerPassOptions,
     _compile,
     _load_main_kernel_from_code,
-    build_candidate_code,
+    build_candidate,
     check_code,
 )
 from .gpu import _create_parallel_env, _gpu_exec_guard
@@ -93,6 +93,9 @@ class CandidateResult:
     # cleave.runtime.validate.MeasuredError per output, when the comparison ran to the end:
     # for every ok candidate, and for one that failed as an OutputMismatch.
     measured: tuple | None = None
+    # How the kernel stores each output: ``(axes, pad)`` per output, in the order it returns
+    # them (cleave.runtime.reference.to_stored / to_logical), when the build recorded it.
+    stored_layouts: tuple | None = None
 
     @property
     def ok(self) -> bool:
@@ -162,6 +165,8 @@ def run_candidates(
     Compile/validate (and ``benchmark`` timing) run on up to ``max_parallel`` persistent
     workers; codegen stays in the parent (TileDicts can't be pickled). Injectable stages:
     ``build_fn`` (parent), ``check_fn`` (worker, picklable), ``reference_fn``, ``pool``.
+    ``build_fn`` returns the source, or ``(source, stored layouts)`` like the default
+    ``build_candidate``; the layouts go to ``check_fn`` and onto the result.
 
     ``tolerance`` is the operator's declared bound (a ``Tolerance`` or one per output),
     handed to ``check_fn``; the default ``check_code`` fails a candidate without one.
@@ -170,7 +175,7 @@ def run_candidates(
         return []
     if build_fn is None:
         options = compiler_pass_options or CompilerPassOptions()
-        build_fn = functools.partial(build_candidate_code, options=options)
+        build_fn = functools.partial(build_candidate, options=options)
     check_fn = check_fn or check_code
     reference_fn = reference_fn or publish_reference
 
@@ -240,7 +245,7 @@ def run_candidates(
             job,
             CandidateResult(
                 job["candidate"], "failed", stage, error, code=code, label=job["label"],
-                measured=measured,
+                measured=measured, stored_layouts=job.get("stored_layouts"),
             ),
             pbar,
         )
@@ -260,15 +265,17 @@ def run_candidates(
                 fail(job, "codegen", _parent_error(CleaveError, label, "reference", exc), pbar)
                 continue
             try:
-                code_str = build_fn(cand)
+                built = build_fn(cand)
             except Exception as exc:
                 fail(job, "codegen", _parent_error(CodegenError, label, "codegen", exc), pbar)
                 continue
+            code_str, stored_layouts = built if isinstance(built, tuple) else (built, None)
+            job["stored_layouts"] = stored_layouts
 
             task = {
                 "check_fn": check_fn, "code_str": code_str, "out_idx": cand_out_idx,
                 "reference_cache_dir": cand_ref_dir, "tolerance": tolerance,
-                "benchmark": benchmark,
+                "benchmark": benchmark, "stored_layouts": stored_layouts,
             }
             worker = None
             try:
@@ -291,7 +298,7 @@ def run_candidates(
                 CandidateResult(
                     job["candidate"], "ok", None, None, job["code_str"],
                     result["cuda_src"], result.get("latency_ms"), job["label"],
-                    result.get("measured"),
+                    result.get("measured"), job.get("stored_layouts"),
                 ),
                 pbar,
             )

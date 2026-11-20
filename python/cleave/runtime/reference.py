@@ -403,25 +403,84 @@ def execute(graph, inputs):
     return outputs
 
 
-def reconcile_output_layout(reference, actual_shape):
+def _check_layout(layout, rank):
+    """``(axes, pad)`` of a stored layout (``Graph.stored_layouts``) for a rank-``rank`` output."""
+    axes, pad = layout
+    axes, pad = tuple(int(a) for a in axes), int(pad)
+    if sorted(axes) != list(range(rank)) or pad < 0:
+        raise ValueError(
+            f"stored layout (axes={axes}, pad={pad}) is not a permutation of the {rank} "
+            "axes of the output it describes plus a number of unit dims"
+        )
+    return axes, pad
+
+
+def stored_shape(logical_shape, layout):
+    """The shape a kernel stores an output of ``logical_shape`` in under ``layout``."""
+    logical_shape = tuple(int(s) for s in logical_shape)
+    axes, pad = _check_layout(layout, len(logical_shape))
+    return tuple(logical_shape[a] for a in axes) + (1,) * pad
+
+
+def to_stored(logical, layout):
+    """``logical`` (an output as the graph defines it) in the layout a kernel stores it in.
+
+    ``layout`` is the ``(axes, pad)`` ``apply_tiling`` recorded for that output:
+    ``axes[p]`` is the logical axis at stored position ``p``, followed by ``pad`` unit dims.
+    """
+    axes, _ = _check_layout(layout, logical.dim())
+    return logical.permute(*axes).reshape(stored_shape(logical.shape, layout))
+
+
+def to_logical(stored, layout, logical_shape):
+    """The inverse of :func:`to_stored`: a kernel's stored output as a contiguous tensor of
+    ``logical_shape``. Raises if ``stored`` is not that output in that layout."""
+    logical_shape = tuple(int(s) for s in logical_shape)
+    axes, pad = _check_layout(layout, len(logical_shape))
+    expected = stored_shape(logical_shape, layout)
+    if tuple(stored.shape) != expected:
+        raise ValueError(
+            f"a tensor of shape {tuple(stored.shape)} is not an output of logical shape "
+            f"{logical_shape} stored as (axes={axes}, pad={pad}), which is {expected}"
+        )
+    inverse = sorted(range(len(axes)), key=axes.__getitem__)
+    return stored.reshape(expected[: len(axes)]).permute(*inverse).contiguous()
+
+
+def reconcile_output_layout(reference, actual_shape, layout=None):
     """Return ``reference`` reshaped/permuted to the kernel's physical output shape.
 
     The executor emits an output in its *logical* axis order, but a scheduled kernel
     may store it differently: it can keep or drop size-1 axes (e.g. a split-partial
     rowsum stored ``(split_k, M, 1)``) and, for split-partial outputs, move the split
     axis to the front (``(split_k, B*H, S_Q, ...)`` vs logical ``(B*H, split_k, ...)``).
-    Both are pure reindexings recovered by matching non-unit axis extents.
 
-    The extent-matching is only well defined when the non-unit extents are distinct.
-    If two non-unit axes share an extent AND a non-identity permutation is required
-    to line up with ``actual_shape`` (e.g. a split-partial output where ``split_k ==
-    B*H``), the layout is ambiguous and we raise rather than silently risk a wrong
-    permutation masking a real mismatch.
+    ``layout`` is the stored layout ``apply_tiling`` recorded for this output
+    (``Graph.stored_layouts``). With it the reindexing is applied as recorded and must
+    produce exactly ``actual_shape``; every kernel the pipeline builds comes with one.
+
+    Without it (a hand-written kernel has no schedule to record anything) the reindexing
+    is recovered by matching non-unit axis extents, which is only well defined when those
+    extents are distinct. If two non-unit axes share an extent AND a non-identity
+    permutation is required to line up with ``actual_shape`` (e.g. a split-partial
+    output where ``split_k == B*H``), the layout is ambiguous and we raise rather than
+    silently risk a wrong permutation masking a real mismatch. Equal shapes are returned
+    as they are, so a kernel that stores a permutation between equal extents is compared
+    transposed: such a kernel needs the record.
     """
     import torch
 
     ref_shape = tuple(int(s) for s in reference.shape)
     actual_shape = tuple(int(s) for s in actual_shape)
+    if layout is not None:
+        stored = to_stored(reference, layout)
+        if tuple(stored.shape) != actual_shape:
+            raise ValueError(
+                f"the recorded stored layout (axes={tuple(layout[0])}, pad={int(layout[1])}) "
+                f"lays the reference of shape {ref_shape} out as {tuple(stored.shape)}, but "
+                f"the kernel returned {actual_shape}"
+            )
+        return stored
     if ref_shape == actual_shape:
         return reference
     if reference.numel() != int(torch.tensor(actual_shape).prod().item()):
