@@ -12,6 +12,7 @@ of a split-partial-shaped graph, the Exp that read storage, and every refusal.
 
 import dataclasses
 import json
+from collections import Counter
 import os
 import re
 import subprocess
@@ -426,6 +427,102 @@ def test_exported_max_is_reused_in_tile(small):
     assert sum("reduce_max" in c.split("(")[0] for c in main) == 1
 
 
+# ------------------------------------------------------------ the tiers the tiler builds
+
+COLUMN = dict(H=4, K=4096, N=256)
+
+
+@pytest.mark.parametrize(
+    ("fn", "shapes", "softmax", "cases"),
+    [
+        (S.flash_attention, SMALL, (), {"rolling", "in-tile"}),
+        (S.column_average, COLUMN, (dict(axis=-2),), {"rolling"}),
+        (S.column_average_2d, dict(K=4096, N=1024), (dict(axis=-2),), {"rolling", "in-tile"}),
+    ],
+    ids=["last_axis", "first_axis_behind_a_batch_dim", "first_axis"],
+)
+def test_the_max_is_emitted_with_the_dim_of_the_sums_next_to_it(fn, shapes, softmax, cases):
+    """The max the pass adds is a reduction over the softmax axis like the sums in its
+    tier, and gets its emitted ``dim`` the way the tiler gives them theirs
+    (``rebase_reduction_axis``, on the tile the scores are stored in): in every tiling that
+    builds, rolling or in place, the two are the same."""
+    ir = S.softmax_ir(fn, shapes, *softmax)
+    (exp,) = S.exps(ir)
+    seen = set()
+    for cand in search_tiling(ir, topk=1000):
+        try:
+            tiled = apply_tiling(cand)
+        except ScheduleRejected:
+            continue
+        tier, _, m = _find(tiled, f"{exp.name}_max")
+        sums = [n for n in tier.nodes if type(n) is ReduceSum
+                and (n.flat_axis, n.flat_axis_arg) == (m.flat_axis, m.flat_axis_arg)]
+        assert sums, _names(tiled)
+        for s in sums:
+            assert (m.axis, m.axis_arg) == (s.axis, s.axis_arg), (cand.output_tile, s.name)
+        seen.add(_find(tiled, exp.name)[2].stabilized.case)
+    assert seen == cases
+
+
+def test_a_loop_tile_of_one_column_is_refused_as_a_single_row():
+    """A loop tier carries the dims its block stores. Where a block holds one column of a
+    column softmax, the tile of the exp is its softmax axis alone. The axis is found where
+    the tile says it is (``Iterator.position``), not counted from the end of a tile that
+    has no trailing dim, so the refusal says what is wrong with the tiling."""
+    ir = S.softmax_ir(S.column_average, COLUMN, dict(axis=-2))
+    (exp,) = S.exps(ir)
+    reasons, single = Counter(), None
+    for cand in search_tiling(ir, topk=1000):
+        try:
+            apply_tiling(cand)
+        except ScheduleRejected as e:
+            reasons[stab._reason_key(e)] += 1
+            if "(N,) holds a single row" in stab._reason_key(e):
+                single = single or cand
+    e = exp.name
+    assert reasons == {
+        f"{e}: its tile (N,) holds a single row": 12,
+        f"{e}: its tile (N, N, N) holds a single row": 1,
+        f"{e}: one element of the softmax axis per iteration; the tile would lose that axis": 8,
+        f"{e}: softmax axis -2 is not the last axis and is not looped": 1,
+    }
+    tier, owner, node = _find(_pristine(ir, single), e)
+    it = tmap_by_name(tier)[e]
+    assert owner is not None and it.axes == (1,) and len(it.tile_size) == 1
+    assert it.position(1, 3) == 0 and it.position(2, 3) is None
+    with pytest.raises(stab.StabilizeRefused, match=r"its tile \(\d+,\) holds a single row"):
+        stab._locate(tier, owner, node)
+
+
+def test_added_nodes_say_which_dims_their_tiles_carry(small):
+    """A loop tier's ``Iterator`` records the dims it carries (``axes``). The nodes the
+    pass adds keep that record: the shifted scores carry what the exp carries, the row
+    vectors the same dims without the softmax axis, renumbered past it."""
+    column = S.softmax_ir(S.column_average, COLUMN, dict(axis=-2))
+    sums = [n for n in column.nodes if type(n) is ReduceSum]
+    rolling = [
+        (small.ir, small.rolling),  # (H, SQ, SKV): the softmax axis is the last one
+        (column, _pick(column, [1, 64], **{n.name: 32 for n in sums})),  # (H, K, N): K
+    ]
+    for ir, cand in rolling:
+        (exp,) = S.exps(ir)
+        tiled = apply_tiling(cand)
+        tier, owner, _ = _find(tiled, exp.name)
+        its = tmap_by_name(tier)
+        assert owner is not None and its[exp.name].axes == (1, 2)
+        assert its[f"{exp.name}_shifted"].axes == (1, 2)
+        for stat in ("max", "max_prev", "max_step", "alpha"):
+            it = its[f"{exp.name}_{stat}"]
+            # the remaining non-batch dim is dim 1 of the row vector either way
+            assert it.axes == (1,) and it.position(1, 2) == 0 and it.position(0, 2) is None
+    # the main tier's tiles are over every dim and record nothing
+    tiled = apply_tiling(small.in_tile)
+    tier, owner, _ = _find(tiled, small.exp.name)
+    assert owner is None
+    assert all(it.axes is None for name, it in tmap_by_name(tier).items()
+               if name.startswith(small.exp.name))
+
+
 # ---------------------------------------------------------- the Exp that read fp16 storage
 
 
@@ -809,7 +906,9 @@ def _export_reads_something_else(t):
 
 
 def _export_reduces_another_axis(t):
-    t.max.axis_arg = 0
+    # The axis the max was built with. Its `axis_arg` is the emitted `dim`, which the
+    # tiler re-counts on the stored tile and the pass does not read.
+    t.max.flat_axis = 0
 
 
 def _export_is_not_float32(t):
@@ -826,7 +925,7 @@ EXPORT_REFUSALS = [
     (_export_reads_something_else,
      r"exported max 'reduce_max_2_exp_0' does not read the operand of the exp"),
     (_export_reduces_another_axis,
-     r"exported max 'reduce_max_2_exp_0' reduces axis 0, the softmax axis is -1"),
+     r"exported max 'reduce_max_2_exp_0' reduces axis 0, the softmax axis is 2"),
     (_export_is_not_float32, r"exported max 'reduce_max_2_exp_0' is float16, not float32"),
     (_export_is_not_carried,
      r"exported max 'reduce_max_2_exp_0' is not an accumulator of GraphNode_\w+"),

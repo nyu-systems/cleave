@@ -41,6 +41,7 @@ from ..ir.graph_utils import edit_graph, graph_tiers, tmap_by_name
 from ..ir.offsets import TileOffset
 from ..ir.ops import NEG_FLT_MAX, Exp, ReduceMax, Sub, wire_input
 from ..ir.rolling import STAT_DTYPE, rolling_nodes
+from .tiling import rebase_reduction_axis
 
 
 class StabilizeRefused(ScheduleRejected):
@@ -91,6 +92,14 @@ def _stored_dtype(edge) -> str:
     return src.out_dtype if isinstance(src, ComputeOpNode) else str(src.get_dtype(0))
 
 
+def _stored_tile(tier, edge) -> Iterator:
+    """The tile of the value ``edge`` reads, in the tier that stores it: an accumulator's
+    buffer is the one its loop's own tier allocates."""
+    if isinstance(edge, AccumEdge):
+        return tmap_by_name(edge.src_node.graph)[edge.accum_node.name]
+    return tmap_by_name(tier)[edge.src_node.name]
+
+
 def _is(node, nodes) -> bool:
     return any(node is n for n in nodes)
 
@@ -127,8 +136,11 @@ def _locate(tier, owner, exp) -> Site:
     tmaps = tmap_by_name(tier)
     it = tmaps[exp.name]
     tile = tuple(int(t) for t in it.tile_size)
-    axis = len(tile) + a
-    if axis < 0:
+    # A loop tier carries only the dims its block stores (``Iterator.axes``), so the place
+    # of the softmax axis is asked of the tile, not counted from its end.
+    flat = len(dims) + a
+    axis = it.position(flat, len(dims))
+    if axis is None:
         raise _refused(exp, f"softmax axis {a} is not in its tile {tile}")
     full = dims[a]
     if owner is None:
@@ -144,9 +156,6 @@ def _locate(tier, owner, exp) -> Site:
     if all(t == 1 for i, t in enumerate(tile) if i != axis):
         # m / alpha would be all-unit tiles, which the emitter squeezes to nothing.
         raise _refused(exp, f"its tile {tile} holds a single row")
-    # What a max over the softmax axis has to say in this tier: the last axis as -1
-    # (stable when leading unit dims are squeezed), any other axis counted on the tile.
-    axis_arg = -1 if a == -1 else (axis if owner is not None else len(dims) + a)
 
     if step == block:
         if a != -1 and (owner is not None or any(t == 1 for t in tile[:axis])):
@@ -161,7 +170,7 @@ def _locate(tier, owner, exp) -> Site:
                     f"exported max {st.export!r} would accumulate over a loop that does "
                     "not tile the softmax axis",
                 )
-            _exported_max(tier, where, exp, axis_arg, carried=False)
+            _exported_max(tier, where, exp, flat, carried=False)
         return Site(exp.name, where, "in-tile", axis, full, block, step)
 
     # rolling: the tier's loop is the loop over the softmax axis
@@ -228,7 +237,7 @@ def _locate(tier, owner, exp) -> Site:
             # Its buffer is allocated unsqueezed, the rescale indexes the squeezed rank.
             raise _refused(exp, f"accumulator {n.name} has a unit extent in its tile {acc_tile}")
     if st.export is not None:
-        _exported_max(tier, where, exp, axis_arg, carried=True)
+        _exported_max(tier, where, exp, flat, carried=True)
     return Site(exp.name, where, "rolling", axis, full, block, step, tuple(n.name for n in accs))
 
 
@@ -246,9 +255,15 @@ def _descends(node, ancestor, tier) -> bool:
     return False
 
 
-def _exported_max(tier, where, exp, axis_arg, *, carried: bool):
+def _exported_max(tier, where, exp, flat, *, carried: bool):
     """The ``ReduceMax`` a split partial exports as its shift, found by its recorded name
-    and verified; never recognised by shape."""
+    and verified; never recognised by shape.
+
+    ``flat`` is the softmax axis among the dims of the exp, counted from the front. It is
+    compared with the axis the max was built with (``flat_axis``): ``axis_arg`` is the
+    ``dim`` the tiler gave the emitted macro, an index into the stored tile, and differs
+    from one tiling to the next.
+    """
     name = exp.stabilize.export
     m = next((n for n in tier.nodes if n.name == name), None)
     if m is None:
@@ -263,11 +278,10 @@ def _exported_max(tier, where, exp, axis_arg, *, carried: bool):
     )
     if not same:
         raise _refused(exp, f"exported max {name!r} does not read the operand of the exp")
-    if m.axis_arg != axis_arg:
+    if m.flat_axis != flat:
         raise _refused(
             exp,
-            f"exported max {name!r} reduces axis {m.axis_arg}, the softmax axis is "
-            f"{axis_arg}",
+            f"exported max {name!r} reduces axis {m.flat_axis}, the softmax axis is {flat}",
         )
     if m.out_dtype != STAT_DTYPE:
         raise _refused(exp, f"exported max {name!r} is {m.out_dtype}, not {STAT_DTYPE}")
@@ -406,7 +420,13 @@ def _drop_axis(it: Iterator, axis: int) -> Iterator:
         offset = TileOffset(drop(offset.terms), offset.num_args)
     else:
         offset = _DroppedAxis(offset, axis)
-    return Iterator(offset, shape=drop(it.shape), tile_size=drop(it.tile_size))
+    # The row vector has the exp's dims without the softmax axis: the dims the tile
+    # carries are the exp's, renumbered past the one that is gone.
+    axes = it.axes
+    if axes is not None:
+        gone = axes[axis]
+        axes = tuple(d - (d > gone) for d in axes if d != gone)
+    return Iterator(offset, shape=drop(it.shape), tile_size=drop(it.tile_size), axes=axes)
 
 
 def _rewrite(tier, owner, exp, site: Site, taken: set, cache: bool = True):
@@ -443,17 +463,16 @@ def _rewrite(tier, owner, exp, site: Site, taken: set, cache: bool = True):
             _wire(m, edge.dst_node, edge.dst_id)
     else:
         m = parts["max"]
-        if m.axis_arg >= 0 and owner is not None:
-            # Re-counted on the tier-local tile, as `_normalize_inner_reduction_axes`
-            # re-counts the sums of a loop.
-            m.axis = m.axis_arg = site.axis
         _read(scores_edge, m, 0)
+        # Its emitted `dim` indexes the stored scores, as for every reduction the tiler
+        # scheduled (`_normalize_inner_reduction_axes`, `_normalize_main_reduction_axes`).
+        rebase_reduction_axis(m, _stored_tile(tier, scores_edge))
         tier.tmap[m] = vec_it
         new_nodes.append(m)
 
     # --- P = exp(s - m) -----------------------------------------------------------------
     _read(scores_edge, shifted, 0)
-    tier.tmap[shifted] = Iterator(exp_it.offset, exp_it.shape, exp_it.tile_size)
+    tier.tmap[shifted] = Iterator(exp_it.offset, exp_it.shape, exp_it.tile_size, exp_it.axes)
     new_nodes.append(shifted)
     if fresh_exp:
         # A node whose dtype attribute and prim_func disagree is not left behind: the Exp
@@ -479,7 +498,7 @@ def _rewrite(tier, owner, exp, site: Site, taken: set, cache: bool = True):
         m.accum_init = NEG_FLT_MAX  # this instance only; the class default stays -inf
         stats = [parts["max_prev"], parts["max_step"], parts["alpha"]]
         for n in stats:
-            tier.tmap[n] = Iterator(vec_it.offset, vec_it.shape, vec_it.tile_size)
+            tier.tmap[n] = Iterator(vec_it.offset, vec_it.shape, vec_it.tile_size, vec_it.axes)
         new_nodes += stats
 
     assert sorted(n.name for n in new_nodes) == sorted(names)

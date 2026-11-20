@@ -60,7 +60,11 @@ OUTSIDE = (ScheduleRejected,
            r"exp_\d+ is computed per iteration of GraphNode_\w+ but also read by \w+ outside it")
 MISCOUNT = (ScheduleRejected,
             r"GraphNode_\w+ runs N iterations but dim N of \w+ is cut into N tiles \(N of N\)")
+# A tile that holds one row. In the main tier the row is a unit extent of the tile; a
+# loop tier does not carry a dim its block holds one element of, so its tile is the
+# softmax axis alone.
 SINGLE_ROW = (stab.StabilizeRefused, r"exp_\d+: its tile \(N, N\) holds a single row")
+SINGLE_ROW_LOOP = (stab.StabilizeRefused, r"exp_\d+: its tile \(N,\) holds a single row")
 TRIP_COUNT = (stab.StabilizeRefused,
               r"exp_\d+: GraphNode_\w+ iterates N times but the softmax axis is stepped N of N")
 NOT_LEADING = (stab.StabilizeRefused,
@@ -86,7 +90,8 @@ def _no_rolling_form(obstacle):
 CASES = {
     "two_softmaxes": (S.two_softmaxes, dict(R=256, C=4096),
                       (dict(rolling=SHARED), dict(rolling=SHARED)), 1,
-                      [(_no_rolling_form("is also scaled by"), 35), (SINGLE_ROW, 8)]),
+                      [(_no_rolling_form("is also scaled by"), 35), (SINGLE_ROW_LOOP, 7),
+                       (SINGLE_ROW, 1)]),
     "column_weighted": (S.column_weighted, dict(M=128, K=4096, N=256),
                         (dict(axis=-2, rolling=TRAILING),), 0,
                         [(MISCOUNT, 52)]),
@@ -176,7 +181,7 @@ def test_shared_sum_is_never_rescaled():
     kernels, reasons = _census(search_tiling(ir, topk=1000))
     assert len(kernels) == n_built
     assert all("ukernel_rescale" not in code for _, _, code in kernels)
-    expected = [(TWO_OWNERS, 35), (SINGLE_ROW, 8)]
+    expected = [(TWO_OWNERS, 35), (SINGLE_ROW_LOOP, 7), (SINGLE_ROW, 1)]
     assert _histogram(reasons, expected) == Counter(dict(expected))
 
 
