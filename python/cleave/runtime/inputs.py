@@ -31,6 +31,13 @@ Each is requested explicitly (``EvalConfig.distributions`` for a program,
 validated on all of them (``ADVERSARIAL``, see ``cleave.pipeline.build``). A graph with no
 score matmul and no logit input has no logits to shape, and asking for an adversarial
 distribution on it is an error.
+
+In a graph whose softmax is exact (an ``Exp`` carries a ``Stabilize`` record) only the
+logits of the stabilized ``Exp`` nodes are shaped: a plain ``exp`` written next to a softmax
+makes no claim about large arguments, and its own matmul is left alone. Where a shaped input
+also feeds such a plain ``exp``, the graph has no adversarial case at all
+(``why_not_adversarial`` says so): its reference would overflow, by the program's own
+definition.
 """
 
 from __future__ import annotations
@@ -83,26 +90,84 @@ def adversarial_cases(graph) -> tuple:
 
     All of them when every score matmul reads a query input and a separate key input, and
     when the logits are an input themselves; only ``large_logits`` when one input is both
-    query and key; none when the graph has neither a score matmul nor a logit input, or an
-    operand of a score matmul is computed (the logits of RMSNorm-ed operands are bounded,
-    whatever the inputs are).
+    query and key; none when the graph has neither a score matmul nor a logit input, when an
+    operand of a score matmul is computed (nothing here can shape it through what computes
+    it), or when a shaped input also feeds a plain ``exp``. :func:`why_not_adversarial`
+    gives the reason for every case that is missing.
     """
+    return _cases(graph)[0]
+
+
+def why_not_adversarial(graph) -> str:
+    """Why ``graph`` is not held to every adversarial case; ``""`` when it is."""
+    return _cases(graph)[1]
+
+
+def _cases(graph) -> tuple:
     scores = score_matmuls(graph)
     try:
         operands = [(_operand(m, 0)[0], _operand(m, 1)[0]) for m in scores]
-    except SpecError:
-        return ()
-    if not operands and not logit_inputs(graph):
-        return ()
-    if {id(q) for q, _ in operands} & {id(k) for _, k in operands}:
-        return ("large_logits",)
-    return ADVERSARIAL
+    except SpecError as e:
+        return (), str(e)
+    logits = [node for node, _, _ in logit_inputs(graph)]
+    if not operands and not logits:
+        return (), "its logits are neither the result of a score matmul nor an input"
+    shaped = [p for pair in operands for p in pair] + logits
+    # Only where the softmax is exact: a graph without a record makes no claim at all, and
+    # the cases are simply what its inputs can be shaped into.
+    exact = any(_stabilized(n) for n in graph.nodes)
+    plain = _plain_exp_fed_by(graph, shaped) if exact else None
+    if plain is not None:
+        exp, placeholder = plain
+        return (), (
+            f"input {placeholder.name!r} also feeds {exp.name!r}, an exp that is not "
+            "stabilized: on shaped logits its reference overflows"
+        )
+    both = {id(q) for q, _ in operands} & {id(k) for _, k in operands}
+    if both:
+        name = next(q.name for q, _ in operands if id(q) in both)
+        return ("large_logits",), (
+            f"input {name!r} is both a query and a key of the scores: it can be scaled, "
+            "not ramped"
+        )
+    return ADVERSARIAL, ""
+
+
+def _stabilized(node) -> bool:
+    return getattr(node, "stabilize", None) is not None
+
+
+def _plain_exp_fed_by(graph, placeholders):
+    """``(exp, placeholder)`` for an ``Exp`` without a record that is computed from one of
+    ``placeholders``, else None. A stabilized ``Exp`` on the way is not crossed: what it
+    returns is at most 1, whatever its logits are."""
+    wanted = {id(p) for p in placeholders}
+    for exp in graph.nodes:
+        if not isinstance(exp, Exp) or _stabilized(exp):
+            continue
+        stack, seen = [exp], set()
+        while stack:
+            for edge in stack.pop().inputs:
+                src = edge.src_node
+                if id(src) in wanted:
+                    return exp, src
+                if id(src) in seen or isinstance(src, PlaceHolderNode) or _stabilized(src):
+                    continue
+                seen.add(id(src))
+                stack.append(src)
+    return None
 
 
 def score_matmuls(graph) -> list:
-    """The matmuls whose result reaches an ``Exp`` without crossing another matmul."""
+    """The matmuls whose result reaches an ``Exp`` without crossing another matmul.
+
+    In a graph whose softmax is exact (some ``Exp`` carries a ``Stabilize`` record) only the
+    stabilized ones count: the logits of a plain ``exp`` are not softmax logits.
+    """
     found, seen = [], set()
     stack = [n for n in graph.nodes if isinstance(n, Exp)]
+    if any(_stabilized(n) for n in stack):
+        stack = [n for n in stack if _stabilized(n)]
     while stack:
         for edge in stack.pop().inputs:
             src = edge.src_node

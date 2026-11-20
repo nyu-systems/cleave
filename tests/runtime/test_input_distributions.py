@@ -29,6 +29,7 @@ from cleave.runtime import reference as rt
 from cleave.runtime.inputs import (
     ADVERSARIAL as DENSE_ADVERSARIAL, DISTRIBUTIONS, INCREASING_SPAN, LARGE_LOGIT_FACTOR,
     LOGIT_OFFSET, OFFSET, OFFSET_GRID, SHARED_DISTRIBUTIONS, adversarial_cases, logit_inputs,
+    why_not_adversarial,
 )
 
 from tests import _graphs as g
@@ -267,6 +268,70 @@ def test_adversarial_cases_are_what_the_inputs_of_a_graph_can_be_shaped_into():
         with pytest.raises(SpecError, match="both a query and a key"):
             _inputs(graph, distribution)
 
+    # every case that is missing has a reason, and a graph that gets them all has none
+    assert why_not_adversarial(g.mha_bhsd_graph(1, 2, 8, 96, 16)) == ""
+    assert "both a query and a key" in why_not_adversarial(graph)
+    assert "neither the result of a score matmul nor an input" in why_not_adversarial(
+        g.matmul_graph(8, 8, 16))
+    assert "not read from an input" in why_not_adversarial(g.qknorm_graph(1, 4, 2, 8, 32, 16))
+
+
+def attention_plus_gate(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
+                        v: cl.Tensor["H", "SKV", "D"], a: cl.Tensor["H", "SQ", "E"],
+                        b: cl.Tensor["H", "D", "E"]):
+    """An exact softmax next to an ``exp`` written by hand, which has a matmul of its own."""
+    return exact_softmax((q @ k.mT) / q.shape[-1] ** 0.5) @ v + cl.exp((a @ b.mT) / 8.0)
+
+
+def attention_plus_exp_of_the_queries(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
+                                      v: cl.Tensor["H", "SKV", "D"], w: cl.Tensor["H", "D", "D"]):
+    """... and one whose plain ``exp`` reads the queries of the softmax."""
+    return exact_softmax((q @ k.mT) / q.shape[-1] ** 0.5) @ v + cl.exp((q @ w.mT) / 8.0)
+
+
+def test_a_plain_exp_next_to_an_exact_softmax_is_not_shaped():
+    """The cases shape the logits of the softmax, not the argument of an ``exp`` that makes
+    no claim: its reference would overflow, and a kernel with a correct softmax would be
+    failed for reproducing the program's own ``inf``."""
+    shapes = dict(H=2, SQ=8, SKV=96, D=16, E=16)
+    graph = lowered(attention_plus_gate, shapes)
+    exps = [n for n in graph.nodes if type(n) is Exp]
+    assert sorted(n.stabilize is not None for n in exps) == [False, True]
+    (scores,) = rt_inputs.score_matmuls(graph)  # the softmax's own matmul only
+    assert scores.K == 16 and scores.N == 96
+    assert adversarial_cases(graph) == DENSE_ADVERSARIAL and why_not_adversarial(graph) == ""
+    names = [p.name for p in rt.placeholder_order(graph)]
+    normal = dict(zip(names, _inputs(graph, "normal")))
+    for distribution in DENSE_ADVERSARIAL:
+        shaped = dict(zip(names, _inputs(graph, distribution)))
+        same = sorted(n for n in names if torch.equal(shaped[n], normal[n]))
+        assert len(same) >= 3 and len(same) < len(names), (distribution, same)  # v, a, b
+        _, reference, _ = rt.build_inputs_and_reference(
+            graph, DTYPE, seed=7, device="cpu", distribution=distribution)
+        assert all(torch.isfinite(r).all() for r in reference), distribution
+    # the inputs of the plain exp's matmul are the ones left alone, in every case
+    gate = next(n for n in graph.nodes if type(n) is Exp and n.stabilize is None)
+    assert rt_inputs._plain_exp_fed_by(graph, rt.placeholder_order(graph))[0] is gate
+
+    # the same graph without the record: every exp counts again, as for any graph that
+    # makes no claim (an explicit request shapes what it can)
+    for n in exps:
+        n.stabilize = None
+    assert len(rt_inputs.score_matmuls(graph)) == 2
+
+
+def test_an_input_shared_with_a_plain_exp_gets_no_adversarial_case():
+    graph = lowered(attention_plus_exp_of_the_queries, dict(H=2, SQ=8, SKV=96, D=16))
+    assert len(rt_inputs.score_matmuls(graph)) == 1
+    assert adversarial_cases(graph) == ()
+    why = why_not_adversarial(graph)
+    assert "also feeds" in why and "not stabilized" in why
+    # asked for explicitly it is still shaped, and the reference shows why it is not held
+    # to it: the plain exp overflows
+    _, reference, _ = rt.build_inputs_and_reference(
+        graph, DTYPE, seed=7, device="cpu", distribution="large_logits")
+    assert not all(torch.isfinite(r).all() for r in reference)
+
 
 def softmax_rows(x: cl.Tensor["R", "C"]):
     return exact_softmax(x, -1)
@@ -448,6 +513,90 @@ def test_adversarial_inputs_are_switched_on_per_operator():
     # logits that are neither a score matmul nor an input: nothing to shape, nothing added
     summed = trace(exp_of_a_sum, dict(R=4, C=32), cl.f16)
     assert held_to(summed, ("normal",), lowered(exp_of_a_sum, dict(R=4, C=32))) == ("normal",)
+
+
+def _stubbed_build(monkeypatch, program, asked=("normal",), tolerance=5e-3):
+    """``pipeline.build`` of ``program``'s identity graph with the workers and the GPU
+    stubbed out: every candidate "passes". Returns ``(BuildSet, published)``, ``published``
+    being the input cases ``build`` had the reference of each flat graph made for."""
+    from cleave import pipeline as P
+    from cleave.pipeline.superopt import GraphSet
+    from cleave.runtime import evaluate, validate
+
+    published = []
+
+    def publish(reference_cache_dir, graph, dtype, distributions=("normal",)):
+        published.append(tuple(distributions))
+        return [-1], 0
+
+    def run_candidates(candidates, dtype, *, reference_fn=None, **kw):
+        seen = set()
+        for cand in candidates:
+            if id(cand.flat_graph) not in seen:
+                seen.add(id(cand.flat_graph))
+                reference_fn("dir", cand.flat_graph, dtype)
+        return [evaluate.CandidateResult(cand, "ok") for cand in candidates]
+
+    monkeypatch.setattr(validate, "publish_reference", publish)
+    monkeypatch.setattr(evaluate, "run_candidates", run_candidates)
+    plans = P.schedule(GraphSet.identity(program), P.ScheduleConfig(topk=2))
+    assert len(plans) >= 1
+    built = P.build(plans, config=EvalConfig(tolerance=cl.Tolerance(rtol=tolerance),
+                                             distributions=asked))
+    return built, published
+
+
+def test_build_holds_an_exact_program_to_its_adversarial_cases(monkeypatch):
+    """The switch where it takes effect: ``build()`` itself has the references made for the
+    adversarial cases, and says on every result what its kernel was held to."""
+    from cleave import pipeline as P
+    from cleave.frontend import trace
+
+    built, published = _stubbed_build(monkeypatch, trace(softmax_rows, dict(R=64, C=256), cl.f16))
+    assert published == [("normal",) + DENSE_ADVERSARIAL]
+    assert len(built) >= 1 and all(r.cases == ("normal",) + DENSE_ADVERSARIAL for r in built)
+    assert not any(r.cases_note for r in built)
+    report = P.evaluate(built)
+    assert report.to_dict()["validation"]["inputs"] == [
+        {"cases": ["normal", *DENSE_ADVERSARIAL], "kernels": len(built), "note": ""}]
+    validate = dict((stage, text) for stage, text, _ in report.stage_lines())["validate"]
+    assert validate.endswith("inputs: normal, " + ", ".join(DENSE_ADVERSARIAL))
+
+    # what was asked for comes first; the cases are added behind it
+    built, published = _stubbed_build(monkeypatch, trace(softmax_rows, dict(R=64, C=256), cl.f16),
+                                      asked=("increasing", "normal"))
+    assert published == [("increasing", "normal", "large_logits", "decreasing", "last_spike",
+                          "constant", "offset")]
+
+    # a fixed-shift program makes no claim: what was asked, and nothing said about it
+    fixed = programs.attention.trace(HQ=32, HKV=32, SQ=64, SKV=256, D=64)
+    built, published = _stubbed_build(monkeypatch, fixed)
+    assert set(published) == {("normal",)} and all(r.cases == ("normal",) for r in built)
+    report = P.evaluate(built)
+    assert "inputs:" not in dict((s, t) for s, t, _ in report.stage_lines())["validate"]
+    assert report.to_dict()["validation"]["inputs"] == [
+        {"cases": ["normal"], "kernels": len(built), "note": ""}]
+
+
+def test_build_says_when_an_exact_program_is_held_to_fewer_cases(monkeypatch):
+    """A graph of an exact program whose logits cannot be shaped is validated on the normal
+    inputs alone. That is a weaker validation than the program's claim, so the result and
+    the report say so, with the reason."""
+    from cleave import pipeline as P
+    from cleave.frontend import trace
+
+    def exp_of_a_sum(x: cl.Tensor["R", "C"], y: cl.Tensor["R", "C"]):
+        return exact_softmax(x + y)
+
+    built, published = _stubbed_build(monkeypatch, trace(exp_of_a_sum, dict(R=64, C=256), cl.f16))
+    assert published == [("normal",)]
+    assert all(r.cases == ("normal",) and "neither the result of a score matmul nor an input"
+               in r.cases_note for r in built)
+    report = P.evaluate(built)
+    validate = dict((stage, text) for stage, text, _ in report.stage_lines())["validate"]
+    assert "inputs: normal [exact softmax not held to every adversarial case: " in validate
+    (entry,) = report.to_dict()["validation"]["inputs"]
+    assert entry["cases"] == ["normal"] and entry["note"] == built[0].cases_note
 
 
 # ----------------------------------------------------------------------------- dynamic

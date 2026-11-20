@@ -74,6 +74,11 @@ class Result:
     plan: Any  # pipeline.plans.Plan
     run: Any  # cleave.runtime.evaluate.CandidateResult
     kernel: Any = None  # pipeline.build.BuiltKernel, when codegen produced source
+    # The input cases the reference of its graph was built for (cleave.runtime.inputs): what
+    # a kernel had to pass to be ok. ``cases_note`` says why a program whose softmax is exact
+    # was held to fewer than every adversarial case ("" when it was held to all of them).
+    cases: tuple | None = None
+    cases_note: str = ""
 
     @property
     def ok(self) -> bool:
@@ -171,6 +176,15 @@ class _Results(Sequence):
     @property
     def failures(self) -> Failures:
         return Failures(r for r in self.results if not r.ok)
+
+    def input_cases(self) -> list[tuple]:
+        """``(cases, kernels, note)`` for each distinct set of input cases the candidates
+        were held to (``Result.cases``), in first-seen order; empty when none is recorded."""
+        groups = {}
+        for r in self.results:
+            if r.cases is not None:
+                groups[(r.cases, r.cases_note)] = groups.get((r.cases, r.cases_note), 0) + 1
+        return [(cases, n, note) for (cases, note), n in groups.items()]
 
     def histogram(self) -> dict[str, int]:
         return self.failures.histogram()
@@ -272,6 +286,7 @@ class Report(_Results):
                               "rel": [m.rel for m in r.measured],
                               "abs": [m.abs for m in r.measured]}
                              for r in self.results if r.measured is not None],
+                **self._inputs_entry(),
             },
             "timings_s": self.timings,
             "variants": {k: {"latency_us": v.latency_us, "kernels": [m.label for m in v.members]}
@@ -280,6 +295,29 @@ class Report(_Results):
             "unpaired": self.unpaired(),
             "best": None if not variants else min(variants.values(), key=lambda v: v.latency_us).variant,
         }
+
+    def _inputs_entry(self) -> dict:
+        """``{"inputs": [...]}`` for ``to_dict()["validation"]``: the input cases the
+        candidates were validated on, when the build recorded them."""
+        held = self.input_cases()
+        if not held:
+            return {}
+        return {"inputs": [{"cases": list(cases), "kernels": n, "note": note}
+                           for cases, n, note in held]}
+
+    def _inputs_text(self) -> str:
+        """What the validate line says about the input cases: nothing while every candidate
+        was held to the normal inputs alone and none of them claims more."""
+        held = self.input_cases()
+        if all(cases == ("normal",) and not note for cases, _, note in held):
+            return ""
+        parts = []
+        for cases, n, note in held:
+            text = ", ".join(cases) + (f" ({n} kernels)" if len(held) > 1 else "")
+            if note:
+                text += f" [exact softmax not held to every adversarial case: {note}]"
+            parts.append(text)
+        return "  inputs: " + "; ".join(parts)
 
     def stage_lines(self) -> list[tuple[str, str, float | None]]:
         """``(stage, text, seconds)`` rows: superoptimize / schedule / build / validate / benchmark."""
@@ -302,7 +340,7 @@ class Report(_Results):
         worst = format_measured(self.measured_error(), self.tolerance)
         rows.append(("validate", f"{n_val - len(val_fail)} ok / {len(val_fail)} failed"
                      + (f"  [{val_fail}]" if val_fail else "")
-                     + (f"  max error {worst}" if worst else ""), None))
+                     + (f"  max error {worst}" if worst else "") + self._inputs_text(), None))
         bench_fail = Failures(r for r in self.results if not r.ok and r.stage == "bench")
         variants, unpaired = self._resolve()
         if variants:

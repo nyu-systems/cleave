@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ast
-import functools
 import time
 from dataclasses import dataclass, field
 from typing import Any, Sequence
@@ -184,16 +183,27 @@ def _reference_fn(distributions, program, publish):
     (``cleave.runtime.inputs.adversarial_cases``), whether asked or not; they are timed on
     the first case, as always. A fixed-shift or hand-written ``exp / sum`` makes no such
     claim (its reference overflows on those inputs) and is validated on what was asked.
+
+    The returned function remembers what each graph was held to: ``held`` maps
+    ``id(flat graph)`` to ``(cases, note)``, ``note`` saying why a graph of an exact program
+    got fewer than every adversarial case (``""`` when it got them all, and for a program
+    that makes no claim).
     """
-    if not getattr(program, "stabilize_requests", ()):
-        return functools.partial(publish, distributions=distributions)
-    from ..runtime.inputs import adversarial_cases
+    exact = bool(getattr(program, "stabilize_requests", ()))
+    held = {}
 
-    def exact(reference_cache_dir, graph, dtype):
-        extra = tuple(d for d in adversarial_cases(graph) if d not in distributions)
-        return publish(reference_cache_dir, graph, dtype, distributions=distributions + extra)
+    def reference(reference_cache_dir, graph, dtype):
+        cases, note = distributions, ""
+        if exact:
+            from ..runtime.inputs import adversarial_cases, why_not_adversarial
 
-    return exact
+            cases += tuple(d for d in adversarial_cases(graph) if d not in distributions)
+            note = why_not_adversarial(graph)
+        held[id(graph)] = (cases, note)
+        return publish(reference_cache_dir, graph, dtype, distributions=cases)
+
+    reference.held = held
+    return reference
 
 
 def _check_tolerance_fits(plan_list, tolerance) -> None:
@@ -260,7 +270,9 @@ def build(plans: PlanSet | Sequence[Plan], workers: int | None = None, *,
                           benchmark=BenchOptions(config.warmup, config.iters),
                           reference_fn=reference_fn)
     kernels = built_kernels(plan_list, runs)
-    results = [Result(p, r, k) for p, r, k in zip(plan_list, runs, kernels)]
+    held = [reference_fn.held.get(id(p.tile.flat_graph), (None, "")) for p in plan_list]
+    results = [Result(p, r, k, cases, note)
+               for p, r, k, (cases, note) in zip(plan_list, runs, kernels, held)]
     return BuildSet(results, plans if isinstance(plans, PlanSet) else None,
                     time.perf_counter() - t0, config.tolerance)
 
