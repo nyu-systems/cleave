@@ -35,7 +35,13 @@ from .compile import (
     check_code,
 )
 from .gpu import _create_parallel_env, _gpu_exec_guard
-from .reference import graph_out_indices, make_inputs, order_inputs_for_kernel
+from .reference import (
+    graph_out_indices,
+    make_inputs,
+    order_inputs_for_kernel,
+    output_order,
+    with_hand_off,
+)
 from .validate import BenchOptions, benchmark_compiled_kernel, publish_reference
 from .workers import WorkerPool
 
@@ -88,6 +94,9 @@ class CandidateResult:
     error: CleaveError | None = None
     code: str | None = None
     cuda_src: str | None = None
+    # Mean time of one launch. For a kernel that stores an output transposed (a split
+    # partial) it includes the copy that hands the outputs over in the logical layout
+    # (cleave.runtime.reference.with_hand_off): no caller gets them without it.
     latency_ms: float | None = None
     label: str = ""
     # cleave.runtime.validate.MeasuredError per output, when the comparison ran to the end:
@@ -418,14 +427,15 @@ class _SerialBench:
             self.graph_inputs[key] = (inputs_by_name, graph_out_indices(graph))
         return self.graph_inputs[key]
 
-    def latency_ms(self, graph, code_str):
+    def latency_ms(self, graph, code_str, stored_layouts=None):
         import torch
 
         inputs_by_name, out_idx = self._inputs_for(graph)
         kernel = _compile(_load_main_kernel_from_code(code_str), out_idx)
+        logical_shapes = [node.get_shape(0) for node in output_order(graph)]
         try:
             return benchmark_compiled_kernel(
-                kernel,
+                with_hand_off(kernel, stored_layouts, logical_shapes),  # as the workers time it
                 order_inputs_for_kernel(inputs_by_name, kernel),
                 warmup_iters=self.warmup,
                 profile_iters=self.iters,
@@ -461,7 +471,8 @@ def benchmark_results(results, dtype, warmup=16, iters=1000) -> list[CandidateRe
                 continue
             try:
                 with _gpu_exec_guard():
-                    latency = bench.latency_ms(result.cand.flat_graph, result.code)
+                    latency = bench.latency_ms(result.cand.flat_graph, result.code,
+                                               result.stored_layouts)
             except Exception as exc:  # noqa: BLE001 - reported per candidate
                 error = _parent_error(BenchmarkError, result.label, "benchmark", exc)
                 timed.append(replace(result, status="failed", stage="bench", error=error))

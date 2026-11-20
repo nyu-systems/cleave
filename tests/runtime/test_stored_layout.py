@@ -4,7 +4,8 @@
 source, ``run_candidates`` hands it to the worker and puts it on the result, and validation
 lays the reference out with it instead of guessing from the extents of two shapes.
 
-``test_gpu_*`` needs a CUDA device (root conftest marks); everything else runs on CPU.
+``test_gpu_*`` needs a CUDA device (root conftest marks); everything else runs on CPU,
+the worker's validation included (``check_on_cpu``).
 """
 
 import multiprocessing as mp
@@ -18,12 +19,14 @@ from cleave.core.errors import OutputMismatch, ValidationError
 from cleave.runtime.compile import build_candidate, build_candidate_code
 from cleave.runtime.evaluate import run_candidates
 from cleave.runtime.reference import (
+    is_transposed,
     reconcile_output_layout,
     stored_shape,
     to_logical,
     to_stored,
+    with_hand_off,
 )
-from cleave.runtime.validate import Tolerance
+from cleave.runtime.validate import BenchOptions, Tolerance
 from cleave.runtime.workers import WorkerPool
 
 # A split partial stores (split, B*H, S_Q[, D]) for the logical (B*H, split, S_Q[, D]);
@@ -111,6 +114,32 @@ def test_reconcile_refuses_a_record_that_is_not_the_kernels_layout():
         reconcile_output_layout(_arange(32, 16, 64), (16, 32, 64), ROWSUM)  # pad of 1 missing
 
 
+def test_a_transposed_output_is_timed_with_its_hand_off():
+    """A kernel that stores an output transposed is only ever read through ``to_logical``,
+    which copies; that copy is part of what a launch costs, so it is in what gets timed.
+    Padding alone is a view and leaves the kernel as it is."""
+    assert is_transposed(ROWSUM) and is_transposed(VALUE)
+    assert not is_transposed(((0, 1, 2), 1)) and not is_transposed(((0, 1), 0))
+
+    rowsum, value = _arange(4, 8, 64), _arange(4, 8, 64, 64)
+    stored = (to_stored(rowsum, ROWSUM).contiguous(), to_stored(value, VALUE).contiguous())
+    kernel = lambda *inputs: stored  # noqa: E731
+    timed = with_hand_off(kernel, (ROWSUM, VALUE), [rowsum.shape, value.shape])
+    assert timed is not kernel
+    handed = timed()
+    assert all(torch.equal(got, want) and got.is_contiguous()
+               for got, want in zip(handed, (rowsum, value)))
+
+    # nothing transposed (a solo kernel, a combine, a single-output partial), or no record
+    for layouts in (None, (), (((0, 1, 2), 1), ((0, 1, 2, 3), 0))):
+        assert with_hand_off(kernel, layouts, [rowsum.shape, value.shape]) is kernel
+    single = lambda *inputs: stored[1]  # noqa: E731 - a kernel returning one tensor
+    (only,) = with_hand_off(single, (VALUE,), [value.shape])()
+    assert torch.equal(only, value)
+    with pytest.raises(ValueError, match="2 stored layouts for 1 outputs"):
+        with_hand_off(kernel, (ROWSUM, VALUE), [value.shape])
+
+
 # ------------------------------------------------------------------ build_candidate (CPU)
 
 def _split_partial_candidate():
@@ -193,14 +222,97 @@ def test_a_build_fn_without_layouts_and_a_check_fn_without_the_keyword_keep_work
     assert unset.ok and unset.cuda_src == "None" and unset.stored_layouts is None
 
 
-# ------------------------------------------------------------------ validation (GPU)
+# ------------------------------------------------------------------ validation
 
 class _FakeKernel:
+    """Stands in for a compiled kernel without inputs: it returns what it was given."""
+
     def __init__(self, *outputs):
         self.outputs = outputs
+        self.adapter = SimpleNamespace(prim_func=SimpleNamespace(params=[], buffer_map={}),
+                                       result_idx=[])
 
     def __call__(self, *inputs):
         return self.outputs
+
+    def get_kernel_source(self):
+        return "cuda source"
+
+
+@pytest.fixture
+def check_on_cpu(monkeypatch):
+    """The candidate check of a worker with the device taken out of it.
+
+    ``check(reference, kernel)`` registers one candidate and returns the source text to
+    hand to ``check_code``: "compiling" that text yields ``kernel``, and the reference the
+    worker would load from disk is ``reference``. The GPU lock and the CUDA cache calls do
+    nothing. Everything between the task a worker receives and the comparison is the real
+    code: ``_run_task`` -> ``check_code`` -> ``_check_kernel`` ->
+    ``_validate_kernel_outputs`` -> ``reconcile_output_layout`` -> ``compare_outputs``.
+    """
+    import contextlib
+
+    from cleave.runtime import compile as runtime_compile
+    from cleave.runtime import validate
+
+    registered = {}
+
+    def register(reference, kernel):
+        code = f"candidate {len(registered)}"
+        registered[code] = (kernel, [("normal", {}, list(reference))])
+        return code
+
+    monkeypatch.setattr(runtime_compile, "_create_parallel_env", lambda: None)
+    monkeypatch.setattr(runtime_compile, "_load_main_kernel_from_code", lambda code: code)
+    monkeypatch.setattr(runtime_compile, "_compile", lambda code, out_idx: registered[code][0])
+    monkeypatch.setattr(validate, "_gpu_exec_guard", contextlib.nullcontext)
+    monkeypatch.setattr(validate, "_load_reference", lambda code: registered[code][1])
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.cuda, "ipc_collect", lambda: None)
+    return register
+
+
+@pytest.mark.parametrize("heads, split, without_the_record", [
+    (4, 4, "OutputMismatch"),  # split == B*H: one shape for both layouts, compared transposed
+    (4, 8, "ValueError"),      # S_Q == D: "Ambiguous output layout reconciliation"
+    (32, 32, "OutputMismatch"),
+    (32, 16, "ValueError"),
+])
+def test_a_worker_validates_a_split_first_partial_only_with_its_record(
+        check_on_cpu, heads, split, without_the_record):
+    """The carriage of the record into validation, without a device: a kernel that is right
+    passes the worker's check exactly when the task carries its stored layouts. Without
+    them these are the two failures every static split-attention partial had."""
+    from cleave.runtime.compile import check_code
+    from cleave.runtime.workers import _run_task
+
+    torch.manual_seed(0)
+    rowsum, value = torch.rand(heads, split, 64).half(), torch.randn(heads, split, 64, 64).half()
+    kernel = _FakeKernel(to_stored(rowsum, ROWSUM).contiguous(),
+                         to_stored(value, VALUE).contiguous())
+    code = check_on_cpu([rowsum, value], kernel)
+    task = {"check_fn": check_code, "code_str": code, "out_idx": [-2, -1],
+            "reference_cache_dir": code, "tolerance": Tolerance(rtol=1e-3), "benchmark": None}
+
+    result = _run_task({**task, "stored_layouts": (ROWSUM, VALUE)})
+    assert result["ok"], result.get("error_message")
+    assert result["cuda_src"] == "cuda source" and result["latency_ms"] is None
+    assert [m.rel for m in result["measured"]] == [0.0, 0.0]
+
+    for bare in (task, {**task, "stored_layouts": None}):  # no record: the extent path
+        result = _run_task(bare)
+        assert not result["ok"] and result["stage"] == "validate"
+        assert result["error_type"] == without_the_record
+        assert ("Ambiguous output layout" in result["error_message"]) == (heads != split)
+
+    # the record of another kernel is an error, never a silent fallback to the extents
+    result = _run_task({**task, "stored_layouts": (VALUE,)})
+    assert not result["ok"] and "1 stored layouts were recorded" in result["error_message"]
+    result = _run_task({**task, "stored_layouts": (((0, 1, 2), 1), ((0, 1, 2, 3), 0))})
+    if heads == split:  # the logical layout has the same shape: a real mismatch
+        assert result["error_type"] == "OutputMismatch"
+    else:
+        assert "but the kernel returned" in result["error_message"]
 
 
 def test_gpu_a_split_first_partial_validates_only_with_its_record():
@@ -234,3 +346,80 @@ def test_gpu_a_split_first_partial_validates_only_with_its_record():
             with pytest.raises(ValueError, match="2 outputs"):
                 validate._validate_kernel_outputs(kernel, (), [rowsum, value],
                                                   tolerance=tolerance, stored_layouts=(VALUE,))
+
+
+def test_a_worker_times_a_split_first_partial_with_its_hand_off(check_on_cpu, monkeypatch):
+    """The latency a worker reports for a split-first partial covers the launch and the
+    copy to the logical layout; the sum of a split variant's stage timings is then what a
+    chained call costs. A kernel that stores its outputs as the graph has them is timed
+    bare."""
+    from cleave.runtime import validate
+    from cleave.runtime.compile import check_code
+    from cleave.runtime.workers import _run_task
+
+    timed = []
+
+    def fake_benchmark(kernel, inputs, *, warmup_iters, profile_iters):
+        outputs = kernel(*inputs)
+        timed.append((kernel, [tuple(out.shape) for out in outputs]))
+        return 0.125
+
+    monkeypatch.setattr(validate, "benchmark_compiled_kernel", fake_benchmark)
+    rowsum, value = torch.rand(4, 8, 64).half(), torch.randn(4, 8, 64, 64).half()
+    partial = _FakeKernel(to_stored(rowsum, ROWSUM).contiguous(),
+                          to_stored(value, VALUE).contiguous())
+    logical = _FakeKernel(rowsum.unsqueeze(-1), value)  # the layout of GQA at split == H_KV
+    task = {"check_fn": check_code, "out_idx": [-2, -1], "tolerance": Tolerance(rtol=1e-3),
+            "benchmark": BenchOptions(warmup=1, iters=2)}
+
+    code = check_on_cpu([rowsum, value], partial)
+    result = _run_task({**task, "code_str": code, "reference_cache_dir": code,
+                        "stored_layouts": (ROWSUM, VALUE)})
+    assert result["ok"] and result["latency_ms"] == 0.125
+    code = check_on_cpu([rowsum, value], logical)
+    result = _run_task({**task, "code_str": code, "reference_cache_dir": code,
+                        "stored_layouts": (((0, 1, 2), 1), ((0, 1, 2, 3), 0))})
+    assert result["ok"] and result["latency_ms"] == 0.125
+
+    (with_copy, handed), (bare, returned) = timed
+    assert with_copy is not partial and handed == [(4, 8, 64), (4, 8, 64, 64)]
+    assert bare is logical and returned == [(4, 8, 64, 1), (4, 8, 64, 64)]
+
+
+def test_the_serial_re_time_includes_the_hand_off_too(monkeypatch):
+    """``benchmark_results`` re-times a result in this process; it must time what the
+    workers time, or a re-timed split partial would lose its hand-off again."""
+    import contextlib
+
+    from cleave.runtime import evaluate
+    from cleave.runtime.reference import output_order
+    from tests._graphs import mha_split_partial_graph
+
+    graph = mha_split_partial_graph(1, 4, 8, 64, 16, 64)  # B*H=4, split 8, S_Q=64, D=64
+    logical = [tuple(int(s) for s in node.get_shape(0)) for node in output_order(graph)]
+    assert logical == [(4, 8, 64), (4, 8, 64, 64)]
+    kernel = _FakeKernel(*(torch.zeros(stored_shape(shape, layout))
+                           for shape, layout in zip(logical, (ROWSUM, VALUE))))
+    timed = []
+
+    def fake_benchmark(timed_kernel, inputs, *, warmup_iters, profile_iters):
+        timed.append([tuple(out.shape) for out in timed_kernel(*inputs)])
+        return 0.25
+
+    monkeypatch.setattr(evaluate, "_gpu_exec_guard", contextlib.nullcontext)
+    monkeypatch.setattr(evaluate, "_load_main_kernel_from_code", lambda code: code)
+    monkeypatch.setattr(evaluate, "_compile", lambda code, out_idx: kernel)
+    monkeypatch.setattr(evaluate, "make_inputs", lambda graph, dtype: [])
+    monkeypatch.setattr(evaluate, "order_inputs_for_kernel", lambda inputs, kernel: [])
+    monkeypatch.setattr(evaluate, "benchmark_compiled_kernel", fake_benchmark)
+    for name in ("synchronize", "empty_cache", "ipc_collect"):
+        monkeypatch.setattr(torch.cuda, name, lambda: None)
+
+    cand = SimpleNamespace(flat_graph=graph)
+    results = [
+        evaluate.CandidateResult(cand, "ok", code="partial", stored_layouts=(ROWSUM, VALUE)),
+        evaluate.CandidateResult(cand, "ok", code="partial"),  # built without the record
+    ]
+    retimed = evaluate.benchmark_results(results, "float16", warmup=1, iters=2)
+    assert [r.latency_ms for r in retimed] == [0.25, 0.25] and all(r.ok for r in retimed)
+    assert timed == [logical, [(8, 4, 64, 1), (8, 4, 64, 64)]]

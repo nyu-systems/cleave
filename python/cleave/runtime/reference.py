@@ -447,6 +447,41 @@ def to_logical(stored, layout, logical_shape):
     return stored.reshape(expected[: len(axes)]).permute(*inverse).contiguous()
 
 
+def is_transposed(layout) -> bool:
+    """Whether ``layout`` permutes the axes of the output it describes. Such an output has
+    to be copied to reach the logical layout (:func:`to_logical`); any other layout only
+    appends unit dims, which is a view."""
+    axes = tuple(int(a) for a in layout[0])
+    return axes != tuple(range(len(axes)))
+
+
+def with_hand_off(kernel, stored_layouts, logical_shapes):
+    """What a launch of ``kernel`` costs its caller: ``kernel`` itself, or -- when it stores
+    an output transposed -- a callable that launches it and brings every output to its
+    logical layout.
+
+    Only a split partial stores outputs transposed, and its outputs are only ever read
+    through that copy (``Kernel.__call__`` hands them to the combine with ``to_logical``).
+    The copy belongs to the tiling that chose the layout, so it is timed with the kernel:
+    a split variant's latency is the sum of its stage timings, and would otherwise leave
+    out part of every call. A kernel without transposed outputs is returned as it is.
+    """
+    layouts = list(stored_layouts or ())
+    if not any(is_transposed(layout) for layout in layouts):
+        return kernel
+    shapes = [tuple(int(s) for s in shape) for shape in logical_shapes]
+    if len(shapes) != len(layouts):
+        raise ValueError(f"{len(layouts)} stored layouts for {len(shapes)} outputs")
+
+    def launch_and_hand_off(*inputs):
+        outputs = kernel(*inputs)
+        outputs = list(outputs) if isinstance(outputs, (tuple, list)) else [outputs]
+        return [to_logical(out, layout, shape)
+                for out, layout, shape in zip(outputs, layouts, shapes)]
+
+    return launch_and_hand_off
+
+
 def reconcile_output_layout(reference, actual_shape, layout=None):
     """Return ``reference`` reshaped/permuted to the kernel's physical output shape.
 

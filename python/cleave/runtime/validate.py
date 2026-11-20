@@ -16,6 +16,7 @@ from .reference import (
     build_inputs_and_reference,
     order_inputs_for_kernel,
     reconcile_output_layout,
+    with_hand_off,
 )
 from .timer import mean_launch_ms
 
@@ -415,6 +416,8 @@ def _check_kernel(
     name in ``distributions``) must be provided. A missing ``tolerance`` is an error.
     ``stored_layouts``: how the kernel stores each output (``_validate_kernel_outputs``).
     Timing happens under the same GPU lock hold as validation, on the first case's inputs.
+    A kernel that stores an output transposed (a split partial) is timed together with the
+    copy that hands its outputs over in the logical layout (``reference.with_hand_off``).
     Returns ``(measured error per output, mean latency in ms or None)``.
     """
     with _stage("validate"):
@@ -426,11 +429,12 @@ def _check_kernel(
             else:
                 cases, _ = _reference_cases(graph, dtype, distributions)
 
-            measured, timing_inputs = None, None
+            measured, timing_inputs, logical_shapes = None, None, None
             for distribution, inputs_by_name, reference in cases:
                 inputs = order_inputs_for_kernel(inputs_by_name, kernel)
                 if timing_inputs is None:
                     timing_inputs = inputs
+                    logical_shapes = [tuple(ref.shape) for ref in reference]
                 measured = worst(measured, _validate_kernel_outputs(
                     kernel, inputs, reference, tolerance=tolerance,
                     what="" if distribution == "normal" else f"{distribution} inputs",
@@ -440,8 +444,8 @@ def _check_kernel(
             return measured, None
         with _stage("bench"):
             return measured, benchmark_compiled_kernel(
-                kernel, timing_inputs, warmup_iters=benchmark.warmup,
-                profile_iters=benchmark.iters,
+                with_hand_off(kernel, stored_layouts, logical_shapes), timing_inputs,
+                warmup_iters=benchmark.warmup, profile_iters=benchmark.iters,
             )
 
 
