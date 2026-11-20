@@ -233,17 +233,36 @@ def run_candidates(
     owns_pool = pool is None
     if owns_pool:
         pool = WorkerPool()
-    graph_refs = {}  # id(flat_graph) -> (reference_cache_dir, out_idx, io_bytes)
+    # id(flat_graph) -> (reference_cache_dir, out_idx, io_bytes), or what building it raised
+    graph_refs = {}
 
-    def reference_for(cand):
-        graph = cand.flat_graph
-        key = id(graph)
-        if key not in graph_refs:
+    def publish_references():
+        """Build the reference of every flat graph, before the first worker starts.
+
+        A reference is built on the GPU, under the lock the workers validate under
+        (``_gpu_exec_guard``). Built at the first candidate of its graph instead, the
+        parent would wait for that lock in the middle of the run -- and a worker whose
+        kernel never returns holds it for good. The parent is the one that times a
+        candidate out, so it would wait with it forever.
+        """
+        for cand in candidates:
+            key = id(cand.flat_graph)
+            if key in graph_refs:
+                continue
             cache_dir = os.path.join(reference_root, f"g{len(graph_refs)}")
             os.makedirs(cache_dir, exist_ok=True)
-            g_out_idx, g_io_bytes = reference_fn(cache_dir, graph, dtype)
-            graph_refs[key] = (cache_dir, g_out_idx, g_io_bytes)
-        return graph_refs[key]
+            try:
+                g_out_idx, g_io_bytes = reference_fn(cache_dir, cand.flat_graph, dtype)
+            except Exception as exc:  # noqa: BLE001 - reported by each candidate of the graph
+                graph_refs[key] = exc
+            else:
+                graph_refs[key] = (cache_dir, g_out_idx, g_io_bytes)
+
+    def reference_for(cand):
+        reference = graph_refs[id(cand.flat_graph)]
+        if isinstance(reference, Exception):
+            raise reference
+        return reference
 
     def finish(job, result, pbar):
         results[job["idx"] - 1] = result
@@ -339,6 +358,7 @@ def run_candidates(
             fail(job, "crash", error, pbar, job["code_str"])
 
     try:
+        publish_references()
         _, _, io_bytes = reference_for(candidates[0])
         max_parallel = _effective_compile_and_run_parallelism(max_parallel, io_bytes)
 
