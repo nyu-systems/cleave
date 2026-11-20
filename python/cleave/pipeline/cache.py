@@ -49,7 +49,9 @@ from pathlib import Path
 #     input in the place of an output).
 # 19: a factor (or divisor) computed elementwise from a sum of lower rank is staged through
 #     shared memory, as that sum itself already was (the RMSNorm split-K combine).
-SCHEMA = 19
+# 20: a tiling whose kernel cannot compile for a unit extent (a reduction stepped one element
+#     at a time, an elementwise op or a matmul on a single row) is refused at build.
+SCHEMA = 20
 # What "validated" means for a saved kernel. A kernel-cache hit returns without validating,
 # so bump this whenever the comparison or its inputs change: saved kernels are then rebuilt.
 # (The inputs include the adversarial cases a program with an exact softmax is held to,

@@ -980,6 +980,89 @@ def _refuse_tile_that_misses_dims(node, shape, tile, expanded_tile):
         )
 
 
+def _stored_rank(tile) -> int:
+    """The rank of the buffer a tile is stored in: its unit extents are squeezed out
+    (codegen's ``kept_extents``), and a tile of unit extents only is stored 1-D."""
+    return max(1, sum(1 for extent in tile if not _is_unit(extent)))
+
+
+def _operand_tile(tier: Graph, edge) -> Optional[Iterator]:
+    """The tile of the value ``edge`` reads, in the tier that stores it."""
+    if isinstance(edge.src_node, GraphNode):
+        accum_node = getattr(edge, "accum_node", None)
+        it = None if accum_node is None else edge.src_node.graph.tmap.get(accum_node)
+    else:
+        it = tier.tmap.get(edge.src_node)
+    return it if isinstance(it, Iterator) else None
+
+
+def refuse_unit_extents(main: Graph) -> None:
+    """Refuse a scheduled graph whose kernel does not compile because of a unit extent.
+
+    A kernel stores a tile without its unit extents. Three kinds of op are emitted for the
+    rank of the tensor, not of the tile, and a tiling that takes one element of a
+    non-batch dim leaves them a buffer of lower rank than they index:
+
+    * a reduction that is handed one element of the axis it reduces per step (a loop that
+      walks the axis one element at a time): the slice has no such axis, so there is no
+      ``dim`` to reduce over (TileLang: "Invalid reduce output shape");
+    * an elementwise op, whose macro has one index per non-batch dim (a block of a single
+      row: "not enough values to unpack", "Can't deduce copy extents");
+    * a matmul, whose operands and result must be stored 2-D (a single row or column:
+      "Swizzle layout expects rank >= 2", the gemm 2-D assert).
+
+    Such a candidate used to be built and handed to TileLang, where it died at parse or in
+    layout inference, each with whatever message the missing dim produced first. This is
+    the default build's check (``runtime.compile.build_candidate``), not ``apply_tiling``'s:
+    the paged path schedules step-1 tilings only to read them (``read_dense_combine``) and
+    emits its own kernels for them.
+    """
+    from ..ir.ops import Matmul
+    from ..ir.ops.elementwise import BinaryElementwise, UnaryElementwise
+
+    for tier, _ in graph_tiers(main):
+        for node in tier.nodes:
+            if isinstance(node, ReduceSum) and len(node.inputs) == 1:
+                it = _operand_tile(tier, node.inputs[0])
+                if it is None:
+                    continue
+                rank = len(node.dims)
+                position = it.position(node.flat_axis, rank)
+                step = 1 if position is None else it.tile_size[position]
+                if _is_unit(step):
+                    raise ScheduleRejected(
+                        f"{node.name} is handed one element of the axis it reduces per step "
+                        f"({int(node.dims[node.flat_axis])} in all): the stored slice has no "
+                        "such axis to reduce over"
+                    )
+            elif isinstance(node, (BinaryElementwise, UnaryElementwise)):
+                it = tier.tmap.get(node)
+                if not isinstance(it, Iterator):
+                    continue
+                indexed = len(node.dims) - node.n_batch_dims
+                tile = tuple(int(t) for t in it.tile_size)
+                if _stored_rank(tile) != indexed:
+                    raise ScheduleRejected(
+                        f"{node.name} indexes {indexed} dims but its tile {tile} is stored "
+                        f"with {_stored_rank(tile)}: a unit extent that is not a batch dim "
+                        "is squeezed out of the tile"
+                    )
+            elif isinstance(node, Matmul):
+                tiles = [("result", tier.tmap.get(node))] + [
+                    (f"operand {edge.dst_id}", _operand_tile(tier, edge)) for edge in node.inputs
+                ]
+                for what, it in tiles:
+                    if not isinstance(it, Iterator):
+                        continue
+                    tile = tuple(int(t) for t in it.tile_size)
+                    if _stored_rank(tile) != 2:
+                        raise ScheduleRejected(
+                            f"{node.name}: its {what} tile {tile} is stored with "
+                            f"{_stored_rank(tile)} dim(s); a matmul takes 2-D operands and "
+                            "gives a 2-D result, so a single row or column has no kernel"
+                        )
+
+
 def apply_tiling(cand: List) -> List[Graph]:
     output_nodes = [n for n in cand.flat_graph.nodes if n.is_output()]
     output_node = _select_canonical_output_node(output_nodes)

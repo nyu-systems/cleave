@@ -213,3 +213,105 @@ def test_the_recognizer_asks_which_axis_a_sum_was_built_to_reduce():
     with pytest.raises(NotDenseAttention, match=r"expected two reductions over the leading "
                                                 r"\(split\) axis, got .*'rowsum_combine_0', 1"):
         read_dense_combine(tiled)
+
+
+# ------------------------------------------- what a unit extent still leaves without a kernel
+#
+# A kernel stores a tile without its unit extents, and three kinds of op are emitted for
+# the rank of the tensor, not of the tile. A tiling that hands one of them a buffer of
+# lower rank used to be built and handed to TileLang, where it died with whatever the
+# missing dim produced first ("Invalid reduce output shape", "not enough values to unpack",
+# "Can't deduce copy extents", "Swizzle layout expects rank >= 2"). The default build
+# refuses it, typed and with the reason.
+
+
+def _build(cand):
+    from cleave.core.errors import ScheduleRejected
+
+    try:
+        return build_candidate_code(cand), None
+    except ScheduleRejected as refusal:
+        return None, str(refusal)
+
+
+@pytest.mark.parametrize("name", sorted(STEP_ONE))
+def test_a_reduction_stepped_one_element_at_a_time_is_a_typed_refusal(name):
+    build, dims, output_tile, steps, _ = STEP_ONE[name]
+    cand = _candidate(build(*dims), output_tile, **steps)
+    # apply_tiling schedules it: the paged path reads such a tiling (read_dense_combine)
+    # and emits its own kernel for it.
+    assert _loop(apply_tiling(cand)).extent == 4
+    code, refusal = _build(cand)
+    assert code is None and refusal == (
+        "reduction_0 is handed one element of the axis it reduces per step (4 in all): the "
+        "stored slice has no such axis to reduce over")
+
+
+def test_an_elementwise_op_on_a_single_row_tile_is_a_typed_refusal():
+    from tests._graphs import mha_split_combine_graph
+
+    cand = _candidate(mha_split_combine_graph(32, 4, 4096, 64), [1, 1, 64],
+                      value_combine_0=2, rowsum_combine_0=2)
+    code, refusal = _build(cand)
+    assert code is None and refusal == (
+        "div_0 indexes 2 dims but its tile (1, 1, 64) is stored with 1: a unit extent that is "
+        "not a batch dim is squeezed out of the tile")
+
+
+def test_a_single_row_matmul_is_a_typed_refusal():
+    from tests._graphs import matmul_graph
+
+    graph = matmul_graph(128, 128, 4096)
+    (mma,) = [n for n in graph.nodes if n.name == "mma_0"]
+    cand = _candidate(graph, [1, 32], mma_0=32)
+    code, refusal = _build(cand)
+    assert code is None and refusal == (
+        "mma_0: its result tile (32,) is stored with 1 dim(s); a matmul takes 2-D operands "
+        "and gives a 2-D result, so a single row or column has no kernel")
+    # the same matmul on a block of rows is built as ever
+    code, refusal = _build(_candidate(matmul_graph(128, 128, 4096), [64, 32], mma_0=32))
+    assert refusal is None and "T.gemm" in code
+
+
+@pytest.mark.parametrize("name", sorted({**SINGLE_ROW, **CONTROLS}))
+def test_reductions_on_single_row_tiles_are_not_refused(name):
+    """What the refusals leave alone: a reduction is emitted for the stored tile (its
+    ``dim`` is rebased), so a single row, column or element still has a kernel."""
+    build, dims, output_tile, steps, _ = {**SINGLE_ROW, **CONTROLS}[name]
+    code, refusal = _build(_candidate(build(*dims), output_tile, **steps))
+    assert refusal is None and "main_kernel" in code
+
+
+# fixture -> (candidates, kernels built, refusals by reason)
+STEP = "is handed one element of the axis it reduces per step"
+ROW = "a unit extent that is not a batch dim is squeezed out of the tile"
+OUTCOMES = {
+    "mha_split_combine": (lambda: __import__("tests._graphs", fromlist=["g"]).mha_split_combine_graph(
+        32, 4, 4096, 64), 87, 34, {STEP: 44, ROW: 9}),
+    "rmsnorm_split_combine": (
+        lambda: __import__("tests._graphs", fromlist=["g"]).rmsnorm_matmul_split_combine_graph(
+            4, 1024, 6144, 4096), 24, 6, {STEP: 9, ROW: 9}),
+}
+
+
+@pytest.mark.parametrize("name", sorted(OUTCOMES))
+def test_every_candidate_is_built_or_refused_with_a_reason(name):
+    """Every tiling the policy proposes for the two split combines: a kernel, or a typed
+    refusal -- nothing else escapes the build (anything but ``ScheduleRejected`` propagates
+    out of ``_build``)."""
+    from collections import Counter
+
+    from cleave.schedule import search_tiling
+
+    build, n_candidates, n_built, refusals = OUTCOMES[name]
+    cands = search_tiling(build(), topk=1000)
+    assert len(cands) == n_candidates
+    built, reasons = 0, Counter()
+    for cand in cands:
+        code, refusal = _build(cand)
+        if code is not None:
+            built += 1
+            continue
+        (reason,) = [r for r in (STEP, ROW) if r in refusal]
+        reasons[reason] += 1
+    assert (built, dict(reasons)) == (n_built, refusals)

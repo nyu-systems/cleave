@@ -77,8 +77,10 @@ def _build_code(cand, mla_decode_pass):
     from cleave.codegen import passes
     from cleave.codegen import TilelangCodeGen
     from cleave.schedule import apply_tiling
+    from cleave.schedule.tiling import refuse_unit_extents
 
     g = apply_tiling(cand)
+    refuse_unit_extents(g)
     g = passes.annotate_args(g, is_main=True)
     g = passes.annotate_tinfo(g, is_main=True)
     g = passes.annotate_tc_layout(g)

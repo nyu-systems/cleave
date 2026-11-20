@@ -17,6 +17,7 @@ torch = pytest.importorskip("torch")
 
 import cleave.lang as cl
 from cleave import pipeline as P
+from cleave.core.errors import ScheduleRejected
 from cleave.frontend import trace
 from cleave.ir.graph_utils import boundary_signature
 from cleave.pipeline.kernel import stages_for
@@ -81,11 +82,16 @@ def test_search_split_records_on_searched_graphs(kind, cache_root):
             assert sorted(ph.boundary.index for ph in placeholder_order(partial)) == [0, 1, 2]
 
     # Record A: the stored shape of every output of every tiling follows from its record.
-    plans = P.schedule(split, P.ScheduleConfig(topk=4, split_k=FACTORS))
+    # The four best partial tilings of every graph and factor, and the combine tilings down
+    # to the first ones that have a kernel: the best-ranked combine tilings take one
+    # partial per step or a single row per block, which the build refuses.
+    plans = P.schedule(split, P.ScheduleConfig(topk=32, split_k=FACTORS))
     assert not plans.refused, plans.summary()
     built = {}  # (variant, role) -> the first plan with a kernel, and its result
     layouts_seen = {}
     for plan in plans:
+        if plan.rank >= 4 and (plan.role != "combine" or (plan.variant, "combine") in built):
+            continue
         try:
             scheduled = apply_tiling(plan.tile)
         except Exception:  # noqa: BLE001 - a tiling apply_tiling refuses has no kernel
@@ -95,7 +101,10 @@ def test_search_split_records_on_searched_graphs(kind, cache_root):
             assert out.name == flat.name
             assert stored_shape(_shape(flat), scheduled.stored_layouts[out.name]) == tuple(
                 int(s) for s in scheduled.tmap[out].shape), plan.label
-        code, layouts = build_candidate(plan.tile)
+        try:
+            code, layouts = build_candidate(plan.tile)
+        except ScheduleRejected:  # a tiling the build refuses (a unit extent) has no kernel
+            continue
         layouts_seen.setdefault((plan.split_factor, plan.role), set()).add(layouts)
         built.setdefault((plan.variant, plan.role), (plan, CandidateResult(
             plan.tile, "ok", code=code, stored_layouts=layouts)))
