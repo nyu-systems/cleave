@@ -150,13 +150,13 @@ def test_absorbed_reduction_keeps_its_whole_axis(name, unformatted):
 
 
 @pytest.mark.parametrize(
-    ("K", "proposed"),
+    ("K", "proposed", "built"),
     [
-        pytest.param(4096, 130, id="K4096_kernel_over_the_cap"),
-        pytest.param(1024, 146, id="K1024_kernel_fits"),
+        pytest.param(4096, 130, 22, id="K4096_kernel_over_the_cap"),
+        pytest.param(1024, 146, 42, id="K1024_kernel_fits"),
     ],
 )
-def test_refuses_to_step_an_axis_that_an_absorbed_reduction_holds_whole(K, proposed):
+def test_refuses_to_step_an_axis_that_an_absorbed_reduction_holds_whole(K, proposed, built):
     """LoRA ``X @ W + (X @ A) @ B`` with all three matmuls stepped below their extents.
 
     ``X @ A`` is absorbed into the loop of ``(X @ A) @ B``, which walks the rank, so it needs
@@ -176,6 +176,11 @@ def test_refuses_to_step_an_axis_that_an_absorbed_reduction_holds_whole(K, propo
     so it prunes on the steps at face value and only what it emits is rated as its kernel.
     Pruning the walk on the kernel's rating proposes nothing at ``K = 4096`` and 96 of
     the 146 at ``K = 1024``.
+
+    Not every proposed candidate has a kernel yet: the policy steps ``X @ W`` and
+    ``X @ A`` apart in most of them, and the loop they share then miscounts the tiles of
+    ``X``. Those are refused by the loop-extent guard, with a reason this test derives
+    from the candidate's own steps; how many are left to build is pinned too.
     """
     # Rank 128: at the end2end case's rank of 16 the up projection never iterates.
     policy = _policy(g.lora_graph(16, 4096, K, 128), False)
@@ -208,7 +213,7 @@ def test_refuses_to_step_an_axis_that_an_absorbed_reduction_holds_whole(K, propo
             ), label
             assert runs != K // tile, label
             assert steps["mma_base"] != steps["mma_down"], label
-    assert n_built, "no candidate without an absorbed reduction is built; the case tests nothing"
+    assert n_built == built
 
     # The step maps the search walks through on its way to those: up projection and base
     # matmul stepped together (they are one group), the down projection at any step.
