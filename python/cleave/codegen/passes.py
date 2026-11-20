@@ -411,11 +411,13 @@ def stage_misplaced_register_operands(graph: Graph) -> Graph:
                 continue
             it = cur_graph.tmap.get(cur_node)
             extents = [] if it is None else kept_extents(it.tile_size)
-            if len(extents) < 2 or not all(isinstance(e, int) for e in extents[-2:]):
+            if len(extents) < 2:
                 continue
-            if not register_operand_is_misplaced(
-                cur_node.warp_policy, int(extents[-2]), int(extents[-1]), n_threads
-            ):
+            try:
+                rows, cols = int(extents[-2]), int(extents[-1])
+            except (TypeError, ValueError):
+                continue  # a symbolic extent: not a tile the static path builds
+            if not register_operand_is_misplaced(cur_node.warp_policy, rows, cols, n_threads):
                 continue
             if not reads_a_fragment(cur_graph, cur_node):
                 continue
