@@ -1,8 +1,10 @@
 """The validation input distributions (CPU): ``normal`` and the adversarial softmax cases.
 
-``large_logits`` and ``increasing`` are generators only for now: no operator validates on
-them until its softmax is stabilized (today's fixed-shift references are NaN there), which
-``test_no_operator_validates_on_adversarial_inputs_yet`` pins.
+``large_logits`` and ``increasing`` are generators only for the dense programs: none of them
+validates on them until its softmax is stabilized (today's fixed-shift references are NaN
+there). The dynamic operators have two more (``large_scale``, ``dominant_last``), and one
+operator's softmax is exact and validates on all four, which
+``test_adversarial_inputs_are_switched_on_per_operator`` pins.
 """
 
 import inspect
@@ -171,8 +173,15 @@ def test_adversarial_inputs_need_softmax_scores_and_a_known_name():
         rt_inputs.check_distributions(())
 
 
-def test_no_operator_validates_on_adversarial_inputs_yet():
-    """The generators exist; switching one on is a deliberate, per-operator change."""
+def test_adversarial_inputs_are_switched_on_per_operator():
+    """The generators exist; switching one on is a deliberate, per-operator change.
+
+    Nothing asks for them by default. A dynamic operator declares that its softmax is exact
+    (``exact_softmax``), and from then on every validation of it includes its adversarial
+    workloads; one operator does so far, and no dense program yet.
+    """
+    assert {name for name, op in OPERATORS.items() if op.exact_softmax} == {
+        "gqa_paged_decode_h32_kv8_d128_ps1"}
     assert EvalConfig().distributions == ("normal",)
     assert EvalConfig(distributions="increasing").distributions == ("increasing",)
     assert inspect.signature(rt.make_inputs).parameters["distribution"].default == "normal"
@@ -185,12 +194,78 @@ def test_no_operator_validates_on_adversarial_inputs_yet():
 
 
 # ----------------------------------------------------------------------------- dynamic
+# logits x100 through the queries and through the scale; increasing along the keys; one
+# dominant key at the end of every request
+ADVERSARIAL = ("large_logits", "large_scale", "increasing", "dominant_last")
+
+
+def test_dynamic_distributions_extend_the_shared_ones():
+    assert dyn.DISTRIBUTIONS == DISTRIBUTIONS + ("large_scale", "dominant_last")
+    assert set(ADVERSARIAL) == set(dyn.DISTRIBUTIONS) - {"normal"}
+    # the dense programs know nothing of the two the dynamic operators add
+    for name in ("large_scale", "dominant_last"):
+        with pytest.raises(SpecError, match="must be drawn from"):
+            rt_inputs.check_distributions(name)
+    with pytest.raises(SpecError, match="must be one of"):
+        dyn.apply_distribution("gqa_paged_decode", [], "uniform")
+
+
+def test_the_captured_cases_are_followed_by_the_adversarial_ones_only_on_request():
+    """``workloads.cases`` and ``keyed_workloads`` yield the adversarial table after the
+    captured workloads, and only when asked: timing never sees it."""
+    import importlib
+
+    # the module: ``cleave.dynamic.workloads`` the attribute is the registry's function
+    wl = importlib.import_module("cleave.dynamic.workloads")
+    name = "gqa_paged_decode_h32_kv8_d128_ps1"
+    op = OPERATORS[name]
+    assert inspect.signature(wl.cases).parameters["adversarial"].default is False
+    seen = []
+
+    def fake(operator, axes, dims, page_size=1, scale=None, distribution="normal"):
+        seen.append((distribution, axes))
+        return axes, distribution
+
+    original, wl.case = wl.case, fake
+    try:
+        plain = list(wl.cases(name, op.dims))
+        assert seen == [("normal", axes) for axes in WORKLOADS[name]] and len(plain) == len(seen)
+        del seen[:]
+        both = list(wl.cases(name, op.dims, adversarial=True))
+    finally:
+        wl.case = original
+    captured = [("normal", axes) for axes in WORKLOADS[name]]
+    assert seen == captured + list(ADVERSARIAL_WORKLOADS[name])
+    assert len(both) == len(WORKLOADS[name]) + 12
+    # the registry's keyed factory is the same list, keyed: captured first, never mixed
+    keys = [key for key, *_ in _keys(op, adversarial=True)]
+    assert len(keys) == len(captured) + 12
+    assert not any("@" in key for key in keys[: len(captured)])
+    assert [key.rpartition("@")[2] for key in keys[len(captured):]] == [
+        d for d, _ in ADVERSARIAL_WORKLOADS[name]]
+    assert not any("@" in key for key, *_ in _keys(op, adversarial=False))
+
+
+def _keys(op, adversarial):
+    """``op.keyed_workloads`` with the tensors stubbed out: the keys alone, on the CPU."""
+    import dataclasses
+
+    stub = dataclasses.replace(op, reference=lambda axes, distribution="normal": ((), ()))
+    original = OPERATORS[op.name]
+    OPERATORS[op.name] = stub
+    try:
+        return list(keyed_workloads(op.name, adversarial=adversarial)())
+    finally:
+        OPERATORS[op.name] = original
+
+
 def test_adversarial_workloads_are_a_table_of_their_own():
     assert set(ADVERSARIAL_WORKLOADS) == set(WORKLOADS) == set(OPERATORS)
     for name, cases in ADVERSARIAL_WORKLOADS.items():
         captured = WORKLOADS[name]
-        assert {d for d, _ in cases} == {"large_logits", "increasing"}
-        for distribution in ("large_logits", "increasing"):
+        assert {d for d, _ in cases} == set(ADVERSARIAL)
+        assert len(cases) == len(set(cases))
+        for distribution in ADVERSARIAL:
             axes = [a for d, a in cases if d == distribution]
             # the smallest, a middle and the largest captured shape (long KV included)
             assert axes[0] == captured[0] and axes[-1] == captured[-1] and len(axes) == 3
@@ -285,6 +360,68 @@ def test_dynamic_large_logits_scales_the_queries_only(family):
         # bf16 rounds the scaled queries again: within a few ulp of the largest logit
         assert torch.allclose(_request_logits(family, large, request), LARGE_LOGIT_FACTOR * before,
                               rtol=0.0, atol=2e-2 * LARGE_LOGIT_FACTOR * float(before.abs().max()))
+
+
+@pytest.mark.parametrize("family", FAMILIES)
+def test_dynamic_large_scale_scales_the_softmax_scale_only(family):
+    inputs = _family_inputs(family)
+    large = dyn.apply_distribution(family, inputs, "large_scale")
+    assert all(a is b for a, b in zip(large[:-1], inputs[:-1])), "no tensor is touched"
+    assert large[-1] == pytest.approx(LARGE_LOGIT_FACTOR * inputs[-1], rel=1e-12)
+    assert isinstance(large[-1], float) and inputs[-1] == _family_inputs(family)[-1]
+    for request in (0, 2):
+        # exactly the logits of large_logits, without rounding the queries a second time
+        assert torch.allclose(_request_logits(family, large, request),
+                              LARGE_LOGIT_FACTOR * _request_logits(family, inputs, request),
+                              rtol=1e-6, atol=0.0)
+
+
+@pytest.mark.parametrize("family", FAMILIES)
+def test_dynamic_dominant_last_puts_one_large_logit_at_the_end_of_each_request(family):
+    inputs = _family_inputs(family)
+    saved = [t.clone() if torch.is_tensor(t) else t for t in inputs]
+    spiked = dyn.apply_distribution(family, inputs, "dominant_last")
+    assert all(torch.equal(a, b) if torch.is_tensor(a) else a == b for a, b in zip(inputs, saved))
+    terms = dyn._SCORE_INPUTS[family][0]
+    replaced = {i for pair in terms for i in pair}
+    for i, (before, after) in enumerate(zip(inputs, spiked)):
+        if i not in replaced:
+            assert after is before
+        else:
+            assert after.shape == before.shape and after.dtype == before.dtype
+            assert torch.isfinite(after).all()
+    for request, kv_len in ((0, 5), (2, 37)):
+        logits = _request_logits(family, spiked, request)
+        assert logits.shape[-1] == kv_len
+        last, rest = logits[..., -1], logits[..., :-1]
+        # a * 128 with a >= 0.5: past what fp32 exp holds for most rows, for every row far
+        # above every other key of the request
+        assert float(last.min()) > 0.48 * INCREASING_SPAN
+        assert float(last.max()) > 88.7
+        assert float((last[..., None] - rest).min()) > 0.4 * INCREASING_SPAN
+        assert float(rest.abs().max()) < 0.1 * INCREASING_SPAN
+    # every key but each request's last is the normal one
+    for _, key_at in terms:
+        changed = (spiked[key_at].float() != inputs[key_at].float()).flatten(1).any(dim=1)
+        assert int(changed.sum()) == 2, "one key row per non-empty request"
+
+
+def test_dynamic_dominant_last_is_the_last_live_token_of_a_partly_filled_page():
+    """A slab's last page holds ``kv_last_page_len`` tokens: the dominant key is the last of
+    those, not the last slot of the page."""
+    page, kv_heads, heads, dim = 4, 2, 4, 16
+    pages_per_request, last_len = [2, 0, 3], [3, 0, 1]
+    pool = sum(pages_per_request) + 2
+    table = torch.randperm(pool, generator=torch.Generator().manual_seed(5))[:5].to(torch.int32)
+    inputs = [_bf16(3, heads, dim, seed=0), _bf16(pool, page, kv_heads, dim, seed=1),
+              _bf16(pool, page, kv_heads, dim, seed=2), _indptr(pages_per_request), table,
+              torch.tensor(last_len, dtype=torch.int32), dim ** -0.5]
+    spiked = dyn.apply_distribution("gqa_paged_decode", inputs, "dominant_last")
+    changed = (spiked[1].float() != inputs[1].float()).flatten(2).any(dim=2)  # (page, slot)
+    want = torch.zeros_like(changed)
+    want[int(table[1]), 3 - 1] = True  # request 0: second page, third token
+    want[int(table[4]), 1 - 1] = True  # request 2: third page, first token
+    assert torch.equal(changed, want)
 
 
 @pytest.mark.parametrize("family", FAMILIES)

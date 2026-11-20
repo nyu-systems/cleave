@@ -12,7 +12,8 @@ unset) it runs
 
   demos     ``demo/<name>.py --preset fast --no-cache ...``, one GPU each;
   dynamic   ``python -m demo.dynamic <operator> --topk 4 --filter-before-topk``, one GPU each
-            (every candidate on every captured workload);
+            (every candidate on every captured workload, and on the adversarial ones too
+            for an operator whose softmax is exact: they are part of what it validates on);
   tests     the suites that validate kernels, one xdist worker per GPU. They are an ordinary
             pytest run and fail where a declared tolerance is exceeded -- that is a finding,
             the measurement itself is in the log either way.
@@ -270,6 +271,12 @@ def load(out: Path) -> dict:
                         or node.startswith("tests/test_runtime_tolerance.py") \
                         or "threaded_into_workers" in node:
                     continue  # comparator unit tests and deliberate failures
+                if node.startswith("tests/graph/handwritten/test_paged_exact_softmax.py"):
+                    # Hand-made requests, held to the declared bound but no input to it: a
+                    # kernel that is non-finite on purpose, and rows whose lse is 0 or close
+                    # to it, where the fixed absolute floor is the bound and a row-relative
+                    # error says nothing about the operator.
+                    continue
                 context = "test:" + operator_of(node)
                 context = context.replace("test:dynamic:", "dynamic:")
             for i, o in enumerate(record["outputs"]):

@@ -17,7 +17,8 @@ import torch
 
 from ..core.errors import SpecError
 from ..core.settings import Settings
-from ..runtime.inputs import INCREASING_SPAN, LARGE_LOGIT_FACTOR, check_distributions
+from ..runtime.inputs import DISTRIBUTIONS as SHARED_DISTRIBUTIONS
+from ..runtime.inputs import INCREASING_SPAN, LARGE_LOGIT_FACTOR
 
 SEED = 0
 BF16 = torch.bfloat16
@@ -383,18 +384,34 @@ _SCORE_INPUTS = {
 }
 
 
+# What a dynamic operator can be validated on: the cases shared with the dense programs
+# (``cleave.runtime.inputs``) and two that only exist here -- the softmax scale is a runtime
+# input of these operators, and their keys have a per-request order.
+DISTRIBUTIONS = SHARED_DISTRIBUTIONS + ("large_scale", "dominant_last")
+
+
 def apply_distribution(operator, inputs, distribution):
     """One workload's ``inputs`` rewritten to an adversarial softmax distribution.
 
     The dynamic counterpart of :func:`cleave.runtime.inputs.apply_distribution`, applied
     after the normal inputs are built so their random stream never shifts:
 
-    ``large_logits``  every query tensor times 100;
-    ``increasing``    logits ``a * 128 * j / (n - 1)`` at token ``j`` of each request's ``n``
-                      keys, in the order the page table lists them (``a >= 0.5`` per query
-                      row and head), so the running max changes at every KV tile.
+    ``large_logits``   every query tensor times 100;
+    ``large_scale``    the softmax scale times 100: the same logits, reached through the
+                       runtime scalar the kernel multiplies its scores by, not the tensors;
+    ``increasing``     logits ``a * 128 * j / (n - 1)`` at token ``j`` of each request's
+                       ``n`` keys, in the order the page table lists them (``a >= 0.5`` per
+                       query row and head), so the running max changes at every KV tile;
+    ``dominant_last``  the last key of each request, in that order, scores ``a * 128`` and
+                       every other key stays where a normal key scores a constant query
+                       (around 0): the max jumps in the request's last KV tile, by more
+                       than ``exp`` can represent, after everything else was accumulated.
     """
-    (distribution,) = check_distributions(distribution)
+    if distribution not in DISTRIBUTIONS:
+        raise SpecError(
+            f"a dynamic operator's input distribution must be one of {DISTRIBUTIONS}, got "
+            f"{distribution!r}"
+        )
     if distribution == "normal":
         return inputs
     family = next((f for f in _SCORE_INPUTS if operator.startswith(f)), None)
@@ -406,6 +423,9 @@ def apply_distribution(operator, inputs, distribution):
         for query_at, _ in terms:
             query = inputs[query_at]
             inputs[query_at] = (query.float() * LARGE_LOGIT_FACTOR).to(query.dtype)
+        return inputs
+    if distribution == "large_scale":
+        inputs[-1] = float(inputs[-1]) * LARGE_LOGIT_FACTOR
         return inputs
 
     scale = float(inputs[-1])
@@ -420,7 +440,7 @@ def apply_distribution(operator, inputs, distribution):
         paged = indices_at is not None
         page_size = keys.shape[1] if paged else 1
         rows = keys.reshape(-1, *keys.shape[2:]) if paged else keys  # one row per token slot
-        for lo, hi in zip(indptr, indptr[1:]):
+        for request, (lo, hi) in enumerate(zip(indptr, indptr[1:])):
             if hi <= lo:
                 continue
             if paged:
@@ -430,6 +450,15 @@ def apply_distribution(operator, inputs, distribution):
             else:
                 tokens = torch.arange(lo, hi, device=keys.device)
             n = tokens.numel()
+            if distribution == "dominant_last":
+                # The request's last *live* token: a slab's last page is partly filled, and
+                # only the input after the page table says by how much.
+                live = n
+                if page_size > 1:
+                    assert len(inputs) == indices_at + 3, "expected kv_last_page_len"
+                    live = n - page_size + int(inputs[indices_at + 1][request])
+                rows[tokens[live - 1]] = top
+                continue
             ramp = torch.arange(n, device=keys.device, dtype=torch.float32) / max(n - 1, 1)
             rows[tokens] = (top * ramp).reshape(n, *[1] * (rows.dim() - 1)).to(keys.dtype)
         inputs[key_at] = keys

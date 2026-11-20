@@ -6,6 +6,9 @@ workloads, held to the same references and the same declared tolerance as the ha
 schedule for the same operator. The operator name is deliberately shared with the
 handwritten case of the same name (``tests/graph/handwritten/_cases.py``) so both are
 checked against identical inputs.
+
+The operator's softmax is exact (a running max), so its adversarial workloads are part of
+those inputs: logits x100, logits increasing along the keys, one dominant last key.
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ OPERATOR = "gqa_paged_decode_h32_kv8_d128_ps1"
 def test_gqa_paged_decode_h32_kv8_d128_ps1_pipeline():
     dims = (32, 8, 128)  # num_qo_heads, num_kv_heads, head_dim
     num_qo_heads, num_kv_heads, _ = dims
+    assert OPERATORS[OPERATOR].exact_softmax and OPERATORS[OPERATOR].adversarial
 
     graph = build_paged_graph(
         PagingSpec(num_qo_heads=num_qo_heads, num_kv_heads=num_kv_heads)
@@ -33,7 +37,7 @@ def test_gqa_paged_decode_h32_kv8_d128_ps1_pipeline():
     compile_and_run_prim_func(
         _load_main_kernel_from_code(code),
         dtype=DTYPE,
-        workloads_fn=lambda: cases(OPERATOR, dims),
+        workloads_fn=lambda: cases(OPERATOR, dims, adversarial=True),
         # Five declared inputs and the scale, then the two outputs.
         out_idx=[6, 7],
         tolerance=OPERATORS[OPERATOR].tolerance,

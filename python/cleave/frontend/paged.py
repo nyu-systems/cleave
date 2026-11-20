@@ -577,7 +577,8 @@ class PagedDecodeWorkloads:
     """Every ``batch`` x ``samples`` log-spaced KV lengths in ``kv_len`` (ragged below).
 
     ``distribution``: ``"normal"``, or an adversarial softmax case (``"large_logits"``,
-    ``"increasing"``; see ``cleave.dynamic.reference.apply_distribution``)."""
+    ``"large_scale"``, ``"increasing"``, ``"dominant_last"``; see
+    ``cleave.dynamic.reference.apply_distribution``)."""
 
     batch: tuple = (1, 7, 64)
     kv_len: tuple = (1, 8192)

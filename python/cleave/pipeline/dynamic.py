@@ -470,7 +470,8 @@ def compile_dynamic(fn, *, dtype=None, preset="default", superopt=None, schedule
     ``max_workloads`` of them. ``reference``: also measure the registry's tuned kernel (it
     cannot win). ``dispatch``: with split pairs, calibrate the split/single choice per workload.
     ``tolerance``: one ``cl.Tolerance`` per output (default: the registry operator's).
-    ``adversarial``: also validate on the registry operator's adversarial softmax workloads."""
+    ``adversarial``: also validate on the registry operator's adversarial softmax workloads;
+    a registry operator whose softmax is exact is validated on them regardless."""
     from ..frontend.paged import trace_paged
     from ..dynamic.paging import SPLIT_KINDS
     from ..runtime.autotune import (benchmark_over_workloads, compile_and_validate_over_workloads,
@@ -517,6 +518,10 @@ def compile_dynamic(fn, *, dtype=None, preset="default", superopt=None, schedule
     cands = [c for c, _ in by_cand.values()]
     tuned = _tuned_reference(attention, spec, cands) if reference else None
     success, errors = [], []
+    # An operator whose softmax is exact is held to its adversarial workloads on every
+    # validation. Timing and the dispatch calibration below stay on the captured ones.
+    op = _registry_op(attention)
+    adversarial = adversarial or (workloads is None and op is not None and op.exact_softmax)
     compile_and_validate_over_workloads(cands, factory(0, adversarial), success, errors,
                                         tolerance=tol)
     t3 = time.perf_counter()

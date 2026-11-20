@@ -335,9 +335,11 @@ def _spread(axes, keep=3):
 
 # Adversarial softmax workloads, apart from the captured ``WORKLOADS``: ``(distribution, axes)``
 # per operator, the axes drawn from its captured ones (see ``reference.apply_distribution``).
-# Nothing validates on these by default; ask for them (``keyed_workloads(adversarial=True)``,
-# ``cleave.compile(fn, adversarial=True)``) once an operator's softmax is stabilized.
-ADVERSARIAL_DISTRIBUTIONS = ("large_logits", "increasing")
+# An operator validates on these once its softmax is exact (``DynamicOperator.exact_softmax``);
+# for any other, ask for them (``keyed_workloads(adversarial=True)``,
+# ``cleave.compile(fn, adversarial=True)``). They are never timed: the latency gate, the
+# autotune timing and the split/single dispatch calibration see the captured workloads only.
+ADVERSARIAL_DISTRIBUTIONS = ("large_logits", "large_scale", "increasing", "dominant_last")
 ADVERSARIAL_WORKLOADS = {
     name: tuple((distribution, axes) for distribution in ADVERSARIAL_DISTRIBUTIONS
                 for axes in _spread(captured))
@@ -450,7 +452,12 @@ def case(operator, axes, dims, page_size=1, scale=None, distribution="normal"):
     return inputs, expected(*inputs)
 
 
-def cases(operator, dims, page_size=1, scale=None):
-    """(inputs, expected outputs) for each captured workload, built one at a time."""
+def cases(operator, dims, page_size=1, scale=None, adversarial=False):
+    """(inputs, expected outputs) for each captured workload, built one at a time; with
+    ``adversarial`` the operator's adversarial workloads follow them."""
     for axes in WORKLOADS[operator]:
         yield case(operator, axes, dims, page_size=page_size, scale=scale)
+    if adversarial:
+        for distribution, axes in ADVERSARIAL_WORKLOADS[operator]:
+            yield case(operator, axes, dims, page_size=page_size, scale=scale,
+                       distribution=distribution)

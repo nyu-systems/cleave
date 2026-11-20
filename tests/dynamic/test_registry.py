@@ -55,6 +55,8 @@ def test_every_operator_is_complete(name):
     # The adversarial softmax workloads live apart from the captured ones.
     assert op.adversarial == ADVERSARIAL_WORKLOADS[name]
     assert {axes for _, axes in op.adversarial} <= set(op.workloads)
+    # ... and an operator validates on them once its softmax is exact. One so far.
+    assert op.exact_softmax is (name == "gqa_paged_decode_h32_kv8_d128_ps1")
     if op.is_mla:
         assert op.scale is not None
 
