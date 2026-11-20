@@ -21,7 +21,10 @@ from pathlib import Path
 #    emitted behind the loops.
 # 9: split partials validate (in their stored layout) and chain into the combine, so a
 #    program's best kernel can now be a split variant; saved stages carry that layout.
-SCHEMA = 9
+# 10: gqa_paged_decode_h32_kv8_d128_ps1 builds the exact (running-max) softmax: the same
+#     paged program now emits a different kernel. (Paged kernels are not kernel-cached, so
+#     no stale one can be returned today.)
+SCHEMA = 10
 # What "validated" means for a saved kernel. A kernel-cache hit returns without validating,
 # so bump this whenever the comparison or its inputs change: saved kernels are then rebuilt.
 VALIDATION = 2
