@@ -14,6 +14,11 @@ built (its ``tmap`` and ``extent``):
                                               right before it accumulates
     softmax axis spread over grid blocks  ->  refused (``StabilizeRefused``)
 
+A rolling Exp whose accumulators are too wide for a thread's registers gets the *lazy* form
+(``Site.lazy``): the shift is the running max rounded down to a grid, which moves only when
+the max crosses a multiple of it, and the rescale is skipped while it does not
+(``cleave.ir.rolling.lazy_rolling_nodes``). Same softmax, far fewer multiplies.
+
 A tiling the pass cannot serve is refused with a reason that names the Exp; the candidate
 is dropped, not the program. A graph without a marked Exp never reaches this module: it is
 returned by ``apply_tiling`` as before, so every non-softmax kernel and every graph built
@@ -40,8 +45,17 @@ from ..ir.graph import AccumEdge, ComputeOpNode, Graph, Iterator
 from ..ir.graph_utils import edit_graph, graph_tiers, tmap_by_name
 from ..ir.offsets import TileOffset
 from ..ir.ops import NEG_FLT_MAX, Exp, ReduceMax, Sub, wire_input
-from ..ir.rolling import STAT_DTYPE, rolling_nodes
+from ..ir.rolling import STAT_DTYPE, lazy_rolling_nodes, rolling_nodes
 from .tiling import rebase_reduction_axis
+
+
+# The lazy rolling form is used when one thread holds at least this many elements of a
+# rescaled accumulator. A thread has at most 255 registers, so such an accumulator lives in
+# memory, and rescaling it is a load, a multiply and a store per element on every iteration
+# (measured on MLA decode, 64 x 512 over 128 threads: 107 of 282 us). Below that the
+# accumulator is in registers, the multiply is nearly free, and the guard and the grid cost
+# more than they save (measured at 128, 64 and 32 elements per thread: 6% to 13% slower).
+LAZY_MIN_ELEMENTS = 256
 
 
 class StabilizeRefused(ScheduleRejected):
@@ -60,6 +74,7 @@ class Site:
     block: int  # ... held by one grid block
     step: int  # ... held by one iteration of the tier
     scaled: tuple = ()  # rolling: names of the rescaled accumulators
+    lazy: bool = False  # rolling: shift on a grid, rescale only when it moved
 
 
 def annotated(graph) -> list:
@@ -111,10 +126,26 @@ def _squeezed(tile) -> list:
 # --------------------------------------------------------------------------- classification
 
 
-def _locate(tier, owner, exp) -> Site:
+def _lazy(accs, tmaps, threads) -> bool:
+    """Whether a thread holds too much of one of the rescaled accumulators ``accs`` for its
+    registers (``LAZY_MIN_ELEMENTS``): the rescale is then worth skipping."""
+    if not threads or not accs:
+        return False
+    widest = 1
+    for n in accs:
+        elements = 1
+        for t in tmaps[n.name].tile_size:
+            elements *= int(t)
+        widest = max(widest, elements)
+    return widest >= LAZY_MIN_ELEMENTS * int(threads)
+
+
+def _locate(tier, owner, exp, threads=None) -> Site:
     """Classify one marked Exp from its tier's own ``tmap`` and ``extent`` (read-only).
 
     Everything a tiling can be refused for is decided here, before anything is edited.
+    ``threads`` is the kernel's thread count, when known: it decides between the eager and
+    the lazy rolling form.
     """
     st = exp.stabilize
     where = "main" if owner is None else owner.name
@@ -238,7 +269,12 @@ def _locate(tier, owner, exp) -> Site:
             raise _refused(exp, f"accumulator {n.name} has a unit extent in its tile {acc_tile}")
     if st.export is not None:
         _exported_max(tier, where, exp, flat, carried=True)
-    return Site(exp.name, where, "rolling", axis, full, block, step, tuple(n.name for n in accs))
+    # An exported max is the kernel's shift as the reference has it: what such a kernel
+    # accumulates must stay in the frame of the max itself.
+    lazy = st.export is None and _lazy(accs, tmaps, threads)
+    return Site(
+        exp.name, where, "rolling", axis, full, block, step, tuple(n.name for n in accs), lazy
+    )
 
 
 def _descends(node, ancestor, tier) -> bool:
@@ -293,7 +329,8 @@ def _exported_max(tier, where, exp, flat, *, carried: bool):
 # --------------------------------------------------------------------------------- rewrite
 
 
-def _build_parts(exp_cls, name, dims, nb, a, scores_dtype, out_dtype, rolling, fresh_exp):
+def _build_parts(exp_cls, name, dims, nb, a, scores_dtype, out_dtype, rolling, fresh_exp,
+                 lazy=False):
     """The nodes one marked Exp gains, wired among themselves, as a small ``Graph``.
 
         scores (a stand-in placeholder)
@@ -301,6 +338,9 @@ def _build_parts(exp_cls, name, dims, nb, a, scores_dtype, out_dtype, rolling, f
         shifted = Sub(scores, m)        {name}_shifted   float32
         exp     = exp_cls(shifted)      {name}           (only when the Exp read storage)
         m_prev, step, alpha             ``ir.rolling.rolling_nodes`` (only when rolling)
+
+    ``lazy`` (rolling only): ``ir.rolling.lazy_rolling_nodes`` instead, with one more node,
+    ``{name}_max_grid = g(m)``, which ``shifted`` then subtracts in place of ``m``.
     """
     flat_axis = len(dims) + a
     pos = flat_axis - nb  # the softmax axis among the two non-batch dims
@@ -324,13 +364,18 @@ def _build_parts(exp_cls, name, dims, nb, a, scores_dtype, out_dtype, rolling, f
         n_batch_dims=nb,
     )
     wire_input(scores, shifted, 0)
-    wire_input(m, shifted, 1)
+    if not (rolling and lazy):
+        wire_input(m, shifted, 1)
     nodes = [scores, m, shifted]
     if fresh_exp:
         exp = exp_cls(dims, name=name, dtype=STAT_DTYPE, out_dtype=out_dtype, n_batch_dims=nb)
         wire_input(shifted, exp, 0)
         nodes.append(exp)
-    if rolling:
+    if rolling and lazy:
+        stats = lazy_rolling_nodes(m, stem=name, rows=rows, n_batch_dims=nb, exp_cls=exp_cls)
+        wire_input(stats[1], shifted, 1)  # s - g(m)
+        nodes += stats
+    elif rolling:
         nodes += rolling_nodes(m, stem=name, rows=rows, n_batch_dims=nb, exp_cls=exp_cls)
     return Graph(nodes=nodes)
 
@@ -357,6 +402,7 @@ def _parts(*key, cache: bool = True) -> dict:
         "shifted": f"{name}_shifted",
         "exp": name,
         "max_prev": f"{name}_max_prev",
+        "max_grid": f"{name}_max_grid",
         "max_step": f"{name}_max_step",
         "alpha": f"{name}_alpha",
     }
@@ -445,13 +491,15 @@ def _rewrite(tier, owner, exp, site: Site, taken: set, cache: bool = True):
     names = [f"{exp.name}_shifted"] + ([] if st.export is not None else [f"{exp.name}_max"])
     if rolling:
         names += [f"{exp.name}_max_prev", f"{exp.name}_max_step", f"{exp.name}_alpha"]
+    if site.lazy:
+        names.append(f"{exp.name}_max_grid")
     clash = sorted(set(names) & taken)
     assert not clash, f"{exp.name}: node name(s) {clash} are already taken in this graph"
     taken.update(names)
 
     parts = _parts(
         type(exp), exp.name, dims, nb, a, _stored_dtype(scores_edge), exp.out_dtype,
-        rolling, fresh_exp, cache=cache,
+        rolling, fresh_exp, *((True,) if site.lazy else ()), cache=cache,
     )
     shifted = parts["shifted"]
     new_nodes = []
@@ -497,6 +545,9 @@ def _rewrite(tier, owner, exp, site: Site, taken: set, cache: bool = True):
     if rolling:
         m.accum_init = NEG_FLT_MAX  # this instance only; the class default stays -inf
         stats = [parts["max_prev"], parts["max_step"], parts["alpha"]]
+        if site.lazy:
+            assert st.export is None and getattr(parts["alpha"], "unit_guard", False)
+            stats.insert(1, parts["max_grid"])
         for n in stats:
             tier.tmap[n] = Iterator(vec_it.offset, vec_it.shape, vec_it.tile_size, vec_it.axes)
         new_nodes += stats
@@ -524,7 +575,8 @@ def stabilize(tiled: Graph, cache: bool = True) -> Graph:
     found = annotated(tiled)
     if not found:
         return tiled
-    plan = [(tier, owner, exp, _locate(tier, owner, exp)) for tier, owner, exp in found]
+    threads = getattr(tiled, "n_threads", None)
+    plan = [(tier, owner, exp, _locate(tier, owner, exp, threads)) for tier, owner, exp in found]
     claimed = {}
     for tier, _, exp, site in plan:
         for name in site.scaled:
@@ -547,7 +599,7 @@ def stabilize(tiled: Graph, cache: bool = True) -> Graph:
 
 def overhead_bytes(tiled: Graph) -> int:
     """Bytes of the row vectors the rewrite added to one block: ``m``, plus ``m_prev`` /
-    ``step`` / ``alpha`` when rolling, 4 bytes a row each.
+    ``step`` / ``alpha`` when rolling (and ``g(m)`` in the lazy form), 4 bytes a row each.
 
     A diagnostic, not a gate: they are register fragments, and charging them to the
     shared-memory model removed no candidate on any measured operator. The shifted-score
@@ -562,7 +614,7 @@ def overhead_bytes(tiled: Graph) -> int:
         rows = 1
         for i, t in enumerate(tile):
             rows *= 1 if i == site.axis else int(t)
-        total += 4 * rows * (4 if site.case == "rolling" else 1)
+        total += 4 * rows * ((5 if site.lazy else 4) if site.case == "rolling" else 1)
     return total
 
 

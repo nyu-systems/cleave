@@ -261,6 +261,43 @@ def test_gpu_exact_softmax_long_rows(cache_root):
     torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2)
 
 
+def wide_value_attention(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
+                         v: cl.Tensor["H", "SKV", "DV"]):
+    """Attention whose values are wider than its keys (the shape of MLA decode's output)."""
+    return cl.softmax((q @ k.mT) / q.shape[-1] ** 0.5, dim=-1) @ v
+
+
+def test_gpu_exact_softmax_wide_values_are_rescaled_lazily(cache_root):
+    """A 64 x 512 value accumulator over 128 threads is 256 elements a thread: more than a
+    thread's registers. Such tilings shift by the running max rounded down to a grid and
+    rescale only when that moved (the lazy rolling form). They are held to every
+    adversarial case like any exact kernel: the ramps move the shift in every other tile,
+    constant rows never again after the first."""
+    _gpu()
+    from cleave.runtime.inputs import ADVERSARIAL
+    from cleave.schedule import apply_tiling
+    from cleave.schedule.stabilize import sites
+
+    shapes = dict(H=8, SQ=64, SKV=1024, D=64, DV=512)
+    prog = trace(wide_value_attention, shapes, cl.f16)
+    plans = P.schedule(P.superoptimize(prog, P.SuperoptConfig()), P.ScheduleConfig(topk=1000))
+    lazy = plans.filter(lambda p: any(s.lazy for s in sites(apply_tiling(p.tile))))
+    eager = plans.filter(lambda p: p.n_threads == 256 and list(p.tile.output_tile) == [1, 64, 512])
+    assert len(lazy) >= 1 and all(p.n_threads == 128 for p in lazy)
+    assert all(list(p.tile.output_tile) == [1, 64, 512] for p in lazy)
+    assert len(eager) >= 1 and not any(
+        s.lazy for p in eager for s in sites(apply_tiling(p.tile)))
+    ev = P.EvalConfig(warmup=2, iters=20, max_parallel=4,
+                      tolerance=tolerance_for("exact_attention"))
+    built = P.build(lazy, config=ev)
+    assert len(built.correct) >= 1, built
+    assert all(r.cases == ("normal",) + ADVERSARIAL for r in built)
+    assert not [r for r in built if r.error_type in ("NonFiniteOutput", "OutputMismatch")], built
+    for r in built.correct:
+        assert "ukernel_rescale_if_moved_lead1_2dims_rr" in r.source
+        assert "ukernel_grid_floor_1dims_rr" in r.source
+
+
 def _kernel_nans(error) -> int:
     """How many NaN the comparator counted in the kernel's own output at x100, and that the
     failure is about the ``large_logits`` case."""

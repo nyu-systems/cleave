@@ -8,7 +8,8 @@ tells a saved kernel that it is stale.
 
 This pins the text (by digest) of a few kernels of programs that record the exact softmax,
 next to the ``SCHEMA`` they were generated under. They are identity graphs (lowered as
-traced, no search), one tiling each: an in-tile max, a running max, and both of one graph.
+traced, no search), one tiling each: an in-tile max, a running max, both of one graph, and
+a running max over accumulators wide enough for the lazily rescaled form.
 When a digest moves, the test fails until ``SCHEMA`` is above the pinned value and the new
 digests are pinned with it.
 
@@ -41,7 +42,15 @@ def attention(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
     return cl.softmax((q @ k.mT) / q.shape[-1] ** 0.5, dim=-1) @ v
 
 
+def flash_wide_values(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
+                      v: cl.Tensor["H", "SKV", "DV"]):
+    """Flash form with values wider than the keys: a 64 x 512 accumulator of ``P @ V``."""
+    e = S.stable_exp((q @ k.mT) / q.shape[-1] ** 0.5)
+    return (e @ v) / cl.sum(e, -1, keepdim=True)
+
+
 SHORT, LONG = dict(H=32, SQ=64, SKV=256, D=64), dict(H=32, SQ=4096, SKV=4096, D=64)
+WIDE = dict(H=8, SQ=64, SKV=1024, D=64, DV=512)
 # name -> (program, shapes, how the pinned tiling serves the softmax). The flash form is the
 # one the search finds for attention (the row sum next to the value matmul); written out
 # here, it makes the request the way ``cl.softmax`` does.
@@ -51,17 +60,23 @@ KERNELS = {
     "flash_skv256/in-tile": (S.flash_attention, SHORT, "in-tile"),
     "flash_skv256/rolling": (S.flash_attention, SHORT, "rolling"),
     "flash_skv4096/rolling": (S.flash_attention, LONG, "rolling"),
+    "flash_wide_values/rolling-lazy": (flash_wide_values, WIDE, "rolling-lazy"),
 }
 
 # The SCHEMA these digests were generated under, and the digests. Re-pin both together.
-PINNED_SCHEMA = 11
+PINNED_SCHEMA = 12
 PINNED = {
     'softmax_64x1024/in-tile': ('tile=[2, 1024] rstep=[1024]', '8211bb6438573d68'),
     'attention_skv256/in-tile': ('tile=[1, 64, 32] rstep=[32, 256, 256]', 'd5982c362d1466dd'),
     'flash_skv256/in-tile': ('tile=[1, 64, 32] rstep=[32, 256, 256]', '9464e85013b3084e'),
     'flash_skv256/rolling': ('tile=[1, 64, 32] rstep=[32, 32, 32]', '963ffee491434feb'),
     'flash_skv4096/rolling': ('tile=[1, 128, 64] rstep=[32, 32, 32]', '6f82f9c294167554'),
+    'flash_wide_values/rolling-lazy': ('tile=[1, 64, 512] rstep=[32, 32, 32]', 'cf186bc349c18508'),
 }
+
+
+def _kind(site) -> str:
+    return site.case + ("-lazy" if site.lazy else "")
 
 
 def digests() -> dict:
@@ -72,7 +87,7 @@ def digests() -> dict:
         ir = S.lowered(fn, shapes)
         assert ir.nodes and stabilize_accept(ir) is not None, f"{name}: no softmax request"
         for cand in search_tiling(ir, topk=1000, accept=stabilize_accept(ir)):
-            if cand.n_threads == 128 and [s.case for s in sites(apply_tiling(cand))] == [case]:
+            if cand.n_threads == 128 and [_kind(s) for s in sites(apply_tiling(cand))] == [case]:
                 break
         else:
             raise AssertionError(f"{name}: no {case} tiling among the accepted candidates")
@@ -126,8 +141,9 @@ def test_a_text_change_fails_until_the_schema_is_bumped_and_pinned():
 
 
 def test_the_guard_pins_both_rewrites():
-    """Each pinned kernel is the kind its name says: an in-tile max and a running max."""
-    assert {name.rpartition("/")[2] for name in PINNED} == {"in-tile", "rolling"}
+    """Each pinned kernel is the kind its name says: an in-tile max, a running max, and a
+    running max that is rescaled lazily."""
+    assert {name.rpartition("/")[2] for name in PINNED} == {"in-tile", "rolling", "rolling-lazy"}
     assert set(PINNED) == set(KERNELS)
     for name, (label, digest) in PINNED.items():
         assert label.startswith("tile=[") and len(digest) == 16, name

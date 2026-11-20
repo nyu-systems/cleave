@@ -117,7 +117,7 @@ def test_cache_schema_retires_kernels_built_before_a_scheduler_fix(monkeypatch):
     # 9: gqa_paged_decode_h32_kv8_d128_ps1 built the unshifted exp, with no running max.
     # 10: cl.softmax traced an opaque max; a program that made the request by hand was
     # validated on normal inputs only.
-    assert cache.SCHEMA >= 11
+    assert cache.SCHEMA >= 12
     key = _kernel_key(prog, *cfgs)
     monkeypatch.setattr(cache, "SCHEMA", 1)
     assert _kernel_key(prog, *cfgs) != key

@@ -15,6 +15,7 @@ from cleave.ir.ops import (
     CausalMaskedScore,
     ConstFill,
     Copy,
+    GridFloor,
     Div,
     Exp,
     Exp2,
@@ -55,7 +56,7 @@ def _variants():
         op.resolve_operand_layout = "rhs"
         yield op
     yield Div((16, 32), const=2.0, const_on_left=True, denom_floor=1e-6)
-    for cls in (Silu, Exp, Exp2, RSqrt, Sqrt, Log2, Copy):
+    for cls in (Silu, Exp, Exp2, RSqrt, Sqrt, Log2, Copy, GridFloor):
         yield cls((16, 32))
         yield cls((16, 32), name="other", dtype="float16")
         yield cls((2, 16, 32), n_batch_dims=0)
@@ -91,6 +92,7 @@ def _variants():
     yield marked
     for rank, lead in ((1, 1), (2, 1), (2, 1), (2, 2), (3, 1)):
         yield Rescale(rank, lead)
+        yield Rescale(rank, lead, guard=True)
     yield PagedGather((16, 64), source_rows=128, index_extent=8, page_size=4)
     yield IndexGather((16,), index_extent=8, row_stride=1, clamp_index=7)
     yield RowGather((16, 64), source_rows=128, n_valid=4)
@@ -144,6 +146,7 @@ def test_key_tells_apart_literals_and_policies():
     assert a.macro_key() != b.macro_key()
     assert ReduceSum((16, 32)).macro_key() != ReduceMax((16, 32)).macro_key()
     assert Rescale(2, 1).macro_key() != Rescale(2, 2).macro_key()
+    assert Rescale(2, 1).macro_key() != Rescale(2, 1, guard=True).macro_key()
     assert Rescale(2, 1).macro_key() != Rescale(3, 1).macro_key()
 
 
