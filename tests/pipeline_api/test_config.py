@@ -147,7 +147,9 @@ def test_cache_schema_retires_kernels_built_before_a_scheduler_fix(monkeypatch):
     # kernel faulted on launch.
     # 28: a rolling softmax loop that weights a loaded slice in registers was pipelined; the
     # slice could be reloaded before its last use.
-    assert cache.SCHEMA >= 29
+    # 29: the split graphs of a program whose softmax is exact were refused; its saved
+    # winner could only be a solo kernel.
+    assert cache.SCHEMA >= 30
     key = _kernel_key(prog, *cfgs)
     monkeypatch.setattr(cache, "SCHEMA", 1)
     assert _kernel_key(prog, *cfgs) != key

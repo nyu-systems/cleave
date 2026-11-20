@@ -111,29 +111,32 @@ def lower(graph: SearchedGraph, split_factor: int | None = None) -> list:
         raise LoweringRejected(f"graph {graph.index}: expected {2 if graph.is_split else 1} "
                                f"stage(s), got {len(bundle)}")
     if getattr(graph.program, "stabilize_requests", ()):
-        _annotate_softmax(graph, bundle)
+        bundle = _annotate_softmax(graph, bundle)
     return bundle
 
 
-SPLIT_SOFTMAX = "exact softmax across a split is not available yet"
-
-
-def _annotate_softmax(graph: SearchedGraph, bundle: list) -> None:
-    """Mark the softmax exps of a freshly lowered graph whose program asked for them.
+def _annotate_softmax(graph: SearchedGraph, bundle: list) -> list:
+    """The freshly lowered graph(s) of a program that asked for a softmax, with its exps
+    marked.
 
     ``cl.softmax`` records a plain ``exp`` plus a request; which Exp of *this* graph the
     request means is derived by the scale analysis. The flat graph stays shift-free (the
     tiling policy must not see a max ahead of the sums): the mark is what the reference
     honours and what the per-schedule stabilization consumes after tiling.
+
+    A split pair keeps a softmax on either side of the cut: the partial's, whose shift it
+    exports as one more output, and the combine's over the split axis, which weights the
+    partials by that shift (``cleave.lower.scale.stabilize_split``).
     """
-    from ..lower.scale import ScaleError, annotate
+    from ..lower.scale import ScaleError, annotate, stabilize_split
 
     try:
         if graph.is_split:
-            raise ScaleError(SPLIT_SOFTMAX)
+            return list(stabilize_split(*bundle, graph.program))
         annotate(bundle[0], graph.program)
     except ScaleError as e:
         raise LoweringRejected(f"graph {graph.index}: softmax cannot be stabilized: {e}") from e
+    return bundle
 
 
 def bind_inputs(ir_graph, program) -> tuple[str, ...] | None:

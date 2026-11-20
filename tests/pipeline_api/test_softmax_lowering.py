@@ -2,7 +2,9 @@
 
 The mark is plain data on the freshly lowered flat graph. The search space and the tiling
 candidates are those of the shift-free graph; a graph that cannot honour the request is
-refused with the analysis' reason, and a split graph is refused until the exact combine exists.
+refused with the analysis' reason. A split graph lowers to an exact pair: the partial
+exports its shift, the combine weights the partials by it
+(``tests/lower/test_split_softmax.py``).
 """
 
 import json
@@ -17,9 +19,9 @@ from cleave import pipeline as P
 from cleave.core.errors import LoweringRejected
 from cleave.frontend import trace
 from cleave.ir.ops import Exp, Stabilize
-from cleave.pipeline.plans import SPLIT_SOFTMAX, describe_tile, lower
+from cleave.pipeline.plans import describe_tile, lower
 from cleave.pipeline.superopt import GraphSet, SearchedGraph
-from cleave.runtime.reference import fingerprint_seed
+from cleave.runtime.reference import fingerprint_seed, output_order, placeholder_order
 from tests._softmax import exact_softmax, stable_exp
 from tests.pipeline import _pipeline as PL
 
@@ -132,29 +134,65 @@ def _split_graph(program):
     return SearchedGraph(0, structure, dict(PL.SYMBOL_MAPS["gqa"]), True, program, ("SKV",))
 
 
-def test_split_graph_of_a_requesting_program_is_refused_for_now():
-    """Until the partial exports its shift and the combine re-weights by it."""
+def test_split_graph_of_a_requesting_program_lowers_to_an_exact_pair():
+    """The partial exports its shift as a float32 output and names it in the record of its
+    exp; the combine reads it and is a softmax over the split axis."""
     requesting, plain = trace(flash, SHAPES, cl.f16), trace(flash_twin, SHAPES, cl.f16)
-    with pytest.raises(LoweringRejected) as e:
-        lower(_split_graph(requesting), 4)
-    assert str(e.value) == f"graph 0: softmax cannot be stabilized: {SPLIT_SOFTMAX}"
-    assert SPLIT_SOFTMAX == "exact softmax across a split is not available yet"
+    partial, combine = lower(_split_graph(requesting), 4)
+    (exp,), (weights,) = _exps(partial), _exps(combine)
+    assert [(o.boundary.role, str(o.get_dtype(0))) for o in output_order(partial)] == [
+        ("shift", "float32"), ("", "float16"), ("", "float16")]
+    assert exp.stabilize.axes == (-1,) and exp.stabilize.export == output_order(
+        partial)[0].inputs[0].src_node.name
+    assert sorted(p.boundary.role for p in placeholder_order(combine)) == ["", "", "shift"]
+    assert weights.stabilize.axes == (-2,) and weights.stabilize.export is None
     # the same structure of a program without the request lowers as it always did
     partial, combine = lower(_split_graph(plain), 4)
     assert [e.stabilize for g in (partial, combine) for e in _exps(g)] == [None]
+    assert len(output_order(partial)) == len(placeholder_order(combine)) == 2
 
 
-def test_split_refusal_is_per_graph_in_a_schedule():
-    """A requesting program keeps its solo plans; each split graph is refused with the reason."""
+def test_a_requesting_program_schedules_its_split_graphs():
+    """Solo plans, and partial and combine plans for the split graph: nothing is refused."""
     prog = trace(flash, SHAPES, cl.f16)
     (solo,) = GraphSet.identity(prog)
     graphs = GraphSet([solo, _split_graph(prog)], prog)
     graphs[1].index = 1
     plans = P.schedule(graphs, P.ScheduleConfig(topk=2, split_k=(PL.SPLIT_FACTOR,)))
+    assert not plans.refused, plans.summary()
+    assert sorted((p.variant, p.role) for p in plans) == [
+        ("solo", "main")] * 2 + [("split-k=4", "combine")] * 2 + [("split-k=4", "partial")] * 2
+    for plan in plans:
+        marked = [e for e in _exps(plan.tile.flat_graph) if e.stabilize is not None]
+        assert len(marked) == 1  # every plan carries a marked flat graph
+
+
+def test_split_refusal_is_per_graph_in_a_schedule():
+    """A split graph that cannot be made exact is refused with the reason; the program
+    keeps its solo plans."""
+    prog = trace(flash, SHAPES, cl.f16)
+    (solo,) = GraphSet.identity(prog)
+    # the split graph of a program that asked for two softmaxes: a split carries one
+    broken = SearchedGraph(1, _split_graph(prog).structure, dict(PL.SYMBOL_MAPS["gqa"]), True,
+                           _two_requests(prog), ("SKV",))
+    plans = P.schedule(GraphSet([solo, broken], prog),
+                       P.ScheduleConfig(topk=2, split_k=(PL.SPLIT_FACTOR,)))
     assert plans and {p.variant for p in plans} == {"solo"}
+    reason = ("graph 1: softmax cannot be stabilized: 2 softmax requests; a split carries one "
+              "softmax")
     assert [(r.variant, r.role, str(r.error)) for r in plans.refused] == [
-        ("split-k=4", "partial", f"graph 1: softmax cannot be stabilized: {SPLIT_SOFTMAX}")]
-    assert f"1x LoweringRejected: graph 1: softmax cannot be stabilized: {SPLIT_SOFTMAX}" in plans.summary()
+        ("split-k=4", "partial", reason)]
+    assert f"1x LoweringRejected: {reason}" in plans.summary()
+
+
+def _two_requests(prog):
+    """``prog`` as a program that asked for two softmaxes."""
+    import copy
+
+    twice = copy.copy(prog)
+    twice.__class__ = type("TwoRequests", (type(prog),), {
+        "stabilize_requests": property(lambda self: prog.stabilize_requests * 2)})
+    return twice
 
 
 def test_search_graphs_are_annotated():

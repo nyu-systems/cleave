@@ -33,6 +33,14 @@ shared symbol is unsound (``exp(x) / exp(y)`` would pass).
 
 ``record_for`` turns a report into the plain-data ``Stabilize`` record of the Exp, or says
 why not; ``annotate`` applies it to a whole solo graph on behalf of a requesting program.
+
+A split pair cannot cancel the factor inside the partial: every output of a partial keeps
+degree 1, each split relative to its own max. ``stabilize_split`` makes the pair exact
+instead. The partial exports that max as one more output (``export_shift``); the combine,
+which the same analysis proves to cancel the factor when its inputs are seeded with the
+partial's output scales (``analyse_split``), weights every partial by ``exp(m_i)`` before
+it sums them over the split axis (``exact_combine``): a softmax over the split axis, marked
+and served like any other.
 """
 
 from __future__ import annotations
@@ -40,10 +48,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 
 from ..ir.analysis import _map_input_axes_to_consumer_axes
-from ..ir.graph import OutputNode, PlaceHolderNode
-from ..ir.graph_utils import gather_all_nodes
+from ..ir.graph import Boundary, ComputeOpNode, Graph, OutputNode, PlaceHolderNode
+from ..ir.graph_utils import boundary_signature, find_topo_sort, gather_all_nodes
 from ..ir.ops import (Add, Div, Exp, Matmul, Mul, ReduceMax, ReduceSum, RSqrt, Silu, SplitView,
-                      Sqrt, Stabilize, Sub)
+                      Sqrt, Stabilize, Sub, wire_input)
+from ..ir.rolling import STAT_DTYPE
 
 
 class ScaleError(Exception):
@@ -272,6 +281,13 @@ def record_for(graph, exp) -> Stabilize:
     for (_, src), s in report.outputs.items():
         if s.deg:
             raise ScaleError(f"{exp.name}: output of {src} keeps degree {s.deg} in its scale")
+    return _record(exp, report)
+
+
+def _softmax_axis(exp, report: ScaleReport) -> int:
+    """The softmax axis of ``exp`` (counted from the front) when its shape is one a tiling
+    can serve, else ``ScaleError``: exactly one softmax axis, a non-batch axis of an Exp
+    with two non-batch axes, every sum of degree 1."""
     if len(report.const) != 1:
         raise ScaleError(f"{exp.name}: the factor must be constant along axes "
                          f"{list(report.const)}; one softmax axis is supported")
@@ -285,9 +301,15 @@ def record_for(graph, exp) -> Stabilize:
     for r in report.reductions:
         if r.degree != 1:
             raise ScaleError(f"{exp.name}: {r.node} accumulates a value of degree {r.degree}")
+    return axis
+
+
+def _record(exp, report: ScaleReport, export=None) -> Stabilize:
+    """The record a legal report gives ``exp`` (``_softmax_axis`` says when it gives one)."""
+    axis = _softmax_axis(exp, report)
     reducers = tuple(dict.fromkeys(r.node for r in report.reductions))
-    return Stabilize(axes=(axis - rank,), scaled=tuple((name, 1) for name in reducers),
-                     rolling=_rolling_obstacle(exp, report, reducers))
+    return Stabilize(axes=(axis - report.rank,), scaled=tuple((name, 1) for name in reducers),
+                     rolling=_rolling_obstacle(exp, report, reducers), export=export)
 
 
 def annotate(graph, program) -> list:
@@ -331,3 +353,233 @@ def annotate(graph, program) -> list:
         exp.stabilize = record
         marked.append(exp)
     return marked
+
+
+# ------------------------------------------------------------------------------ split pairs
+
+SHIFT = "shift"  # Boundary.role of the max a partial exports and its combine reads
+
+
+def _outputs(graph) -> list:
+    return [n for n in graph.nodes if isinstance(n, OutputNode)]
+
+
+def _placeholders(graph) -> list:
+    return [n for n in graph.nodes if isinstance(n, PlaceHolderNode)]
+
+
+def _partial_report(partial, exp) -> ScaleReport:
+    """The report of ``exp`` as the softmax exp of a split partial, else ``ScaleError``.
+
+    The solo rule (``record_for``) with one difference: a partial returns the statistics of
+    its own split, so nothing cancels the factor there. Every output keeps degree 1, and
+    carries the factor on its leading axes, the axes of the Exp without the softmax axis:
+    the shape of the shift every one of them is relative to.
+    """
+    report = analyse(partial, exp)
+    if not report.const:
+        raise ScaleError(f"{exp.name}: nothing sums it, so there is no softmax axis")
+    for (_, src), s in report.outputs.items():
+        if s.deg != 1:
+            raise ScaleError(f"{exp.name}: partial output of {src} has degree {s.deg} in its "
+                             "scale; every output of a split partial keeps degree 1")
+    axis = _softmax_axis(exp, report)
+    rows = tuple(a for a in range(report.rank) if a != axis)
+    for (_, src), s in report.outputs.items():
+        if s.ax != rows + (None,) * (len(s.ax) - len(rows)):
+            raise ScaleError(f"{exp.name}: partial output of {src} carries the factor on axes "
+                             f"{s.ax}, not on its leading axes {rows}")
+    return report
+
+
+def _crossing(signature) -> str:
+    return "[" + ", ".join(f"#{index}{':' + role if role else ''} {shape} {dtype}"
+                           for index, role, shape, dtype in signature) + "]"
+
+
+def analyse_split(partial, combine):
+    """``(exp, partial report, combine report)`` of a lowered split pair, else ``ScaleError``.
+
+    Partial: exactly one Exp passes ``_partial_report``. Combine: every placeholder is
+    seeded with the scale of the partial output that is the same tensor -- paired by
+    boundary record (index, role, logical shape and dtype, compared exactly), never by
+    position -- and has to cancel the factor: legal, with outputs of degree 0. The scale
+    axes are numbered as the axes of the partial's Exp on both sides, so ``const`` of the
+    combine report is the split axis in that numbering: the one axis the partials are
+    summed over.
+    """
+    found, reasons = [], []
+    for exp in exps(partial):
+        try:
+            found.append((exp, _partial_report(partial, exp)))
+        except ScaleError as e:
+            reasons.append(str(e))
+    if not found:
+        raise ScaleError(reasons[0] if reasons else "the partial has no exp")
+    if len(found) != 1:
+        raise ScaleError(f"{[exp.name for exp, _ in found]} are softmax exps of one partial; "
+                         "a split carries one softmax")
+    exp, report = found[0]
+
+    outs, phs = _outputs(partial), _placeholders(combine)
+    try:
+        wrote, read = boundary_signature(outs), boundary_signature(phs)
+    except ValueError as e:  # records on some tensors of one side only, or an index twice
+        raise ScaleError(f"split boundary: {e}") from e
+    if wrote is None or read is None:
+        bare = "partial's outputs" if wrote is None else "combine's inputs"
+        raise ScaleError(f"split boundary: the {bare} carry no boundary records, so the two "
+                         "sides of the cut cannot be paired")
+    if wrote != read:
+        raise ScaleError(f"split boundary: the combine reads {_crossing(read)} but the "
+                         f"partial writes {_crossing(wrote)}")
+    scale_of = {out: s for (out, _), s in report.outputs.items()}
+    written = {out.boundary.index: scale_of[out.name] for out in outs}
+    seeds = {ph.name: written[ph.boundary.index] for ph in phs}
+    combined = analyse(combine, None, seeds)
+    for (_, src), s in combined.outputs.items():
+        if s.deg:
+            raise ScaleError(f"combine: output of {src} keeps degree {s.deg} in the scale of "
+                             f"{exp.name}")
+    if len(combined.const) != 1:
+        raise ScaleError(f"combine: the partials of {exp.name} are summed over axes "
+                         f"{list(combined.const)} of its scale; one split axis is supported")
+    return exp, report, combined
+
+
+def _stored_dtype(edge) -> str:
+    """The dtype the value ``edge`` reads is stored in."""
+    src = edge.src_node
+    return src.out_dtype if isinstance(src, ComputeOpNode) else str(src.get_dtype(edge.src_id))
+
+
+def export_shift(partial, exp, report: ScaleReport):
+    """``(partial, m)``: the partial with its shift as one more output.
+
+    ``m = ReduceMax(scores)`` over the softmax axis reads what the Exp reads, in float32 (a
+    max of stored values is exact there), and feeds nothing but its own ``OutputNode``. It is
+    a sibling of the Exp, not an ancestor of the sums: the tiling policy steps it with them
+    and has nothing to pin. The Exp's record names it (``Stabilize.export``), so the rewrite
+    reuses it as the shift -- the carried max, where the softmax axis is looped -- and what
+    the kernel returns is the max its sums are relative to.
+
+    The outputs the cut produced keep their names and their boundary index; the shift takes
+    the next index and the role ``"shift"``. The kernel returns it first, in front of the
+    sums that are relative to it: the tiling policy walks a graph in the order of its
+    outputs, and its memory model frees a tile when the last reader has run. The kernel
+    takes the max before the exp, and listed there the max lets the scores go when the exp
+    has read them, as in the two-output partial. Listed behind the sums it would hold the
+    scores across the whole softmax, one score tile more than the kernel ever has, and the
+    tilings with the widest key steps would go over the shared-memory cap (8 of 32 for MHA
+    decode split 16 ways, 32 of 80 for GQA and MQA decode at every factor).
+    """
+    (axis,) = report.const
+    scores = exp.inputs[0]
+    dims = _shape(exp)
+    m = ReduceMax(dims, axis=-1 if axis == len(dims) - 1 else axis,
+                  name=f"reduce_max_{axis}_{exp.name}", dtype=_stored_dtype(scores),
+                  out_dtype=STAT_DTYPE)
+    wire_input(scores.src_node, m, 0, scores.src_id)
+    outs = _outputs(partial)
+    shift = OutputNode(m, dtype=STAT_DTYPE)
+    shift.boundary = Boundary(1 + max(out.boundary.index for out in outs), SHIFT)
+    while shift.name in {out.name for out in outs}:  # as ``to_ir`` names a further output
+        shift.name = shift.name[:-1] + chr(ord(shift.name[-1]) + 1)
+    exp.stabilize = _record(exp, report, export=m.name)
+    return Graph(nodes=find_topo_sort([shift] + outs)), m
+
+
+def exact_combine(combine, shift_shape, split_axis: int) -> Graph:
+    """The lowered ``combine`` as a softmax over the split axis: ``w = exp(m)`` weights
+    every partial before the partials are summed.
+
+    Derived from the combine the cut produced, not rebuilt from a template: every
+    ``ReduceSum`` over ``split_axis`` that reads a boundary input ``p`` becomes
+    ``ReduceSum(p * w)`` with a float32 product, where ``w = Exp(m)`` reads one more
+    boundary input, the float32 shift of shape ``shift_shape`` (role ``"shift"``).
+    Everything behind the sums is kept as it is. ``w`` is then held to the solo rule
+    (``record_for``), which gives it its record: the scale analysis proves that the max of
+    ``m`` over the split axis cancels, and the rewrite turns ``w`` into ``exp(m - M)`` per
+    schedule, ``M`` a running max where the split axis is looped. The graph itself stays
+    shift-free: a ``ReduceMax`` ahead of the sums would pin the split axis to one tile.
+
+    A boundary input that anything but such a sum reads has no place for its weight; the
+    combine is refused, with the reader named.
+    """
+    shift_shape = tuple(int(s) for s in shift_shape)
+    rank = len(shift_shape)
+    inputs = _placeholders(combine)
+    sums = []
+    for p in inputs:
+        for edge in p.outputs:
+            reader = edge.dst_node
+            if type(reader) is not ReduceSum or reader.flat_axis != split_axis:
+                raise ScaleError(
+                    "combine: not every boundary input is summed over the split axis "
+                    f"({p.name} is read by {type(reader).__name__} {reader.name})")
+            if not any(reader is s for s in sums):
+                sums.append(reader)
+    if not sums:
+        raise ScaleError("combine: no boundary input is summed over the split axis")
+    if any(p.boundary is None for p in inputs):
+        raise ScaleError("combine: its inputs carry no boundary records, so the shift has no "
+                         "place among them")
+
+    w = Exp(shift_shape, name="exp_shift", dtype=STAT_DTYPE, out_dtype=STAT_DTYPE,
+            n_batch_dims=max(rank - 2, 0))
+    m = w.inputs[0].src_node
+    m.name = "PlaceHolder_shift"
+    m.boundary = Boundary(1 + max(p.boundary.index for p in inputs), SHIFT)
+    for old in sums:
+        p = old.inputs[0].src_node
+        dims = _shape(p)
+        if dims == shift_shape:
+            broadcast = -1
+        elif dims[:-1] == shift_shape:
+            broadcast = 0  # B is A without its last axis: one weight per row of the tile
+        else:
+            raise ScaleError(f"combine: {p.name} {dims} is not the shift {shift_shape} with "
+                             "at most one trailing axis")
+        weighted = Mul(dims, broadcast=broadcast, name=f"{old.name}_weighted",
+                       dtype=STAT_DTYPE, out_dtype=STAT_DTYPE, n_batch_dims=w.n_batch_dims)
+        new = ReduceSum(dims, axis=old.flat_axis_arg, name=old.name, dtype=STAT_DTYPE,
+                        out_dtype=old.out_dtype)
+        p._out_edges[:] = [e for e in p._out_edges if e is not old.inputs[0]]
+        wire_input(p, weighted, 0)
+        wire_input(w, weighted, 1)
+        wire_input(weighted, new, 0)
+        for edge in list(old.outputs):
+            wire_input(new, edge.dst_node, edge.dst_id)
+    exact = Graph(nodes=find_topo_sort(_outputs(combine)))
+    # Held to the rule it was derived from; the record is the analysis's own.
+    record = record_for(exact, w)
+    if record.axes != (split_axis - rank,) or {name for name, _ in record.scaled} != {
+            old.name for old in sums}:
+        raise ScaleError(f"combine: the weights cancel over axes {record.axes} in "
+                         f"{[name for name, _ in record.scaled]}, not over the split axis "
+                         f"{split_axis - rank} in {[old.name for old in sums]}")
+    w.stabilize = record
+    return exact
+
+
+def stabilize_split(partial, combine, program):
+    """``(partial, combine)`` of a lowered split pair, made exact for a program that
+    requested a softmax; ``ScaleError`` (and the pair is refused) when it cannot be.
+
+    A split carries one softmax: the program made one request, and unless it also wrote a
+    plain ``exp`` the softmax exp is the only Exp of the pair.
+    """
+    requests = len(program.stabilize_requests)
+    if requests != 1:
+        raise ScaleError(f"{requests} softmax requests; a split carries one softmax")
+    exp, report, combined = analyse_split(partial, combine)
+    if not any(r.kind == "exp" and r.attr("stabilize") is None for r in program.ops):
+        plain = [n.name for graph in (partial, combine) for n in exps(graph) if n is not exp]
+        if plain:
+            raise ScaleError(f"{plain} would stay plain exps, and the program wrote none")
+    (axis,), (split,) = report.const, combined.const
+    rows = tuple(a for a in range(report.rank) if a != axis)  # the Exp axes of the shift
+    dims = _shape(exp)
+    partial, _ = export_shift(partial, exp, report)
+    combine = exact_combine(combine, tuple(dims[a] for a in rows), rows.index(split))
+    return partial, combine

@@ -69,7 +69,10 @@ from pathlib import Path
 #     the split combines' tilings on 8 or 16 rows (they faulted on launch) have kernels.
 # 29: a loop with a running max that multiplies a slice it loads into the softmax's output
 #     is a plain loop (in a pipeline the slice could be overwritten while still in use).
-SCHEMA = 29
+# 30: a split graph of a program that requested a softmax lowers to an exact pair (the
+#     partial returns its shift as a third output, the combine weights the partials by it);
+#     such graphs were refused, so the best kernel of the program can now be a split variant.
+SCHEMA = 30
 # What "validated" means for a saved kernel. A kernel-cache hit returns without validating,
 # so bump this whenever the comparison or its inputs change: saved kernels are then rebuilt.
 # (The inputs include the adversarial cases a program with an exact softmax is held to,
