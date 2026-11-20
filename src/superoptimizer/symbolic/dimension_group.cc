@@ -1,5 +1,7 @@
 #include "cleave/superoptimizer/symbolic/dimension_group.h"
 
+#include "cleave/superoptimizer/kernel/device_tensor.h"
+
 #include <cassert>
 #include <numeric>
 
@@ -10,7 +12,9 @@ namespace symbolic {
 // DimensionGrouper Implementation
 // ============================================================================
 
-DimensionGrouper::DimensionGrouper() {}
+DimensionGrouper::DimensionGrouper(type::GuidType first_guid)
+    : position_hash{kernel::DTensor::FIRST_GUID - first_guid},
+      parent(0, position_hash) {}
 
 void DimensionGrouper::touch(DimensionID d) {
   (void)find(d);
@@ -75,7 +79,7 @@ bool DimensionGrouper::is_broadcast(DimensionID d) const {
 std::vector<std::set<DimensionID>> DimensionGrouper::get_groups() const {
   // Map from representative to all members in that group
   std::unordered_map<DimensionID, std::set<DimensionID>, DimensionID::Hash>
-      rep_to_group;
+      rep_to_group(0, position_hash);
 
   // Collect all dimensions that have been touched
   for (auto const &[dim, parent_dim] : parent) {

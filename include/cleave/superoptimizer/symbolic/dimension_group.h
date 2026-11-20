@@ -33,9 +33,12 @@ struct DimensionID {
 
   // Hash function for use in unordered containers
   struct Hash {
+    // Added to the tensor guid before hashing (see DimensionGrouper).
+    type::GuidType guid_offset = 0;
+
     size_t operator()(DimensionID const &id) const {
       // Combine tensor_guid and dim_idx using standard hash combination
-      size_t h1 = std::hash<type::GuidType>{}(id.tensor_guid);
+      size_t h1 = std::hash<type::GuidType>{}(id.tensor_guid + guid_offset);
       size_t h2 = std::hash<int>{}(id.dim_idx);
       return h1 ^ (h2 << 1);
     }
@@ -49,7 +52,8 @@ struct DivisibilityRelation {
 
 class DimensionGrouper {
 public:
-  DimensionGrouper();
+  // first_guid: the guid of the first tensor of the graph being grouped.
+  explicit DimensionGrouper(type::GuidType first_guid);
   void touch(DimensionID d);
   void merge(DimensionID d1, DimensionID d2);
   DimensionID find(DimensionID d);
@@ -65,6 +69,17 @@ public:
   }
 
 private:
+  // get_groups() returns the groups in the iteration order of `parent` and of
+  // a table of representatives, and the symbolizer numbers them in that order.
+  // Guids come from a process-wide counter, so hashing a dimension by its guid
+  // made that order, and with it the symbols and the checkpoint key of a
+  // graph, depend on what the process had built before. The two tables hash a
+  // dimension by the place of its tensor in the graph instead: its guid
+  // relative to the graph's first tensor, counted from the counter's start.
+  // Every graph then gets the symbols it gets as the first graph of a process.
+  // (Which group gets which symbol does not change what the search finds, but
+  // it prunes by comparing symbols, so it changes how many states it visits.)
+  DimensionID::Hash position_hash;
   std::unordered_map<DimensionID, DimensionID, DimensionID::Hash> parent;
   std::unordered_map<DimensionID, int, DimensionID::Hash> rank;
   std::set<DimensionID> broadcast_group;
