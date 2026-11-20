@@ -17,7 +17,8 @@ from cleave.ir.graph import PlaceHolderNode
 from cleave.pipeline.kernel import _fit, stages_for
 from cleave.pipeline.plans import Plan, bind_inputs, lower
 from cleave.pipeline.superopt import GraphSet
-from cleave.runtime.reference import execute, placeholder_order
+from cleave.runtime.evaluate import CandidateResult
+from cleave.runtime.reference import execute, output_order, placeholder_order, to_logical
 from tests._lowering import run_lowered
 
 
@@ -90,12 +91,22 @@ class _Tile:
         self.flat_graph = flat_graph
 
 
+def _executed(graph):
+    """The result of a stage the graph executor stands in for: it returns every output as
+    the graph defines it, which is the stored layout of a kernel that permutes nothing.
+    ``stages_for`` hands a partial's outputs to the combine only with that record."""
+    layouts = tuple((tuple(range(len(o.get_shape(0)))), 0) for o in output_order(graph))
+    return CandidateResult(None, "ok", code="", stored_layouts=layouts)
+
+
 def _call(stages, graphs, inputs):
     """``Kernel.__call__`` with the graph executor in place of each compiled stage."""
     outs = []
     for stage, graph in zip(stages, graphs):
-        feed = {p.name: _fit(inputs[p.index] if p.source == "input" else outs[p.index], p.shape)
-                for p in stage.params}
+        feed = {}
+        for p in stage.params:
+            x = inputs[p.index] if p.source == "input" else outs[p.index]
+            feed[p.name] = _fit(x, p.shape) if p.layout is None else to_logical(x, p.layout, p.shape)
         outs = execute(graph, [feed[n.name] for n in placeholder_order(graph)])
     return outs
 
@@ -119,8 +130,11 @@ def test_search_split_partials_bind_in_program_order():
         assert [phs[n].input_index for n in names] == list(range(len(prog.inputs)))
         plans = [Plan(graph.index, "split-k=4", role, _Tile(ir), f"g{graph.index} {role}", 0, 4, graph, bound)
                  for role, ir, bound in (("partial", partial, names), ("combine", combine, None))]
-        stages, problem = stages_for([(plan, None) for plan in plans], prog)
+        stages, problem = stages_for([(plan, _executed(plan.tile.flat_graph)) for plan in plans],
+                                     prog)
         assert problem is None, graph.summary()
+        # every tensor crossing the cut is handed over by its record, none by a reshape
+        assert all(p.layout is not None for p in stages[1].params)
         (got,) = _call(stages, (partial, combine), ins)
         assert got.numel() == want.numel(), graph.summary()
         torch.testing.assert_close(got.reshape(want.shape), want, rtol=1e-5, atol=1e-5)
