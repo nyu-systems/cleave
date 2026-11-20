@@ -37,7 +37,9 @@ from pathlib import Path
 # 14: every paged layer builds the exact softmax, and a split-KV pair hands the partials'
 #     running max to its combine as a third partial: every paged program emits a different
 #     kernel, and every split pair a different parameter list.
-SCHEMA = 14
+# 15: an input the graph declares without its unit axes is bound to its program input (the
+#     Kernel saved for such a program could not be called).
+SCHEMA = 15
 # What "validated" means for a saved kernel. A kernel-cache hit returns without validating,
 # so bump this whenever the comparison or its inputs change: saved kernels are then rebuilt.
 # (The inputs include the adversarial cases a program with an exact softmax is held to,
