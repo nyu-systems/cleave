@@ -31,6 +31,7 @@ public:
   DimStrategy dim_strategy;
 
   char const *filename;
+  // In search-tree order once generate_kernel_graphs() returns.
   std::vector<json> generated_graphs;
   int num_thread;
   bool eager_save_viz_graphs;
@@ -71,6 +72,11 @@ private:
   // Verifier
   std::shared_ptr<Verifier> verifier;
 
+  // Search-tree position of each entry of generated_graphs; appended in the
+  // same critical section.
+  std::vector<std::vector<int>> generated_graph_paths;
+  void sort_generated_graphs();
+
   // First exception thrown inside an OpenMP region; rethrown after the
   // region ends (an exception escaping a task/parallel region terminates).
   std::exception_ptr search_error;
@@ -85,7 +91,7 @@ private:
 
   void preprocess(kernel::Graph const &computation_graph);
   bool check_pattern(std::shared_ptr<AbstractExpr> pattern);
-  bool verify(kernel::Graph &g);
+  bool verify(kernel::Graph &g, std::vector<int> const &path);
 
   void save_results() const;
   double get_elapsed_time_in_sec() const;
