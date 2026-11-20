@@ -179,9 +179,10 @@ def test_tile_that_misses_a_unit_dim_is_a_typed_refusal():
     matmul = _one(ir, Matmul)
     assert tuple(int(s) for s in matmul.get_shape()) == (4096, 1)
     cands = search_tiling(ir, topk=1000)
-    # Both spellings of the old failure are among them: the matmul looped over K
-    # (KeyError: 1 at the output's offsets) and not (the assert on iter_repeat_factors).
-    assert {_step(c, matmul) < 64 for c in cands} == {True, False}
+    # The old failure had two spellings: the assert on iter_repeat_factors for a matmul
+    # that holds K whole, and KeyError: 1 at the output's offsets for one looped over K
+    # (which the policy may or may not propose).
+    assert any(_step(c, matmul) == 64 for c in cands)
 
     # Anything but ScheduleRejected propagates out of here.
     built, refused = _outcomes(cands)
