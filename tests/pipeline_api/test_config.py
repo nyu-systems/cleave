@@ -105,9 +105,17 @@ def test_cache_schema_retires_kernels_built_before_a_scheduler_fix(monkeypatch):
     # 2: `e / sum(e, 0)` on equal extents divided by the row sums, and a saved kernel fed two
     # inputs of one shape in graph order (`b / a` computed `a / b`).
     # 3: an unused `a + x` declared the live input `x` with the shape of `a`.
+    # 4: a sum that is not looped, over an axis other than the last, was emitted with its
+    # flat `dim` and reduced the next axis of the stored tile.
+    # 5: a candidate with an absorbed reduction was rated, and cut at top-k, on the steps it
+    # names instead of as the kernel that is built for it.
+    # 6: a loop tier carried dims its block does not store; single-row loop kernels did not
+    # build.
+    # 7: a split combine built only with both of its sums in one loop.
     # 8: no static split-attention partial validated and the partial -> combine Kernel was
     # unrunnable, so the saved winner of a split program could only be a solo kernel.
-    assert cache.SCHEMA >= 9
+    # 9: gqa_paged_decode_h32_kv8_d128_ps1 built the unshifted exp, with no running max.
+    assert cache.SCHEMA >= 10
     key = _kernel_key(prog, *cfgs)
     monkeypatch.setattr(cache, "SCHEMA", 1)
     assert _kernel_key(prog, *cfgs) != key
