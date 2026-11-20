@@ -12,17 +12,22 @@ from cleave.ir.ops import (
     NEG_FLT_MAX,
     Add,
     CausalMaskedExp,
+    CausalMaskedScore,
     ConstFill,
     Copy,
     Div,
     Exp,
+    Exp2,
     IndexGather,
     IndptrTileScan,
     Log2,
+    Lse2,
     MacroOp,
     MaskedDiv,
     MaskedExp,
     MaskedLog2,
+    MaskedLse2,
+    MaskedScore,
     Matmul,
     ReduceMax,
     Mul,
@@ -50,7 +55,7 @@ def _variants():
         op.resolve_operand_layout = "rhs"
         yield op
     yield Div((16, 32), const=2.0, const_on_left=True, denom_floor=1e-6)
-    for cls in (Silu, Exp, RSqrt, Sqrt, Log2, Copy):
+    for cls in (Silu, Exp, Exp2, RSqrt, Sqrt, Log2, Copy):
         yield cls((16, 32))
         yield cls((16, 32), name="other", dtype="float16")
         yield cls((2, 16, 32), n_batch_dims=0)
@@ -59,6 +64,20 @@ def _variants():
     yield MaskedExp((16, 32), 0.5)
     yield MaskedExp((16, 32), None, scalar_args=("a", "b", "c"))
     yield CausalMaskedExp((16, 32), 0.5, row_group=2)
+    # the exact paged softmax: masked score, shifted exp, two-operand lse
+    for name in ("a", "b"):
+        yield MaskedExp((16, 32), None, scalar_args=("a", "b"), shift=True, name=name)
+        yield MaskedScore((16, 32), scalar_args=("a", "b", "c"), name=name)
+        yield Lse2((16,), name=name)
+    yield MaskedExp((2, 16, 32), None, scalar_args=("a", "b"), shift=True, n_batch_dims=0)
+    yield CausalMaskedExp((16, 32), None, scalar_args=("a", "b", "c"), row_group=2, shift=True)
+    yield CausalMaskedExp((16, 32), None, scalar_args=("a", "b", "c"), shift=True)
+    yield MaskedScore((16, 32))
+    yield CausalMaskedScore((16, 32), row_group=2)
+    yield CausalMaskedScore((16, 32))
+    yield Lse2((16, 32))
+    yield MaskedLse2((16,))
+    yield MaskedLse2((16, 32), row_group=2, fuse_dst=False)
     for policy in ("rows", "cols"):
         for dtype in ("float16", "bfloat16"):
             yield Matmul((64, 64, 32), warp_policy=policy, dtype=dtype)
@@ -126,6 +145,22 @@ def test_key_tells_apart_literals_and_policies():
     assert ReduceSum((16, 32)).macro_key() != ReduceMax((16, 32)).macro_key()
     assert Rescale(2, 1).macro_key() != Rescale(2, 2).macro_key()
     assert Rescale(2, 1).macro_key() != Rescale(3, 1).macro_key()
+
+
+def test_shift_and_mask_are_part_of_the_key():
+    plain = MaskedExp((16, 32), None, scalar_args=("tile_base", "valid_len", "scale2"))
+    shifted = MaskedExp((16, 32), None, scalar_args=("tile_base", "valid_len"), shift=True)
+    assert "shift" in MaskedExp._macro_attrs
+    assert plain.macro_key() != shifted.macro_key()
+    assert _emit(plain, "rr", True)[0] != _emit(shifted, "rrr", True)[0]
+    causal = CausalMaskedExp(
+        (16, 32), None, scalar_args=("tile_base", "valid_len", "diag"), shift=True)
+    assert causal.macro_key() != shifted.macro_key()
+    assert _emit(causal, "rrr", True)[0] != _emit(shifted, "rrr", True)[0]
+    assert MaskedScore((16, 32)).macro_key() != CausalMaskedScore((16, 32)).macro_key()
+    assert Lse2((16,)).macro_key() != MaskedLse2((16,)).macro_key()
+    assert Exp((16,)).macro_key() != Exp2((16,)).macro_key()
+    assert Lse2((16,)).macro_key() != Log2((16,)).macro_key()
 
 
 def test_rescale_is_emitted_for_register_operands():

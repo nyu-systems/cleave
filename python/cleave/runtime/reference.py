@@ -24,7 +24,9 @@ from ..ir.ops import (
     Copy,
     Div,
     Exp,
+    Exp2,
     Log2,
+    Lse2,
     Matmul,
     ReduceMax,
     Mul,
@@ -307,6 +309,8 @@ REFERENCES = {
     Log2: _unary(lambda x: x.log2()),
     Accumulate: _unary(lambda x: x),
     Copy: _unary(lambda x: x),
+    Exp2: _unary(lambda x: x.exp2()),
+    Lse2: _compute(lambda node, args, out_dtype: args[0].to(out_dtype).log2() + args[1].to(out_dtype)),
 }
 
 
