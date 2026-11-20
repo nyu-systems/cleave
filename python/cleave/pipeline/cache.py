@@ -27,6 +27,8 @@ from pathlib import Path
 # 11: cl.softmax records the exact softmax as a request on its exp (no max in the program),
 #     every schedule of such a program gets its own shift (in-tile max or running max), and
 #     its kernels are validated on the adversarial softmax inputs as well.
+#     tests/pipeline_api/test_schema_guard.py pins the text of a few such kernels next to
+#     this number: text that changes without a bump here fails there.
 SCHEMA = 11
 # What "validated" means for a saved kernel. A kernel-cache hit returns without validating,
 # so bump this whenever the comparison or its inputs change: saved kernels are then rebuilt.
