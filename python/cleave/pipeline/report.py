@@ -15,6 +15,23 @@ VALIDATION_KINDS = {OutputMismatch: "mismatch", NonFiniteOutput: "non_finite",
                     LaunchCrash: "launch_crash"}
 
 
+def matmul_operands(graph) -> tuple:
+    """``(format, significant bits)`` of every format the matmuls of a lowered graph
+    multiply their operands in that is not the operands' own dtype, sorted.
+
+    Today that is ``("tf32", 11)`` for a float32 matmul (``Matmul.tensor_core_format``):
+    the one case in which a kernel computes with fewer bits than its program's dtype has.
+    """
+    from ..ir.ops import Matmul
+
+    found = set()
+    for node in getattr(graph, "nodes", ()):
+        if isinstance(node, Matmul) and node.tensor_core_format != node.dtype:
+            fmt = node.tensor_core_format
+            found.add((fmt, Matmul.SIGNIFICANT_BITS[fmt]))
+    return tuple(sorted(found))
+
+
 def validation_kind(error) -> str:
     return next((kind for cls, kind in VALIDATION_KINDS.items() if isinstance(error, cls)),
                 "other")
@@ -214,6 +231,25 @@ class _Results(Sequence):
     def histogram(self) -> dict[str, int]:
         return self.failures.histogram()
 
+    def matmul_operands(self) -> tuple:
+        """``(format, significant bits)`` of the reduced formats the candidates' matmuls
+        multiply in (``matmul_operands``), over every lowered graph; empty when every
+        matmul multiplies its operands as they are."""
+        found, seen = set(), set()
+        for r in self.results:
+            graph = getattr(getattr(r.plan, "tile", None), "flat_graph", None)
+            if graph is not None and id(graph) not in seen:
+                seen.add(id(graph))
+                found.update(matmul_operands(graph))
+        return tuple(sorted(found))
+
+    def _matmul_text(self) -> str:
+        """What the validate line and a failed compile say about reduced matmul operands."""
+        return "".join(
+            f"  matmul operands multiplied as {fmt} ({bits} significant bits): the result "
+            "is not the product at the program's dtype"
+            for fmt, bits in self.matmul_operands())
+
 
 class Report(_Results):
     def __init__(self, results: list[Result], plans=None, timings: dict | None = None,
@@ -276,6 +312,9 @@ class Report(_Results):
                 for name in [variant] if variant is not None else unpaired:
                     if name in unpaired:
                         why += f"; {name} unpaired: {unpaired[name]}"
+                if any(isinstance(r.error, OutputMismatch) for r in self.failures):
+                    # a bound set for the program's dtype is one no such kernel can meet
+                    why += self._matmul_text().replace("  matmul", "; matmul", 1)
                 raise CleaveError(f"no {variant or 'kernel'} compiled, validated and timed "
                                   f"({len(self)} candidates; failures: {self.failures}{why})")
             win = min(variants.values(), key=lambda v: v.latency_us)
@@ -319,6 +358,7 @@ class Report(_Results):
                               "abs": [m.abs for m in r.measured]}
                              for r in self.results if r.measured is not None],
                 **self._inputs_entry(),
+                **self._matmul_entry(),
             },
             "timings_s": self.timings,
             "variants": {k: {"latency_us": v.latency_us, "kernels": [m.label for m in v.members]}
@@ -336,6 +376,16 @@ class Report(_Results):
             return {}
         return {"inputs": [{"cases": list(cases), "kernels": n, "note": note}
                            for cases, n, note in held]}
+
+    def _matmul_entry(self) -> dict:
+        """``{"matmul_operands": [...]}`` for ``to_dict()["validation"]``: the formats the
+        matmuls multiply in that keep fewer bits than the program's dtype, when there are
+        any."""
+        reduced = self.matmul_operands()
+        if not reduced:
+            return {}
+        return {"matmul_operands": [{"format": fmt, "significant_bits": bits}
+                                    for fmt, bits in reduced]}
 
     def _inputs_text(self) -> str:
         """What the validate line says about the input cases: nothing while every candidate
@@ -372,7 +422,8 @@ class Report(_Results):
         worst = format_measured(self.measured_error(), self._bounds())
         rows.append(("validate", f"{n_val - len(val_fail)} ok / {len(val_fail)} failed"
                      + (f"  [{val_fail}]" if val_fail else "")
-                     + (f"  max error {worst}" if worst else "") + self._inputs_text(), None))
+                     + (f"  max error {worst}" if worst else "") + self._inputs_text()
+                     + self._matmul_text(), None))
         bench_fail = Failures(r for r in self.results if not r.ok and r.stage == "bench")
         variants, unpaired = self._resolve()
         if variants:
@@ -496,6 +547,10 @@ def _make_kernel(win: VariantResult, report: Report):
         problem = "split kernel without Program output shapes"
     meta = {"fingerprint": program.fingerprint() if hasattr(program, "fingerprint") else None,
             "graph_index": plans[0].graph_index, "dtype": str(getattr(program, "dtype", ""))}
+    reduced = sorted({found for plan in plans
+                      for found in matmul_operands(getattr(plan.tile, "flat_graph", None))})
+    if reduced:  # what this kernel's matmuls multiply in, where that is not its dtype
+        meta["matmul_operands"] = [fmt for fmt, _ in reduced]
     from . import cache
 
     meta["build_id"] = cache.build_id()

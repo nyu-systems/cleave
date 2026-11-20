@@ -9,6 +9,10 @@ from .base import MacroOp
 
 class Matmul(ComputeOpNode):
     _macro_attrs = ("transpose_A", "transpose_B", "warp_policy", "dtype")
+    # What the tensor cores multiply for each operand dtype (``tensor_core_format``), and
+    # how many significant bits of an operand that format keeps.
+    TENSOR_CORE_FORMATS = {"float16": "float16", "bfloat16": "bfloat16", "float32": "tf32"}
+    SIGNIFICANT_BITS = {"float16": 11, "bfloat16": 8, "tf32": 11}
 
     def __init__(
         self,
@@ -54,6 +58,23 @@ class Matmul(ComputeOpNode):
         # The tiling policy keys tensor-core tiling on this tag; declaring it here means
         # search_tiling's own set_tag is a no-op instead of a mutation of its input.
         self.set_tag("tensorcore_config", True)
+
+    @property
+    def tensor_core_format(self) -> str:
+        """The format this matmul's operands are multiplied in.
+
+        A matmul is a tensor-core instruction (``T.gemm``), and the instruction decides
+        what it reads of an operand. Operands of 16 bits are multiplied as they are. A
+        ``float32`` operand is multiplied as ``tf32``: TileLang lowers a float32 gemm to
+        the TF32 instruction, which reads the sign, the exponent and the leading 10
+        fraction bits of each operand and drops the other 13. The products are summed in
+        float32, so the result has float32's range and a float16's significand: against
+        the float32 product of the same inputs it is off by about 1e-3 of the row
+        maximum (1.05e-3 measured for a 512 x 1024 x 512 matmul; 4.3e-6 when the
+        operands have no bits to drop). Nothing is cast to half precision, and nothing
+        in the kernel says so either: this property is where it is declared.
+        """
+        return self.TENSOR_CORE_FORMATS.get(self.dtype, self.dtype)
 
     def _validate_input_batch_dims(self, input_batch_dims: tuple[int], input_name: str):
         if len(input_batch_dims) != self.n_batch_dims:
