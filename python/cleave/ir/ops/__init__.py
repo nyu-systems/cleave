@@ -1,7 +1,7 @@
 from ..graph import ComputeOpNode, ViewOpNode
 from .base import NEG_FLT_MAX, MacroOp, wire_input
 from .fill import ConstFill
-from .reduction import Accumulate, Matmul, ReduceMax, ReduceSum, Rescale
+from .reduction import Accumulate, AccumulateMax, Matmul, ReduceMax, ReduceSum, Rescale
 from .elementwise import (
     Add,
     CausalMaskedExp,
@@ -39,6 +39,7 @@ __all__ = [
     "ReduceSum",
     "ReduceMax",
     "Accumulate",
+    "AccumulateMax",
     "Rescale",
     "Stabilize",
     "NEG_FLT_MAX",

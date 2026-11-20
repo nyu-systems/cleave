@@ -393,6 +393,58 @@ class Accumulate(ComputeOpNode):
         return func_name
 
 
+class AccumulateMax(Accumulate):
+    """Keeps the elementwise maximum of its input, iteration after iteration.
+
+    The running max of a loop whose softmax axis is one element per iteration: a split-KV
+    combine at ``split_step == 1`` reads one split's max per trip, the split axis of that
+    slice is a unit extent the codegen squeezes away, and so there is no axis left for a
+    ``ReduceMax`` to fold. What ``Accumulate`` is to ``ReduceSum``, this is to ``ReduceMax``:
+    the same carried state, with the loop itself as the fold.
+
+    Like every running max it may be read inside the loop that carries it
+    (``running_max``), and it starts at ``accum_init``: the identity of max by default, a
+    finite value per instance where the loop also forms ``exp(m_prev - m)``.
+    """
+
+    accum_init = -float("inf")
+    running_max = True
+
+    def __init__(
+        self,
+        dims: tuple[int],
+        n_batch_dims: int = 0,
+        name: str = "accumulate_max",
+        dtype: str = "float32",
+        out_dtype: str = "float32",
+        accum_init: float | None = None,
+    ):
+        super().__init__(
+            dims, n_batch_dims=n_batch_dims, name=name, dtype=dtype, out_dtype=out_dtype
+        )
+        # Per instance, as for ReduceMax: the class default is untouched, and the start
+        # value is no part of the macro (it is the fill of the accumulator's buffer).
+        if accum_init is not None:
+            self.accum_init = accum_init
+
+    def gen_macro(self, **kwargs) -> str:
+        a_scope, b_scope = kwargs["mem_scope"]
+        assert b_scope == "r", "AccumulateMax only supports register accumulation."
+        idx = ", ".join(f"i{d}" for d in range(len(self.dims)))
+        value = f"A[{idx}]" if kwargs["clear"] else f"T.max(B[{idx}], A[{idx}])"
+        macro_str = f"""\
+        @T.macro
+        def {self.get_macro_name(**kwargs)}(A, B):
+            for {idx} in T.Parallel(*B.shape):
+                B[{idx}] = {value}"""
+        return self._format_code(macro_str)
+
+    def get_macro_name(self, **kwargs) -> str:
+        func_name = f"ukernel_accumulate_max_{len(self.dims)}dims_{kwargs['mem_scope']}"
+        func_name += "_clear" if kwargs["clear"] else ""
+        return func_name
+
+
 class Rescale(MacroOp):
     """``ACC *= S`` in place, ``S`` indexed by the leading ``lead`` axes of ``ACC``.
 

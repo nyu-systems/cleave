@@ -7,6 +7,7 @@ tvm = pytest.importorskip("tvm")
 from cleave.ir.graph import Graph, OutputNode, PlaceHolderNode
 from cleave.ir.ops import (
     Accumulate,
+    AccumulateMax,
     CausalMaskedScore,
     Copy,
     Div,
@@ -18,6 +19,7 @@ from cleave.ir.ops import (
     MaskedLog2,
     MaskedLse2,
     MaskedScore,
+    Mul,
     wire_input,
 )
 from cleave.ir.graph_utils import find_topo_sort, gather_all_nodes
@@ -64,10 +66,17 @@ def test_div_const_right():
     torch.testing.assert_close(_run(Div(SHAPE, const=2.0), a), a / 2.0)
 
 
-@pytest.mark.parametrize("op", [Copy, Accumulate])
+@pytest.mark.parametrize("op", [Copy, Accumulate, AccumulateMax])
 def test_identity_ops(op):
     a = _rand()
     torch.testing.assert_close(_run(op(SHAPE), a), a)
+
+
+def test_mul_broadcast_over_the_last_axis_of_a_three_dim_tile():
+    """``broadcast == 0`` with three non-batch dims: B is A without its last axis."""
+    a, b = torch.randn(2, 4, 8), torch.randn(2, 4)
+    out = _run(Mul((2, 4, 8), broadcast=0, n_batch_dims=0), a, b)
+    torch.testing.assert_close(out, a * b[:, :, None])
 
 
 def test_masked_div_is_refused_not_unmasked():

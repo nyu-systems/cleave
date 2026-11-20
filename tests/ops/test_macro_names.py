@@ -10,6 +10,7 @@ from cleave.codegen import TilelangCodeGen
 from cleave.ir.ops import (
     NEG_FLT_MAX,
     Accumulate,
+    AccumulateMax,
     Add,
     CausalMaskedExp,
     CausalMaskedScore,
@@ -132,8 +133,80 @@ def test_carried_max_start_is_per_instance():
 
 def test_only_a_max_is_a_running_accumulator():
     assert ReduceMax.running_max is True and ReduceMax((16, 32)).running_max is True
+    assert AccumulateMax.running_max is True and AccumulateMax((16,)).running_max is True
     for cls in (ReduceSum, Matmul, Accumulate, Mul):
         assert cls.running_max is False, cls.__name__
+
+
+def test_accumulate_max_macro_names_and_bodies():
+    """The elementwise running max: ``B = max(B, A)`` where ``Accumulate`` has ``B += A``."""
+    cg = TilelangCodeGen()
+    name = _emit(cg, AccumulateMax((4,)), "rr")
+    wide = _emit(cg, AccumulateMax((4, 128)), "sr")
+    assert (name, wide) == ("ukernel_accumulate_max_1dims_rr", "ukernel_accumulate_max_2dims_sr")
+    assert cg.generated_macros[name] == (
+        "@T.macro\n"
+        "def ukernel_accumulate_max_1dims_rr(A, B):\n"
+        "    for i0 in T.Parallel(*B.shape):\n"
+        "        B[i0] = T.max(B[i0], A[i0])\n"
+    )
+    assert "B[i0, i1] = T.max(B[i0, i1], A[i0, i1])" in cg.generated_macros[wide]
+    # its own name next to the sum's, for the same tile and scopes
+    assert _emit(cg, Accumulate((4,)), "rr") == "ukernel_accumulate_1dims_rr" != name
+    # outside a loop there is nothing to fold with: the first value is the max
+    first = _emit(cg, AccumulateMax((4,)), "rr", clear=True)
+    assert first == "ukernel_accumulate_max_1dims_rr_clear"
+    assert "B[i0] = A[i0]\n" in cg.generated_macros[first]
+    assert "T.max" not in cg.generated_macros[first]
+    with pytest.raises(AssertionError, match="register"):
+        AccumulateMax((4,)).gen_macro(mem_scope="rs", clear=False)
+
+
+def test_accumulate_max_start_is_per_instance():
+    """As for ``ReduceMax``: the class starts at the identity of max, a carried softmax max
+    at the most negative finite float32, and neither is part of the macro."""
+    plain, carried = AccumulateMax((4,)), AccumulateMax((4,), accum_init=NEG_FLT_MAX)
+    assert carried.accum_init == NEG_FLT_MAX
+    assert plain.accum_init == -math.inf and "accum_init" not in vars(plain)
+    assert AccumulateMax.accum_init == -math.inf
+    assert getattr(Accumulate((4,)), "accum_init", None) is None  # a sum starts cleared
+    assert carried.macro_key() == plain.macro_key() != Accumulate((4,)).macro_key()
+    cg = TilelangCodeGen()
+    assert _emit(cg, carried, "rr") == _emit(cg, plain, "rr")
+    assert len(cg.generated_macros) == 1
+
+
+def test_broadcast_over_the_last_axis_of_a_three_dim_tile():
+    """``broadcast == 0`` over more than two non-batch dims: B is A without its last axis,
+    the weight of a split combine (``o[s, r, d] * w[s, r]``). Two dims read as before."""
+    cg = TilelangCodeGen()
+    lead = Mul((2, 4, 128), broadcast=0, n_batch_dims=0)
+    assert [tuple(int(d) for d in e.src_node.get_shape(0)) for e in lead.inputs] == [
+        (2, 4, 128), (2, 4)]
+    name = _emit(cg, lead, "srr", clear=True)
+    assert name == "ukernel_mul_broadcast_0_3dims_srr"
+    assert cg.generated_macros[name].rstrip("\n") == (
+        "@T.macro\n"
+        "def ukernel_mul_broadcast_0_3dims_srr(A, B, C):\n"
+        "    for i0, i1, i2 in T.Parallel(*C.shape):\n"
+        "        C[i0, i1, i2] = A[i0, i1, i2] * B[i0, i1]"
+    )
+    two = Mul((4, 128), broadcast=0, n_batch_dims=0)
+    assert [tuple(int(d) for d in e.src_node.get_shape(0)) for e in two.inputs] == [
+        (4, 128), (4,)]
+    name = _emit(cg, two, "srr", clear=True)
+    assert name == "ukernel_mul_broadcast_0_2dims_srr"
+    assert "C[i0, i1] = A[i0, i1] * B[i0]\n" in cg.generated_macros[name]
+    # with a batch dim the tile has two non-batch dims again: B is (batch, M) as before
+    batched = Mul((2, 4, 128), broadcast=0)
+    assert [tuple(int(d) for d in e.src_node.get_shape(0)) for e in batched.inputs] == [
+        (2, 4, 128), (2, 4)]
+    assert batched.n_batch_dims == 1 and not batched._lead()
+    assert "C[i0, i1] = A[i0, i1] * B[i0]\n" in batched.gen_macro(mem_scope="rrr", clear=True)
+    # the other broadcast index is untouched by the rule
+    last = Sub((2, 4), broadcast=1, n_batch_dims=0)
+    assert [tuple(int(d) for d in e.src_node.get_shape(0)) for e in last.inputs] == [(2, 4), (4,)]
+    assert "C[i0, i1] = A[i0, i1] - B[i1]\n" in last.gen_macro(mem_scope="rrr", clear=True)
 
 
 def test_rescale_macro_names_and_bodies():

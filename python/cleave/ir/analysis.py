@@ -114,6 +114,11 @@ def _reduction_axes(consumer, input_id, producer_rank, consumer_rank):
 def _binary_axes(consumer, input_id, producer_rank, consumer_rank):
     if input_id == 0 or consumer.const is not None or consumer.broadcast == -1:
         return _identity_axis_map(producer_rank, consumer_rank=consumer_rank)
+    if consumer.broadcast == 0:
+        # B is A without its last axis: every B axis is the same-numbered consumer axis.
+        # (Identical to the rule below while B is `(*batch, M)`; needed once the product
+        # keeps more than two non-batch dims, where "B's last axis" is not `n_batch`.)
+        return _identity_axis_map(producer_rank, consumer_rank=consumer_rank)
 
     n_batch = consumer.n_batch_dims
     axis_map = [set() for _ in range(producer_rank)]

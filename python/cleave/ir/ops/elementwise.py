@@ -70,7 +70,14 @@ def _init_elementwise(op, dims, name, dtype, out_dtype, n_batch_dims):
 
 
 class BinaryElementwise(ComputeOpNode):
-    """``C = A <token> B`` (or ``A <token> const``), with B optionally broadcast on one axis."""
+    """``C = A <token> B`` (or ``A <token> const``), with B optionally broadcast on one axis.
+
+    ``broadcast == 0`` with exactly two non-batch dims: B is ``(*batch, M)``, indexed by the
+    first non-batch index. With MORE than two non-batch dims B is A without its last axis
+    (``B = A.shape[:-1]``), indexed by all but the last index -- the weight of a split
+    combine, ``o[s, r, d] * w[s, r]``, where the split axis must stay a loop index of the
+    tile. For two non-batch dims the two readings coincide, so no existing node changes.
+    """
 
     kind = ""  # macro-name stem and default node name
     token = ""  # infix operator in the macro body
@@ -112,9 +119,16 @@ class BinaryElementwise(ComputeOpNode):
     def _te_const(self, a, c):
         return type(self).py_op(a, c)
 
+    def _lead(self) -> bool:
+        """``broadcast == 0`` over more than two non-batch dims: B lacks only A's last axis."""
+        return self.broadcast == 0 and len(self.dims) - self.n_batch_dims > 2
+
     def create_prim_func(self, dims, in_dtype, out_dtype):
         nb = self.n_batch_dims
+        lead = self._lead()
         b_shape = (*self.batch_dims, dims[self.broadcast + nb]) if self.broadcast != -1 else dims
+        if lead:
+            b_shape = dims[:-1]
         A = te.placeholder(dims, name="A", dtype=in_dtype)
         B = te.placeholder(b_shape, name="B", dtype=in_dtype) if self.const is None else None
 
@@ -123,6 +137,8 @@ class BinaryElementwise(ComputeOpNode):
             if B is None:
                 return self._te_const(a, tvm.tirx.const(self.const, dtype=out_dtype))
             b_idx = (*args[:nb], args[self.broadcast + nb]) if self.broadcast != -1 else args
+            if lead:
+                b_idx = args[:-1]
             return type(self).py_op(a, B[b_idx].astype(out_dtype))
 
         C = te.compute(dims, gen_lambda, name="C")
@@ -139,6 +155,8 @@ class BinaryElementwise(ComputeOpNode):
         _idxs = [f"i{d}" for d in range(len(self.dims) - self.n_batch_dims)]
         _idxs_str = ", ".join(_idxs)
         b_sub = _idxs_str if self.broadcast == -1 else _idxs[self.broadcast]
+        if self._lead():
+            b_sub = ", ".join(_idxs[:-1])
         tensor_rhs = self.const is None
         move_a_to_smem, move_b_to_smem = _resolve_binary_operand_layout(
             self.resolve_operand_layout,

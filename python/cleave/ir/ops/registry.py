@@ -16,6 +16,7 @@ from typing import Dict, Optional, Tuple
 
 from . import (
     Accumulate,
+    AccumulateMax,
     Add,
     CausalMaskedExp,
     CausalMaskedScore,
@@ -104,6 +105,7 @@ AXIS_MAP_EXEMPT: Dict[str, str] = {
     "Copy": _UNARY,
     "GridFloor": _UNARY,
     "Accumulate": _UNARY,
+    "AccumulateMax": _UNARY,
     # Unary in the plain form; the shifted form also reads the row max of its operand, and
     # exists only in the loop tiers the paged builders and hand-written schedules make.
     "MaskedExp": _POST_TILING,
@@ -147,6 +149,7 @@ _SPECS = (
     _spec(Copy),
     _spec(GridFloor),
     _spec(Accumulate),
+    _spec(AccumulateMax),
     _spec(PermuteView),
     _spec(MaskedExp),
     _spec(CausalMaskedExp),

@@ -10,6 +10,8 @@ pytest.importorskip("tilelang")
 from cleave.ir.graph import GraphNode, TensorOp
 from cleave.ir.ops import (
     NEG_FLT_MAX,
+    Accumulate,
+    AccumulateMax,
     Add,
     CausalMaskedExp,
     CausalMaskedScore,
@@ -87,6 +89,16 @@ def _variants():
     yield ReduceMax((16, 32), axis=-1)
     yield ReduceMax((16, 32), axis=1, name="other")
     yield ReduceMax((16, 32), axis=-1, name="carried", accum_init=NEG_FLT_MAX)
+    # the split combine: the elementwise running max next to the elementwise sum, and the
+    # weight broadcast over the last axis of a three-dim tile next to the two-dim form
+    for dims in ((16,), (16, 32)):
+        yield Accumulate(dims)
+        yield AccumulateMax(dims)
+        yield AccumulateMax(dims, name="carried", accum_init=NEG_FLT_MAX)
+    for cls in (Mul, Sub):
+        yield cls((2, 16, 32), broadcast=0, n_batch_dims=0)
+        yield cls((2, 16, 32), broadcast=0, n_batch_dims=0, name="other")
+        yield cls((2, 16), broadcast=1, n_batch_dims=0)
     marked = Exp((16, 32), name="marked")
     marked.stabilize = Stabilize(axes=(-1,), scaled=(("rowsum", 1),))
     yield marked
@@ -145,6 +157,7 @@ def test_key_tells_apart_literals_and_policies():
     a, b = (Matmul((64, 64, 32), warp_policy=p) for p in ("rows", "cols"))
     assert a.macro_key() != b.macro_key()
     assert ReduceSum((16, 32)).macro_key() != ReduceMax((16, 32)).macro_key()
+    assert Accumulate((16,)).macro_key() != AccumulateMax((16,)).macro_key()
     assert Rescale(2, 1).macro_key() != Rescale(2, 2).macro_key()
     assert Rescale(2, 1).macro_key() != Rescale(2, 1, guard=True).macro_key()
     assert Rescale(2, 1).macro_key() != Rescale(3, 1).macro_key()

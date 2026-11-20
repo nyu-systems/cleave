@@ -20,6 +20,7 @@ from ..core.settings import Settings
 from ..ir.graph import OutputNode, PlaceHolderNode
 from ..ir.ops import (
     Accumulate,
+    AccumulateMax,
     Add,
     Copy,
     GridFloor,
@@ -309,6 +310,8 @@ REFERENCES = {
     RSqrt: _unary(lambda x: x.rsqrt()),
     Log2: _unary(lambda x: x.log2()),
     Accumulate: _unary(lambda x: x),
+    # One iteration of it, like Accumulate: the max over a single slice is the slice.
+    AccumulateMax: _unary(lambda x: x),
     Copy: _unary(lambda x: x),
     GridFloor: _unary(lambda x: (x / GridFloor.GRID).floor() * GridFloor.GRID),
     Exp2: _unary(lambda x: x.exp2()),
