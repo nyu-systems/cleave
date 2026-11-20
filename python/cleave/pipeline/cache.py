@@ -53,7 +53,9 @@ from pathlib import Path
 #     at a time, an elementwise op or a matmul on a single row) is refused at build.
 # 21: an output next to the canonical one is refused where the grid walks an axis it was
 #     paired with by extent only (such kernels were built, and wrote wrong values).
-SCHEMA = 21
+# 22: a matmul operand that lost a batch axis the output has one entry of lowers again, and
+#     one that a reduction left in a fragment is staged through shared memory.
+SCHEMA = 22
 # What "validated" means for a saved kernel. A kernel-cache hit returns without validating,
 # so bump this whenever the comparison or its inputs change: saved kernels are then rebuilt.
 # (The inputs include the adversarial cases a program with an exact softmax is held to,

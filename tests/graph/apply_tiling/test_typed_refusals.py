@@ -302,6 +302,62 @@ def test_matmul_operand_with_a_unit_batch_dim_is_tiled():
     assert built and not refused
 
 
+def reduced_operands(x: cl.Tensor["B", "M", "K"], y: cl.Tensor["B", "K", "N"]):
+    """sum(x, 0) @ sum(y, 0): both operands lost the batch axis, the output has one entry."""
+    return cl.sum(x, 0, keepdim=True) @ cl.sum(y, 0, keepdim=True)
+
+
+def reduced_operand_and_input(x: cl.Tensor["B", "M", "K"], w: cl.Tensor["ONE", "K", "N"]):
+    """sum(x, 0) @ w: the reduced operand next to an input."""
+    return cl.sum(x, 0, keepdim=True) @ w
+
+
+def input_and_reduced_operand(x: cl.Tensor["ONE", "M", "K"], y: cl.Tensor["B", "K", "N"]):
+    return x @ cl.sum(y, 0, keepdim=True)
+
+
+def chain_from_reduced_operand_and_input(x: cl.Tensor["B", "M", "K"],
+                                         w: cl.Tensor["ONE", "K", "N"]):
+    return cl.exp(cl.sum(x, 0, keepdim=True)) @ w
+
+
+REDUCED_OPERANDS = [reduced_operands, reduced_operand_and_input, input_and_reduced_operand,
+                    chain_from_reduced_operand_and_input]
+
+
+@pytest.mark.parametrize("fn", REDUCED_OPERANDS, ids=[fn.__name__ for fn in REDUCED_OPERANDS])
+def test_matmul_operand_that_lost_a_unit_batch_axis_is_tiled(fn):
+    """A matmul that reads a sum over a batch axis as an operand. Every tiling builds
+    (but the ones that walk the batch axis one entry at a time, which have no kernel).
+    CPU: they lower. Next to an *input* they did not: the sum is a fragment laid out from
+    the tensor it reduces, the gemm wants its operand in the tensor-core layout, and
+    TileLang found "no available layout" for 22 of 24 tilings. The operand is staged
+    through shared memory, as both are when both are computed."""
+    from cleave.runtime.compile import build_candidate_code
+    from tests._lowering import lower_to_cuda
+
+    ir = _identity_graph(fn, dict(B=4, M=128, K=256, N=128, ONE=1)
+                         if fn is not reduced_operands else dict(B=4, M=128, K=256, N=128))
+    cands = search_tiling(ir, topk=1000)
+    built, refused = _outcomes(cands)
+    assert built and not refused
+    lowered = 0
+    for cand, _ in built:
+        try:
+            code = build_candidate_code(cand)
+        except ScheduleRejected as refusal:
+            assert "is handed one element of the axis it reduces per step (4 in all)" in str(refusal)
+            continue
+        # a reduced operand never reaches the gemm as the fragment the sum left it in:
+        # neither operand is read from a fragment (the scopes in the macro's name)
+        (scopes,) = re.findall(r"^    ukernel_mma_([a-z]{3})\w*\(", code, flags=re.M)
+        assert "r" not in scopes[:2] and scopes[2] == "r", scopes
+        if lowered < 3 and list(cand.output_tile)[-2:] == [64, 64] and cand.n_threads == 128:
+            assert "main_kernel" in lower_to_cuda(code)
+            lowered += 1
+    assert lowered
+
+
 @pytest.mark.parametrize("dtype, first", [(cl.f32, 32), (cl.f16, 32)], ids=["f32", "f16"])
 def test_siblings_over_one_axis_are_stepped_together(dtype, first):
     """The flash-form softmax: the row sum and the value matmul reduce the same axis of

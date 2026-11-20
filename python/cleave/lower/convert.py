@@ -582,13 +582,19 @@ def _matmul(ctx: _Ctx, idx: int, op: KGOp) -> Built:
     dims, ta, tb, a_batch, b_batch = _infer_matmul_config(
         shapes["first"], shapes["second"], ctx.shape(op.outputs[0]),
         bool(op.attrs.get("trans_A", False)), bool(op.attrs.get("trans_B", False)))
+    batch_entries = math.prod(int(extent) for extent in dims[:-3])  # of the output
     for (which, shape), t in zip(shapes.items(), (a, b)):
         # The op declares both operands with the batch axes of its output. An input takes
         # the declared shape (unit extents where it has no batch axis); a computed value
-        # keeps its own, and one that has fewer axes -- it lost a batch axis to a reduction
-        # -- is tiled as the matmul reads it, not as it is stored: no tiling of such a
-        # graph builds.
-        if len(shape) >= 2 and len(shape) != len(dims) - 1 and not ctx.is_input(t):
+        # keeps its own, and one that has fewer axes lost a batch axis to a reduction.
+        # While it still has every batch entry of the output -- the output has one entry
+        # along each axis the value lacks, because the other operand lost it too or is
+        # broadcast over it -- the declared shape is the stored one with unit axes, which
+        # every tile squeezes. Where the output has more entries, the value is read once
+        # per entry and is tiled as the matmul reads it, not as it is stored: no tiling of
+        # such a graph builds.
+        if (len(shape) >= 2 and len(shape) != len(dims) - 1 and not ctx.is_input(t)
+                and math.prod(shape[:-2]) != batch_entries):
             raise ValueError(
                 f"{op.op_type} at index {idx}: the {which} operand {shape} is computed "
                 f"without the batch axes of its matmul, whose output is {tuple(dims[:-1])} "

@@ -167,6 +167,12 @@ def annotate_fragment_layout_conflicts(graph: Graph) -> Graph:
     sum itself but computed from it elementwise: the RMSNorm split-K combine multiplies
     the summed matmul partials by ``1 / sqrt(rowsum.sum(split) / K)``, a chain of three
     ops that all keep the row sum's fragment layout.
+
+    And for a matmul that reads a sum (or such a chain from one) as an operand:
+    ``sum(x, 0, keepdim=True) @ w`` with ``x`` of shape ``(B, M, K)``. The sum's fragment
+    is laid out from the tensor it reduces, the gemm wants its operand in the tensor-core
+    layout, and nothing serves both. It is staged like the operands of a matmul of two
+    computed values (``annotate_tinfo``).
     """
 
     def reset_graph(cur_graph: Graph) -> None:
@@ -250,6 +256,20 @@ def annotate_fragment_layout_conflicts(graph: Graph) -> Graph:
 
         return True
 
+    def reduced_operands(cur_node, cur_graph: Graph) -> set:
+        """The operands of a matmul that are fragments a reduction filled: the sum itself
+        (in this tier, or a loop's accumulator) or what a chain of one-operand,
+        shape-keeping ops made of it."""
+        found = set()
+        for edge in cur_node.inputs:
+            if get_input_scope(cur_graph, edge) != "r":
+                continue
+            sum_edge = through_elementwise_chain(edge)
+            producer = getattr(sum_edge, "accum_node", None) or sum_edge.src_node
+            if isinstance(producer, ReduceSum):
+                found.add(edge.dst_id)
+        return found
+
     def annotate_graph(cur_graph: Graph) -> None:
         for cur_node in cur_graph.nodes:
             if isinstance(cur_node, GraphNode):
@@ -259,6 +279,11 @@ def annotate_fragment_layout_conflicts(graph: Graph) -> Graph:
                 cur_node, cur_graph
             ):
                 cur_node.resolve_operand_layout = "rhs"
+            if isinstance(cur_node, Matmul) and len(cur_node.inputs) == 2:
+                staged = set(cur_node.stage_fragment_operands_in_shared)
+                reduced = reduced_operands(cur_node, cur_graph)
+                if not reduced <= staged:
+                    cur_node.stage_fragment_operands_in_shared = tuple(sorted(staged | reduced))
 
     reset_graph(graph)
     annotate_graph(graph)

@@ -587,9 +587,9 @@ LOST_BATCH_AXIS = {
 def test_matmul_operand_computed_without_its_batch_axes_is_refused(name):
     """``sum(x, 0) @ x.mT``: the flat graph is right, but the matmul declares the operand
     with a unit batch axis the value does not have, and the tiling policy tiles the value as
-    the matmul reads it. None of the 16 plans of such a graph built, each dying in whichever
-    guard its tiles tripped first ("runs 8 iterations but dim 0 ... is cut into 4 tiles",
-    "Expected exactly one launch-axis mapping")."""
+    the matmul reads it: once per batch entry of the output. None of the 16 plans of such a
+    graph built, each dying in whichever guard its tiles tripped first ("runs 8 iterations
+    but dim 0 ... is cut into 4 tiles", "Expected exactly one launch-axis mapping")."""
     fn, sizes, which, shape, out, dims = LOST_BATCH_AXIS[name]
     prog = trace(fn, sizes, cl.f32)
     (graph,) = GraphSet.identity(prog)
@@ -600,6 +600,76 @@ def test_matmul_operand_computed_without_its_batch_axes_is_refused(name):
         f"whose output is {out} (dims {dims}); only an input is read over batch axes it "
         "does not have")
     assert "kn_matmul_op at index " in str(refusal.value)
+
+
+def both_lost_the_batch_axis(x: cl.Tensor["B", "M", "K"], y: cl.Tensor["B", "K", "N"]):
+    return cl.sum(x, 0, keepdim=True) @ cl.sum(y, 0, keepdim=True)
+
+
+def both_lost_a_middle_batch_axis(x: cl.Tensor["B", "H", "M", "K"],
+                                  y: cl.Tensor["B", "H", "K", "N"]):
+    return cl.sum(x, 1, keepdim=True) @ cl.sum(y, 1, keepdim=True)
+
+
+def lost_axis_against_a_unit_batch_value(x: cl.Tensor["B", "M", "K"],
+                                         w: cl.Tensor["ONE", "K", "N"]):
+    return cl.exp(cl.sum(x, 0, keepdim=True)) @ cl.exp(w)
+
+
+def a_lost_axis_against_a_unit_batch_input(x: cl.Tensor["B", "M", "K"],
+                                           w: cl.Tensor["ONE", "K", "N"]):
+    return cl.sum(x, 0, keepdim=True) @ w
+
+
+def b_lost_axis_against_a_unit_batch_input(x: cl.Tensor["ONE", "M", "K"],
+                                           y: cl.Tensor["B", "K", "N"]):
+    return x @ cl.sum(y, 0, keepdim=True)
+
+
+# fn: (sizes, value shapes of the two operands, the matmul's output)
+LOST_UNIT_BATCH_AXIS = {
+    both_lost_the_batch_axis: (dict(B=4, M=6, K=3, N=5), [(6, 3), (3, 5)], (1, 6, 5)),
+    both_lost_a_middle_batch_axis: (dict(B=2, H=4, M=6, K=3, N=5),
+                                    [(2, 6, 3), (2, 3, 5)], (2, 1, 6, 5)),
+    lost_axis_against_a_unit_batch_value: (dict(B=4, M=6, K=3, N=5, ONE=1),
+                                           [(6, 3), (1, 3, 5)], (1, 6, 5)),
+    a_lost_axis_against_a_unit_batch_input: (dict(B=4, M=6, K=3, N=5, ONE=1),
+                                             [(6, 3), (1, 3, 5)], (1, 6, 5)),
+    b_lost_axis_against_a_unit_batch_input: (dict(B=4, M=6, K=3, N=5, ONE=1),
+                                             [(1, 6, 3), (3, 5)], (1, 6, 5)),
+}
+
+
+@pytest.mark.parametrize("fn", LOST_UNIT_BATCH_AXIS, ids=[fn.__name__ for fn in LOST_UNIT_BATCH_AXIS])
+def test_matmul_operand_without_a_batch_axis_the_output_has_one_entry_of_still_lowers(fn):
+    """The refusal above is for an operand that would be read once per batch entry. Where
+    the output has one entry along every axis the value lacks -- both operands lost it,
+    or the other one is broadcast over it -- the declared operand is the stored one with
+    unit axes, and these programs were lowered, tiled and compiled before the refusal
+    existed. It refused them all, by rank alone."""
+    sizes, operands, out = LOST_UNIT_BATCH_AXIS[fn]
+    prog, ir = _lower(fn, sizes)
+    (mma,) = [n for n in ir.nodes if type(n) is Matmul]
+    assert [_shape(e.src_node, e.src_id)
+            for e in sorted(mma.inputs, key=lambda e: e.dst_id)] == operands
+    assert _shape(mma) == out
+    _assert_computes_the_program(ir, prog)
+
+
+def test_matmul_operand_without_a_batch_axis_is_refused_by_entries_not_by_rank():
+    """The line between the two: the same operand, one batch entry in the output or four."""
+    def one_entry(x: cl.Tensor["B", "M", "K"], y: cl.Tensor["ONE", "K", "N"]):
+        return cl.sum(x, 0, keepdim=True) @ cl.exp(y)
+
+    def four_entries(x: cl.Tensor["B", "M", "K"], y: cl.Tensor["B", "K", "N"]):
+        return cl.sum(x, 0, keepdim=True) @ cl.exp(y)
+
+    _lower(one_entry, dict(B=4, M=6, K=3, N=5, ONE=1))
+    (graph,) = GraphSet.identity(trace(four_entries, dict(B=4, M=6, K=3, N=5), cl.f32))
+    with pytest.raises(LoweringRejected, match=r"the first operand \(6, 3\) is computed "
+                                               r"without the batch axes of its matmul, "
+                                               r"whose output is \(4, 6, 5\)"):
+        lower(graph)
 
 
 def unit_batch_input_b(x: cl.Tensor["B", "M", "K"], w: cl.Tensor["ONE", "K", "N"]):
