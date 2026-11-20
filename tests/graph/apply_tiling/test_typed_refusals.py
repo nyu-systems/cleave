@@ -60,6 +60,12 @@ def matmul_of_rowsum(x: cl.Tensor["M", "K"], w: cl.Tensor["K", "N"]):
     return x @ w.sum(-1, keepdim=True)
 
 
+def flash_rows(x: cl.Tensor["R", "C"], v: cl.Tensor["C", "D"]):
+    """(e @ v) / sum(e): the value matmul and the row sum both reduce C, and share ``e``."""
+    e = cl.exp(x)
+    return (e @ v) / cl.sum(e, -1, keepdim=True)
+
+
 def _identity_graph(fn, shapes, dtype=cl.f16):
     (graph,) = list(GraphSet.identity(trace(fn, shapes, dtype)))
     (ir,) = lower(graph)
@@ -186,6 +192,43 @@ def test_tile_that_misses_a_unit_dim_is_a_typed_refusal():
             f"{matmul.name}: tile {list(cand.output_tile)} does not cover the 2 dims of its "
             "tensor (4096, 1); a unit dim that is not a batch dim has no tile"
         )
+
+
+def test_float32_siblings_are_refused_rather_than_miscounted():
+    """A limit that holds today, pinned so that its fix has a case that flips.
+
+    The policy picks the smallest step of each reduction on its own (``TCPolicy.
+    _assign_reduce_step``: a tensor-core matmul by the byte width of its operand, any other
+    reduction by its read pattern) and then enlarges the steps of a group in lockstep. Two
+    reductions of one operand that start apart stay apart: with float32 operands the value
+    matmul steps half of what the row sum steps, for every candidate. The tiler merges
+    both into one loop, which used to run the row sum's trip count over the matmul's
+    tiles and so summed half the row. The loop-extent guard refuses all of them: a
+    float32 flash-form softmax has no tiling, where float16 has all of them.
+    """
+    shapes = dict(R=64, C=4096, D=64)
+
+    ir = _identity_graph(flash_rows, shapes, cl.f32)
+    matmul, rowsum = _one(ir, Matmul), _one(ir, ReduceSum)
+    cands = search_tiling(ir, topk=1000)
+    assert cands and all(2 * _step(c, matmul) == _step(c, rowsum) for c in cands)
+    built, refused = _outcomes(cands)
+    for cand, text in refused:
+        assert re.fullmatch(
+            rf"GraphNode_\S+ runs {4096 // _step(cand, rowsum)} iterations but dim \d of "
+            rf"\S+ is cut into {4096 // _step(cand, matmul)} tiles "
+            rf"\({_step(cand, matmul)} of 4096\)",
+            text,
+        ), text
+    # THE LIMIT. Once the policy steps the two together, these build.
+    assert not built and len(refused) == len(cands)
+
+    ir = _identity_graph(flash_rows, shapes, cl.f16)
+    matmul, rowsum = _one(ir, Matmul), _one(ir, ReduceSum)
+    cands = search_tiling(ir, topk=1000)
+    assert cands and all(_step(c, matmul) == _step(c, rowsum) for c in cands)
+    built, refused = _outcomes(cands)
+    assert len(built) == len(cands) and not refused
 
 
 def test_a_consistent_loop_is_not_refused():
