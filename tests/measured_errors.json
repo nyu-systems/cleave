@@ -218,7 +218,7 @@
    "dtype": "bfloat16",
    "rel": 0.0078125,
    "seeds": 3,
-   "validated": 960
+   "validated": 993
   },
   {
    "abs": 0.000244140625,
@@ -226,7 +226,7 @@
    "dtype": "float32",
    "rel": 4.1119432125924504e-07,
    "seeds": 3,
-   "validated": 960
+   "validated": 993
   }
  ],
  "dynamic:gqa_paged_decode_h32_kv8_d128_ps64": [

@@ -135,7 +135,21 @@ def recommend(largest_valid: float, dtype: str) -> float:
 # never measured: the lse error is proportional to |lse| (2 .. 25 on the captured workloads,
 # hundreds at x100 logits, where one fp32 ulp alone is 3e-5), so an absolute bound sized on
 # one logit scale is wrong on every other. The measured part of the bound is its rtol.
+#
+# The rtol is measured where it is what bounds the output. A comparison in which every
+# entry is within the floor is inside ``rtol * rowmax + ATOL_FLOOR`` whatever the rtol, so
+# it says nothing about the rtol: its row-relative error is the floor's share of a small
+# row, not an error that grows with the row. That is a row whose lse is 0 or close to it
+# (one key with a logit near 0; logits that only fall along the keys), where 2 or 3 fp32
+# ulps of the operands are 5e-7 .. 7e-7 of a row max of 0.6. Such a comparison is counted
+# and held to the declared bound like any other; it does not feed ``largest valid``
+# (``feeds_rtol``). A comparison with a single entry over the floor feeds it in full.
 ATOL_FLOOR = step125(SAFETY * ULP["float32"] / math.log(2))  # 1e-6
+
+
+def feeds_rtol(absolute: bool, abs_error: float) -> bool:
+    """Whether a valid comparison's row-relative error is an input to the output's rtol."""
+    return not (absolute and abs_error <= ATOL_FLOOR)
 
 
 def expected_tolerances(outputs) -> list:
@@ -235,7 +249,8 @@ def _test_operators():
             case = handwritten[param]
             return f"dynamic:{param}" if case.out_idx is not None else case.source.__name__
         if path in ("tests/graph/handwritten/test_empty_request.py",
-                    "tests/graph/handwritten/test_splitkv_decode.py"):
+                    "tests/graph/handwritten/test_splitkv_decode.py",
+                    "tests/graph/handwritten/test_paged_exact_softmax.py"):
             return f"dynamic:{param or 'gqa_paged_decode_h32_kv8_d128_ps1'}"
         if path.endswith("test_gqa_paged_decode_h32_kv8_d128_ps1.py"):
             return "dynamic:gqa_paged_decode_h32_kv8_d128_ps1"
@@ -269,13 +284,10 @@ def load(out: Path) -> dict:
                 node = context.rpartition(" (")[0]
                 if not node.startswith("tests/") or "test_compare_outputs" in node \
                         or node.startswith("tests/test_runtime_tolerance.py") \
-                        or "threaded_into_workers" in node:
-                    continue  # comparator unit tests and deliberate failures
-                if node.startswith("tests/graph/handwritten/test_paged_exact_softmax.py"):
-                    # Hand-made requests, held to the declared bound but no input to it: a
-                    # kernel that is non-finite on purpose, and rows whose lse is 0 or close
-                    # to it, where the fixed absolute floor is the bound and a row-relative
-                    # error says nothing about the operator.
+                        or "threaded_into_workers" in node \
+                        or "test_without_the_running_max" in node:
+                    # comparator unit tests and deliberate failures (the last one runs an
+                    # operator's kernel as it was before its softmax was exact)
                     continue
                 context = "test:" + operator_of(node)
                 context = context.replace("test:dynamic:", "dynamic:")
@@ -314,7 +326,10 @@ def rows(table):
                         if rel is not None and kind != "non_finite"]
             limit = valid_limit(dtype)
             valid = [(rel, abs_) for rel, abs_ in measured if rel <= limit]
-            largest = max((rel for rel, _ in valid), default=None)
+            feeding = [rel for rel, abs_ in valid if feeds_rtol(absolute, abs_)]
+            # No valid comparison at all: nothing was measured. Valid ones that the floor
+            # covers entirely: nothing the rtol has to cover, which is an error of 0.
+            largest = max(feeding, default=0.0 if valid else None)
             yield {
                 "operator": context, "output": i, "dtype": dtype, "absolute": absolute,
                 "seeds": sorted({e[5] for e in entries}), "n": len(entries),
@@ -322,6 +337,7 @@ def rows(table):
                 "largest_valid": largest,
                 "largest_valid_abs": max((abs_ for _, abs_ in valid), default=None),
                 "ambiguous": sorted(rel for rel, _ in measured if limit < rel < WRONG),
+                "within_floor": len(valid) - len(feeding),
                 "rtol": None if largest is None else recommend(largest, dtype),
                 "atol": ATOL_FLOOR if absolute else 0.0,
             }
@@ -329,7 +345,10 @@ def rows(table):
 
 def measured_errors(table) -> dict:
     """operator -> per output ``{dtype, rel, abs, absolute, seeds, validated}``: the largest
-    clearly-valid error of each output, which is all the rule needs (``MEASURED``)."""
+    clearly-valid error of each output, which is all the rule needs (``MEASURED``).
+
+    ``rel`` is taken over the comparisons that feed the rtol (``feeds_rtol``); ``abs`` and
+    ``validated`` over all of them."""
     out = defaultdict(list)
     for r in rows(table):
         assert r["output"] == len(out[r["operator"]]), r
@@ -352,6 +371,8 @@ def markdown(table) -> str:
         largest_abs = "-" if r["largest_valid_abs"] is None else f"{r['largest_valid_abs']:.2e}"
         tol = "-" if r["rtol"] is None else f"rtol={r['rtol']:g}" + (
             f", atol={r['atol']:g}" if r["atol"] else "")
+        if r["within_floor"]:
+            tol += f" ({r['within_floor']} within the floor alone)"
         if r["ambiguous"]:
             tol += f" (AMBIGUOUS: {len(r['ambiguous'])} in ({valid_limit(r['dtype']):g}, " \
                    f"{WRONG:g}), max {r['ambiguous'][-1]:.2e})"

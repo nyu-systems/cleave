@@ -150,3 +150,85 @@ def test_the_rule_that_turns_a_measured_error_into_a_tolerance():
     # An output with an absolute part gets the fixed floor; its measured part is the rtol.
     lse = [dict(dtype="float32", rel=5.7e-7, absolute=True)]
     assert expected_tolerances(lse) == [Tolerance(rtol=5e-6, atol=1e-6)]
+
+
+def test_a_comparison_within_the_absolute_floor_does_not_feed_the_rtol():
+    """The lse bound is ``rtol * rowmax + LSE_ATOL``. A comparison whose every entry is
+    within the floor is inside it whatever the rtol: it is counted, and it is no input to
+    the rtol. One entry over the floor and it is an input in full.
+
+    The numbers are gqa_paged_decode_h32_kv8_d128_ps1's. Its rows with an lse near 0
+    (logits that only fall along the keys) are off by 3.7e-7 .. 4.8e-7, which is 5.0e-7 ..
+    6.8e-7 of a row max of 0.6; where the rtol is what bounds the output it measures
+    4.1e-7. Taken as an rtol input the first would declare 5e-6 for an operator whose
+    declared 2e-6 * rowmax + 1e-6 holds those very rows with 5x to spare.
+    """
+    from tests._measure_tolerances import feeds_rtol, measured_errors, rows
+
+    def table(*lse, absolute=True):
+        return {"dynamic:op": {0: [("float32", absolute, rel, abs_, None, "default")
+                                   for rel, abs_ in lse]}}
+
+    scaled, near_zero = (4.112e-7, 2.44e-4), (6.845e-7, 4.768e-7)
+    assert recommend(scaled[0], "float32") == 2e-6 and recommend(near_zero[0], "float32") == 5e-6
+    assert feeds_rtol(True, scaled[1]) and not feeds_rtol(True, near_zero[1])
+    assert feeds_rtol(True, 1.01 * ATOL_FLOOR) and not feeds_rtol(True, ATOL_FLOOR)
+    assert feeds_rtol(False, near_zero[1]), "no floor, nothing that covers it"
+
+    (row,) = rows(table(scaled, near_zero))
+    assert (row["largest_valid"], row["within_floor"], row["n"]) == (scaled[0], 1, 2)
+    assert row["largest_valid_abs"] == scaled[1]  # abs and the count see every comparison
+    assert (row["rtol"], row["atol"]) == (2e-6, ATOL_FLOOR)
+    (entry,) = measured_errors(table(scaled, near_zero))["dynamic:op"]
+    assert (entry["rel"], entry["abs"], entry["validated"]) == (scaled[0], scaled[1], 2)
+    assert expected_tolerances([entry]) == [Tolerance(rtol=2e-6, atol=LSE_ATOL)]
+    # the same row-relative error with one entry over the floor is an input like any other
+    (row,) = rows(table(scaled, (near_zero[0], 1.2e-6)))
+    assert (row["largest_valid"], row["within_floor"], row["rtol"]) == (near_zero[0], 0, 5e-6)
+    # an output without an absolute part has no floor to be within
+    (row,) = rows(table(scaled, near_zero, absolute=False))
+    assert (row["largest_valid"], row["within_floor"], row["atol"]) == (near_zero[0], 0, 0.0)
+    # only comparisons the floor covers: valid, and nothing left for the rtol to cover
+    (row,) = rows(table(near_zero))
+    assert (row["largest_valid"], row["within_floor"]) == (0.0, 1)
+    assert row["rtol"] == recommend(0.0, "float32") == 2e-7
+    # no valid comparison at all: nothing was measured
+    (row,) = rows({"dynamic:op": {0: [("float32", True, None, None, "non_finite", "default")]}})
+    assert row["largest_valid"] is None and row["rtol"] is None and row["within_floor"] == 0
+
+
+def test_the_measurement_counts_hand_made_requests_and_not_a_kernel_broken_on_purpose(tmp_path):
+    """``tests/graph/handwritten/test_paged_exact_softmax.py`` runs an operator's kernel on
+    hand-made requests, which are that operator's validations like any other, and once more
+    as it was before its softmax was exact, which is no kernel of the operator at all."""
+    from tests._measure_tolerances import load, measured_errors
+
+    name = "gqa_paged_decode_h32_kv8_d128_ps1"
+    path = "tests/graph/handwritten/test_paged_exact_softmax.py"
+
+    def record(test, lse_rel, lse_abs, kind=None):
+        bad = kind is not None
+        outputs = [
+            dict(shape=[7, 32, 128], dtype="bfloat16", rtol=2e-2, atol=0.0, kind=kind,
+                 rel=None if bad else 7.8e-3, abs=None if bad else 1.5e-2),
+            dict(shape=[7, 32], dtype="float32", rtol=2e-6, atol=1e-6, kind=kind,
+                 rel=lse_rel, abs=lse_abs),
+        ]
+        return json.dumps({"context": f"{path}::{test}[{name}] (call)", "what": "",
+                           "kind": kind, "outputs": outputs})
+
+    lines = [
+        record("test_exact_softmax_on_hand_made_requests", 2.7e-7, 1.2e-4),
+        record("test_exact_softmax_on_hand_made_requests", 6.845e-7, 4.768e-7),
+        record("test_without_the_running_max_the_adversarial_workloads_fail", 9.0e-6, 3.0e-3),
+        record("test_without_the_running_max_the_adversarial_workloads_fail", None, None,
+               kind="non_finite"),
+    ]
+    (tmp_path / "validation").mkdir()
+    (tmp_path / "validation" / "tests__default.jsonl").write_text("\n".join(lines) + "\n")
+    table = load(tmp_path)
+    assert set(table) == {f"dynamic:{name}"}
+    out, lse = measured_errors(table)[f"dynamic:{name}"]
+    assert (out["validated"], lse["validated"]) == (2, 2)
+    assert (lse["rel"], lse["abs"], lse["absolute"]) == (2.7e-7, 1.2e-4, True)
+    assert out["rel"] == 7.8e-3 and not out["absolute"]

@@ -43,8 +43,13 @@ def _tolerance(out_rtol, lse_rtol):
     demanding a bit-exact answer; an empty row's -inf is matched exactly either way.
 
     ``lse_rtol`` is the next 1-2-5 step at or above 4x the largest row-relative error the
-    operator's valid kernels measured over its captured workloads and three seeds (and over
-    its adversarial workloads, once its softmax is exact and it validates on them). ``out``
+    operator's valid kernels measured over three seeds on everything they are validated on:
+    its captured workloads, its adversarial workloads once its softmax is exact, and the
+    hand-made requests of its tests. One kind of comparison is counted and is no input: an
+    lse output whose every entry is within ``LSE_ATOL``. It is inside the bound whatever
+    the rtol, and its row-relative error is the floor's share of a row near 0, not an error
+    that grows with the row (requests whose logits only fall along the keys: 5e-7 .. 7e-7
+    of a row max of 0.6, held by the bound with 5x to spare). ``out``
     follows the same rule at 2x: bf16 has 8 significand bits, so one ulp is 7.8e-3 of the
     row max, every kernel measures 1 to 1.2 ulps (7.8e-3 .. 9.4e-3), and 4x would be the
     5e-2 ceiling, looser than the elementwise 0.01 + 0.01|ref| these operators were held to
@@ -77,7 +82,9 @@ class DynamicOperator:
     # (distribution, axes) adversarial workloads; validated on only when asked for ...
     adversarial: tuple = ()
     # ... or always, once the operator's softmax is exact (a running max): it then holds at
-    # any logit scale, and every validation of it runs the adversarial workloads as well.
+    # any logit scale, and every validation of its single kernel runs the adversarial
+    # workloads as well. Its split-KV pairs follow when they are exact too
+    # (``pipeline.dynamic._validation_passes``).
     exact_softmax: bool = False
     page_size: int = 1
     scale: float | None = None
