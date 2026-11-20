@@ -15,6 +15,7 @@ import pytest
 pytest.importorskip("tilelang")
 pytest.importorskip("tvm")
 
+from cleave.core.errors import ScheduleRejected
 from cleave.ir.graph import OutputNode
 from cleave.schedule import apply_tiling, search_tiling
 
@@ -85,18 +86,24 @@ def test_stored_layouts_of_hand_built_graphs(case):
         assert clone.stored_layouts == layouts and clone.stored_layouts is not scheduled.stored_layouts
 
 
-def _t(guid, dims):
-    return {"guid": guid, "num_dims": len(dims), "dim": list(dims), "dtype": "float16"}
+def _t(guid, dims, dtype="float16"):
+    return {"guid": guid, "num_dims": len(dims), "dim": list(dims), "dtype": dtype}
 
 
 def _op(op_type, ins, outs, **extra):
     return {"op_type": op_type, "input_tensors": ins, "output_tensors": outs, **extra}
 
 
-def _rowsum_and_value(BH, SQ, SKV, D):
-    """exp(Q K^T) reduced two ways, both outputs of one unsplit graph."""
+def _rowsum_and_value(BH, SQ, SKV, D, weights="float32"):
+    """exp(Q K^T) reduced two ways, both outputs of one unsplit graph.
+
+    ``weights`` is the dtype the exp is stored in. In float32 -- what lowering makes of a
+    traced program -- the row sum and the value matmul step ``S_KV`` together. Stored in
+    float16, the policy steps the row sum twice as far as the matmul (it sizes each
+    reduction's step alone, by what it reads), and the two cannot share a loop.
+    """
     q, k, v = _t(1, (BH, SQ, D)), _t(2, (BH, SKV, D)), _t(3, (BH, SKV, D))
-    scores, weights = _t(4, (BH, SQ, SKV)), _t(5, (BH, SQ, SKV))
+    scores, weights = _t(4, (BH, SQ, SKV)), _t(5, (BH, SQ, SKV), weights)
     return [
         _op("kn_input_op", [], [q]),
         _op("kn_input_op", [], [k]),
@@ -129,6 +136,33 @@ def test_a_padded_sibling_output_without_a_split_records_its_pad(dims):
         assert scheduled.stored_layouts == {rowsum.name: ((0, 1), 1), value.name: IDENTITY3}
         assert tuple(scheduled.tmap[rowsum].shape) == (BH, SQ, 1)
         assert tuple(scheduled.tmap[value].shape) == (BH, SQ, D)
+
+
+@pytest.mark.parametrize("dims", [(32, 4096, 4096, 64), (4, 64, 1024, 64)])
+def test_siblings_stepped_apart_are_refused_and_record_nothing(dims):
+    """The same graph with the exp stored in float16: every candidate steps the row sum
+    twice as far as the value matmul. Both are in one loop over ``S_KV``, which then runs
+    twice as many iterations as the weights have tiles. The tiler refuses that (it used to
+    build a kernel that read past the row, and this file recorded its layouts), so there
+    is no stored layout to speak of. The limit is the policy's; when it steps siblings
+    together this test fails, and the float16 form belongs in the test above."""
+    from cleave.lower import to_ir
+
+    SKV = dims[2]
+    graph = to_ir(_rowsum_and_value(*dims, weights="float16"))
+    candidates = search_tiling(graph, topk=PL.TOPK)
+    assert candidates
+    for cand in candidates:
+        steps = {n.name: next(iter(v.values())) for n, v in cand.rstep_map.items() if v}
+        rowsum, value = steps["reduction_2_5"], steps["mma_6"]
+        assert rowsum == 2 * value
+        with pytest.raises(ScheduleRejected) as refusal:
+            apply_tiling(cand)
+        assert str(refusal.value) == (
+            f"GraphNode_mma_6 runs {SKV // value} iterations but dim 1 of exp_4 is cut into "
+            f"{SKV // rowsum} tiles ({rowsum} of {SKV})"
+        )
+        assert cand.flat_graph.stored_layouts == {} and graph.stored_layouts == {}
 
 
 @pytest.mark.parametrize("name", PL.fixture_names())
