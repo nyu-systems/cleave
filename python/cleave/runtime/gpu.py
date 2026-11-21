@@ -115,6 +115,44 @@ def _release_thread_stacks(limit):
     driver.cuCtxSetLimit(_CU_LIMIT_STACK_SIZE, ctypes.c_size_t(limit))
 
 
+def lock_state(path) -> tuple[Optional[int], frozenset]:
+    """``(holder pid, waiter pids)`` of the ``flock`` on ``path``, from ``/proc/locks``.
+
+    ``(None, frozenset())`` where that cannot be told: nobody holds it, the file is not
+    there, or the kernel's lock table is not readable (it is Linux's). The table lists the
+    lock an inode is held under and, behind ``->``, every request that waits for it.
+    """
+    try:
+        st = os.stat(path)
+        inode = f"{os.major(st.st_dev):02x}:{os.minor(st.st_dev):02x}:{st.st_ino}"
+        with open("/proc/locks") as table:
+            lines = [line.split() for line in table]
+    except (OSError, TypeError):
+        return None, frozenset()
+    holder, waiters = None, set()
+    for fields in lines:
+        waiting = "->" in fields[:2]
+        if waiting:
+            fields.remove("->")
+        if len(fields) < 6 or fields[1] != "FLOCK" or fields[5] != inode:
+            continue
+        try:
+            pid = int(fields[4])
+        except ValueError:
+            continue
+        if waiting:
+            waiters.add(pid)
+        elif holder is None:
+            holder = pid
+    return holder, frozenset(waiters)
+
+
+def device_lock_state() -> tuple[Optional[int], frozenset]:
+    """``lock_state`` of this process's device lock (the one ``_gpu_exec_guard`` takes)."""
+    _create_parallel_env()
+    return lock_state(_GPU_LOCK_PATH)
+
+
 @contextlib.contextmanager
 def _gpu_exec_guard():
     """One process at a time on the device. Whoever holds the lock leaves its CUDA context

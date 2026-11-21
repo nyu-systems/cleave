@@ -173,6 +173,116 @@ def test_a_kernel_that_never_returns_cannot_stall_the_parent(tmp_path, monkeypat
     assert [r.cuda_src for r in results[1:]] == ["cuda_a", "cuda_b"]
 
 
+def _check_under_the_lock(code_str, *, out_idx, reference_cache_dir, tolerance=None,
+                          benchmark=None):
+    """Worker-side fake of ``check_code``: compile, then validate and time under the device
+    lock. ``hang`` is compiled at once and never gives the device back (a kernel that
+    spins); the others take a moment to compile, so they find the device taken."""
+    if code_str != "hang":
+        time.sleep(0.4)
+    with open(os.environ["FAKE_GPU_LOCK"], "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if code_str == "hang":
+            time.sleep(600)
+        time.sleep(0.05)
+    return f"cuda_{code_str}", os.getpid()
+
+
+def _device_lock_is(monkeypatch, path):
+    """Point the parent's view of the device lock at the fake one the workers take."""
+    from cleave.runtime import evaluate, gpu
+
+    monkeypatch.setenv("FAKE_GPU_LOCK", str(path))
+    monkeypatch.setattr(evaluate, "device_lock_state", lambda: gpu.lock_state(str(path)))
+
+
+def test_a_kernel_that_never_returns_costs_only_its_own_candidate(tmp_path, monkeypatch):
+    """Every worker validates under the device lock, so the candidates launched next to a
+    kernel that never returns wait behind it until it is timed out. Their own time used to
+    be up in that same pass, although none of them had had the device: one spinning kernel
+    failed every candidate in flight. demo/swiglu.py at the fast preset lost all eight that
+    way ("8 kernels: 0 compiled, 8 failed [8x CandidateTimeout]") after its first kernel
+    had validated and then hung while it was timed.
+
+    The time a candidate waits for the device behind another candidate of the run is not
+    counted: the one that hangs is timed out, the others then get the device."""
+    _device_lock_is(monkeypatch, tmp_path / "gpu.lock")
+    cands = _candidates("hang", "a", "b", "c")
+    started = time.monotonic()
+    with WorkerPool(mp.get_context("fork")) as pool:
+        results = run_candidates(
+            cands, "float16", build_fn=_build, check_fn=_check_under_the_lock,
+            reference_fn=_no_reference, pool=pool, max_parallel=4, timeout_s=2.0,
+        )
+    assert [r.stage for r in results] == ["timeout", None, None, None]
+    assert isinstance(results[0].error, CandidateTimeout)
+    assert "exceeded 2s" in str(results[0].error)
+    assert [r.cuda_src for r in results[1:]] == ["cuda_a", "cuda_b", "cuda_c"]
+    assert time.monotonic() - started < 20  # one timeout, not one per candidate
+
+
+def test_a_candidate_that_holds_the_device_too_long_is_still_timed_out(tmp_path, monkeypatch):
+    """Only waiting is taken off the clock. Two kernels that never return, one after the
+    other: each is charged from the moment it has the device, and the third candidate, which
+    waited behind both, still runs."""
+    _device_lock_is(monkeypatch, tmp_path / "gpu.lock")
+    cands = _candidates("hang", "hang", "a")
+    with WorkerPool(mp.get_context("fork")) as pool:
+        results = run_candidates(
+            cands, "float16", build_fn=_build, check_fn=_check_under_the_lock,
+            reference_fn=_no_reference, pool=pool, max_parallel=3, timeout_s=1.5,
+        )
+    assert [r.stage for r in results] == ["timeout", "timeout", None]
+    assert results[2].cuda_src == "cuda_a"
+
+
+def test_waiting_behind_another_process_on_the_device_is_charged(tmp_path, monkeypatch):
+    """A lock held by a process that is no worker of this run (another session on the same
+    GPU) is not ended by this run's timeouts, so waiting behind it counts as before: the
+    candidates time out instead of waiting for good."""
+    _device_lock_is(monkeypatch, tmp_path / "gpu.lock")
+    cands = _candidates("a", "b")
+    with open(tmp_path / "gpu.lock", "w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)  # this process: not one of the pool's workers
+        with WorkerPool(mp.get_context("fork")) as pool:
+            results = run_candidates(
+                cands, "float16", build_fn=_build, check_fn=_check_under_the_lock,
+                reference_fn=_no_reference, pool=pool, max_parallel=2, timeout_s=1.5,
+            )
+    assert [r.stage for r in results] == ["timeout", "timeout"]
+
+
+def _take_and_release(path):
+    with open(path, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+
+
+def test_lock_state_names_the_holder_and_the_waiters(tmp_path):
+    from cleave.runtime.gpu import lock_state
+
+    path = tmp_path / "device.lock"
+    assert lock_state(str(path)) == (None, frozenset())  # no such file
+    assert lock_state(None) == (None, frozenset())
+    path.touch()
+    assert lock_state(str(path)) == (None, frozenset())  # nobody holds it
+    with open(path, "w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        assert lock_state(str(path)) == (os.getpid(), frozenset())
+        child = mp.get_context("fork").Process(target=_take_and_release, args=(str(path),))
+        child.start()
+        deadline = time.monotonic() + 10
+        while lock_state(str(path))[1] != {child.pid} and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert lock_state(str(path)) == (os.getpid(), frozenset({child.pid}))
+        # a lock on another file is another lock
+        other = tmp_path / "other.lock"
+        other.touch()
+        assert lock_state(str(other)) == (None, frozenset())
+        fcntl.flock(held, fcntl.LOCK_UN)
+    child.join(timeout=10)
+    assert child.exitcode == 0 and lock_state(str(path)) == (None, frozenset())
+
+
 def test_a_reference_that_cannot_be_built_fails_the_candidates_of_its_graph(pool):
     good, bad = object(), object()
 

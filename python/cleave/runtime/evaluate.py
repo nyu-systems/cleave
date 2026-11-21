@@ -35,7 +35,7 @@ from .compile import (
     build_candidate,
     check_code,
 )
-from .gpu import _create_parallel_env, _gpu_exec_guard
+from .gpu import _create_parallel_env, _gpu_exec_guard, device_lock_state
 from .reference import (
     graph_out_indices,
     make_inputs,
@@ -353,6 +353,32 @@ def run_candidates(
             stage, error = _restore_compile_error(result, job["label"])
             fail(job, stage, error, pbar, job["code_str"], result.get("measured"))
 
+    waits_charged_at = [time.monotonic()]
+
+    def uncharge_waits(now):
+        """Take the time a worker waited for the device, behind another worker of this run,
+        off its candidate's clock.
+
+        Workers validate and time one at a time, under the device lock. A kernel that never
+        returns holds that lock until its worker is timed out, and every candidate launched
+        next to it waits behind it for exactly as long: their time was up in the same pass,
+        though none of them had had the device. One spinning kernel so failed every candidate
+        in flight, and all of them in a run of no more than ``max_parallel`` (the fast preset
+        of demo/swiglu.py: "8 kernels: 0 compiled, 8 failed [8x CandidateTimeout]", after
+        its first kernel had validated). The timeout therefore counts what a candidate does,
+        not what it waits for: the holder is always a candidate this run times out, so the
+        wait ends. A holder that is no worker of this run is another process on the device;
+        nothing here ends it, and waiting behind it is charged as before.
+        """
+        since, waits_charged_at[0] = waits_charged_at[0], now
+        holder, waiters = device_lock_state()
+        pids = {worker.process.pid: job for worker, job in active_jobs.items()}
+        if holder not in pids:
+            return
+        for pid in waiters & set(pids):
+            job = pids[pid]
+            job["started_at"] = min(now, job["started_at"] + (now - since))
+
     def collect(pbar):
         # A worker's result is read before its death is noticed, so a worker that
         # reported and then exited (a retired one) is never counted as crashed.
@@ -383,7 +409,7 @@ def run_candidates(
 
         with tqdm(total=total_candidates) as pbar:
             launch_until_full(pbar)
-            last_heartbeat_at = time.monotonic()
+            last_heartbeat_at = waits_charged_at[0] = time.monotonic()
 
             while active_jobs:
                 now = time.monotonic()
@@ -405,6 +431,7 @@ def run_candidates(
 
                 now = time.monotonic()
                 if timeout_secs is not None:
+                    uncharge_waits(now)
                     for worker, job in list(active_jobs.items()):
                         elapsed = now - job["started_at"]
                         if elapsed < timeout_secs:
