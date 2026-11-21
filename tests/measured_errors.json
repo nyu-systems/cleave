@@ -6,7 +6,7 @@
    "dtype": "float16",
    "rel": 0.0009756097570061684,
    "seeds": 3,
-   "validated": 387
+   "validated": 405
   },
   {
    "abs": 0.001953125,
@@ -44,7 +44,7 @@
    "dtype": "float16",
    "rel": 0.0009523809421807528,
    "seeds": 3,
-   "validated": 111
+   "validated": 129
   }
  ],
  "demo:matmul_matmul": [
@@ -54,7 +54,7 @@
    "dtype": "float16",
    "rel": 0.0009756097570061684,
    "seeds": 3,
-   "validated": 158
+   "validated": 201
   }
  ],
  "demo:matmul_rowsum": [
@@ -74,7 +74,7 @@
    "dtype": "float16",
    "rel": 0.0009551098337396979,
    "seeds": 3,
-   "validated": 138
+   "validated": 144
   },
   {
    "abs": 0.00048828125,
@@ -87,12 +87,29 @@
  ],
  "demo:mha_decode_exact": [
   {
-   "abs": 6.103515625e-05,
+   "abs": 0.03125,
    "absolute": false,
    "dtype": "float16",
    "rel": 0.0009765625,
    "seeds": 3,
-   "validated": 168
+   "validated": 2184
+  },
+  {
+   "abs": 0.015625,
+   "absolute": false,
+   "dtype": "float16",
+   "rel": 0.0009765625,
+   "seeds": 3,
+   "validated": 1344
+  },
+  {
+   "abs": 2.384185791015625e-06,
+   "absolute": false,
+   "dtype": "float32",
+   "rel": 5.915308065596037e-07,
+   "role": "shift",
+   "seeds": 3,
+   "validated": 1344
   }
  ],
  "demo:mha_prefill": [
@@ -132,7 +149,7 @@
    "dtype": "float16",
    "rel": 0.0009765625,
    "seeds": 3,
-   "validated": 387
+   "validated": 405
   },
   {
    "abs": 0.001953125,
@@ -357,20 +374,20 @@
  ],
  "test:attention": [
   {
-   "abs": 0.00048828125,
+   "abs": 0.0009765625,
    "absolute": false,
    "dtype": "float16",
    "rel": 0.0009765625,
    "seeds": 3,
-   "validated": 78
+   "validated": 288
   },
   {
-   "abs": 0.00048828125,
+   "abs": 0.0009765625,
    "absolute": false,
    "dtype": "float16",
    "rel": 0.0011370097054168582,
    "seeds": 3,
-   "validated": 48
+   "validated": 144
   }
  ],
  "test:batched_matmul_graph": [
@@ -390,7 +407,7 @@
    "dtype": "float16",
    "rel": 0.0,
    "seeds": 3,
-   "validated": 270
+   "validated": 414
   }
  ],
  "test:batched_matmul_splitk_partial_graph": [
@@ -411,6 +428,33 @@
    "rel": 0.0009756097570061684,
    "seeds": 3,
    "validated": 630
+  }
+ ],
+ "test:exact_split_attention": [
+  {
+   "abs": 0.0625,
+   "absolute": false,
+   "dtype": "float16",
+   "rel": 0.0015117158181965351,
+   "seeds": 3,
+   "validated": 2040
+  },
+  {
+   "abs": 0.015625,
+   "absolute": false,
+   "dtype": "float16",
+   "rel": 0.0009765625,
+   "seeds": 3,
+   "validated": 504
+  },
+  {
+   "abs": 2.86102294921875e-06,
+   "absolute": false,
+   "dtype": "float32",
+   "rel": 5.952418291599315e-07,
+   "role": "shift",
+   "seeds": 3,
+   "validated": 504
   }
  ],
  "test:flash_attention_sd_graph": [
@@ -528,7 +572,7 @@
    "dtype": "float16",
    "rel": 0.0,
    "seeds": 3,
-   "validated": 312
+   "validated": 414
   }
  ],
  "test:matmul_splitk_partial_graph": [
@@ -568,7 +612,7 @@
    "dtype": "float16",
    "rel": 0.0009541984763927758,
    "seeds": 3,
-   "validated": 24
+   "validated": 150
   }
  ],
  "test:mha_split_partial_graph": [

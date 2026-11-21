@@ -16,8 +16,8 @@ import pytest
 import cleave.examples as examples
 from cleave.runtime.validate import Tolerance
 
-from .._measure_tolerances import MEASURED, expected_tolerance
-from .._tolerances import CEILING
+from .._measure_tolerances import MEASURED, expected_tolerance, expected_tolerances_by_role
+from .._tolerances import CEILING, FP32_CEILING
 from ..frontend.test_trace_equivalence import normalized, spy
 from ._snapshot import SNAPSHOT, record, updating
 
@@ -91,13 +91,29 @@ def test_every_demo_has_a_case():
     assert {c[0] for c in CASES} == set(SNAPSHOT["demos"])
 
 
+# The demos whose kernels return an output with a boundary role: an exact softmax, split.
+# Its partials return their float32 shift, so the demo declares one bound per role.
+BY_ROLE = {"mha_decode_exact"}
+
+
 def _assert_declared(config, name):
-    """One measured bound for the operator, within the ceiling; it asks for normal inputs."""
+    """One measured bound for the operator, within the ceiling (one per boundary role for a
+    demo of ``BY_ROLE``); it asks for normal inputs."""
     tolerance = config.tolerance
+    measured = json.loads(MEASURED.read_text())[f"demo:{name}"]
+    if name in BY_ROLE:
+        assert isinstance(tolerance, dict) and set(tolerance) == {"", "shift"}
+        expected = expected_tolerances_by_role(measured)
+        shift, tolerance = tolerance["shift"], tolerance[""]
+        assert isinstance(shift, Tolerance) and 0 < shift.rtol <= FP32_CEILING
+        assert shift.atol == 0 and shift == expected["shift"]
+        expected = expected[""]
+    else:
+        expected = expected_tolerance(measured)
     assert isinstance(tolerance, Tolerance), "the demo declares no tolerance"
     assert 0 < tolerance.rtol <= CEILING and tolerance.atol == 0
     # ... and exactly the one the rule gives for the pinned measurement of this demo
-    assert tolerance == expected_tolerance(json.loads(MEASURED.read_text())[f"demo:{name}"])
+    assert tolerance == expected
     # No demo asks for more than the normal inputs. (The build holds a program whose softmax
     # is exact to the adversarial cases as well, whatever is asked: pipeline.build.)
     assert config.distributions == ("normal",)
@@ -132,16 +148,23 @@ def test_staged_demo_declares_its_own_tolerance(monkeypatch):
 
 def test_mha_decode_exact_config(monkeypatch):
     """The exact softmax at the decode demo's own shape: no max in the program (the request
-    stands for it), no split, and the search budget the auto rule gives."""
+    stands for it), the decode demo's split over the keys, and the search budget the auto
+    rule gives."""
     seen = run_demo(monkeypatch, "mha_decode_exact", [])
-    program, so = seen["program"], seen["so"]
+    program, so, sc = seen["program"], seen["so"], seen["sc"]
     assert [r.kind for r in program.ops if r.kind != "input"] == [
         "matmul", "div", "exp", "reduce_sum", "div", "matmul"]
     assert len(program.stabilize_requests) == 1
-    assert not so.split and so.max_ops == "auto" and so.resolve_max_ops(program) == 13
+    assert so.split == ("SKV",) and sc.split_k == (16, 32)
+    assert so.max_ops == "auto" and so.resolve_max_ops(program) == 13
     assert program.sizes == {"H": 32, "SQ": 64, "D": 64, "SKV": 4096}
-    # ... the shape of demo/mha_decode.py, whose softmax is still the fixed shift
-    assert run_demo(monkeypatch, "mha_decode", [])["program"].sizes == program.sizes
+    # ... the shape and the split of demo/mha_decode.py, whose softmax is still the fixed shift
+    fixed = run_demo(monkeypatch, "mha_decode", [])
+    assert fixed["program"].sizes == program.sizes
+    assert (fixed["so"].split, fixed["sc"].split_k) == (so.split, sc.split_k)
+    # --split none: the solo kernels only, as before the exact softmax crossed a split
+    solo = run_demo(monkeypatch, "mha_decode_exact", ["--split", "none"])
+    assert not solo["so"].split and not solo["sc"].split_k
 
 
 @pytest.mark.parametrize("name", DEMOS)

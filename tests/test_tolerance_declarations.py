@@ -22,6 +22,7 @@ from tests._measure_tolerances import (
     MEASURED,
     expected_tolerance,
     expected_tolerances,
+    expected_tolerances_by_role,
     recommend,
     step125,
 )
@@ -32,7 +33,16 @@ PINNED = json.loads(MEASURED.read_text())
 
 def test_declared_tolerances_are_row_relative_bounds_within_the_ceiling():
     assert (CEILING, FP32_CEILING) == (5e-2, 2e-5)
+    by_role = {name for name, tolerance in TOLERANCES.items() if isinstance(tolerance, dict)}
+    assert by_role == {"exact_split_attention"}
     for name, tolerance in TOLERANCES.items():
+        if name in by_role:
+            # one bound per boundary role: the program's float16 outputs, and the float32
+            # shift a split partial returns, which is held to a float32 bound of its own
+            assert set(tolerance) == {"", "shift"}, name
+            tolerance, shift = tolerance[""], tolerance["shift"]
+            assert isinstance(shift, Tolerance), name
+            assert 0 < shift.rtol <= FP32_CEILING < tolerance.rtol and shift.atol == 0, name
         assert isinstance(tolerance, Tolerance), name
         # fp16 outputs: relative to the row, no absolute slack, never the old 0.5
         assert 1e-3 <= tolerance.rtol <= CEILING and tolerance.atol == 0, name
@@ -55,6 +65,9 @@ def test_every_declared_tolerance_follows_from_the_pinned_measurement():
         outputs = PINNED.get(f"test:{name}")
         if outputs is None:
             unmeasured.add(name)
+        elif isinstance(tolerance, dict):
+            assert tolerance == expected_tolerances_by_role(outputs), name
+            assert all(o["seeds"] >= 3 for o in outputs), name
         else:
             assert tolerance == expected_tolerance(outputs), name
     # No kernel of this operator validates (its tests are deselected), so there is nothing
@@ -445,3 +458,147 @@ def test_a_paged_operators_adversarial_workloads_are_held_to_its_bound_and_do_no
     _, lse = rows(table_of(record(demo, "wl_1_8_7", 2.313e-7, 2.86e-6),
                            record(demo, "", 4.208e-7, 2.44e-4)))
     assert (lse["largest_valid"], lse["rtol"], lse["adversarial"]) == (4.208e-7, 2e-6, 0)
+
+
+def test_an_output_with_a_boundary_role_is_measured_apart(tmp_path):
+    """The split partial of an exact softmax returns its float32 shift in front of its two
+    float16 sums. The shift is one output of the operator, under its role, wherever a kernel
+    returns it; the sums are numbered as in a partial without it, so the first is measured
+    with the output of the solo and combine kernels as before. Each role gets the bound the
+    rule gives its own outputs: nothing of one dtype is held to the error of another."""
+    from tests._measure_tolerances import load, markdown, measured_errors, rows
+
+    path = "tests/pipeline_api/test_exact_split_attention.py::test_gpu_exact_split_attention"
+
+    def out(dtype, rel, role=None, shape=(32, 16, 64)):
+        entry = dict(shape=list(shape), dtype=dtype, rtol=5e-3, atol=0.0, kind=None, rel=rel,
+                     abs=rel / 4)
+        return {**entry, "role": role} if role else entry
+
+    def record(what, *outputs, kind="mha"):
+        return json.dumps({"context": f"{path}[{kind}] (call)", "what": what, "kind": None,
+                           "outputs": list(outputs)})
+
+    partial = [out("float32", 9.4e-7, role="shift"), out("float16", 6.5e-4),
+               out("float16", 1.1e-3, shape=(32, 16, 64, 64))]
+    lines = [
+        record("", *partial),
+        record("", out("float16", 3.3e-4, shape=(32, 64, 64))),  # a combine
+        record("", out("float16", 9.8e-4, shape=(32, 64, 64))),  # the chained Kernel
+        # adversarial cases: held to the bounds, no input to them
+        record("increasing inputs", out("float32", 1.9e-6, role="shift"),
+               out("float16", 8.0e-4), out("float16", 1.6e-3, shape=(32, 16, 64, 64))),
+    ]
+    (tmp_path / "validation").mkdir()
+    (tmp_path / "validation" / "tests__default.jsonl").write_text("\n".join(lines) + "\n")
+    table = load(tmp_path)
+    assert set(table) == {"test:exact_split_attention"}
+    assert list(table["test:exact_split_attention"]) == ["shift", 0, 1]
+    by_output = {r["output"]: r for r in rows(table)}
+    assert list(by_output) == [0, 1, "shift"]  # the numbered outputs first
+    assert (by_output[0]["dtype"], by_output[0]["n"], by_output[0]["largest_valid"]) == (
+        "float16", 4, 9.8e-4)
+    assert (by_output[1]["dtype"], by_output[1]["largest_valid"]) == ("float16", 1.1e-3)
+    shift = by_output["shift"]
+    assert (shift["dtype"], shift["n"], shift["largest_valid"]) == ("float32", 2, 9.4e-7)
+    assert (shift["adversarial"], shift["largest_adversarial"], shift["rtol"]) == (1, 1.9e-6, 5e-6)
+
+    entries = measured_errors(table)["test:exact_split_attention"]
+    assert [e.get("role") for e in entries] == [None, None, "shift"]
+    assert [e["dtype"] for e in entries] == ["float16", "float16", "float32"]
+    assert expected_tolerances_by_role(entries) == {
+        "": Tolerance(rtol=5e-3), "shift": Tolerance(rtol=5e-6)}
+    # an operator with such an output has no single bound to declare
+    with pytest.raises(AssertionError, match="declare this operator by role"):
+        expected_tolerance(entries)
+    assert "| test:exact_split_attention | shift | float32 |" in markdown(table)
+    # ... and one without is not declared by role
+    with pytest.raises(AssertionError):
+        expected_tolerances_by_role(entries[:2])
+
+
+def test_a_tiling_test_of_a_file_with_several_builders_has_its_own_operator(tmp_path):
+    """A validation a tiling test logs is measured under the graph builder that test passed
+    to ``tolerance_for``. Two files validate at several builders (and import them in one
+    statement): the tool could not load a measurement that ran them (a ``TypeError`` while
+    looking for the one builder of the file)."""
+    from tests._measure_tolerances import _test_operators, load
+
+    operator_of = _test_operators()
+    tiling = "tests/graph/apply_tiling/"
+    single = tiling + "test_unit_extents.py::test_a_loop_over_a_single_row_block_validates"
+    assert {name: operator_of(f"{single}[{name}]") for name in (
+        "rowsum_one_row", "combine_one_row", "combine_one_column", "combine_one_element",
+        "batched_combine_one_row")} == {
+        "rowsum_one_row": "rowsum_graph",
+        "combine_one_row": "matmul_splitk_combine_graph",
+        "combine_one_column": "matmul_splitk_combine_graph",
+        "combine_one_element": "matmul_splitk_combine_graph",
+        "batched_combine_one_row": "batched_matmul_splitk_combine_graph"}
+    assert operator_of(tiling + "test_unit_extents.py::"
+                       "test_a_block_that_computes_one_element_validates") == "rowsum_graph"
+    axes = tiling + "test_reduction_axes.py::"
+    assert operator_of(axes + "test_unlooped_sum_over_a_front_named_axis_validates[rows128]") \
+        == "batched_matmul_splitk_combine_graph"
+    assert operator_of(axes + "test_unlooped_sum_over_a_loops_accumulator_validates[cols128]") \
+        == "matmul_rowsum_graph"
+    # a file with one builder is read as before
+    assert operator_of(tiling + "test_matmul.py::test_apply_tiling_matmul[x]") == "matmul_graph"
+    # a test of such a file that is not listed is named, not guessed
+    with pytest.raises(AssertionError, match="say which one in SEVERAL_BUILDERS"):
+        operator_of(tiling + "test_unit_extents.py::test_some_new_validation")
+
+    # ... and a measurement that ran them loads, each under its own operator
+    def record(node, rel):
+        return json.dumps({"context": f"{node} (call)", "what": "", "kind": None, "outputs": [
+            dict(shape=[4, 128], dtype="float16", rtol=1e-3, atol=0.0, kind=None, rel=rel,
+                 abs=rel)]})
+
+    (tmp_path / "validation").mkdir()
+    (tmp_path / "validation" / "tests__default.jsonl").write_text("\n".join([
+        record(f"{single}[rowsum_one_row]", 1e-4),
+        record(f"{single}[combine_one_row]", 0.0),
+        record(axes + "test_unlooped_sum_over_a_loops_accumulator_validates[cols128]", 2e-4),
+    ]) + "\n")
+    assert set(load(tmp_path)) == {
+        "test:rowsum_graph", "test:matmul_splitk_combine_graph", "test:matmul_rowsum_graph"}
+
+
+def test_every_tiling_test_that_passes_a_tolerance_has_an_operator():
+    """Every test under tests/graph/apply_tiling and tests/reference that passes a declared
+    tolerance resolves to a declared operator: its file imports one graph builder on a line
+    of its own, or names the builder of each such test in ``SEVERAL_BUILDERS``."""
+    import ast
+    import re
+    from pathlib import Path
+
+    from tests._measure_tolerances import ROOT, SEVERAL_BUILDERS, _test_operators
+
+    operator_of = _test_operators()
+    # a file pytest.ini leaves out of every run logs nothing
+    ignored = re.findall(r"--ignore=(\S+)", (Path(ROOT) / "pytest.ini").read_text())
+    seen = 0
+    for directory in ("tests/graph/apply_tiling", "tests/reference"):
+        for path in sorted((Path(ROOT) / directory).glob("test_*.py")):
+            source = path.read_text()
+            rel = f"{directory}/{path.name}"
+            if rel in ignored:
+                continue
+            for node in ast.parse(source).body:
+                if not isinstance(node, ast.FunctionDef) or not node.name.startswith("test_"):
+                    continue
+                if "tolerance_for(" not in ast.get_source_segment(source, node):
+                    continue
+                seen += 1
+                if rel in SEVERAL_BUILDERS:
+                    assert node.name in SEVERAL_BUILDERS[rel], (rel, node.name)
+                else:
+                    assert operator_of(f"{rel}::{node.name}") in TOLERANCES, (rel, node.name)
+    assert seen >= 30
+    # the listed tests exist, and name declared operators
+    for rel, tests in SEVERAL_BUILDERS.items():
+        source = (Path(ROOT) / rel).read_text()
+        for name, builder in tests.items():
+            assert f"def {name}(" in source, (rel, name)
+            if isinstance(builder, str):
+                assert builder in TOLERANCES and f"tolerance_for({builder})" in source

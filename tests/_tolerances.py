@@ -15,6 +15,10 @@ value to make a kernel pass.
 The measurement itself is checked in as ``tests/measured_errors.json`` and
 ``tests/test_tolerance_declarations.py`` holds every entry here to what the rule gives for
 it, so a value cannot be edited by hand in either direction: re-measure and ``--pin``.
+
+An operator whose kernels return an output with a boundary role declares one bound per
+role instead of one ``Tolerance``: the split partial of an exact softmax returns its float32
+shift next to its float16 sums, and the rule gives each role the bound of its own outputs.
 """
 
 from __future__ import annotations
@@ -70,11 +74,15 @@ TOLERANCES = {
     "exact_attention": Tolerance(rtol=5e-3),
     # the fixed-shift attention, split: partials, combines and the chained Kernel
     "attention": Tolerance(rtol=5e-3),
+    # the exact attention, split: partials, combines and the chained Kernel. By boundary
+    # role: a partial returns its shift (the max of its split, float32) next to its sums.
+    "exact_split_attention": {"": Tolerance(rtol=1e-2), "shift": Tolerance(rtol=5e-6)},
 }
 
 
-def tolerance_for(operator) -> Tolerance:
-    """The declared tolerance of a graph builder (or its name). Undeclared is an error."""
+def tolerance_for(operator):
+    """The declared tolerance of a graph builder (or its name): a ``Tolerance``, or one per
+    boundary role. Undeclared is an error."""
     name = operator if isinstance(operator, str) else operator.__name__
     try:
         return TOLERANCES[name]

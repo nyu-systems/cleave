@@ -20,7 +20,10 @@ unset) it runs
 
 The table has one row per operator and output: a histogram of the measured row-relative
 errors, the largest error of the candidates that are clearly valid, and the tolerance that
-follows from it by the rule in ``recommend``. That is the operator's error on its normal
+follows from it by the rule in ``recommend``. An output with a boundary role (the float32
+shift a split partial of an exact softmax returns) has a row of its own, under its role,
+whatever place it has among a kernel's outputs; the other outputs are numbered among
+themselves. That is the operator's error on its normal
 inputs. Where its softmax is exact (a dense program that records the request, every
 dynamic operator) its kernels also run on adversarial softmax inputs, at the same bound,
 and those comparisons are counted without feeding it (``ADVERSARIAL_CASE``).
@@ -107,6 +110,7 @@ GPU_TESTS = [
     "tests/schedule/end2end", "tests/graph/apply_tiling", "tests/graph/handwritten",
     "tests/reference", "tests/runtime/test_run_candidates.py", "tests/pipeline_api/test_e2e.py",
     "tests/pipeline_api/test_split_attention.py",
+    "tests/pipeline_api/test_exact_split_attention.py",
     "tests/frontend/test_exact_softmax.py", "tests/frontend_dynamic/test_paged_pipeline.py",
 ]
 
@@ -216,9 +220,23 @@ def expected_tolerances(outputs) -> list:
 def expected_tolerance(outputs) -> Tolerance:
     """The single ``Tolerance`` an operator declares for all its outputs: the loosest of what
     the rule gives each (a dense program's plans do not all have the same outputs)."""
+    assert not any(o.get("role") for o in outputs), "declare this operator by role"
     rtols = [t.rtol for t in expected_tolerances(outputs) if t is not None]
     assert rtols and not any(o["absolute"] for o in outputs), outputs
     return Tolerance(rtol=max(rtols))
+
+
+def expected_tolerances_by_role(outputs) -> dict:
+    """What an operator with an output that has a boundary role declares: one ``Tolerance``
+    per role. ``""`` is the loosest of what the rule gives the outputs without a role, as
+    for any other operator; each role's is what the rule gives the outputs of that role."""
+    by_role = {}
+    for o in outputs:
+        by_role.setdefault(o.get("role", ""), []).append(o)
+    assert set(by_role) > {""}, outputs
+    return {role: expected_tolerance([{k: v for k, v in o.items() if k != "role"}
+                                      for o in entries])
+            for role, entries in by_role.items()}
 
 
 # ----------------------------------------------------------------------------- running
@@ -283,13 +301,53 @@ def measure(out: Path, gpus, seeds, only, names=None):
 
 
 # ----------------------------------------------------------------------------- reporting
+def _single_row_builder(param):
+    from tests.graph.apply_tiling.test_unit_extents import SINGLE_ROW
+
+    return SINGLE_ROW[param][0].__name__
+
+
+# Tiling test files that validate at more than one operator: test -> the graph builder it
+# passes to ``tolerance_for`` (a name, or a function of the test's parameter id). Every
+# other file under tests/graph/apply_tiling and tests/reference imports its one builder on
+# a line of its own.
+SEVERAL_BUILDERS = {
+    "tests/graph/apply_tiling/test_reduction_axes.py": {
+        "test_unlooped_sum_over_a_front_named_axis_validates":
+            "batched_matmul_splitk_combine_graph",
+        "test_unlooped_sum_over_a_loops_accumulator_validates": "matmul_rowsum_graph",
+    },
+    "tests/graph/apply_tiling/test_unit_extents.py": {
+        "test_a_loop_over_a_single_row_block_validates": _single_row_builder,
+        "test_a_block_that_computes_one_element_validates": "rowsum_graph",
+    },
+    "tests/graph/apply_tiling/test_rmsnorm_matmul_split_combine.py": {
+        "test_apply_tiling_rmsnorm_matmul_split_combine": "rmsnorm_matmul_split_combine_graph",
+    },
+}
+
+
 def _test_operators():
     """pytest node id (without the phase) -> the operator whose tolerance it validates at."""
     from tests.graph.handwritten._cases import CASES as handwritten
     from tests.schedule.end2end.test_end2end import CASES as end2end
 
-    def builder_of(path):
-        return re.search(r"^from tests\._graphs import (\w+)$", (ROOT / path).read_text(), re.M)[1]
+    def builder_of(path, test, param):
+        """The graph builder a tiling test validates at: the one its file imports, or, in a
+        file that validates at several, the one that test passes to ``tolerance_for``."""
+        if path in SEVERAL_BUILDERS:
+            tests = SEVERAL_BUILDERS[path]
+            name = test.partition("[")[0]
+            assert name in tests, (
+                f"{path}::{name} logs a validation, and its file validates at several "
+                f"operators: say which one in SEVERAL_BUILDERS")
+            builder = tests[name]
+            return builder if isinstance(builder, str) else builder(param)
+        found = re.search(r"^from tests\._graphs import (\w+)$", (ROOT / path).read_text(), re.M)
+        assert found, (
+            f"{path} logs a validation and does not import one graph builder on a line of "
+            f"its own: say which operator each of its tests validates at in SEVERAL_BUILDERS")
+        return found[1]
 
     def operator(node):
         path, _, test = node.partition("::")
@@ -310,13 +368,15 @@ def _test_operators():
         if path == "tests/frontend_dynamic/test_paged_pipeline.py":
             return f"dynamic:gqa_paged_decode_h32_kv8_d128_ps{param}"
         if path.startswith(("tests/graph/apply_tiling/", "tests/reference/")):
-            return builder_of(path)
+            return builder_of(path, test, param)
         if path == "tests/runtime/test_run_candidates.py":
             return "matmul_graph"
         if path == "tests/pipeline_api/test_e2e.py":
             return "matmul"
         if path == "tests/pipeline_api/test_split_attention.py":
             return "attention"
+        if path == "tests/pipeline_api/test_exact_split_attention.py":
+            return "exact_split_attention"
         if path == "tests/frontend/test_exact_softmax.py":
             if "middle_axis" in test:
                 return "softmax_mid"
@@ -327,7 +387,12 @@ def _test_operators():
 
 
 def load(out: Path) -> dict:
-    """operator -> output index -> list of (dtype, absolute part?, rel, abs, kind, seed)."""
+    """operator -> output -> list of (dtype, absolute part?, rel, abs, kind, seed).
+
+    An output is its place among the outputs of its kernel that have no boundary role, or
+    the role of one that has: a split partial's ``"shift"`` is one output of the operator,
+    wherever the kernel returns it, and the sums next to it are numbered as in a partial
+    without it."""
     operator_of = _test_operators()
     table = defaultdict(lambda: defaultdict(list))
     for path in sorted((out / "validation").glob("*.jsonl")):
@@ -351,12 +416,15 @@ def load(out: Path) -> dict:
             # a dense program on one of its adversarial softmax cases, or a dynamic
             # operator on one of its adversarial softmax workloads
             hard = is_adversarial(context, record.get("what", ""))
-            for i, o in enumerate(record["outputs"]):
+            place = 0
+            for o in record["outputs"]:
                 # Every output is judged by its row-relative error, whatever bound it was
                 # validated at when this was logged; "absolute" only records that the
                 # operator declares an absolute part as well (ATOL_FLOOR).
                 kind = ADVERSARIAL_CASE if hard and o["kind"] != "non_finite" else o["kind"]
-                table[context][i].append(
+                key = o.get("role") or place
+                place += not o.get("role")
+                table[context][key].append(
                     (o["dtype"], o["atol"] > 0, o["rel"], o["abs"], kind, seed))
     return table
 
@@ -377,7 +445,9 @@ def _bucket(value, kind):
 
 def rows(table):
     for context in sorted(table, key=lambda c: (c.split(":")[0] != "demo", c)):
-        for i, entries in sorted(table[context].items()):
+        # numbered outputs first, then the ones under a role
+        for i, entries in sorted(table[context].items(),
+                                 key=lambda item: (isinstance(item[0], str), item[0])):
             dtype = entries[0][0]
             absolute = any(e[1] for e in entries)
             counts = defaultdict(int)
@@ -413,17 +483,21 @@ def rows(table):
 
 def measured_errors(table) -> dict:
     """operator -> per output ``{dtype, rel, abs, absolute, seeds, validated}``: the largest
-    clearly-valid error of each output, which is all the rule needs (``MEASURED``).
+    clearly-valid error of each output, which is all the rule needs (``MEASURED``). The
+    numbered outputs come first, in order; an output under a boundary role follows, with
+    its ``role``.
 
     ``rel`` is taken over the comparisons that feed the rtol (``feeds_rtol``, and for a
     dense program or a dynamic operator its normal inputs only: ``ADVERSARIAL_CASE``); ``abs``
     over the valid comparisons on normal inputs and ``validated`` over all of them."""
     out = defaultdict(list)
     for r in rows(table):
-        assert r["output"] == len(out[r["operator"]]), r
+        role = r["output"] if isinstance(r["output"], str) else None
+        assert role or r["output"] == len(out[r["operator"]]), r
         out[r["operator"]].append({
             "dtype": r["dtype"], "rel": r["largest_valid"], "abs": r["largest_valid_abs"],
             "absolute": r["absolute"], "seeds": len(r["seeds"]), "validated": r["n"],
+            **({"role": role} if role else {}),
         })
     return dict(out)
 

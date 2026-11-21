@@ -71,7 +71,7 @@ All demos share the same flags (`python demo/<name>.py --help`):
 | `swiglu.py`, `lora.py`, `matmul_rowsum.py` | SwiGLU, LoRA (`cleave.Program` builder), row-sum |
 | `matmul_matmul.py` | `(Q K^T) V`; `--preset split` for the split-KV decode shapes |
 | `{mha,gqa,mqa}_decode.py` | decode attention, split along `SKV` by default |
-| `mha_decode_exact.py` | decode attention with the exact `exp(s - max(s)) / sum` softmax (a running max over long rows) |
+| `mha_decode_exact.py` | decode attention with the exact `exp(s - max(s)) / sum` softmax (a running max over long rows), split along `SKV` by default: each partial returns the max of its split, the combine weights by it |
 | `{mha,gqa,mqa,mla}_prefill.py`, `mla_decode.py`, `qknorm.py` | prefill / MLA / QK-norm attention |
 | `staged.py` | the pipeline one stage at a time (research view) |
 
