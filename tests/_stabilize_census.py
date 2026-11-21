@@ -21,8 +21,12 @@ top-k cut) it checks what unit tests cannot afford to:
                            through shared memory, as in the plain twin;
   (f) split                a split job's partial serves its softmax with the max it exports
                            (no second max, never the lazy form) and builds no fewer tilings
-                           than the two-output partial of the cut; its combine has no max in
-                           the flat graph and loops over the split axis in a plain loop.
+                           than the two-output partial of the cut at the key steps the max
+                           is offered (the policy starts a max of 16-bit logits where its
+                           read fills a transaction, and what loops with it starts there
+                           too: the tilings of the cut below that step are counted and
+                           printed); its combine has no max in the flat graph and loops
+                           over the split axis in a plain loop.
 
 Jobs come from three sources.
 
@@ -39,7 +43,9 @@ writes; a graph it leaves without one is reported as not checked.
 
 ``split:`` jobs: a decode demo's program, traced the same way, searched with the demo's own
 split and lowered at one factor (``split:mha_decode@16``): the partial of every split graph
-that lowers to a different partial, and the combine.
+that lowers to a different partial, and the combine. ``split:rows@4`` is the same for a
+program that is no demo: ``softmax(x) @ v`` split over the softmax axis, whose partial
+reads its logits from storage.
 
 Exit status, also the last line printed:
 
@@ -171,6 +177,14 @@ SPLITS = {
 }
 
 
+# job -> (program of tests/_softmax.py, shapes, split axis, max_ops, split factor): a
+# softmax whose logits are an input, split over the softmax axis
+PROGRAM_SPLITS = {
+    f"rows@{factor}": (S.traced_rows, dict(R=64, C=1024, D=64), "C", 10, factor)
+    for factor in (4, 8)
+}
+
+
 def _traced_demo(name, flags=()):
     """``(program, superopt config, schedule config)`` of a demo, its program traced with
     ``cl.softmax`` as the frontend will record it (see the module docstring)."""
@@ -258,8 +272,16 @@ def _split_graphs(name):
     from cleave.pipeline import superoptimize
     from cleave.pipeline.plans import lower
 
-    demo, factor = SPLITS[name]
-    program, so, sc = _traced_demo(demo)
+    if name in PROGRAM_SPLITS:
+        import cleave.lang as cl
+        from cleave.frontend import trace
+        from cleave.pipeline import SuperoptConfig
+
+        fn, shapes, axis, max_ops, factor = PROGRAM_SPLITS[name]
+        program, so = trace(fn, shapes, cl.f16), SuperoptConfig(split=(axis,), max_ops=max_ops)
+    else:
+        demo, factor = SPLITS[name]
+        program, so, _ = _traced_demo(demo)
     graphs, notes, partials, combines = [], [], {}, {}
     for g in superoptimize(program, so):
         if g.invalid_split or not g.is_split:
@@ -284,11 +306,19 @@ def _split_graphs(name):
     return graphs, {}, notes
 
 
+def _step_of(cand, names):
+    """The smallest step a candidate gives the reductions called ``names``."""
+    return min(int(x) for node, steps in cand.rstep_map.items() if node.name in names
+               for x in (steps or {}).values())
+
+
 def _partial_check(partial, plain):
     """Check (f) for a partial: every tiling serves the softmax with the exported max, and
-    no fewer tilings build than for ``plain``, the two-output partial of the cut."""
+    no fewer tilings build than for ``plain``, the two-output partial of the cut, at the
+    key steps the exported max is offered."""
     ((_, _, exp),) = annotated(partial)
     export = exp.stabilize.export
+    scaled = {name for name, _ in exp.stabilize.scaled}  # what loops over the keys with it
 
     def tiled_check(tiled):
         (site,) = sites(tiled)
@@ -311,18 +341,26 @@ def _partial_check(partial, plain):
 
     def graph_check(rows):
         cands = list(search_tiling(plain, topk=1000))
-        built = 0
+        # The smallest key step the policy offers the exported max. Over logits a kernel
+        # computes (float32) that is the step of the sums next to it; over 16-bit logits
+        # read from storage it is twice that, and the sums start with the max.
+        floor = min(_step_of(c, {export}) for c in search_tiling(partial, topk=1000))
+        built = below = 0
         for cand in cands:
             try:
                 build_candidate_code(cand)
-                built += 1
             except Exception:  # noqa: BLE001 - counted, not classified
-                pass
+                continue
+            built += 1
+            below += _step_of(cand, scaled) < floor
         mine = sum(r["build"] == "ok" for r in rows)
+        offered = f", {built - below} of them at a key step the exported max takes " \
+                  f"({floor} and up)" if below else ""
         print(f"    the two-output partial of the cut: {len(cands)} raw candidates, "
-              f"{built} build; with the exported max: {len(rows)} raw, {mine} build")
-        return [] if mine >= built else [
-            f"(f) {mine} tilings build with the exported max, {built} without it"]
+              f"{built} build{offered}; with the exported max: {len(rows)} raw, {mine} build")
+        return [] if mine >= built - below else [
+            f"(f) {mine} tilings build with the exported max, {built - below} without it "
+            f"at the key steps it takes ({floor} and up)"]
 
     return tiled_check, graph_check
 
@@ -551,7 +589,7 @@ def main(argv):
     out, job = Path(argv[1]), argv[2]
     if job == "list":
         print("\n".join(list(FIXTURES) + [f"demo:{d}" for d in DEMOS]
-                        + [f"split:{d}" for d in SPLITS]))
+                        + [f"split:{d}" for d in list(SPLITS) + list(PROGRAM_SPLITS)]))
         return 0
     n_lower = argv[argv.index("--lower") + 1] if "--lower" in argv else "8"
     rows, problems, unchecked = run(job, n_lower, "--nvcc" in argv)

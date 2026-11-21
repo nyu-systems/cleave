@@ -271,6 +271,53 @@ def test_a_split_job_censuses_the_partial_and_the_combine(monkeypatch, tmp_path,
     assert tool.SPLITS["mha_decode@32"] == ("mha_decode", 32)
 
 
+def test_a_split_job_of_a_softmax_over_an_input(monkeypatch, tmp_path, capsys):
+    """``softmax(x) @ v`` split over the softmax axis, 4 splits of 256 keys: the partial
+    reads its logits from storage. Every tiling of the partial is accepted and builds, 8
+    that loop over the keys of a split with the exported max as their carried max and 4
+    that take a split in one step. (All 8 looped ones used to be refused: the tile of the
+    input was asked for a dim of the split tensor.)
+
+    The policy starts a max of 16-bit logits at 64 keys, where its read fills a
+    transaction, and the sums start with it: the 4 tilings of the two-output partial that
+    step 32 keys have no counterpart, and the job says so instead of failing on them."""
+    monkeypatch.setenv("CLEAVE_CACHE_ROOT", str(tmp_path / "cache"))
+    status, lines, report = _run(tmp_path, capsys, "split:rows@4")
+    assert status == 0 and lines[-1] == "split:rows@4: ok", lines[-8:]
+    assert not report["unchecked"] and not report["problems"]
+
+    by_graph = {}
+    for row in report["rows"]:
+        by_graph.setdefault(row["graph"].partition(".")[2], []).append(row)
+    assert sorted(by_graph) == ["combine", "partial"]
+
+    def counts(rows):
+        return (len(rows), sum(r["accepted"] for r in rows),
+                sum(r["tiling"] == "rolling" for r in rows),
+                sum(r["tiling"] == "in-tile" for r in rows))
+
+    assert counts(by_graph["partial"]) == (12, 12, 8, 4)
+    assert counts(by_graph["combine"]) == (21, 12, 6, 6)
+    assert ("    the two-output partial of the cut: 16 raw candidates, 16 build, 12 of them at "
+            "a key step the exported max takes (64 and up); with the exported max: 12 raw, "
+            "12 build") in lines
+    assert sorted(tool.PROGRAM_SPLITS) == ["rows@4", "rows@8"]
+
+
+def test_the_partial_check_counts_the_cut_at_the_steps_the_max_takes():
+    """Check (f) on a partial whose max starts where its sums do (the scores are computed):
+    every tiling of the cut counts, and one that does not build with the max is a problem."""
+    from tests.lower.test_split_softmax import _plain_pair
+
+    partial, _ = _split_pair()
+    plain, _ = _plain_pair(1)
+    _, graph_check = tool._partial_check(partial, plain)
+    assert graph_check([{"build": "ok"}] * 16) == []
+    assert graph_check([{"build": "ok"}] * 15 + [{"build": "ScheduleRejected: no"}]) == [
+        "(f) 15 tilings build with the exported max, 16 without it at the key steps it "
+        "takes (32 and up)"]
+
+
 def _split_pair():
     from tests.lower.test_split_softmax import _exact_pair
 

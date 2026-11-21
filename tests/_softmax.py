@@ -73,6 +73,11 @@ def flash_rows(x: cl.Tensor["R", "C"], v: cl.Tensor["C", "D"]):
     return (e @ v) / cl.sum(e, -1, keepdim=True)
 
 
+def traced_rows(x: cl.Tensor["R", "C"], v: cl.Tensor["C", "D"]):
+    """``softmax(x) @ v`` as a user writes it; the logits are an input."""
+    return exact_softmax(x) @ v
+
+
 def column_average(x: cl.Tensor["H", "K", "N"], y: cl.Tensor["H", "K", "N"]):
     """``sum_k(softmax_k(x) * y)``: the softmax axis is the FIRST non-batch axis of the exp;
     both sums reduce it, so their accumulators lead with the remaining axis ``N``."""
