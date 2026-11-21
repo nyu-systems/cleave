@@ -52,7 +52,7 @@ from .reference import placeholder_order
 # of its own), and what only a dense program can.
 SHARED_DISTRIBUTIONS = ("normal", "large_logits", "increasing")
 DISTRIBUTIONS = SHARED_DISTRIBUTIONS + ("decreasing", "last_spike", "constant", "offset")
-# Everything but ``normal``: what a program is held to once its softmax is exact.
+# Everything but ``normal``: what a program whose softmax is exact (``cl.softmax``) is held to.
 ADVERSARIAL = DISTRIBUTIONS[1:]
 
 LARGE_LOGIT_FACTOR = 100.0

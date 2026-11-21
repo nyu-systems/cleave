@@ -17,9 +17,9 @@ It is a refusal with its reason now, in two places:
   knows, instead of dying on the lookup, whoever hands it one.
 
 The attention at S_KV = 1000 is the case that showed it: the value matmul contracts over the
-keys, in float16, and 1000 = 8 x 125. It is the same for the exact softmax, the fixed shift
-and a plain ``exp``, so the exact softmax still has no plan at such a length. That needs a
-padded last tile, which is not built here.
+keys, in float16, and 1000 = 8 x 125. It is the same for the exact softmax and for a plain
+``exp`` behind a constant shift written by hand, so the exact softmax still has no plan at
+such a length. That needs a padded last tile, which is not built here.
 """
 
 import re
@@ -48,7 +48,7 @@ NOT_PADDED = "the last tile of a reduction is not padded"
 
 def flash_fixed_shift(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
                       v: cl.Tensor["H", "SKV", "D"]):
-    """The flash form under a fixed shift: no request, no record."""
+    """The flash form with a constant shift written by hand: no request, no record."""
     e = cl.exp((q @ k.mT) / q.shape[-1] ** 0.5 + -6.25)
     return (e @ v) / cl.sum(e, -1, keepdim=True)
 
