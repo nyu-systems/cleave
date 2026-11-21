@@ -320,7 +320,7 @@ class GraphValidator:
                 # that is the ``dim`` of the emitted macro, an index into the stored
                 # operand, which has its unit extents squeezed out and the tile here
                 # has not.
-                axis = it.position(node.flat_axis, len(node.dims))
+                axis = node.position_in(it)
                 if axis is None:
                     given, whole = 1, node.dims[node.flat_axis]
                 else:

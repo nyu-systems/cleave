@@ -3,7 +3,7 @@ from __future__ import annotations
 import tvm
 from tvm import te
 
-from ..graph import ComputeOpNode
+from ..graph import ComputeOpNode, PlaceHolderNode
 from .base import MacroOp
 
 
@@ -196,8 +196,9 @@ class ReduceSum(ComputeOpNode):
     * ``flat_axis`` / ``flat_axis_arg``: the axis the node was built with, over its full
       ``dims`` (``flat_axis`` counted from the front, ``flat_axis_arg`` as given, so
       possibly from the end). They never change. Anything that asks *which axis* the node
-      reduces reads these; on a scheduled graph, the place of that axis in a tier tile is
-      ``Iterator.position(node.flat_axis, len(node.dims))``.
+      reduces reads these; on a scheduled graph, the place of that axis in the tier tile
+      of the value the node reads is ``node.position_in(tile)`` (the tile numbers the dims
+      of the value it is a tile of, which are not always ``dims``: ``operand_dims``).
     * ``axis`` / ``axis_arg``: what is emitted. ``axis_arg`` is the ``dim`` given to
       ``T.reduce_*`` and ``axis`` is in the macro's name. On a flat graph they are the
       built axis. On a scheduled graph ``axis_arg`` indexes the buffer the input is
@@ -266,6 +267,45 @@ class ReduceSum(ComputeOpNode):
             is_batch_dim=is_batch_dim,
             input_is_batch_dim=input_is_batch_dim,
         )
+
+    def operand_dims(self) -> tuple:
+        """``(dims, rank)``: for each dim of the tensor this node reduces (``self.dims``),
+        which dim of the value it reads that is, in that value's own numbering (``None``
+        where the value has none), and the rank of that value.
+
+        They are the same dims one for one, with one exception. ``apply_tiling`` takes the
+        split views out of a graph, so a reduction that read a ``SplitView`` reads the
+        input behind it: a tensor of one dim less, which has no split dim (the grid walks
+        the splits, a block holds one of them). A ``SplitView`` puts the split dim in
+        front of the last two dims of its output, so the dims in front of it keep their
+        place and the two behind it are one place further back. A tile of that input -- a
+        tier's ``Iterator``, an entry of a candidate's tile maps -- is over the input's
+        dims: asked where dim 2 of ``(f, R, C / f)`` is, it has to be asked for dim 1 of
+        ``(R, C)``.
+
+        A value whose rank differs in any other way is not something ``apply_tiling``
+        builds; its dims are matched from the end, as ``Iterator.position`` matches a
+        tile that records no ``axes``.
+        """
+        rank = len(self.dims)
+        edge = self.inputs[0]
+        src = edge.src_node
+        own = len(src.get_shape(edge.src_id)) if isinstance(src, PlaceHolderNode) else rank
+        if own == rank - 1:
+            split = max(rank - 3, 0)  # ``SplitView.split_pos`` for an output of this rank
+            dims = [d if d < split else None if d == split else d - 1 for d in range(rank)]
+        else:
+            dims = [d - (rank - own) if d >= rank - own else None for d in range(rank)]
+        return dims, own
+
+    def position_in(self, it, dim=None):
+        """Where dim ``dim`` of the tensor this node reduces (the reduced axis, by
+        default) sits in ``it``, the ``Iterator`` of the value it reads in the tier that
+        stores it; ``None`` if the tile does not carry it: it then holds one element.
+        """
+        dims, own = self.operand_dims()
+        dim = dims[self.flat_axis if dim is None else dim]
+        return None if dim is None else it.position(dim, own)
 
     def create_prim_func(self, dims, in_dtype, out_dtype):
         input_shape = dims

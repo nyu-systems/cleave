@@ -680,6 +680,19 @@ def _rebase_reduction_axis(node: ReduceSum, tile):
         node.axis = node.axis_arg = node.stored_axis
 
 
+def _tile_over_dims(node: ReduceSum, tile) -> Optional[list]:
+    """``tile``, a tile of the value ``node`` reads over that value's own dims, as a tile
+    over ``node.dims``: a dim the value does not have (an input read through a split
+    view, ``ReduceSum.operand_dims``) is one the block holds one element of. ``tile``
+    itself where it is not over the value's dims."""
+    if tile is None:
+        return None
+    dims, own = node.operand_dims()
+    if len(tile) != own:
+        return list(tile)
+    return [1 if d is None else tile[d] for d in dims]
+
+
 def _normalize_inner_reduction_axes(graph_node: GraphNode, itile_map: dict):
     """Rebase the reduction axes of a loop tier onto the iteration tiles they read."""
     for node in graph_node.graph.nodes:
@@ -687,8 +700,7 @@ def _normalize_inner_reduction_axes(graph_node: GraphNode, itile_map: dict):
             continue
         src_node = node.inputs[0].src_node
         bind_node = graph_node.graph.binding.get(src_node.name, src_node)
-        tile = itile_map.get(bind_node.name)
-        _rebase_reduction_axis(node, None if tile is None else list(tile))
+        _rebase_reduction_axis(node, _tile_over_dims(node, itile_map.get(bind_node.name)))
 
 
 def rebase_reduction_axis(node: ReduceSum, it: Iterator):
@@ -701,7 +713,7 @@ def rebase_reduction_axis(node: ReduceSum, it: Iterator):
     rank = len(node.dims)
     tile = [1] * rank  # a dim the tier does not carry is one the tile holds one element of
     for dim in range(rank):
-        position = it.position(dim, rank)
+        position = node.position_in(it, dim)
         if position is not None:
             tile[dim] = it.tile_size[position]
     _rebase_reduction_axis(node, tile)
@@ -727,9 +739,12 @@ def _normalize_main_reduction_axes(main: Graph):
             else:
                 _rebase_reduction_axis(node, None)
         else:
-            # A tile of this tier is over the node's dims as it is. One of another rank
-            # (a unit dim that is not a batch dim has no tile) is left alone.
-            _rebase_reduction_axis(node, list(main.tmap[edge.src_node].tile_size))
+            # A tile of this tier is over the dims of the value it stores: the node's
+            # own, but for an input read through a split view. One of another rank (a
+            # unit dim that is not a batch dim has no tile) is left alone.
+            _rebase_reduction_axis(
+                node, _tile_over_dims(node, list(main.tmap[edge.src_node].tile_size))
+            )
 
 
 def _iterative_reductions(nodes, rstep_map):
@@ -1153,8 +1168,7 @@ def refuse_unit_extents(main: Graph) -> None:
                 it = _operand_tile(tier, node.inputs[0])
                 if it is None:
                     continue
-                rank = len(node.dims)
-                position = it.position(node.flat_axis, rank)
+                position = node.position_in(it)
                 step = 1 if position is None else it.tile_size[position]
                 if _is_unit(step):
                     raise ScheduleRejected(

@@ -72,7 +72,10 @@ from pathlib import Path
 # 30: a split graph of a program that requested a softmax lowers to an exact pair (the
 #     partial returns its shift as a third output, the combine weights the partials by it);
 #     such graphs were refused, so the best kernel of the program can now be a split variant.
-SCHEMA = 30
+# 31: a reduction that reads an input through a split is given that input's tile in the
+#     input's own dims: its looped tilings have kernels (they were refused as loops over
+#     single elements) and one built with its axis counted from the front reduces that axis.
+SCHEMA = 31
 # What "validated" means for a saved kernel. A kernel-cache hit returns without validating,
 # so bump this whenever the comparison or its inputs change: saved kernels are then rebuilt.
 # (The inputs include the adversarial cases a program with an exact softmax is held to,
