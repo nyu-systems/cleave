@@ -40,7 +40,10 @@ and leaves the others as they are pinned: a demo's operator is fed by that demo'
 test operator by the GPU tests (always the whole list), a dynamic operator by its
 ``demo.dynamic`` run and by the GPU tests. The directory records what was run
 (``ran.json``), so ``--report DIR --pin`` pins the same operators later, and a directory
-that does not say, or that ran fewer than the three seeds, pins nothing.
+that does not say, or that ran fewer than the three seeds, pins nothing. An operator no
+kernel validated at keeps its entry too, and is named: the one whose tests are deselected
+was measured once by hand (``rowsum_div_graph``); a pin without a declaration fails the
+declaration tests.
 
     python -m tests._measure_tolerances --gpus 0,1,2,3 --out DIR --only tests --pin
     python -m tests._measure_tolerances --gpus 0,1,2,3 --out DIR --only demos \
@@ -340,8 +343,9 @@ def pin(out: Path, measured: dict) -> dict:
 
     Only what was measured in full is pinned: the operators every feeder of which the
     measurement ran (``measured_in_full``), over the three seeds. Such an operator's entry
-    is replaced, or dropped if nothing validated at it any more; every other operator
-    keeps the entry it has. A measurement that ran everything therefore replaces the file.
+    is replaced; every other operator keeps the entry it has, and so does one that was
+    run in full without a single kernel validating at it (its tests are deselected, or
+    gone: it is named, and a pin that no declaration answers fails the declaration tests).
     """
     record = out / RAN
     if not record.exists():
@@ -353,14 +357,16 @@ def pin(out: Path, measured: dict) -> dict:
                          f"{list(SEEDS)}")
     in_full = measured_in_full(ran)
     pinned = json.loads(MEASURED.read_text()) if MEASURED.exists() else {}
-    kept = {operator: entry for operator, entry in pinned.items() if not in_full(operator)}
     fresh = {operator: entry for operator, entry in measured.items() if in_full(operator)}
     partial = sorted(set(measured) - set(fresh))
-    content = {**kept, **fresh}
+    silent = sorted(operator for operator in pinned if in_full(operator) and operator not in fresh)
+    content = {**pinned, **fresh}
     MEASURED.write_text(json.dumps(content, indent=1, sort_keys=True) + "\n")
-    print(f"pinned {len(fresh)} operator(s) measured in full; {len(kept)} keep their entry"
-          + (f"; measured in part and not pinned: {', '.join(partial)}" if partial else ""),
-          file=sys.stderr)
+    print(f"pinned {len(fresh)} operator(s) measured in full; {len(content) - len(fresh)} "
+          "keep their entry"
+          + (f"; measured in part and not pinned: {', '.join(partial)}" if partial else "")
+          + (f"; run in full, no kernel validated, entry kept: {', '.join(silent)}"
+             if silent else ""), file=sys.stderr)
     return content
 
 

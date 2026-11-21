@@ -542,20 +542,22 @@ ALL_SEEDS = ["default", "1", "2"]
 E2E = "tests/pipeline_api/test_e2e.py::test_compile_end_to_end"  # the operator "matmul"
 
 
-def test_a_measurement_of_a_part_pins_the_operators_it_measured_in_full(tmp_path, monkeypatch):
+def test_a_measurement_of_a_part_pins_the_operators_it_measured_in_full(tmp_path, monkeypatch,
+                                                                         capsys):
     """``--only tests`` runs every GPU test, so it measures every test operator in full and
     none of the others: a dynamic operator is also fed by its ``demo.dynamic`` run and a
-    demo's by the demo. ``--pin`` replaces the entries of the first kind, drops one nothing
-    validates at any more, and leaves the others as they were pinned. (A subset used to be
-    pinned by a script that merged keys by hand; ``--pin`` on its directory would have
-    overwritten every operator with the subset's counts.)"""
+    demo's by the demo. ``--pin`` replaces the entries of the first kind and leaves the
+    others as they were pinned, also a test operator none of whose kernels validated in
+    this run (``rowsum_div_graph``: its test is deselected, its entry was measured by hand
+    once). (A subset used to be pinned by a script that merged keys by hand; ``--pin`` on
+    its directory would have overwritten every operator with the subset's counts.)"""
     import tests._measure_tolerances as tool
 
     old = [{"dtype": "float16", "rel": 1e-3, "abs": 1e-4, "absolute": False, "seeds": 3,
             "validated": 7}]
     pinned = tmp_path / "measured_errors.json"
     pinned.write_text(json.dumps({"demo:matmul": old, "dynamic:gqa_paged_decode_h32_kv8_d128_ps1": old,
-                                  "test:matmul": old, "test:no_longer_validated": old}))
+                                  "test:matmul": old, "test:rowsum_div_graph": old}))
     monkeypatch.setattr(tool, "MEASURED", pinned)
     handwritten = "tests/graph/handwritten/test_splitkv_decode.py::test_splitkv_decode"
     run = tmp_path / "run"
@@ -564,8 +566,11 @@ def test_a_measurement_of_a_part_pins_the_operators_it_measured_in_full(tmp_path
     tool.main(["--report", str(run), "--pin"])
     now = json.loads(pinned.read_text())
     assert sorted(now) == ["demo:matmul", "dynamic:gqa_paged_decode_h32_kv8_d128_ps1",
-                           "test:matmul"]
+                           "test:matmul", "test:rowsum_div_graph"]
     assert now["demo:matmul"] == old and now["dynamic:gqa_paged_decode_h32_kv8_d128_ps1"] == old
+    assert now["test:rowsum_div_graph"] == old
+    assert "run in full, no kernel validated, entry kept: test:rowsum_div_graph" in (
+        capsys.readouterr().err)
     assert (now["test:matmul"][0]["rel"], now["test:matmul"][0]["validated"]) == (4e-4, 3)
     # what the directory itself keeps is the whole table of what it measured
     assert sorted(json.loads((run / "measured_errors.json").read_text())) == [
@@ -585,12 +590,14 @@ def test_a_measurement_of_a_part_pins_the_operators_it_measured_in_full(tmp_path
         in_full = tool.measured_in_full({"only": only, "names": None})
         assert in_full("dynamic:gqa_paged_decode_h32_kv8_d128_ps1") is complete
 
-    # everything: the file is what was measured
+    # everything: every operator it validated is replaced
     full = tmp_path / "full"
     _measurement(full, {"seeds": ALL_SEEDS, "only": ["demos", "dynamic", "tests"], "names": None},
-                 tests=[(E2E, 3e-4)])
+                 tests=[(E2E, 3e-4)], demos=[("matmul", 2e-4)])
     tool.main(["--report", str(full), "--pin"])
-    assert sorted(json.loads(pinned.read_text())) == ["test:matmul"]
+    now = json.loads(pinned.read_text())
+    assert (now["test:matmul"][0]["rel"], now["demo:matmul"][0]["rel"]) == (3e-4, 2e-4)
+    assert now["test:rowsum_div_graph"] == old
 
 
 @pytest.mark.parametrize(
