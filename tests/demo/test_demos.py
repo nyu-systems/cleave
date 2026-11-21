@@ -104,6 +104,17 @@ ATTENTION = ["mha_decode", "gqa_decode", "mqa_decode", "mha_prefill", "gqa_prefi
 BY_ROLE = set(ATTENTION) - {"mla_decode", "mla_prefill", "qknorm"}
 
 
+def test_the_readme_says_which_attention_demos_have_no_split_run():
+    """Every demo parses ``--split``, and the README lists it among the flags the demos
+    share. Three attention demos have no split run; the README names them where it lists
+    the flag."""
+    readme = (DEMO.parent / "README.md").read_text()
+    (paragraph,) = [p for p in readme.split("\n\n") if p.startswith("`--split` is parsed by")]
+    assert sorted(set(ATTENTION) - BY_ROLE) == ["mla_decode", "mla_prefill", "qknorm"]
+    for name in ATTENTION:
+        assert (f"`{name}.py`" in paragraph) == (name not in BY_ROLE), name
+
+
 def _assert_declared(config, name):
     """One measured bound for the operator, within the ceiling (one per boundary role for a
     demo of ``BY_ROLE``); it asks for normal inputs."""

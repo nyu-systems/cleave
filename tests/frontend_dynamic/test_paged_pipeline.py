@@ -81,6 +81,39 @@ def test_filtered_top_k_slots_are_distinct_kernels(preset):
     assert [p.source == expected for p in plans].count(True) == 1
 
 
+def _hold_to_the_declared_bound(kernel, outputs, want, what):
+    """What a compiled paged Kernel returns, against the reference, at the bound its
+    registry operator declares for ``(out, lse)``."""
+    from cleave.runtime.validate import compare_outputs
+
+    return compare_outputs(list(outputs), list(want), OPERATORS[kernel.name].tolerance, what=what)
+
+
+@pytest.mark.parametrize("page", [1, 64])
+def test_the_returned_kernel_is_held_to_the_declared_bound_not_to_a_percent(page, monkeypatch):
+    """``test_compile_end_to_end`` is the one check of what ``cleave.compile`` returns for a
+    paged program, on requests the compile did not validate. It compared both outputs
+    elementwise at 1e-2 + 1e-2 |ref|, the bound the operators had before they declared
+    their own: an lse off by 1e-4 passed, and so did an output off by 4% of its row."""
+    import torch
+
+    from cleave.core.errors import OutputMismatch
+
+    # (References and made-up tensors, no kernel: nothing here belongs in a measurement.)
+    monkeypatch.delenv("CLEAVE_VALIDATION_LOG", raising=False)
+    kernel = type("Kernel", (), {"name": f"gqa_paged_decode_h32_kv8_d128_ps{page}"})()
+    gen = torch.Generator().manual_seed(page)
+    out = (torch.randn(4, 32, 128, generator=gen) * 0.07).to(torch.bfloat16)
+    lse = torch.randn(4, 32, generator=gen) + 8.0
+    _hold_to_the_declared_bound(kernel, (out, lse), (out, lse), "the reference itself")
+    for wrong in ((out, lse + 1e-4), ((out.float() + 9e-3).to(torch.bfloat16), lse)):
+        # the comparison this replaces accepts both
+        torch.testing.assert_close(wrong[0].float(), out.float(), rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(wrong[1], lse, rtol=1e-2, atol=1e-2)
+        with pytest.raises(OutputMismatch):
+            _hold_to_the_declared_bound(kernel, wrong, (out, lse), "off by less than a percent")
+
+
 @pytest.mark.gpu
 @pytest.mark.search
 @pytest.mark.slow
@@ -107,14 +140,15 @@ def test_compile_end_to_end(page, tmp_path):
     want = reference.gqa_paged_decode_reference(dims, lens, page_size=page)(*inputs)
     args = inputs if page > 1 else [*inputs[:5], None, inputs[5]]
     out, lse = kernel(*args)
-    torch.testing.assert_close(out.float(), want[0].float(), rtol=1e-2, atol=1e-2)
-    torch.testing.assert_close(lse, want[1], rtol=1e-2, atol=1e-2)
+    # requests the compile did not validate (700 keys, 1 key), at the operator's own bound
+    _hold_to_the_declared_bound(kernel, (out, lse), want, f"kv lens {lens}")
     named = dict(zip(["q", "k_cache", "v_cache", "kv_indptr", "kv_indices", "kv_last_page_len",
                       "sm_scale"], args))
-    out2, _ = kernel(**named)
-    assert torch.equal(out, out2)
+    out2, lse2 = kernel(**named)
+    assert torch.equal(out, out2) and torch.equal(lse, lse2)
     loaded = cleave.load(kernel.save(tmp_path / "paged"))
-    assert type(loaded) is PagedKernel and torch.equal(loaded(*args)[0], out)
+    out3, lse3 = loaded(*args)
+    assert type(loaded) is PagedKernel and torch.equal(out3, out) and torch.equal(lse3, lse)
 
 
 def test_resolve_workloads_has_no_fallback_tolerance():

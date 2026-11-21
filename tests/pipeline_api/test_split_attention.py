@@ -250,6 +250,10 @@ def test_gpu_chained_split_attention_matches_the_program_reference(cache_root):
         variant = f"split-k={factor}"
         _partials_all_validate(report, factor)
         assert any(r.ok for r in report if r.role == "combine" and r.variant == variant)
+        # ... and no combine that compiled and ran is wrong, as for the partials
+        assert not [(r.label, r.error_type) for r in report
+                    if r.role == "combine" and r.variant == variant
+                    and r.error_type in ("OutputMismatch", "NonFiniteOutput")]
 
         kernel = report.best(variant)
         assert kernel.unrunnable is None and kernel.variant == variant

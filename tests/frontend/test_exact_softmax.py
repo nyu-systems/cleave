@@ -221,6 +221,43 @@ def test_search_max_row_limit_reason(tmp_path, monkeypatch):
     assert MAX_ROW_LIMIT in e.value.report.summary()
 
 
+def attention_weights(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"]):
+    return cl.softmax((q @ k.mT) / q.shape[-1] ** 0.5, dim=-1)
+
+
+def attention_weights_by_hand(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"]):
+    s = (q @ k.mT) / q.shape[-1] ** 0.5
+    e = cl.exp(s - cl.max(s, -1, keepdim=True))
+    return e / cl.sum(e, -1, keepdim=True)
+
+
+def test_search_a_returned_softmax_is_not_promised_a_row_of_any_length(tmp_path, monkeypatch):
+    """Attention weights over 4096 keys: the softmax is the output, so nothing sums it and
+    no loop can carry it. Written with a max by hand or with ``cl.softmax`` the program has
+    no plan. The refusal of the first used to say that ``cl.softmax`` serves "a row of any
+    length": it does where the softmax feeds a sum or a matmul, and says so now."""
+    from cleave.pipeline.plans import MAX_ROW_LIMIT
+
+    monkeypatch.setenv("CLEAVE_CACHE_ROOT", str(tmp_path))
+    shapes = dict(H=32, SQ=64, SKV=4096, D=64)
+    search, topk = P.SuperoptConfig(cache=False), P.ScheduleConfig(topk=2)
+    by_hand = P.schedule(P.superoptimize(trace(attention_weights_by_hand, shapes, cl.f16), search),
+                         topk)
+    exact = P.schedule(P.superoptimize(trace(attention_weights, shapes, cl.f16), search), topk)
+    assert not by_hand and by_hand.refused and not exact and exact.refused
+    advice = [str(r.error) for r in by_hand.refused if "cl.softmax" in str(r.error)]
+    assert advice and set(advice) == {MAX_ROW_LIMIT}
+    assert "any row it feeds to a sum or a matmul" in MAX_ROW_LIMIT
+    assert "a row of any length" not in MAX_ROW_LIMIT
+    assert len(MAX_ROW_LIMIT) <= 160  # a refusal's reason is one line of that many characters
+    assert MAX_ROW_LIMIT in by_hand.summary()
+    # the exact softmax of the same program: every tiling loops the row sum, and is refused
+    # because the divide would need each iteration's exp again
+    assert all(re.search(r"exp_\d+ is computed per iteration of GraphNode_reduction_\d+_\d+ but "
+                         r"also read by div_\d+ outside it", str(r.error))
+               for r in exact.refused), exact.summary()
+
+
 def test_search_long_rows_schedule_with_rolling_plans(tmp_path, monkeypatch):
     """The same attention through ``cl.softmax``: S_KV = 4096 schedules, and every plan
     carries a running max over the loop that tiles the keys."""
@@ -262,14 +299,45 @@ def _gpu():
         pytest.skip("needs a GPU")
 
 
+def _hold_returned_kernel(kernel, fn, shapes, inputs, operator):
+    """The kernel ``compile`` returned, on logits far larger than the ones it was validated
+    and measured on, against the program's own reference at the bound the operator
+    declares. (Logged as the ``large_logits`` case: held to the bound, no input to it.
+    These checks compared elementwise at 2e-2 + 2e-2 |ref| or 2e-3 against a float32
+    formula: 1.5% off everywhere passed.)"""
+    from cleave.runtime.validate import compare_outputs
+
+    reference = trace(fn, shapes, cl.f16).reference(*inputs)
+    assert all(torch.isfinite(r).all() for r in reference)
+    out = kernel(*inputs)
+    assert torch.isfinite(out).all()
+    return compare_outputs([out], reference, tolerance_for(operator), what="large_logits inputs")
+
+
+def test_the_returned_kernel_check_has_the_declared_bound(monkeypatch):
+    """CPU: what ``_hold_returned_kernel`` accepts. The reference itself passes; the
+    reference 1.5% off, which the elementwise comparison it replaces accepted, does not."""
+    from cleave.core.errors import OutputMismatch
+
+    # (References and made-up tensors, no kernel: nothing here belongs in a measurement.)
+    monkeypatch.delenv("CLEAVE_VALIDATION_LOG", raising=False)
+    shapes = {"R": 64, "C": 1024}
+    x = (torch.randn(64, 1024) * 30).to(torch.float16)
+    (reference,) = trace(softmax, shapes, cl.f16).reference(x)
+    _hold_returned_kernel(lambda x: reference.clone(), softmax, shapes, [x], "softmax")
+    off = (reference.float() * 1.015).to(torch.float16)
+    torch.testing.assert_close(off.float(), torch.softmax(x.float(), -1), rtol=2e-2, atol=2e-3)
+    with pytest.raises(OutputMismatch):
+        _hold_returned_kernel(lambda x: off, softmax, shapes, [x], "softmax")
+
+
 def test_gpu_exact_softmax_standalone(cache_root):
     _gpu()
     kernel = P.compile(softmax, shapes={"R": 64, "C": 1024}, dtype=cl.f16, split=False,
                        tolerance=tolerance_for("softmax"), **FAST)
     assert len(kernel.report.correct) >= 1
     x = (torch.randn(64, 1024) * 30).to("cuda", torch.float16)  # exp(x + c) would overflow
-    torch.testing.assert_close(kernel(x).float(), torch.softmax(x.float(), -1),
-                               rtol=2e-2, atol=2e-3)
+    _hold_returned_kernel(kernel, softmax, {"R": 64, "C": 1024}, [x], "softmax")
 
 
 def test_gpu_exact_softmax_attention(cache_root):
@@ -283,8 +351,7 @@ def test_gpu_exact_softmax_attention(cache_root):
     q, k, v = (torch.randn(s, generator=g).to("cuda", torch.float16)
                for s in [(32, 64, 64), (32, 256, 64), (32, 256, 64)])
     q = q * 4  # scores a constant shift chosen for unit-variance logits would not suit
-    ref = torch.softmax((q.float() @ k.float().mT) / 8.0, -1) @ v.float()
-    torch.testing.assert_close(kernel(q, k, v).float(), ref, rtol=2e-2, atol=2e-2)
+    _hold_returned_kernel(kernel, attention, shapes, [q, k, v], "exact_attention")
 
 
 def test_gpu_exact_softmax_over_a_middle_axis(cache_root):
@@ -300,8 +367,7 @@ def test_gpu_exact_softmax_over_a_middle_axis(cache_root):
     assert len(report.correct) >= 1
     assert all(r.cases == ("normal",) + ADVERSARIAL for r in report.results)
     x = (torch.randn(4, 256, 64) * 30).to("cuda", torch.float16)
-    torch.testing.assert_close(kernel(x).float(), torch.softmax(x.float(), 1),
-                               rtol=2e-2, atol=2e-3)
+    _hold_returned_kernel(kernel, softmax_mid, dict(H=4, C=256, R=64), [x], "softmax_mid")
 
 
 def test_gpu_exact_softmax_over_the_queries(cache_root):
@@ -321,10 +387,7 @@ def test_gpu_exact_softmax_over_the_queries(cache_root):
     q, k, v = (torch.randn(s, generator=g).to("cuda", torch.float16)
                for s in [(32, 64, 64), (32, 1024, 64), (32, 1024, 64)])
     q = q * 40  # logits up to several hundred
-    ref = torch.softmax((q.float() @ k.float().mT) / 8.0, -2) @ v.float()
-    out = kernel(q, k, v).float()
-    assert torch.isfinite(out).all()
-    torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2)
+    _hold_returned_kernel(kernel, attention_over_queries, shapes, [q, k, v], "exact_attention")
 
 
 def test_gpu_exact_softmax_long_rows(cache_root):
@@ -341,10 +404,51 @@ def test_gpu_exact_softmax_long_rows(cache_root):
     q, k, v = (torch.randn(s, generator=g).to("cuda", torch.float16)
                for s in [(32, 64, 64), (32, 4096, 64), (32, 4096, 64)])
     q = q * 40  # logits up to several hundred: exp of them overflows fp32
-    ref = torch.softmax((q.float() @ k.float().mT) / 8.0, -1) @ v.float()
-    out = kernel(q, k, v).float()
-    assert torch.isfinite(out).all()
-    torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2)
+    _hold_returned_kernel(kernel, attention, shapes, [q, k, v], "exact_attention")
+
+
+def test_gpu_softmax_next_to_an_exp_of_its_logits(cache_root):
+    """``cl.softmax(x) + cl.exp(x)``: the search returns one exp of ``x``, read by the
+    softmax and by the sum, and every searched graph was refused. The lowering computes the
+    exp a second time; the softmax's copy is stabilized, the other is the plain exp the
+    program wrote. The returned kernel is checked on logits around -100, where ``exp`` is
+    0 in float32 and only the exact softmax has anything to divide by."""
+    _gpu()
+    from tests.frontend.test_merged_exps import softmax_plus_exp
+
+    shapes = dict(R=64, C=256)
+    kernel = P.compile(softmax_plus_exp, shapes=shapes, dtype=cl.f16, split=False,
+                       tolerance=tolerance_for("softmax_plus_exp"), **FAST)
+    report = kernel.report
+    assert kernel.variant == "solo" and len(report.correct) >= 1
+    assert not [r.label for r in report.results
+                if r.error_type in ("OutputMismatch", "NonFiniteOutput")]
+    # the plain exp reads the same input, so no adversarial case is run, and the report says why
+    assert all(r.cases == ("normal",) and "an exp that is not stabilized" in r.cases_note
+               for r in report.results)
+    x = (torch.randn(64, 256) - 100.0).to("cuda", torch.float16)
+    (measured,) = _hold_returned_kernel(kernel, softmax_plus_exp, shapes, [x], "softmax_plus_exp")
+    assert float(kernel(x).float().sum(-1).min()) > 0.99  # the rows are softmax rows
+
+
+def test_gpu_two_softmaxes_of_one_input(cache_root):
+    """``cl.softmax(x, -1) * cl.softmax(x, 0)``: one searched exp that would need its factor
+    constant along both axes. Lowered with the exp computed twice, each copy is a softmax
+    over its own axis, and the kernels are held to every adversarial case."""
+    _gpu()
+    from cleave.runtime.inputs import ADVERSARIAL
+    from tests.frontend.test_merged_exps import dual_softmax
+
+    shapes = dict(R=16, C=32)
+    kernel = P.compile(dual_softmax, shapes=shapes, dtype=cl.f16, split=False,
+                       tolerance=tolerance_for("dual_softmax"), **FAST)
+    report = kernel.report
+    assert kernel.variant == "solo" and len(report.correct) >= 1
+    assert not [r.label for r in report.results
+                if r.error_type in ("OutputMismatch", "NonFiniteOutput")]
+    assert all(r.cases == ("normal",) + ADVERSARIAL and not r.cases_note for r in report.results)
+    x = (torch.randn(16, 32) * 30).to("cuda", torch.float16)
+    _hold_returned_kernel(kernel, dual_softmax, shapes, [x], "dual_softmax")
 
 
 def wide_value_attention(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],

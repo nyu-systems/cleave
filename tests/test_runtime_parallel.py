@@ -396,3 +396,65 @@ def test_a_run_is_sized_for_its_largest_reference(pool, monkeypatch, order, size
     assert sized == [(5, sized_for)]
     assert [r.ok for r in results] == [name != "broken" for name in names]
 
+
+
+def _check_values(code_str, *, out_idx, reference_cache_dir, tolerance=None, benchmark=None):
+    """Worker-side fake that runs the real comparator: the code string names what the
+    candidate's kernel returns."""
+    import torch
+
+    from cleave.runtime.validate import compare_outputs
+
+    if code_str.startswith("uncompilable"):
+        raise RuntimeError("TileLang could not lower it")
+    reference = torch.arange(1.0, 33.0).reshape(4, 8)
+    out = reference.clone()
+    if code_str.startswith("wrong"):
+        out *= 1.5
+    elif code_str.startswith("nan"):
+        out[0, 0] = float("nan")
+    compare_outputs([out], [reference], tolerance)
+    return f"cuda_{code_str}", 1.0
+
+
+def test_end2end_helper_fails_on_a_kernel_that_validates_wrong(monkeypatch, pool):
+    """``tests/schedule/end2end`` asserted a minimum number of validated candidates and
+    nothing else: a tiling that built, ran and returned wrong or non-finite values was
+    written to ``errors.err`` next to the refusals and the compile errors, and the case
+    passed while enough others validated."""
+    import functools
+
+    from cleave.core.errors import NonFiniteOutput, OutputMismatch
+    from cleave.runtime.validate import Tolerance
+    from tests.schedule.end2end import _test_utils
+
+    monkeypatch.setattr(_test_utils, "run_candidates", functools.partial(
+        run_candidates, build_fn=_build, check_fn=_check_values, reference_fn=_no_reference,
+        pool=pool))
+    bound = Tolerance(rtol=5e-3)
+
+    def run(*codes, min_success):
+        return _test_utils.run_end2end_candidates("fake", _candidates(*codes), "float16",
+                                                  min_success=min_success, tolerance=bound,
+                                                  log=False)
+
+    # candidates without a kernel leave the count to decide, as before
+    results = run("ok_a", "uncompilable_a", "ok_b", "uncompilable_b", min_success=2)
+    assert [r.ok for r in results] == [True, False, True, False]
+    assert {r.stage for r in results if not r.ok} == {"compile"}
+    with pytest.raises(AssertionError, match="2 scheduled graphs compiled and ran successfully, "
+                                             "expected >= 3"):
+        run("ok_a", "uncompilable_a", "ok_b", min_success=3)
+    # one wrong kernel fails the case although the count is met
+    with pytest.raises(AssertionError, match="1 scheduled graphs built and ran but validated "
+                                             "wrong: .*OutputMismatch"):
+        run("ok_a", "ok_b", "wrong", "uncompilable_a", min_success=2)
+    with pytest.raises(AssertionError, match="2 scheduled graphs built and ran but validated "
+                                             "wrong: .*(OutputMismatch|NonFiniteOutput)"):
+        run("ok_a", "nan", "ok_b", "wrong", min_success=2)
+    # ... and they are what the comparator calls them
+    results = run_candidates(_candidates("wrong", "nan"), "float16", build_fn=_build,
+                             check_fn=_check_values, reference_fn=_no_reference, pool=pool,
+                             tolerance=bound)
+    assert [type(r.error) for r in results] == [OutputMismatch, NonFiniteOutput]
+    assert [r.stage for r in results] == ["validate", "validate"]
