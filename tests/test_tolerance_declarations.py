@@ -34,7 +34,7 @@ PINNED = json.loads(MEASURED.read_text())
 def test_declared_tolerances_are_row_relative_bounds_within_the_ceiling():
     assert (CEILING, FP32_CEILING) == (5e-2, 2e-5)
     by_role = {name for name, tolerance in TOLERANCES.items() if isinstance(tolerance, dict)}
-    assert by_role == {"exact_split_attention"}
+    assert by_role == {"exact_split_attention", "exact_split_rows"}
     for name, tolerance in TOLERANCES.items():
         if name in by_role:
             # one bound per boundary role: the program's float16 outputs, and the float32

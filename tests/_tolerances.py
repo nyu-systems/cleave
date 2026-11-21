@@ -77,6 +77,9 @@ TOLERANCES = {
     # the exact attention, split: partials, combines and the chained Kernel. By boundary
     # role: a partial returns its shift (the max of its split, float32) next to its sums.
     "exact_split_attention": {"": Tolerance(rtol=1e-2), "shift": Tolerance(rtol=5e-6)},
+    # the exact softmax of an input, split over the softmax axis: the partial reads its
+    # logits from storage, so its shift is the max of stored values
+    "exact_split_rows": {"": Tolerance(rtol=5e-3), "shift": Tolerance(rtol=2e-7)},
 }
 
 

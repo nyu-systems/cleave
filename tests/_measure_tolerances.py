@@ -128,6 +128,7 @@ GPU_TESTS = [
     "tests/reference", "tests/runtime/test_run_candidates.py", "tests/pipeline_api/test_e2e.py",
     "tests/pipeline_api/test_split_attention.py",
     "tests/pipeline_api/test_exact_split_attention.py",
+    "tests/pipeline_api/test_exact_split_rows.py",
     "tests/frontend/test_exact_softmax.py", "tests/frontend_dynamic/test_paged_pipeline.py",
 ]
 
@@ -447,6 +448,8 @@ def _test_operators():
             return "attention"
         if path == "tests/pipeline_api/test_exact_split_attention.py":
             return "exact_split_attention"
+        if path == "tests/pipeline_api/test_exact_split_rows.py":
+            return "exact_split_rows"
         if path == "tests/frontend/test_exact_softmax.py":
             if "middle_axis" in test:
                 return "softmax_mid"
