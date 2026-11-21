@@ -70,12 +70,17 @@ All demos share the same flags (`python demo/<name>.py --help`):
 | `rmsnorm_matmul.py` | `RMSNorm(X) @ W`; `--preset split-k` for the split-K shapes |
 | `swiglu.py`, `lora.py`, `matmul_rowsum.py` | SwiGLU, LoRA (`cleave.Program` builder), row-sum |
 | `matmul_matmul.py` | `(Q K^T) V`; `--preset split` for the split-KV decode shapes |
-| `{mha,gqa,mqa}_decode.py` | decode attention, split along `SKV` by default |
-| `mha_decode_exact.py` | decode attention with the exact `exp(s - max(s)) / sum` softmax (a running max over long rows), split along `SKV` by default: each partial returns the max of its split, the combine weights by it |
+| `{mha,gqa,mqa}_decode.py` | decode attention, split along `SKV` by default: each partial returns the max of its split, the combine weights by it |
 | `{mha,gqa,mqa,mla}_prefill.py`, `mla_decode.py`, `qknorm.py` | prefill / MLA / QK-norm attention |
 | `staged.py` | the pipeline one stage at a time (research view) |
 
 `demo/dynamic/` holds the paged-KV dynamic-shape demos.
+
+`cl.softmax` is the exact softmax, `exp(s - max(s)) / sum`, at any row length: the search
+sees `exp / sum / div` and no max, and every schedule gets the shift it needs (the row max
+where a tile holds the row, a running max over a looped row as in FlashAttention, the max of
+each split under split-KV as in FlashDecoding; the paged kernels carry a running max too).
+Kernels of such a program are validated on adversarial logits as well as on normal ones.
 
 ## Search-to-Kernel Path
 

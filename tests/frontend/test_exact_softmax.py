@@ -27,12 +27,16 @@ def softmax(x: cl.Tensor["R", "C"]):
     return cl.softmax(x, -1)
 
 
-def softmax_shift(x: cl.Tensor["R", "C"]):
-    return cl.softmax(x, -1, shift=-4.0)
+def softmax_fixed_shift(x: cl.Tensor["R", "C"]):
+    """A constant shift written out by hand: ``cl.softmax`` has no such parameter."""
+    e = cl.exp(x + -4.0)
+    return e / cl.sum(e, -1, keepdim=True)
 
 
-def softmax_shift_free(x: cl.Tensor["R", "C"]):
-    return cl.softmax(x, -1, shift=0.0)
+def softmax_unstabilized(x: cl.Tensor["R", "C"]):
+    """The twin of ``softmax`` without the request: a plain ``exp / sum / div``."""
+    e = cl.exp(x)
+    return e / cl.sum(e, -1, keepdim=True)
 
 
 def softmax_mid(x: cl.Tensor["H", "C", "R"]):
@@ -87,10 +91,10 @@ def test_exact_softmax_records_the_request():
     x = torch.randn(4, 32) * 30
     torch.testing.assert_close(prog.reference(x)[0], torch.softmax(x, -1))
     # the request is in the fingerprint: the program never shares a search or kernel cache
-    # entry with the same ops under a fixed shift of zero, which make no such claim
-    shift_free = trace(softmax_shift_free, {"R": 4, "C": 32}, cl.f32)
-    assert _kinds(shift_free) == _kinds(prog) and not shift_free.stabilize_requests
-    assert shift_free.fingerprint() != prog.fingerprint()
+    # entry with the same ops written out by hand, which make no such claim
+    plain = trace(softmax_unstabilized, {"R": 4, "C": 32}, cl.f32)
+    assert _kinds(plain) == _kinds(prog) and not plain.stabilize_requests
+    assert plain.fingerprint() != prog.fingerprint()
 
 
 def test_max_written_by_hand_traces_max_and_sub():
@@ -105,10 +109,42 @@ def test_max_written_by_hand_traces_max_and_sub():
     torch.testing.assert_close(prog.reference(x)[0], torch.softmax(x, -1))
 
 
-def test_shift_softmax_is_unchanged():
-    prog = trace(softmax_shift, {"R": 4, "C": 32}, cl.f32)
+def test_softmax_takes_no_shift():
+    """The fixed shift is gone from the frontend, with no stand-in: ``cl.softmax`` is the
+    exact softmax and nothing else, traced, eager and paged."""
+    import inspect
+
+    from cleave.frontend import composites, paged
+
+    assert list(inspect.signature(composites.softmax).parameters) == ["x", "dim"]
+    assert list(inspect.signature(cl.softmax).parameters) == ["x", "dim", "return_lse", "causal"]
+    assert cl.softmax is paged.softmax
+    p = Program("p", cl.f32)
+    traced = p.input("x", [4, 32])
+    for x in (torch.randn(4, 32), traced):
+        with pytest.raises(TypeError, match="shift"):
+            cl.softmax(x, -1, shift=-4.0)
+        with pytest.raises(TypeError, match="shift"):
+            composites.softmax(x, -1, shift=-4.0)
+        # ... nor by position: the options behind ``dim`` are keyword-only, so a call
+        # written for the old signature is not read as ``return_lse``
+        with pytest.raises(TypeError):
+            composites.softmax(x, -1, -4.0)
+        with pytest.raises(TypeError):
+            cl.softmax(x, -1, -4.0)
+    assert [r.kind for r in p.ops] == ["input"]
+    kinds = {name: param.kind for name, param in inspect.signature(cl.softmax).parameters.items()}
+    assert kinds["return_lse"] is kinds["causal"] is inspect.Parameter.KEYWORD_ONLY
+
+
+def test_constant_shift_written_by_hand_makes_no_request():
+    """``exp(x + c) / sum(exp(x + c))`` stays expressible: an add, a plain exp, the sum and
+    the division. It asks for nothing, so it is not stabilized."""
+    prog = trace(softmax_fixed_shift, {"R": 4, "C": 32}, cl.f32)
     assert _kinds(prog) == ["input", "add", "exp", "reduce_sum", "div"]
     assert not prog.stabilize_requests
+    x = torch.randn(4, 32)
+    torch.testing.assert_close(prog.reference(x)[0], torch.softmax(x, -1))
 
 
 def test_tensor_sub_and_max_builder():
@@ -246,7 +282,7 @@ def test_gpu_exact_softmax_attention(cache_root):
     g = torch.Generator().manual_seed(0)
     q, k, v = (torch.randn(s, generator=g).to("cuda", torch.float16)
                for s in [(32, 64, 64), (32, 256, 64), (32, 256, 64)])
-    q = q * 4  # scores far from the fixed -50/sqrt(d) shift
+    q = q * 4  # scores a constant shift chosen for unit-variance logits would not suit
     ref = torch.softmax((q.float() @ k.float().mT) / 8.0, -1) @ v.float()
     torch.testing.assert_close(kernel(q, k, v).float(), ref, rtol=2e-2, atol=2e-2)
 

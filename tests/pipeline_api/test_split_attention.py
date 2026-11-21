@@ -1,6 +1,13 @@
 """Static split attention through the pipeline: the split records on the searched graphs, and
 the partial -> combine Kernel against the Program's own reference.
 
+The attention here writes its softmax out by hand, on a constant shift (``exp(s + c) / sum``
+with ``c = -50 / sqrt(D)``), so it makes no request and its split pair is the cut as it is:
+a partial with two outputs, the row sum and the value product, and nothing else across the
+boundary. It is the program these tests have always held: ``cl.softmax(s, shift=c)``
+recorded exactly these ops while it took a shift. (``cl.softmax`` is the exact softmax,
+whose partial also returns its shift: ``test_exact_split_attention.py``.)
+
 Until the records existed no static split-attention kernel could be used: a partial never
 validated (its reference was laid out by matching extents, which raises when ``S_Q == D``
 and silently compares transposed when the split extent equals the heads), and the chained
@@ -29,7 +36,6 @@ from cleave.runtime.reference import output_order, placeholder_order, stored_sha
 from cleave.runtime.validate import compare_outputs
 from cleave.schedule import apply_tiling
 from tests._tolerances import tolerance_for
-from tests.frontend import _programs as programs
 
 TOLERANCE = tolerance_for("attention")
 FACTORS = (4, 8, 16, 32)
@@ -38,15 +44,24 @@ LOGICAL = (((0, 1, 2), 1), ((0, 1, 2, 3), 0))
 UNLOOPED = (((0, 1, 2), 0), ((0, 1, 2, 3), 0))  # neither sum looped: stored as computed
 
 
+def grouped(q: cl.Tensor["HQ", "SQ", "D"], k: cl.Tensor["HKV", "SKV", "D"],
+            v: cl.Tensor["HKV", "SKV", "D"]):
+    """Attention with the softmax written out on a constant shift, and no request: the add,
+    a plain ``exp``, its row sum and the division."""
+    n = q.shape[-1] ** 0.5
+    e = cl.exp(cl.matmul(q, k.mT) / n + -50 / n)
+    return cl.matmul(e / cl.sum(e, -1, keepdim=True), v)
+
+
 def mha(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"], v: cl.Tensor["H", "SKV", "D"]):
-    """demo/mha_decode.py: the fixed-shift attention of ``_programs`` with one head dim."""
-    return programs.attention.fn(q, k, v)
+    """The same with one head dim (the shape of demo/mha_decode.py)."""
+    return grouped(q, k, v)
 
 
 KINDS = {
     "mha": (mha, dict(H=32, SQ=64, SKV=4096, D=64)),
-    "gqa": (programs.attention, dict(HQ=32, HKV=8, SQ=4096, SKV=4096, D=64)),
-    "mqa": (programs.attention, dict(HQ=32, HKV=1, SQ=4096, SKV=4096, D=64)),
+    "gqa": (grouped, dict(HQ=32, HKV=8, SQ=4096, SKV=4096, D=64)),
+    "mqa": (grouped, dict(HQ=32, HKV=1, SQ=4096, SKV=4096, D=64)),
 }
 SPLIT = P.SuperoptConfig(split=("SKV",), max_ops=14)
 
@@ -306,8 +321,8 @@ def test_gpu_partials_that_take_a_whole_split_in_one_step_validate_and_chain(cac
 # 32 splits, so a split of 256 or 128 keys fits a block whole.
 DECODE = {
     "mha": (mha, dict(H=32, SQ=64, SKV=4096, D=64)),
-    "gqa": (programs.attention, dict(HQ=32, HKV=8, SQ=64, SKV=4096, D=64)),
-    "mqa": (programs.attention, dict(HQ=32, HKV=1, SQ=64, SKV=4096, D=64)),
+    "gqa": (grouped, dict(HQ=32, HKV=8, SQ=64, SKV=4096, D=64)),
+    "mqa": (grouped, dict(HQ=32, HKV=1, SQ=64, SKV=4096, D=64)),
 }
 
 

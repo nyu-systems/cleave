@@ -3,9 +3,10 @@
 ``large_logits`` and ``increasing`` are shared by the dense programs and the dynamic
 operators. The dense programs have four more (``decreasing``, ``last_spike``, ``constant``,
 ``offset``), the dynamic operators two (``large_scale``, ``dominant_last``). A dense program
-is held to its adversarial cases once its softmax is exact, that is when ``cl.softmax``
-recorded the request (a fixed-shift reference is NaN on them); one dynamic operator's
-softmax is exact so far. ``test_adversarial_inputs_are_switched_on_per_operator`` pins both.
+is held to its adversarial cases where its softmax is exact, that is when ``cl.softmax``
+recorded the request (the reference of an ``exp / sum`` written out by hand is NaN on them);
+the softmax of every dynamic operator is exact.
+``test_adversarial_inputs_are_switched_on_per_path`` pins both.
 """
 
 import inspect
@@ -33,7 +34,7 @@ from cleave.runtime.inputs import (
 )
 
 from tests import _graphs as g
-from tests._softmax import exact_softmax, lowered
+from tests._softmax import lowered
 from tests.frontend import _programs as programs
 
 DTYPE = "float16"
@@ -106,8 +107,8 @@ def test_adversarial_inputs_rewrite_only_the_score_operands(name):
         assert torch.equal(large[i], want)
         assert torch.isfinite(large[i]).all()
     for before, after in zip(_scores(graph, normal), _scores(graph, large)):
-        # The fixtures' fixed shift is a constant and is not scaled; differences along the
-        # keys cancel it, and those are 100 times larger.
+        # The constant shift the fixtures build in front of their exp is not scaled;
+        # differences along the keys cancel it, and those are 100 times larger.
         steps = before.diff(dim=-1)
         assert torch.allclose(after.diff(dim=-1), LARGE_LOGIT_FACTOR * steps,
                               rtol=2e-2, atol=2e-2 * LARGE_LOGIT_FACTOR * float(steps.abs().max()))
@@ -255,7 +256,7 @@ def test_adversarial_cases_are_what_the_inputs_of_a_graph_can_be_shaped_into():
     assert adversarial_cases(g.qknorm_graph(1, 4, 2, 8, 32, 16)) == ()
 
     def self_attention(x: cl.Tensor["H", "S", "D"]):
-        return exact_softmax((x @ x.mT) / x.shape[-1] ** 0.5) @ x
+        return cl.softmax((x @ x.mT) / x.shape[-1] ** 0.5) @ x
 
     from cleave.frontend import trace
     from cleave.lower import to_ir
@@ -280,13 +281,13 @@ def attention_plus_gate(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "
                         v: cl.Tensor["H", "SKV", "D"], a: cl.Tensor["H", "SQ", "E"],
                         b: cl.Tensor["H", "D", "E"]):
     """An exact softmax next to an ``exp`` written by hand, which has a matmul of its own."""
-    return exact_softmax((q @ k.mT) / q.shape[-1] ** 0.5) @ v + cl.exp((a @ b.mT) / 8.0)
+    return cl.softmax((q @ k.mT) / q.shape[-1] ** 0.5) @ v + cl.exp((a @ b.mT) / 8.0)
 
 
 def attention_plus_exp_of_the_queries(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
                                       v: cl.Tensor["H", "SKV", "D"], w: cl.Tensor["H", "D", "D"]):
     """... and one whose plain ``exp`` reads the queries of the softmax."""
-    return exact_softmax((q @ k.mT) / q.shape[-1] ** 0.5) @ v + cl.exp((q @ w.mT) / 8.0)
+    return cl.softmax((q @ k.mT) / q.shape[-1] ** 0.5) @ v + cl.exp((q @ w.mT) / 8.0)
 
 
 def test_a_plain_exp_next_to_an_exact_softmax_is_not_shaped():
@@ -334,15 +335,15 @@ def test_an_input_shared_with_a_plain_exp_gets_no_adversarial_case():
 
 
 def softmax_rows(x: cl.Tensor["R", "C"]):
-    return exact_softmax(x, -1)
+    return cl.softmax(x, -1)
 
 
 def softmax_columns(x: cl.Tensor["C", "R"]):
-    return exact_softmax(x, 0)
+    return cl.softmax(x, 0)
 
 
 def softmax_of_negated_rows(x: cl.Tensor["R", "C"]):
-    return exact_softmax(x * -0.5, -1)
+    return cl.softmax(x * -0.5, -1)
 
 
 # name -> (program, shapes, softmax axis of the input, the constant between input and exp)
@@ -537,8 +538,8 @@ def test_adversarial_inputs_are_switched_on_per_path():
     factories still default to them. A dense program says so by what it records: the
     request for the exact softmax (``Program._stable_exp``, what ``cl.softmax`` records),
     and the kernels of such a program are held to every adversarial case its inputs can be
-    shaped into, whatever was asked for. A fixed-shift program, or an ``exp / sum`` written
-    by hand, is validated on what was asked.
+    shaped into, whatever was asked for. An ``exp / sum`` written by hand makes no such
+    request and is validated on what was asked.
     """
     assert all(len(op.adversarial) == 12 for op in OPERATORS.values())
     assert not any(hasattr(op, "exact_softmax") for op in OPERATORS.values())
@@ -558,7 +559,7 @@ def test_adversarial_inputs_are_switched_on_per_path():
 
     def exact(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
               v: cl.Tensor["H", "SKV", "D"]):
-        return exact_softmax((q @ k.mT) / q.shape[-1] ** 0.5) @ v
+        return cl.softmax((q @ k.mT) / q.shape[-1] ** 0.5) @ v
 
     def by_hand(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
                 v: cl.Tensor["H", "SKV", "D"]):
@@ -578,14 +579,17 @@ def test_adversarial_inputs_are_switched_on_per_path():
         return seen[-1]
 
     shapes = dict(H=2, SQ=8, SKV=96, D=16)
-    fixed = programs.attention.trace(HQ=2, HKV=2, SQ=8, SKV=96, D=16)
-    assert trace(exact, shapes, cl.f16).stabilize_requests and not fixed.stabilize_requests
+    plain = trace(by_hand, shapes, cl.f16)
+    assert trace(exact, shapes, cl.f16).stabilize_requests and not plain.stabilize_requests
     assert held_to(trace(exact, shapes, cl.f16), ("normal",)) == ("normal",) + DENSE_ADVERSARIAL
     assert held_to(trace(exact, shapes, cl.f16), ("increasing", "normal")) == (
         "increasing", "normal", "large_logits", "decreasing", "last_spike", "constant", "offset")
-    assert held_to(fixed, ("normal",)) == ("normal",)
-    assert held_to(trace(by_hand, shapes, cl.f16), ("normal",)) == ("normal",)
-    assert held_to(fixed, ("normal", "large_logits")) == ("normal", "large_logits")
+    assert held_to(plain, ("normal",)) == ("normal",)
+    assert held_to(plain, ("normal", "large_logits")) == ("normal", "large_logits")
+    # the demos' attention is ``cl.softmax``: it makes the request, and is held to them all
+    demos = programs.attention.trace(HQ=2, HKV=2, SQ=8, SKV=96, D=16)
+    assert demos.stabilize_requests
+    assert held_to(demos, ("normal",)) == ("normal",) + DENSE_ADVERSARIAL
 
     # a softmax of an input: the logits are the input, and the lowered graph says along
     # which axis (the Exp's record), so it is held to every case as well
@@ -594,7 +598,7 @@ def test_adversarial_inputs_are_switched_on_per_path():
         "normal",) + DENSE_ADVERSARIAL
 
     def exp_of_a_sum(x: cl.Tensor["R", "C"], y: cl.Tensor["R", "C"]):
-        return exact_softmax(x + y)
+        return cl.softmax(x + y)
 
     # logits that are neither a score matmul nor an input: nothing to shape, nothing added
     summed = trace(exp_of_a_sum, dict(R=4, C=32), cl.f16)
@@ -654,9 +658,15 @@ def test_build_holds_an_exact_program_to_its_adversarial_cases(monkeypatch):
     assert published == [("increasing", "normal", "large_logits", "decreasing", "last_spike",
                           "constant", "offset")]
 
-    # a fixed-shift program makes no claim: what was asked, and nothing said about it
-    fixed = programs.attention.trace(HQ=32, HKV=32, SQ=64, SKV=256, D=64)
-    built, published = _stubbed_build(monkeypatch, fixed)
+    # a softmax written out by hand makes no claim: what was asked, and nothing said about it
+    def by_hand(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
+                v: cl.Tensor["H", "SKV", "D"]):
+        e = cl.exp((q @ k.mT) / q.shape[-1] ** 0.5)
+        return (e / cl.sum(e, -1, keepdim=True)) @ v
+
+    plain = trace(by_hand, dict(H=32, SQ=64, SKV=256, D=64), cl.f16)
+    assert not plain.stabilize_requests
+    built, published = _stubbed_build(monkeypatch, plain)
     assert set(published) == {("normal",)} and all(r.cases == ("normal",) for r in built)
     report = P.evaluate(built)
     assert "inputs:" not in dict((s, t) for s, t, _ in report.stage_lines())["validate"]
@@ -672,7 +682,7 @@ def test_build_says_when_an_exact_program_is_held_to_fewer_cases(monkeypatch):
     from cleave.frontend import trace
 
     def exp_of_a_sum(x: cl.Tensor["R", "C"], y: cl.Tensor["R", "C"]):
-        return exact_softmax(x + y)
+        return cl.softmax(x + y)
 
     built, published = _stubbed_build(monkeypatch, trace(exp_of_a_sum, dict(R=64, C=256), cl.f16))
     assert published == [("normal",)]

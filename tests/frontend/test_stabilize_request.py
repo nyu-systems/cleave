@@ -11,11 +11,11 @@ torch = pytest.importorskip("torch")
 import cleave.lang as cl
 from cleave.core.errors import SpecError
 from cleave.frontend import Program, trace
-from tests._softmax import exact_softmax, stable_exp
+from tests._softmax import stable_exp
 
 
 def requested(x: cl.Tensor["R", "C"]):
-    return exact_softmax(x, -1)
+    return cl.softmax(x, -1)
 
 
 def handwritten(x: cl.Tensor["R", "C"]):
@@ -23,13 +23,9 @@ def handwritten(x: cl.Tensor["R", "C"]):
     return e / cl.sum(e, -1, keepdim=True)
 
 
-def shift0(x: cl.Tensor["R", "C"]):
-    return cl.softmax(x, -1, shift=0.0)
-
-
 def attention(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
               v: cl.Tensor["H", "SKV", "D"]):
-    return exact_softmax((q @ k.mT) / q.shape[-1] ** 0.5, -1) @ v
+    return cl.softmax((q @ k.mT) / q.shape[-1] ** 0.5, -1) @ v
 
 
 SIZES = {"R": 4, "C": 32}
@@ -44,7 +40,6 @@ def test_record_is_a_tagged_exp():
     assert "exp(%0) stabilize=1" in repr(prog)
     # nothing else carries the request
     assert trace(handwritten, SIZES, cl.f32).stabilize_requests == ()
-    assert trace(shift0, SIZES, cl.f32).stabilize_requests == ()
 
 
 def test_requests_are_deduplicated_and_dim_zero_counts():
@@ -86,13 +81,12 @@ def test_search_and_lowering_see_a_plain_exp():
 
 def test_fingerprint_separates_the_request():
     """The request must never share a search or kernel cache entry with a plain exp."""
-    prog, plain, zero = (trace(f, SIZES, cl.f32) for f in (requested, handwritten, shift0))
-    assert plain.fingerprint() == zero.fingerprint()
+    prog, plain = (trace(f, SIZES, cl.f32) for f in (requested, handwritten))
     assert prog.fingerprint() != plain.fingerprint()
 
     def over(dim):
         def f(x: cl.Tensor["R", "C"]):
-            return exact_softmax(x, dim)
+            return cl.softmax(x, dim)
         return trace(f, SIZES, cl.f32).fingerprint()
 
     assert over(-1) == over(1) == prog.fingerprint()
@@ -105,7 +99,7 @@ def test_fingerprint_separates_the_request():
 def test_reference_is_the_exact_softmax(shape, dim, scale):
     p = Program("p", cl.f32)
     x = p.input("x", list(shape))
-    p.output(exact_softmax(x, dim))
+    p.output(cl.softmax(x, dim))
     torch.manual_seed(0)
     data = torch.randn(*shape) * scale
     (got,) = p.reference(data)

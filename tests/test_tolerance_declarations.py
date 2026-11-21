@@ -409,7 +409,7 @@ def test_a_dense_programs_adversarial_cases_are_held_to_its_bound_and_do_not_fee
     """
     from tests._measure_tolerances import ADVERSARIAL_CASE, load, markdown, measured_errors, rows
 
-    def record(what, rel, kind=None, context="demo:mha_decode_exact"):
+    def record(what, rel, kind=None, context="demo:mha_decode"):
         output = dict(shape=[32, 64, 64], dtype="float16", rtol=5e-3, atol=0.0, kind=kind,
                       rel=rel, abs=None if rel is None else rel / 4)
         return json.dumps({"context": context, "what": what, "kind": kind, "outputs": [output]})
@@ -425,13 +425,13 @@ def test_a_dense_programs_adversarial_cases_are_held_to_its_bound_and_do_not_fee
         record("", 9.8e-4), record("", 1.2e-3),
         record("increasing inputs", 1.63e-3), record("offset inputs", 9.77e-4),
         record("large_logits inputs", None, kind="non_finite"))
-    assert [e[4] for e in table["demo:mha_decode_exact"][0]] == [
+    assert [e[4] for e in table["demo:mha_decode"][0]] == [
         None, None, ADVERSARIAL_CASE, ADVERSARIAL_CASE, "non_finite"]
     (row,) = rows(table)
     assert (row["n"], row["adversarial"], row["largest_adversarial"]) == (5, 2, 1.63e-3)
     assert (row["largest_valid"], row["rtol"]) == (1.2e-3, 5e-3)
     assert row["histogram"] == {"<1e-3": 2, "<1e-2": 2, "non-finite": 1}
-    (entry,) = measured_errors(table)["demo:mha_decode_exact"]
+    (entry,) = measured_errors(table)["demo:mha_decode"]
     assert (entry["rel"], entry["abs"], entry["validated"]) == (1.2e-3, 3.0e-4, 5)
     assert expected_tolerance([entry]) == Tolerance(rtol=5e-3)
     assert "2 on adversarial inputs, largest 1.63e-03: held to the bound" in markdown(table)

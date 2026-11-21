@@ -36,14 +36,14 @@ fixtures of ``tests/_graphs.py`` (the end2end cases: IR built by hand, never low
 the ``Stabilize`` record put on the Exp by hand.
 
 ``demo:`` jobs: a demo's own program and configs through ``superoptimize`` and
-``plans.lower``, i.e. the *searched* graphs. The demo is traced with the ``shift=`` of its
-``cl.softmax`` dropped, so that it records the exact softmax (the requested exp, its sum,
-the division) and the search sees the shift-free program. The records are the ones lowering
-writes; a graph it leaves without one is reported as not checked.
+``plans.lower``, i.e. the *searched* graphs. The demo's ``cl.softmax`` records the exact
+softmax (the requested exp, its sum, the division), so the search sees a program without a
+max or a shift. The records are the ones lowering writes; a graph it leaves without one is
+reported as not checked.
 
-``split:`` jobs: a decode demo's program, traced the same way, searched with the demo's own
-split and lowered at one factor (``split:mha_decode@16``): the partial of every split graph
-that lowers to a different partial, and the combine. ``split:rows@4`` is the same for a
+``split:`` jobs: a decode demo's program, searched with the demo's own split and lowered at
+one factor (``split:mha_decode@16``): the partial of every split graph that lowers to a
+different partial, and the combine. ``split:rows@4`` is the same for a
 program that is no demo: ``softmax(x) @ v`` split over the softmax axis, whose partial
 reads its logits from storage.
 
@@ -160,12 +160,12 @@ DEMOS = {
     "mla_prefill": (None, None, None),
     "mla_decode": (MLA, lambda c: _whole_head_dim(c) and c.n_threads == 128, _whole_head_dim),
     "qknorm": (None, lambda c: c.n_threads == 128, None),
-    "mha_decode_exact": (None, None, None),
+    "mha_decode": (None, None, None),
     # the same demo at a row one block holds: one graph has in-tile and rolling tilings
-    "mha_decode_exact@256": (None, None, None),
+    "mha_decode@256": (None, None, None),
 }
 # job -> (demo file, its command line), where they differ from (the job's name, none)
-DEMO_ARGV = {"mha_decode_exact@256": ("mha_decode_exact", ["--SKV", "256"])}
+DEMO_ARGV = {"mha_decode@256": ("mha_decode", ["--SKV", "256"])}
 
 
 # job -> (demo, split factor): the decode demos at the factors they split their keys by
@@ -186,13 +186,11 @@ PROGRAM_SPLITS = {
 
 
 def _traced_demo(name, flags=()):
-    """``(program, superopt config, schedule config)`` of a demo, its program traced with
-    ``cl.softmax`` as the frontend will record it (see the module docstring)."""
+    """``(program, superopt config, schedule config)`` of a demo, as the demo itself traces
+    and configures it."""
     import runpy
 
     import cleave.examples as examples
-    import cleave.lang as cl
-    from cleave.frontend.tensor import Tensor
 
     seen = {}
 
@@ -203,16 +201,8 @@ def _traced_demo(name, flags=()):
         seen.update(program=program, so=superopt, sc=schedule)
         raise Stop
 
-    real_softmax = cl.softmax
-
-    def requested_softmax(x, dim=-1, shift=None, **paged):
-        if paged or not isinstance(x, Tensor):
-            return real_softmax(x, dim, shift, **paged)
-        return real_softmax(x, dim)  # the demo's ``shift=`` dropped: the exact softmax
-
     real_compile, real_target, argv = examples._compile, examples._target, sys.argv
     examples._compile, examples._target = fake_compile, lambda: "cpu"
-    cl.softmax = requested_softmax
     sys.argv = [str(ROOT / "demo" / f"{name}.py"), *flags]
     sys.path.insert(0, str(ROOT / "demo"))  # the demos import each other by bare name
     try:
@@ -221,7 +211,7 @@ def _traced_demo(name, flags=()):
         pass
     finally:
         examples._compile, examples._target = real_compile, real_target
-        cl.softmax, sys.argv = real_softmax, argv
+        sys.argv = argv
         sys.path.remove(str(ROOT / "demo"))
     return seen["program"], seen["so"], seen["sc"]
 

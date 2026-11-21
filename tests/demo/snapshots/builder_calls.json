@@ -77,54 +77,46 @@
      "t4"
     ],
     [
-     "add",
+     "exp",
      [
-      "t4",
-      -6.25
+      "t4"
      ],
      "t5"
     ],
     [
-     "exp",
+     "reduce_sum",
      [
-      "t5"
+      "t5",
+      2.0
      ],
      "t6"
     ],
     [
-     "reduce_sum",
+     "div",
      [
-      "t6",
-      2.0
+      "t5",
+      "t6"
      ],
      "t7"
     ],
     [
-     "div",
-     [
-      "t6",
-      "t7"
-     ],
-     "t8"
-    ],
-    [
      "matmul",
      [
-      "t8",
+      "t7",
       "t2",
       false,
       false
      ],
-     "t9"
+     "t8"
     ],
     [
      "create_tiled_output",
      [
-      "t9"
+      "t8"
      ]
     ]
    ],
-   "max_ops": 14,
+   "max_ops": 13,
    "split_k": [
     4,
     8,
@@ -208,54 +200,46 @@
      "t4"
     ],
     [
-     "add",
+     "exp",
      [
-      "t4",
-      -6.25
+      "t4"
      ],
      "t5"
     ],
     [
-     "exp",
+     "reduce_sum",
      [
-      "t5"
+      "t5",
+      2.0
      ],
      "t6"
     ],
     [
-     "reduce_sum",
+     "div",
      [
-      "t6",
-      2.0
+      "t5",
+      "t6"
      ],
      "t7"
     ],
     [
-     "div",
-     [
-      "t6",
-      "t7"
-     ],
-     "t8"
-    ],
-    [
      "matmul",
      [
-      "t8",
+      "t7",
       "t2",
       false,
       false
      ],
-     "t9"
+     "t8"
     ],
     [
      "create_tiled_output",
      [
-      "t9"
+      "t8"
      ]
     ]
    ],
-   "max_ops": 14,
+   "max_ops": 13,
    "split_k": []
   },
   "gqa_prefill": {
@@ -335,50 +319,42 @@
      "t4"
     ],
     [
-     "add",
+     "exp",
      [
-      "t4",
-      -6.25
+      "t4"
      ],
      "t5"
     ],
     [
-     "exp",
+     "reduce_sum",
      [
-      "t5"
+      "t5",
+      2.0
      ],
      "t6"
     ],
     [
-     "reduce_sum",
+     "div",
      [
-      "t6",
-      2.0
+      "t5",
+      "t6"
      ],
      "t7"
     ],
     [
-     "div",
-     [
-      "t6",
-      "t7"
-     ],
-     "t8"
-    ],
-    [
      "matmul",
      [
-      "t8",
+      "t7",
       "t2",
       false,
       false
      ],
-     "t9"
+     "t8"
     ],
     [
      "create_tiled_output",
      [
-      "t9"
+      "t8"
      ]
     ]
    ],
@@ -1090,54 +1066,46 @@
      "t4"
     ],
     [
-     "add",
+     "exp",
      [
-      "t4",
-      -6.25
+      "t4"
      ],
      "t5"
     ],
     [
-     "exp",
+     "reduce_sum",
      [
-      "t5"
+      "t5",
+      2.0
      ],
      "t6"
     ],
     [
-     "reduce_sum",
+     "div",
      [
-      "t6",
-      2.0
+      "t5",
+      "t6"
      ],
      "t7"
     ],
     [
-     "div",
-     [
-      "t6",
-      "t7"
-     ],
-     "t8"
-    ],
-    [
      "matmul",
      [
-      "t8",
+      "t7",
       "t2",
       false,
       false
      ],
-     "t9"
+     "t8"
     ],
     [
      "create_tiled_output",
      [
-      "t9"
+      "t8"
      ]
     ]
    ],
-   "max_ops": 14,
+   "max_ops": 13,
    "split_k": [
     16,
     32
@@ -1220,54 +1188,46 @@
      "t4"
     ],
     [
-     "add",
+     "exp",
      [
-      "t4",
-      -6.25
+      "t4"
      ],
      "t5"
     ],
     [
-     "exp",
+     "reduce_sum",
      [
-      "t5"
+      "t5",
+      2.0
      ],
      "t6"
     ],
     [
-     "reduce_sum",
+     "div",
      [
-      "t6",
-      2.0
+      "t5",
+      "t6"
      ],
      "t7"
     ],
     [
-     "div",
-     [
-      "t6",
-      "t7"
-     ],
-     "t8"
-    ],
-    [
      "matmul",
      [
-      "t8",
+      "t7",
       "t2",
       false,
       false
      ],
-     "t9"
+     "t8"
     ],
     [
      "create_tiled_output",
      [
-      "t9"
+      "t8"
      ]
     ]
    ],
-   "max_ops": 14,
+   "max_ops": 13,
    "split_k": []
   },
   "mha_prefill": {
@@ -1347,54 +1307,46 @@
      "t4"
     ],
     [
-     "add",
+     "exp",
      [
-      "t4",
-      -6.25
+      "t4"
      ],
      "t5"
     ],
     [
-     "exp",
+     "reduce_sum",
      [
-      "t5"
+      "t5",
+      2.0
      ],
      "t6"
     ],
     [
-     "reduce_sum",
+     "div",
      [
-      "t6",
-      2.0
+      "t5",
+      "t6"
      ],
      "t7"
     ],
     [
-     "div",
-     [
-      "t6",
-      "t7"
-     ],
-     "t8"
-    ],
-    [
      "matmul",
      [
-      "t8",
+      "t7",
       "t2",
       false,
       false
      ],
-     "t9"
+     "t8"
     ],
     [
      "create_tiled_output",
      [
-      "t9"
+      "t8"
      ]
     ]
    ],
-   "max_ops": 12,
+   "max_ops": 11,
    "split_k": []
   },
   "mla_decode": {
@@ -1509,50 +1461,42 @@
      "t7"
     ],
     [
-     "add",
+     "exp",
      [
-      "t7",
-      -4.419417382415921
+      "t7"
      ],
      "t8"
     ],
     [
-     "exp",
+     "reduce_sum",
      [
-      "t8"
+      "t8",
+      2.0
      ],
      "t9"
     ],
     [
-     "reduce_sum",
+     "div",
      [
-      "t9",
-      2.0
+      "t8",
+      "t9"
      ],
      "t10"
     ],
     [
-     "div",
-     [
-      "t9",
-      "t10"
-     ],
-     "t11"
-    ],
-    [
      "matmul",
      [
-      "t11",
+      "t10",
       "t1",
       false,
       false
      ],
-     "t12"
+     "t11"
     ],
     [
      "create_tiled_output",
      [
-      "t12"
+      "t11"
      ]
     ]
    ],
@@ -1636,54 +1580,46 @@
      "t4"
     ],
     [
-     "add",
+     "exp",
      [
-      "t4",
-      -3.6084391824351614
+      "t4"
      ],
      "t5"
     ],
     [
-     "exp",
+     "reduce_sum",
      [
-      "t5"
+      "t5",
+      2.0
      ],
      "t6"
     ],
     [
-     "reduce_sum",
+     "div",
      [
-      "t6",
-      2.0
+      "t5",
+      "t6"
      ],
      "t7"
     ],
     [
-     "div",
-     [
-      "t6",
-      "t7"
-     ],
-     "t8"
-    ],
-    [
      "matmul",
      [
-      "t8",
+      "t7",
       "t2",
       false,
       false
      ],
-     "t9"
+     "t8"
     ],
     [
      "create_tiled_output",
      [
-      "t9"
+      "t8"
      ]
     ]
    ],
-   "max_ops": 12,
+   "max_ops": 11,
    "split_k": []
   },
   "mqa_decode": {
@@ -1763,54 +1699,46 @@
      "t4"
     ],
     [
-     "add",
+     "exp",
      [
-      "t4",
-      -6.25
+      "t4"
      ],
      "t5"
     ],
     [
-     "exp",
+     "reduce_sum",
      [
-      "t5"
+      "t5",
+      2.0
      ],
      "t6"
     ],
     [
-     "reduce_sum",
+     "div",
      [
-      "t6",
-      2.0
+      "t5",
+      "t6"
      ],
      "t7"
     ],
     [
-     "div",
-     [
-      "t6",
-      "t7"
-     ],
-     "t8"
-    ],
-    [
      "matmul",
      [
-      "t8",
+      "t7",
       "t2",
       false,
       false
      ],
-     "t9"
+     "t8"
     ],
     [
      "create_tiled_output",
      [
-      "t9"
+      "t8"
      ]
     ]
    ],
-   "max_ops": 14,
+   "max_ops": 13,
    "split_k": [
     4,
     8,
@@ -1894,54 +1822,46 @@
      "t4"
     ],
     [
-     "add",
+     "exp",
      [
-      "t4",
-      -6.25
+      "t4"
      ],
      "t5"
     ],
     [
-     "exp",
+     "reduce_sum",
      [
-      "t5"
+      "t5",
+      2.0
      ],
      "t6"
     ],
     [
-     "reduce_sum",
+     "div",
      [
-      "t6",
-      2.0
+      "t5",
+      "t6"
      ],
      "t7"
     ],
     [
-     "div",
-     [
-      "t6",
-      "t7"
-     ],
-     "t8"
-    ],
-    [
      "matmul",
      [
-      "t8",
+      "t7",
       "t2",
       false,
       false
      ],
-     "t9"
+     "t8"
     ],
     [
      "create_tiled_output",
      [
-      "t9"
+      "t8"
      ]
     ]
    ],
-   "max_ops": 14,
+   "max_ops": 13,
    "split_k": []
   },
   "mqa_prefill": {
@@ -2021,54 +1941,46 @@
      "t4"
     ],
     [
-     "add",
+     "exp",
      [
-      "t4",
-      -6.25
+      "t4"
      ],
      "t5"
     ],
     [
-     "exp",
+     "reduce_sum",
      [
-      "t5"
+      "t5",
+      2.0
      ],
      "t6"
     ],
     [
-     "reduce_sum",
+     "div",
      [
-      "t6",
-      2.0
+      "t5",
+      "t6"
      ],
      "t7"
     ],
     [
-     "div",
-     [
-      "t6",
-      "t7"
-     ],
-     "t8"
-    ],
-    [
      "matmul",
      [
-      "t8",
+      "t7",
       "t2",
       false,
       false
      ],
-     "t9"
+     "t8"
     ],
     [
      "create_tiled_output",
      [
-      "t9"
+      "t8"
      ]
     ]
    ],
-   "max_ops": 12,
+   "max_ops": 11,
    "split_k": []
   },
   "qknorm": {
@@ -2258,54 +2170,46 @@
      "t18"
     ],
     [
-     "add",
+     "exp",
      [
-      "t18",
-      -4.419417382415921
+      "t18"
      ],
      "t19"
     ],
     [
-     "exp",
+     "reduce_sum",
      [
-      "t19"
+      "t19",
+      2.0
      ],
      "t20"
     ],
     [
-     "reduce_sum",
+     "div",
      [
-      "t20",
-      2.0
+      "t19",
+      "t20"
      ],
      "t21"
     ],
     [
-     "div",
-     [
-      "t20",
-      "t21"
-     ],
-     "t22"
-    ],
-    [
      "matmul",
      [
-      "t22",
+      "t21",
       "t2",
       false,
       false
      ],
-     "t23"
+     "t22"
     ],
     [
      "create_tiled_output",
      [
-      "t23"
+      "t22"
      ]
     ]
    ],
-   "max_ops": 26,
+   "max_ops": 25,
    "split_k": []
   },
   "rmsnorm_matmul": {
@@ -2696,50 +2600,42 @@
     "t4"
    ],
    [
-    "add",
+    "exp",
     [
-     "t4",
-     -6.25
+     "t4"
     ],
     "t5"
    ],
    [
-    "exp",
+    "reduce_sum",
     [
-     "t5"
+     "t5",
+     2.0
     ],
     "t6"
    ],
    [
-    "reduce_sum",
+    "div",
     [
-     "t6",
-     2.0
+     "t5",
+     "t6"
     ],
     "t7"
    ],
    [
-    "div",
-    [
-     "t6",
-     "t7"
-    ],
-    "t8"
-   ],
-   [
     "matmul",
     [
-     "t8",
+     "t7",
      "t2",
      false,
      false
     ],
-    "t9"
+    "t8"
    ],
    [
     "create_tiled_output",
     [
-     "t9"
+     "t8"
     ]
    ]
   ],
@@ -2819,50 +2715,42 @@
     "t4"
    ],
    [
-    "add",
+    "exp",
     [
-     "t4",
-     -6.25
+     "t4"
     ],
     "t5"
    ],
    [
-    "exp",
+    "reduce_sum",
     [
-     "t5"
+     "t5",
+     2.0
     ],
     "t6"
    ],
    [
-    "reduce_sum",
+    "div",
     [
-     "t6",
-     2.0
+     "t5",
+     "t6"
     ],
     "t7"
    ],
    [
-    "div",
-    [
-     "t6",
-     "t7"
-    ],
-    "t8"
-   ],
-   [
     "matmul",
     [
-     "t8",
+     "t7",
      "t2",
      false,
      false
     ],
-    "t9"
+    "t8"
    ],
    [
     "create_tiled_output",
     [
-     "t9"
+     "t8"
     ]
    ]
   ],
@@ -3304,50 +3192,42 @@
     "t4"
    ],
    [
-    "add",
+    "exp",
     [
-     "t4",
-     -6.25
+     "t4"
     ],
     "t5"
    ],
    [
-    "exp",
+    "reduce_sum",
     [
-     "t5"
+     "t5",
+     2.0
     ],
     "t6"
    ],
    [
-    "reduce_sum",
+    "div",
     [
-     "t6",
-     2.0
+     "t5",
+     "t6"
     ],
     "t7"
    ],
    [
-    "div",
-    [
-     "t6",
-     "t7"
-    ],
-    "t8"
-   ],
-   [
     "matmul",
     [
-     "t8",
+     "t7",
      "t2",
      false,
      false
     ],
-    "t9"
+    "t8"
    ],
    [
     "create_tiled_output",
     [
-     "t9"
+     "t8"
     ]
    ]
   ],
@@ -3427,50 +3307,42 @@
     "t4"
    ],
    [
-    "add",
+    "exp",
     [
-     "t4",
-     -6.25
+     "t4"
     ],
     "t5"
    ],
    [
-    "exp",
+    "reduce_sum",
     [
-     "t5"
+     "t5",
+     2.0
     ],
     "t6"
    ],
    [
-    "reduce_sum",
+    "div",
     [
-     "t6",
-     2.0
+     "t5",
+     "t6"
     ],
     "t7"
    ],
    [
-    "div",
-    [
-     "t6",
-     "t7"
-    ],
-    "t8"
-   ],
-   [
     "matmul",
     [
-     "t8",
+     "t7",
      "t2",
      false,
      false
     ],
-    "t9"
+    "t8"
    ],
    [
     "create_tiled_output",
     [
-     "t9"
+     "t8"
     ]
    ]
   ],
@@ -3660,50 +3532,42 @@
     "t18"
    ],
    [
-    "add",
+    "exp",
     [
-     "t18",
-     -4.419417382415921
+     "t18"
     ],
     "t19"
    ],
    [
-    "exp",
+    "reduce_sum",
     [
-     "t19"
+     "t19",
+     2.0
     ],
     "t20"
    ],
    [
-    "reduce_sum",
+    "div",
     [
-     "t20",
-     2.0
+     "t19",
+     "t20"
     ],
     "t21"
    ],
    [
-    "div",
-    [
-     "t20",
-     "t21"
-    ],
-    "t22"
-   ],
-   [
     "matmul",
     [
-     "t22",
+     "t21",
      "t2",
      false,
      false
     ],
-    "t23"
+    "t22"
    ],
    [
     "create_tiled_output",
     [
-     "t23"
+     "t22"
     ]
    ]
   ],

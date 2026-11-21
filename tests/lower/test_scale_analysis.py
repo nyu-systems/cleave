@@ -25,8 +25,9 @@ from cleave.pipeline.plans import lower
 from cleave.pipeline.superopt import GraphSet
 from tests import _graphs as G
 from tests._lowering import run_lowered
-from tests._softmax import exact_softmax as softmax
 from tests._softmax import stable_exp as sexp
+
+softmax = cl.softmax  # the requested exp, its sum, the division
 
 # ------------------------------------------------------------------ programs: softmax exps
 

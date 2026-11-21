@@ -19,12 +19,12 @@ from cleave.pipeline.superopt import GraphSet
 from cleave.runtime.inputs import DISTRIBUTIONS
 from cleave.runtime.reference import build_inputs_and_reference
 from tests._lowering import run_lowered
-from tests._softmax import exact_softmax, stable_exp
+from tests._softmax import stable_exp
 
 
 def _softmax(dims, dim):
     def softmax(x):
-        return exact_softmax(x, dim)
+        return cl.softmax(x, dim)
 
     softmax.__annotations__ = {"x": cl.Tensor[dims]}
     return softmax
@@ -36,7 +36,7 @@ def flash(q: cl.Tensor["HQ", "SQ", "D"], k: cl.Tensor["HKV", "SKV", "D"], v: cl.
 
 
 def traced(q: cl.Tensor["HQ", "SQ", "D"], k: cl.Tensor["HKV", "SKV", "D"], v: cl.Tensor["HKV", "SKV", "D"]):
-    return exact_softmax((q @ k.mT) / q.shape[-1] ** 0.5, -1) @ v
+    return cl.softmax((q @ k.mT) / q.shape[-1] ** 0.5, -1) @ v
 
 
 def flash_plus_exp(q: cl.Tensor["HQ", "SQ", "D"], k: cl.Tensor["HKV", "SKV", "D"],
@@ -45,7 +45,7 @@ def flash_plus_exp(q: cl.Tensor["HQ", "SQ", "D"], k: cl.Tensor["HKV", "SKV", "D"
 
 
 def two_softmaxes(a: cl.Tensor["R", "C"], b: cl.Tensor["C", "D"]):
-    return exact_softmax(a, -1) @ exact_softmax(b, -1)
+    return cl.softmax(a, -1) @ cl.softmax(b, -1)
 
 
 def flash_twin(q: cl.Tensor["HQ", "SQ", "D"], k: cl.Tensor["HKV", "SKV", "D"], v: cl.Tensor["HKV", "SKV", "D"]):

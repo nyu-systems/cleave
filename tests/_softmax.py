@@ -31,12 +31,6 @@ def stable_exp(x, dim: int = -1):
     return x.program._stable_exp(x, dim)
 
 
-def exact_softmax(x, dim: int = -1):
-    """``softmax(x, dim)`` as the frontend records it: the requested exp, its sum, the
-    division. No max and no shift."""
-    return cl.softmax(x, dim)
-
-
 # ------------------------------------------------------------------------------- programs
 
 
@@ -75,7 +69,7 @@ def flash_rows(x: cl.Tensor["R", "C"], v: cl.Tensor["C", "D"]):
 
 def traced_rows(x: cl.Tensor["R", "C"], v: cl.Tensor["C", "D"]):
     """``softmax(x) @ v`` as a user writes it; the logits are an input."""
-    return exact_softmax(x) @ v
+    return cl.softmax(x) @ v
 
 
 def column_average(x: cl.Tensor["H", "K", "N"], y: cl.Tensor["H", "K", "N"]):

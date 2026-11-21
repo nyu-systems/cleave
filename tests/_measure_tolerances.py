@@ -105,8 +105,21 @@ def valid_limit(dtype: str) -> float:
 # demo -> the runs that cover its plans (fast settings; lora and qknorm keep the fast
 # preset's topk because few of their tilings survive, and mla_decode needs its whole
 # tiling pool: its first valid tiling ranks far below the top 32).
+# The attention demos declare their tolerance by boundary role, because ``cl.softmax`` is
+# exact and a split partial of it returns its shift. The decode demos split by default; the
+# MHA / GQA / MQA prefill demos get a second run with the split their docstrings name, so
+# that the "shift" bound they declare is measured like any other. (qknorm, mla_prefill and
+# mla_decode offer no split and declare one tolerance: the split search of qknorm's 25 ops
+# does not end within an hour, the references of mla_prefill's split graphs take about
+# 190 GB, and no split graph of mla_decode has a partial / combine cut.)
+#
+# Disk: a run writes the references of its graphs under <out>/cache/runtime while it lasts,
+# one file per graph with every input case. For a program whose softmax is exact that is
+# seven cases; a split run of a prefill or decode demo at S_Q = 4096 takes about 20 GB.
+# ``--gpus`` bounds how many runs are alive at once.
 FAST = ["--preset", "fast", "--topk", "8"]
 SPLIT = ["--topk", "8", "--warmup", "4", "--iters", "100"]
+SPLIT_KV = ["--split", "SKV"]
 DEMOS = {
     "matmul": [FAST, FAST + ["--split", "K:4,8"]],
     "matmul_matmul": [FAST, ["--preset", "split", *SPLIT]],
@@ -115,13 +128,12 @@ DEMOS = {
     "swiglu": [FAST],
     "rmsnorm_matmul": [FAST, ["--preset", "split-k", *SPLIT]],
     "qknorm": [["--preset", "fast"]],
-    "mha_decode": [FAST],
-    "mha_decode_exact": [["--preset", "fast", "--topk", "16"]],
+    "mha_decode": [["--preset", "fast", "--topk", "16"]],
     "gqa_decode": [FAST],
     "mqa_decode": [FAST],
-    "mha_prefill": [FAST],
-    "gqa_prefill": [FAST],
-    "mqa_prefill": [FAST],
+    "mha_prefill": [FAST, FAST + SPLIT_KV + ["--max-ops", "13"]],
+    "gqa_prefill": [FAST, FAST + SPLIT_KV],
+    "mqa_prefill": [FAST, FAST + SPLIT_KV + ["--max-ops", "13"]],
     "mla_decode": [["--preset", "fast", "--topk", "1000"]],
     "mla_prefill": [FAST],
     "staged": [["--topk", "8"]],

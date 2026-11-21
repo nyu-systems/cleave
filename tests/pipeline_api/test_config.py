@@ -50,15 +50,18 @@ def test_config_normalization_and_replace():
     assert EvalConfig().max_parallel == 8
 
 
-# Hand-set budgets in demo/*.py (13 = engine default where the demo sets none).
+# The budgets of demo/*.py (13 = engine default where the rule gives less). The attention
+# programs are one op shorter than they were under the fixed shift (its add is gone), and
+# the budget follows: the search finds the same graphs.
 DEMO_MAX_OPS = [
     (P.matmul, dict(M=128, N=128, K=4096), (), 13),
     (P.matmul, dict(M=128, N=128, K=4096), ("K",), 13),
     (P.rmsnorm_matmul, dict(M=128, N=6144, K=4096), ("K",), 13),
-    (P.attention, dict(HQ=32, SQ=64, HKV=32, SKV=4096, D=64), ("SKV",), 14),  # mha/gqa/mqa decode
-    (P.attention, dict(HQ=32, SQ=4096, HKV=32, SKV=4096, D=64), ("SKV",), 14),  # prefill split
-    (P.qknorm, dict(HQ=64, SQ=4096, HKV=8, SKV=4096, D=128), (), 26),
-    (P.qknorm, dict(HQ=64, SQ=4096, HKV=8, SKV=4096, D=128), ("SKV",), 28),
+    (P.attention, dict(HQ=32, SQ=64, HKV=32, SKV=4096, D=64), (), 13),  # decode, --split none
+    (P.attention, dict(HQ=32, SQ=64, HKV=32, SKV=4096, D=64), ("SKV",), 13),  # mha/gqa/mqa decode
+    (P.attention, dict(HQ=32, SQ=4096, HKV=32, SKV=4096, D=64), ("SKV",), 13),  # prefill split
+    (P.qknorm, dict(HQ=64, SQ=4096, HKV=8, SKV=4096, D=128), (), 25),
+    (P.qknorm, dict(HQ=64, SQ=4096, HKV=8, SKV=4096, D=128), ("SKV",), 27),
 ]
 
 
@@ -70,7 +73,7 @@ def test_auto_max_ops_reproduces_demo_budgets(fn, shapes, split, expected):
 
 
 def test_auto_max_ops_floor():
-    # Demos that hand-set budgets below the engine default (prefill unsplit 12,
+    # Demos that hand-set budgets below the engine default (prefill unsplit 11,
     # matmul_matmul_split 5/8) get the default floor of 13 instead: a superset search.
     assert auto_max_ops(3, 1, False) == 13
     assert auto_max_ops(24, 1, True) == 28

@@ -9,7 +9,7 @@ from __future__ import annotations
 from tilelang.carver.roller import Edge
 
 from ..ir.graph import Graph, OutputNode
-from ..ir.ops import Add, Div, Exp, Matmul, Mul, ReduceSum, Sub
+from ..ir.ops import Add, Div, Exp, Matmul, Mul, ReduceSum
 from ..ir.graph_utils import find_topo_sort, gather_all_nodes
 
 DTYPE = "bfloat16"
@@ -33,23 +33,26 @@ def _finalize(*roots):
 
 
 def _softmax_tail(S_Q, S_KV, D, scale, accum_dtype, dtype):
+    """The scaled scores' ``exp``, its row sum next to the value matmul, and the divide.
+
+    The exp is a plain one, with no shift in front of it: this body is what gets tiled, and
+    the access layer builds the softmax of the kernel it emits itself -- the exact one, on
+    the running row max of its own masked scores (``paging.stages._online_softmax``).
+    """
     mul = Mul((S_Q, S_KV), const=scale, dtype=accum_dtype, out_dtype=accum_dtype, name="mul_0")
-    sub = Sub(
-        (S_Q, S_KV), const=(50.0 * scale), dtype=accum_dtype, out_dtype=accum_dtype, name="sub_0"
-    )
     exp = Exp((S_Q, S_KV), dtype=accum_dtype, out_dtype=accum_dtype, name="exp_0")
     value = Matmul(
         (S_Q, D, S_KV), dtype=dtype, out_dtype=accum_dtype, name="mma_1", warp_policy="rows"
     )
     rowsum = ReduceSum((S_Q, S_KV), dtype=accum_dtype, out_dtype=accum_dtype, name="rowsum_0")
     div = Div((S_Q, D), broadcast=0, dtype=accum_dtype, out_dtype=accum_dtype, name="div_0")
-    return mul, sub, exp, value, rowsum, div
+    return mul, exp, value, rowsum, div
 
 
 def flash_attention_sd_graph(
     S_Q, S_KV, D, *, dtype="float16", accum_dtype=ACCUM_DTYPE, out_dtype="float16"
 ):
-    """Single-head flash-attention (safe-exp), no batch dim. Kernel params: Q,K,V (S,D)."""
+    """Single-head flash-attention, no batch dim. Kernel params: Q,K,V (S,D)."""
     scale = 1 / (D**0.5)
     score = Matmul(
         (S_Q, S_KV, D),
@@ -59,22 +62,21 @@ def flash_attention_sd_graph(
         transpose_B=True,
         warp_policy="rows",
     )
-    mul, sub, exp, value, rowsum, div = _softmax_tail(S_Q, S_KV, D, scale, accum_dtype, dtype)
+    mul, exp, value, rowsum, div = _softmax_tail(S_Q, S_KV, D, scale, accum_dtype, dtype)
     _connect(score, mul, 0, 0)
-    _connect(mul, sub, 0, 0)
-    _connect(sub, exp, 0, 0)
+    _connect(mul, exp, 0, 0)
     _connect(exp, value, 0, 0)
     _connect(exp, rowsum, 0, 0)
     _connect(value, div, 0, 0)
     _connect(rowsum, div, 0, 1)
     OutputNode(div, dtype=out_dtype)
-    return _finalize(score, mul, sub, exp, value, rowsum, div)
+    return _finalize(score, mul, exp, value, rowsum, div)
 
 
 def mla_attention_sd_graph(
     S_Q, S_KV, HD, PE, *, dtype="float16", accum_dtype=ACCUM_DTYPE, out_dtype="float16"
 ):
-    """Single-head MLA attention (safe-exp) with RoPE positional scores, no batch dim.
+    """Single-head MLA attention with RoPE positional scores, no batch dim.
 
     Placeholders by role: Q ``PlaceHolder_A`` (S_Q,HD), KV ``PlaceHolder_B`` (S_KV,HD),
     Q_pe ``PlaceHolder_C`` (S_Q,PE), K_pe ``PlaceHolder_D`` (S_KV,PE); the value matmul
@@ -103,19 +105,18 @@ def mla_attention_sd_graph(
     pe.inputs[0].src_node.name = "PlaceHolder_C"
     pe.inputs[1].src_node.name = "PlaceHolder_D"
     add = Add((S_Q, S_KV), dtype=accum_dtype, out_dtype=accum_dtype, name="add_0")
-    mul, sub, exp, value, rowsum, div = _softmax_tail(S_Q, S_KV, HD, scale, accum_dtype, dtype)
+    mul, exp, value, rowsum, div = _softmax_tail(S_Q, S_KV, HD, scale, accum_dtype, dtype)
     _connect(score, add, 0, 0)
     _connect(pe, add, 0, 1)
     _connect(add, mul, 0, 0)
-    _connect(mul, sub, 0, 0)
-    _connect(sub, exp, 0, 0)
+    _connect(mul, exp, 0, 0)
     _connect(exp, value, 0, 0)
     _connect(kv, value, 0, 1)
     _connect(exp, rowsum, 0, 0)
     _connect(value, div, 0, 0)
     _connect(rowsum, div, 0, 1)
     OutputNode(div, dtype=out_dtype)
-    return _finalize(score, pe, add, mul, sub, exp, value, rowsum, div)
+    return _finalize(score, pe, add, mul, exp, value, rowsum, div)
 
 
 def build_tiled_candidate(main_graph, output_tile, rstep_by_name):

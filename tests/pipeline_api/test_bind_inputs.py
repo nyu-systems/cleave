@@ -31,7 +31,7 @@ def late_first(a: cl.Tensor["R", "C"], b: cl.Tensor["R", "C"], c: cl.Tensor["R",
 
 
 def attention(q: cl.Tensor["H", "S", "D"], k: cl.Tensor["H", "S", "D"], v: cl.Tensor["H", "S", "D"]):
-    return cl.softmax((q @ k.mT) / q.shape[-1] ** 0.5, dim=-1, shift=-1.0) @ v
+    return cl.softmax((q @ k.mT) / q.shape[-1] ** 0.5, dim=-1) @ v
 
 
 CASES = [(swapped, dict(R=4, C=8)), (late_first, dict(R=4, C=8)), (attention, dict(H=2, S=16, D=16))]

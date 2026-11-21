@@ -53,17 +53,14 @@ def rms_norm(x, dim: int = -1, eps: float = 0.0):
     return x * rsqrt(ms)
 
 
-def softmax(x, dim: int = -1, shift: float | None = None):
-    """``shift=None``: the exact softmax, ``exp(x - max(x)) / sum(...)`` over ``dim``.
+def softmax(x, dim: int = -1):
+    """The exact softmax, ``exp(x - max(x)) / sum(...)`` over ``dim``.
 
     Traced, it records ``exp, sum, div`` and asks for the exp to be stabilized
     (``Program._stable_exp``): the search sees no max, and each schedule gets the shift it
     needs -- the row max where a tile holds the whole row, a running max where the row is
-    looped over. Eagerly it is the max written out. A constant ``shift`` is the fixed-shift
-    ``exp(x + shift) / sum(exp(x + shift))`` (no max anywhere, and not safe on arbitrary
-    logits)."""
-    if shift is None:
-        e = x.program._stable_exp(x, dim) if _traced(x) else exp(x - max(x, dim, keepdim=True))
-    else:
-        e = exp(x + shift) if shift else exp(x)
+    looped over, the max of each split where the row is split. Eagerly it is the max written
+    out. (``cl.exp(x) / cl.sum(cl.exp(x), dim, keepdim=True)`` written by hand makes no such
+    request: it is the plain exp, and overflows where its logits do.)"""
+    e = x.program._stable_exp(x, dim) if _traced(x) else exp(x - max(x, dim, keepdim=True))
     return e / sum(e, dim, keepdim=True)

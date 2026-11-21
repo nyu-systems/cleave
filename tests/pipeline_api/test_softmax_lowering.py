@@ -22,7 +22,7 @@ from cleave.ir.ops import Exp, Stabilize
 from cleave.pipeline.plans import describe_tile, lower
 from cleave.pipeline.superopt import GraphSet, SearchedGraph
 from cleave.runtime.reference import fingerprint_seed, output_order, placeholder_order
-from tests._softmax import exact_softmax, stable_exp
+from tests._softmax import stable_exp
 from tests.pipeline import _pipeline as PL
 
 
@@ -37,11 +37,11 @@ def flash_twin(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"], v: c
 
 
 def traced(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"], v: cl.Tensor["H", "SKV", "D"]):
-    return exact_softmax((q @ k.mT) / q.shape[-1] ** 0.5, -1) @ v
+    return cl.softmax((q @ k.mT) / q.shape[-1] ** 0.5, -1) @ v
 
 
 def softmax(x: cl.Tensor["R", "C"]):
-    return exact_softmax(x, -1)
+    return cl.softmax(x, -1)
 
 
 def cube(x: cl.Tensor["R", "C"]):

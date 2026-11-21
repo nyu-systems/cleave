@@ -87,13 +87,20 @@ def test_demo_emits_recorded_search(monkeypatch, request, case):
 
 def test_every_demo_has_a_case():
     covered = {c[1] for c in CASES}
-    assert set(DEMOS) - covered == {"staged", "mha_decode_exact"}
+    assert set(DEMOS) - covered == {"staged"}
     assert {c[0] for c in CASES} == set(SNAPSHOT["demos"])
 
 
-# The demos whose kernels return an output with a boundary role: an exact softmax, split.
-# Its partials return their float32 shift, so the demo declares one bound per role.
-BY_ROLE = {"mha_decode_exact"}
+# The demos whose softmax is ``cl.softmax``, the exact one: every attention demo.
+ATTENTION = ["mha_decode", "gqa_decode", "mqa_decode", "mha_prefill", "gqa_prefill",
+             "mqa_prefill", "mla_prefill", "mla_decode", "qknorm"]
+# The demos whose kernels can return an output with a boundary role: an exact softmax,
+# split over the keys (by default for the decode demos, with the ``--split SKV`` their
+# docstrings name for the MHA / GQA / MQA prefill demos). Its partials return their float32
+# shift, so the demo declares one bound per role. mla_decode, mla_prefill and qknorm offer
+# no split: no split graph of mla_decode has a partial / combine cut, the split graphs of
+# mla_prefill need about 190 GB of references, and qknorm's split search is no demo run.
+BY_ROLE = set(ATTENTION) - {"mla_decode", "mla_prefill", "qknorm"}
 
 
 def _assert_declared(config, name):
@@ -146,11 +153,10 @@ def test_staged_demo_declares_its_own_tolerance(monkeypatch):
     assert (seen["config"].warmup, seen["config"].iters) == (16, 1000)
 
 
-def test_mha_decode_exact_config(monkeypatch):
-    """The exact softmax at the decode demo's own shape: no max in the program (the request
-    stands for it), the decode demo's split over the keys, and the search budget the auto
-    rule gives."""
-    seen = run_demo(monkeypatch, "mha_decode_exact", [])
+def test_mha_decode_config(monkeypatch):
+    """The decode demo: no max in the program (the request stands for it), the split over
+    the keys, and the search budget the auto rule gives."""
+    seen = run_demo(monkeypatch, "mha_decode", [])
     program, so, sc = seen["program"], seen["so"], seen["sc"]
     assert [r.kind for r in program.ops if r.kind != "input"] == [
         "matmul", "div", "exp", "reduce_sum", "div", "matmul"]
@@ -158,13 +164,37 @@ def test_mha_decode_exact_config(monkeypatch):
     assert so.split == ("SKV",) and sc.split_k == (16, 32)
     assert so.max_ops == "auto" and so.resolve_max_ops(program) == 13
     assert program.sizes == {"H": 32, "SQ": 64, "D": 64, "SKV": 4096}
-    # ... the shape and the split of demo/mha_decode.py, whose softmax is still the fixed shift
-    fixed = run_demo(monkeypatch, "mha_decode", [])
-    assert fixed["program"].sizes == program.sizes
-    assert (fixed["so"].split, fixed["sc"].split_k) == (so.split, sc.split_k)
-    # --split none: the solo kernels only, as before the exact softmax crossed a split
-    solo = run_demo(monkeypatch, "mha_decode_exact", ["--split", "none"])
+    # --split none: the solo kernels only, on the same budget
+    solo = run_demo(monkeypatch, "mha_decode", ["--split", "none"])
     assert not solo["so"].split and not solo["sc"].split_k
+    assert solo["so"].resolve_max_ops(solo["program"]) == 13
+
+
+@pytest.mark.parametrize("name", ATTENTION)
+def test_attention_demo_softmax_is_exact(monkeypatch, name):
+    """No attention demo shifts its scores by a constant: each records the one request of
+    ``cl.softmax`` on an exp that reads the scaled scores themselves, and no max."""
+    program = run_demo(monkeypatch, name, [])["program"]
+    assert len(program.stabilize_requests) == 1
+    ops = {r.out: r for r in program.ops}
+    (exp,) = [r for r in program.ops if r.kind == "exp"]
+    assert exp.attr("stabilize") == 2  # the keys: the last of three axes
+    scores = ops[exp.args[0]]
+    # the exp's operand is the division by sqrt(d), not an add of a constant behind it
+    assert scores.kind == "div" and isinstance(scores.args[1], float)
+    assert not [r for r in program.ops if r.kind in ("reduce_max", "sub")]
+    # an add in the program adds two tensors (MLA's two score terms) or qknorm's eps to
+    # a mean of squares; none of them feeds the exp
+    for add in (r for r in program.ops if r.kind == "add"):
+        assert add.out != exp.args[0]
+        assert all(isinstance(a, int) for a in add.args) or name == "qknorm"
+
+
+def test_no_demo_passes_a_shift():
+    """The parameter is gone, and so is every mention of it in a demo's source."""
+    for path in sorted(DEMO.glob("*.py")) + sorted((DEMO / "dynamic").glob("*.py")):
+        assert "shift=" not in path.read_text(), path.name
+    assert not (DEMO / "mha_decode_exact.py").exists()  # merged into mha_decode.py
 
 
 @pytest.mark.parametrize("name", DEMOS)

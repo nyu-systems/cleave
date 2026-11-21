@@ -181,7 +181,7 @@ def _reference_fn(distributions, program, publish):
     (``cl.softmax`` recorded the stabilize request) is right at any logit scale, so its
     kernels are also held to every adversarial softmax case its inputs can be shaped into
     (``cleave.runtime.inputs.adversarial_cases``), whether asked or not; they are timed on
-    the first case, as always. A fixed-shift or hand-written ``exp / sum`` makes no such
+    the first case, as always. An ``exp / sum`` written out by hand makes no such
     claim (its reference overflows on those inputs) and is validated on what was asked.
 
     The returned function remembers what each graph was held to: ``held`` maps
