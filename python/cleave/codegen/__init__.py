@@ -32,6 +32,8 @@ class TilelangCodeGen(KernelEmitter, SplitEmitter, OperandResolver, MacroEmitter
         self.graph_code = ""
         self.symbol_code = ""
         self.pass_code = ""
+        # (tier, fragment name) -> the shared buffer that fragment's slice was loaded through
+        self._loaded_through = {}
         self._reset_macros()
 
     def gen(self, graph: Graph | Sequence[Graph]):

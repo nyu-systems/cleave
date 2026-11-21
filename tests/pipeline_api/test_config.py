@@ -159,7 +159,8 @@ def test_cache_schema_retires_kernels_built_before_a_scheduler_fix(monkeypatch):
     # 35: a program that returns a value another op reads had no tiling, for an assertion.
     # 36: the quotient of an input by its row sum was laid out like the sum, a row per thread.
     # 37: ... and so was the quotient by anything computed elementwise from such a sum.
-    assert cache.SCHEMA >= 38
+    # 38: a matmul staged an input slice by copying its fragment into a second shared buffer.
+    assert cache.SCHEMA >= 39
     key = _kernel_key(prog, *cfgs)
     monkeypatch.setattr(cache, "SCHEMA", 1)
     assert _kernel_key(prog, *cfgs) != key

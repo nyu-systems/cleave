@@ -15,7 +15,8 @@ reference overflows on landed in another row.
 The fragment is there because the operand has a second reader in the loop (``x`` under
 ``x @ w`` next to ``sum(x * x)``, or under two matmuls). Codegen now keeps the operand
 of such a matmul in shared memory, where the gemm addresses the rows of each group
-itself: an input that only matmuls read is loaded there in the first place, any other
+itself: an input that only matmuls read is loaded there in the first place, an input with
+another reader is read from the shared buffer its slice was loaded through, and a computed
 operand is staged.
 """
 
@@ -121,13 +122,18 @@ def test_which_tiles_tilelang_multiplies_on_the_wrong_rows(policy, n_threads, ro
 
 @pytest.mark.parametrize("tile, step", RMSNORM_WRONG)
 def test_an_input_with_another_reader_is_staged_for_the_matmul(tile, step):
-    """``x`` feeds the matmul and the sum of squares: the square keeps its fragment, the
-    matmul gets a copy in shared memory."""
+    """``x`` feeds the matmul and the sum of squares: the square keeps its fragment, and
+    the matmul reads the slice in the shared buffer it was loaded through on its way to
+    that fragment. (It used to get a copy of the fragment in a second shared buffer.)"""
     graph = _annotated(_rmsnorm(tile, step))
     assert _first_operands(graph) == {"mma_0": ("r", True)}
     code = build_candidate_code(_rmsnorm(tile, step))
-    assert "T.copy(PlaceHolder_AA, PlaceHolder_AA_intermediate)" in code
-    assert "(PlaceHolder_AA_intermediate, PlaceHolder_BB, t_mma_0)" in code
+    assert "T.copy(PlaceHolder_A, PlaceHolder_A_intermediate)" in code
+    assert "T.copy(PlaceHolder_A_intermediate, PlaceHolder_AA)" in code
+    assert "(PlaceHolder_A_intermediate, PlaceHolder_BB, t_mma_0)" in code
+    assert "PlaceHolder_AA_intermediate" not in code
+    # the loop keeps three shared buffers: the two operands and the staged result
+    assert code.count("T.alloc_shared(") == 3
 
 
 @pytest.mark.parametrize("tile, step", SWIGLU_WRONG)
@@ -164,7 +170,7 @@ def test_the_mla_pass_keeps_the_operand_out_of_the_fragment():
     graph = passes.annotate_mla_accumulation_layout_conflict(_annotated(cand))
     assert _first_operands(graph) == {"mma_0": ("r", True)}
     code = build_candidate_code(cand, CompilerPassOptions(mla_decode_pass=True))
-    assert "(PlaceHolder_AA_intermediate, PlaceHolder_BB, t_mma_0)" in code
+    assert "(PlaceHolder_A_intermediate, PlaceHolder_BB, t_mma_0)" in code
 
 
 def test_a_main_tier_input_is_never_a_fragment():

@@ -510,6 +510,9 @@ class KernelEmitter:
                 dtype=node.get_dtype(0),
             )
         )
+        if (src_scope, scope) == ("g", "r") and tc_layout(graph, node):
+            # gen_copy took the slice through a shared buffer in the tensor-core layout
+            self._loaded_through[(id(graph), tname)] = src_name + "_intermediate"
 
     def _emit_compute(self, graph, node, buf, is_main_iter, name_prefix):
         tname, scope = graph.tinfo_map[node]

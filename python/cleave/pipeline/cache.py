@@ -94,7 +94,9 @@ from pathlib import Path
 #     with the sum looped in narrow steps, every thread computed and kept whole rows.
 # 38: ... and so is what a chain of elementwise ops made of such an accumulator: the
 #     kernels of x / sqrt(sum(x * x, -1)) kept whole rows per thread as well.
-SCHEMA = 38
+# 39: a staged matmul operand that is an input slice is read from the shared buffer the
+#     slice was loaded through, not from a second copy of its fragment.
+SCHEMA = 39
 # What "validated" means for a saved kernel. A kernel-cache hit returns without validating,
 # so bump this whenever the comparison or its inputs change: saved kernels are then rebuilt.
 # (The inputs include the adversarial cases a program with an exact softmax is held to,

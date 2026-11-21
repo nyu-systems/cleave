@@ -78,6 +78,11 @@ class OperandResolver:
             emit_staged_copy(buf, tname, cast, shape, node.dtype, scope, tc=stage)
             tname = cast
         if stage and scope == "r":
+            # An input slice came to its fragment through a shared buffer in the layout a
+            # staged copy would have: read it there, where it already is.
+            loaded_through = self._loaded_through.get((id(graph), tname))
+            if loaded_through is not None:
+                return loaded_through, scope
             dtype = node.dtype if in_dtype != node.dtype else in_dtype
             emit_staged_copy(
                 buf, tname, f"{tname}_intermediate", shape, dtype, "s", tc=True

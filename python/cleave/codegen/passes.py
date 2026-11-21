@@ -413,7 +413,9 @@ def stage_misplaced_register_operands(graph: Graph) -> Graph:
     An input of the loop that only matmuls read (``x`` under ``x @ w1`` and ``x @ w2``)
     is a fragment for no reader's sake: it is loaded into shared memory instead, as an
     input with a single reader is, and no fragment is left to copy back. Any other
-    operand is staged (``Matmul.stage_fragment_operands_in_shared``).
+    operand is staged (``Matmul.stage_fragment_operands_in_shared``): an input that has
+    another reader is read from the shared buffer its slice was loaded through, a computed
+    operand is copied into one (``OperandResolver._resolve_operand``).
 
     ``graph`` is the main tier (it carries ``n_threads``). Run after every pass that
     writes ``stage_fragment_operands_in_shared``.
