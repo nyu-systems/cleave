@@ -215,11 +215,32 @@ pip install -e . -v
 ```
 
 (the command of Quick Installation; `MAX_JOBS` applies). An editable install always relinks
-the extension. In an environment that already holds the build requirements of
-`pyproject.toml` (`setuptools>=77`, `cmake>=3.24`, `cython`, `z3-solver==4.15.4`),
-`pip install -e . -v --no-build-isolation` builds against that environment's z3 instead of a
-temporary one; either way `ldd python/cleave/superoptimizer/core*.so` must name the
-`libz3.so.4.15` of the environment the tests run in.
+the extension.
+
+The extension needs `libz3.so.4.15` and records, as the place to look for it, the `z3/lib`
+directory of the `z3-solver` it was built against. Which one that is depends on the command:
+
+- `pip install -e . -v` builds in a temporary environment that pip fills with the build
+  requirements of `pyproject.toml` and deletes afterwards. The recorded directory is gone
+  with it, so `ldd python/cleave/superoptimizer/core*.so` prints
+  `libz3.so.4.15 => not found` (unless the loader finds a copy somewhere else). This is not
+  a broken install: when the extension does not find the library,
+  `python/cleave/superoptimizer/__init__.py` loads the `libz3.so.4.15` of the installed
+  `z3-solver` and imports the extension again.
+- `pip install -e . -v --no-build-isolation`, in an environment that already holds those
+  build requirements (`setuptools>=77.0`, `wheel`, `cmake>=3.24`, `cython>=0.28`,
+  `z3-solver==4.15.4`), builds against that environment's z3. `ldd` then resolves
+  `libz3.so.4.15` to `.../site-packages/z3/lib/libz3.so.4.15` of that environment.
+
+The check that holds after either command is the import, in the environment the tests run in:
+
+```bash
+python -c "import cleave.superoptimizer.core as core; print(core.__file__)"
+```
+
+It prints the path of the extension. It fails with an `ImportError` that names
+`libz3.so.4.15` when the `z3-solver` of that environment is missing or is not a 4.15 release
+(the library name carries the minor version; the install pins `z3-solver==4.15.4`).
 
 With a library older than the sources the search still runs, with the behaviour of the old
 sources: it is not reproducible across processes and saved checkpoints are searched again.
