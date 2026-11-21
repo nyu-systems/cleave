@@ -187,19 +187,31 @@ def device_lock_state() -> tuple[Optional[int], frozenset]:
 
 @contextlib.contextmanager
 def _gpu_exec_guard():
-    """One process at a time on the device. Whoever holds the lock leaves its CUDA context
-    with the thread stacks it came with (``_release_thread_stacks``): the stacks of the
-    kernels it launched are device memory the next holder needs."""
+    """One process at a time on the device, from its first touch of it. Whoever holds the
+    lock leaves its CUDA context with the thread stacks it came with
+    (``_release_thread_stacks``): the stacks of the kernels it launched are device memory
+    the next holder needs.
+
+    The context is made under the lock as well (``_ensure_cuda_context`` launches a fill).
+    A generated kernel that is running while another process launches anything on the same
+    device can go on running for good, its launcher waiting in ``synchronize`` with the
+    device at 100%. Measured on an H100 with one kernel of demo/swiglu.py launched in a
+    loop: alone it returned from 59,960 launches in 150 s; next to four processes that each
+    launched a one-element fill twenty times a second it stopped returning after 55 s, and
+    next to four that ran small matmuls after 29 s. Every worker used to make its context
+    before it waited for the lock, that is while the first kernels of its run were validated
+    and timed: the candidate "that never returns" (1 or 2 of 80 runs of that demo).
+    """
     _create_parallel_env()
-    _ensure_cuda_context()
     os.makedirs(os.path.dirname(_GPU_LOCK_PATH), exist_ok=True)
     with open(_GPU_LOCK_PATH, "w") as lock_file:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        stack_limit = _stack_limit()
         try:
-            yield
-        finally:
+            _ensure_cuda_context()
+            stack_limit = _stack_limit()
             try:
-                _release_thread_stacks(stack_limit)
+                yield
             finally:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                _release_thread_stacks(stack_limit)
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)

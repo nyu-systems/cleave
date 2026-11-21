@@ -92,13 +92,21 @@ def _run_task(task):
 
 
 def _cuda_context_healthy():
-    """False once a kernel fault has left this process's CUDA context unusable."""
+    """False once a kernel fault has left this process's CUDA context unusable.
+
+    The probe launches a fill, so it waits for the device like any other work of a worker
+    (``gpu._gpu_exec_guard``): launched next to the kernel another worker is validating or
+    timing, it can leave that kernel running for good.
+    """
     torch = sys.modules.get("torch")
     if torch is None or not torch.cuda.is_initialized():
         return True
+    from .gpu import _gpu_exec_guard
+
     try:
-        torch.cuda.synchronize()
-        torch.zeros(1, device="cuda").item()
+        with _gpu_exec_guard():
+            torch.cuda.synchronize()
+            torch.zeros(1, device="cuda").item()
     except Exception:  # noqa: BLE001 - any failure means the context is gone
         return False
     return True

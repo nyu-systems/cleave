@@ -59,6 +59,70 @@ def driver(monkeypatch, tmp_path):
     return fake
 
 
+def test_the_device_is_first_touched_under_its_lock(driver, monkeypatch):
+    """A worker makes its CUDA context (a fill is launched) once it holds the device lock,
+    not while it waits for it: another worker of its run is validating or timing a kernel
+    then, and a kernel that runs while another process launches on the device can go on
+    running for good (the candidate "that never returns": see ``_gpu_exec_guard``)."""
+    import os
+
+    held_by = []
+    monkeypatch.setattr(gpu, "_ensure_cuda_context",
+                        lambda: held_by.append(gpu.lock_state(gpu._GPU_LOCK_PATH)[0]))
+    with gpu._gpu_exec_guard():
+        assert held_by == [os.getpid()]
+    assert gpu.lock_state(gpu._GPU_LOCK_PATH)[0] is None  # ... and it is given up after
+
+    # a context that cannot be made (an exception past the helper) still gives the lock up
+    def broken():
+        raise RuntimeError("no device")
+
+    monkeypatch.setattr(gpu, "_ensure_cuda_context", broken)
+    with pytest.raises(RuntimeError, match="no device"):
+        with gpu._gpu_exec_guard():
+            raise AssertionError("not reached")
+    assert gpu.lock_state(gpu._GPU_LOCK_PATH)[0] is None
+
+
+def test_a_worker_probes_its_context_under_the_device_lock(driver, monkeypatch):
+    """After a candidate that failed, a worker checks that its CUDA context still works: a
+    synchronize and a fill that is read back. That is device work too."""
+    import os
+    import sys
+    import types
+
+    from cleave.runtime import workers
+
+    seen = []
+
+    def held():
+        seen.append(gpu.lock_state(gpu._GPU_LOCK_PATH)[0] == os.getpid())
+
+    class _Value:
+        def item(self):
+            held()
+            return 0.0
+
+    fake = types.SimpleNamespace(
+        cuda=types.SimpleNamespace(is_initialized=lambda: True, synchronize=held),
+        zeros=lambda *a, **kw: _Value())
+    monkeypatch.setitem(sys.modules, "torch", fake)
+    assert workers._cuda_context_healthy() is True
+    assert seen == [True, True]
+    assert gpu.lock_state(gpu._GPU_LOCK_PATH)[0] is None
+
+    # a context that a fault broke: the probe raises, the worker retires, the lock is free
+    def faulted():
+        raise RuntimeError("CUDA error: an illegal memory access was encountered")
+
+    fake.cuda.synchronize = faulted
+    assert workers._cuda_context_healthy() is False
+    assert gpu.lock_state(gpu._GPU_LOCK_PATH)[0] is None
+    # ... and a process that never touched the device has nothing to probe, or to wait for
+    fake.cuda.is_initialized = lambda: False
+    assert workers._cuda_context_healthy() is True
+
+
 def test_the_guard_puts_back_a_stack_limit_that_a_launch_raised(driver):
     with gpu._gpu_exec_guard():
         driver.limit = 15552  # what launching the row-sum quotient does to the context
