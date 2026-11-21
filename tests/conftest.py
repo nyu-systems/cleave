@@ -25,6 +25,7 @@ _MARKERS = {
         "tests/pipeline_api/test_exact_split_rows.py::test_gpu_",
         "tests/runtime/test_run_candidates.py",
         "tests/runtime/test_stored_layout.py::test_gpu_",
+        "tests/runtime/test_thread_stacks.py::test_gpu_",
         "tests/frontend/test_exact_softmax.py::test_gpu_",
     ),
     "expected": (
