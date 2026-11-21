@@ -690,6 +690,42 @@
    "validated": 147
   }
  ],
+ "test:product_and_chain": [
+  {
+   "abs": 0.03125,
+   "absolute": false,
+   "dtype": "float16",
+   "rel": 0.0008230452658608556,
+   "seeds": 3,
+   "validated": 60
+  },
+  {
+   "abs": 0.25,
+   "absolute": false,
+   "dtype": "float16",
+   "rel": 0.0009009009227156639,
+   "seeds": 3,
+   "validated": 60
+  }
+ ],
+ "test:product_and_double": [
+  {
+   "abs": 0.03125,
+   "absolute": false,
+   "dtype": "float16",
+   "rel": 0.0007042253273539245,
+   "seeds": 3,
+   "validated": 174
+  },
+  {
+   "abs": 0.0625,
+   "absolute": false,
+   "dtype": "float16",
+   "rel": 0.0007042253273539245,
+   "seeds": 3,
+   "validated": 174
+  }
+ ],
  "test:qknorm_graph": [
   {
    "abs": 0.0001220703125,

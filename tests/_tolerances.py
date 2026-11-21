@@ -79,6 +79,11 @@ TOLERANCES = {
     # the exact softmax of an input, split over the softmax axis: the partial reads its
     # logits from storage, so its shift is the max of stored values
     "exact_split_rows": {"": Tolerance(rtol=5e-3), "shift": Tolerance(rtol=2e-7)},
+    # ---- traced programs of tests/graph/apply_tiling
+    # a returned product that another op reads, every tiling that is built
+    # (test_returned_intermediates.py): next to a second matmul, and next to its double
+    "product_and_chain": Tolerance(rtol=5e-3),
+    "product_and_double": Tolerance(rtol=5e-3),
 }
 
 

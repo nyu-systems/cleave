@@ -747,6 +747,10 @@ class DefaultPolicy:
                         if has_unprocessed_consumer(dst, view_out_id):
                             return True
                     continue
+                if dst.is_output():
+                    # a returned value is stored, not held: its output node is not
+                    # one of ordered_nodes and so is never processed
+                    continue
                 if dst not in processed:
                     return True
             return False
@@ -787,7 +791,10 @@ class DefaultPolicy:
                         output_elem * dtype_bytes
                     )
 
-        assert len(block_map) == 0
+        assert not block_map, (
+            "the shared-memory model never gave back the blocks of "
+            f"{sorted(f'{node.name}:{out_id}' for node, out_id in block_map)}"
+        )
         return allocator.limit, cached_tensors_map
 
     def _kernel_rstep_map(self, rstep_map):
