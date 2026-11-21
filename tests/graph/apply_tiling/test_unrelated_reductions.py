@@ -35,7 +35,6 @@ from cleave.schedule.tiling import schedule_kernel
 
 from tests._lowering import lower_to_cuda
 from tests._tolerances import tolerance_for
-from tests.graph.apply_tiling._test_utils import assert_candidate_compiles_and_runs
 
 
 def two_matmuls(x: cl.Tensor["M", "K"], w: cl.Tensor["K", "N"], y: cl.Tensor["M", "K2"],
@@ -129,10 +128,25 @@ def test_the_second_loop_is_a_plain_one_and_the_kernel_lowers():
     assert "main_kernel" in lower_to_cuda(code)
 
 
-@pytest.mark.parametrize("steps", [{256: 32, 512: 32}, {256: 64, 512: 64},
-                                   {256: 128, 512: 128}], ids=["step_32", "step_64", "step_128"])
-def test_gpu_a_loop_each_validates(steps):
-    """GPU: tilings that had no kernel. Each output of the program is a plain matmul, so
-    the kernel is held to that operator's bound."""
-    assert_candidate_compiles_and_runs(_candidate(two_matmuls, LONGER, [64, 64], steps),
-                                       tolerance_for("matmul"))
+def _validate_equal_steps(fn, tolerance):
+    """GPU: every tiling of ``fn`` whose two steps agree -- the 36 that had no kernel."""
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required to compile and run candidates.")
+    from cleave.runtime.evaluate import run_candidates
+
+    cands = [c for c in search_tiling(_ir(fn, LONGER), topk=1000)
+             if _steps(c)[256] == _steps(c)[512] < 256]
+    results = run_candidates(cands, "float16", max_parallel=8, tolerance=tolerance)
+    assert len(results) == 36
+    assert all(r.ok for r in results), [str(r.error)[:300] for r in results if not r.ok]
+
+
+def test_gpu_a_loop_each_validates():
+    """Two outputs, a plain matmul each, held to the bound measured on this program."""
+    _validate_equal_steps(two_matmuls, tolerance_for("two_matmuls"))
+
+
+def test_gpu_a_loop_each_validates_where_the_products_are_added():
+    """One output: the sum of two products rounds once more than either."""
+    _validate_equal_steps(sum_of_matmuls, tolerance_for("sum_of_matmuls"))

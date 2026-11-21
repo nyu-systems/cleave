@@ -814,6 +814,16 @@
    "validated": 126
   }
  ],
+ "test:sum_of_matmuls": [
+  {
+   "abs": 0.125,
+   "absolute": false,
+   "dtype": "float16",
+   "rel": 0.0009671180159784853,
+   "seeds": 3,
+   "validated": 108
+  }
+ ],
  "test:swiglu_graph": [
   {
    "abs": 32.0,
@@ -822,6 +832,24 @@
    "rel": 0.0009718172950670123,
    "seeds": 3,
    "validated": 156
+  }
+ ],
+ "test:two_matmuls": [
+  {
+   "abs": 0.015625,
+   "absolute": false,
+   "dtype": "float16",
+   "rel": 0.0004681647988036275,
+   "seeds": 3,
+   "validated": 108
+  },
+  {
+   "abs": 0.03125,
+   "absolute": false,
+   "dtype": "float16",
+   "rel": 0.0006013229140080512,
+   "seeds": 3,
+   "validated": 108
   }
  ]
 }

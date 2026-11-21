@@ -78,6 +78,10 @@ TOLERANCES = {
     # logits from storage, so its shift is the max of stored values
     "exact_split_rows": {"": Tolerance(rtol=5e-3), "shift": Tolerance(rtol=2e-7)},
     # ---- traced programs of tests/graph/apply_tiling
+    # two reductions that share nothing, every tiling whose two steps agree
+    # (test_unrelated_reductions.py): two outputs, and the two products added
+    "two_matmuls": Tolerance(rtol=5e-3),
+    "sum_of_matmuls": Tolerance(rtol=5e-3),
     # a returned product that another op reads, every tiling that is built
     # (test_returned_intermediates.py): next to a second matmul, and next to its double
     "product_and_chain": Tolerance(rtol=5e-3),
