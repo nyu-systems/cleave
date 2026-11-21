@@ -35,7 +35,9 @@ def test_declared_tolerances_are_row_relative_bounds_within_the_ceiling():
     assert (CEILING, FP32_CEILING) == (5e-2, 2e-5)
     by_role = {name for name, tolerance in TOLERANCES.items() if isinstance(tolerance, dict)}
     assert by_role == {"exact_split_attention", "exact_split_rows"}
+    float32 = set()
     for name, tolerance in TOLERANCES.items():
+        outputs = PINNED[f"test:{name}"]
         if name in by_role:
             # one bound per boundary role: the program's float16 outputs, and the float32
             # shift a split partial returns, which is held to a float32 bound of its own
@@ -43,9 +45,21 @@ def test_declared_tolerances_are_row_relative_bounds_within_the_ceiling():
             tolerance, shift = tolerance[""], tolerance["shift"]
             assert isinstance(shift, Tolerance), name
             assert 0 < shift.rtol <= FP32_CEILING < tolerance.rtol and shift.atol == 0, name
+            assert {o["dtype"] for o in outputs if o.get("role")} == {"float32"}, name
+            outputs = [o for o in outputs if not o.get("role")]  # held to tolerance[""]
         assert isinstance(tolerance, Tolerance), name
+        (dtype,) = {o["dtype"] for o in outputs}
+        if dtype == "float32":
+            # between one float32 ulp and the float32 ceiling, like the paged lse
+            float32.add(name)
+            assert 2e-7 <= tolerance.rtol <= FP32_CEILING and tolerance.atol == 0, name
+            continue
         # fp16 outputs: relative to the row, no absolute slack, never the old 0.5
+        assert dtype == "float16", name
         assert 1e-3 <= tolerance.rtol <= CEILING and tolerance.atol == 0, name
+    # The one float32 operator is the TF32 matmul on operands TF32 holds exactly. A float32
+    # matmul on ordinary operands is 1e-3 off and has no entry: no float32 bound admits it.
+    assert float32 == {"matmul_tf32"}
     for name, operator in OPERATORS.items():
         out, lse = operator.tolerance
         assert 0 < out.rtol <= CEILING and out.atol == 0, name

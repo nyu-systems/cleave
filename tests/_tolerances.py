@@ -10,7 +10,8 @@ operator's valid candidates over three seeds, and never below one fp16 ulp of th
 (1e-3), which two correct results may differ by. Errors are bimodal -- valid kernels within a
 few ulp (<= 1.6e-3, 3.9e-3 for the quotient ``rowsum_div``), wrong ones above 1e-1 -- so a
 candidate that needs more than its operator's value is wrong, not unlucky. Never raise a
-value to make a kernel pass.
+value to make a kernel pass. (The outputs are float16 but for one operator, ``matmul_tf32``;
+a float32 output has its own ulp and its own ceiling.)
 
 The measurement itself is checked in as ``tests/measured_errors.json`` and
 ``tests/test_tolerance_declarations.py`` holds every entry here to what the rule gives for
@@ -26,9 +27,10 @@ from __future__ import annotations
 from cleave.runtime.validate import Tolerance
 
 CEILING = 5e-2  # no operator may declare a looser rtol than this
-# ... and an fp32 output (the paged lse) none looser than this. Valid kernels measure
-# 2e-7 .. 1.6e-6 of the row max; a kernel that loses one key in 8192 is 1.4e-5 off, which
-# this ceiling keeps out of the "clearly valid" range (a quarter of it) when re-measuring.
+# ... and an fp32 output (the paged lse, the TF32 matmul) none looser than this. Valid
+# kernels measure 2e-7 .. 1.6e-6 of the row max; a kernel that loses one key in 8192 is
+# 1.4e-5 off, which this ceiling keeps out of the "clearly valid" range (a quarter of it)
+# when re-measuring.
 FP32_CEILING = 2e-5
 
 TOLERANCES = {
@@ -86,6 +88,11 @@ TOLERANCES = {
     # (test_returned_intermediates.py): next to a second matmul, and next to its double
     "product_and_chain": Tolerance(rtol=5e-3),
     "product_and_double": Tolerance(rtol=5e-3),
+    # ---- the one float32 operator (tests/reference/test_matmul_tf32.py)
+    # A float32 matmul on operands TF32 holds exactly, against their float32 product. On
+    # ordinary float32 operands the same kernels are 1e-3 off, the TF32 instruction's
+    # truncation, which no float32 bound admits: that case has no entry and never will.
+    "matmul_tf32": Tolerance(rtol=5e-6),
 }
 
 

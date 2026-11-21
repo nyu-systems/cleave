@@ -612,6 +612,16 @@
    "validated": 135
   }
  ],
+ "test:matmul_tf32": [
+  {
+   "abs": 3.814697265625e-05,
+   "absolute": false,
+   "dtype": "float32",
+   "rel": 1.0191326964559266e-06,
+   "seeds": 3,
+   "validated": 12
+  }
+ ],
  "test:mha_bhsd_graph": [
   {
    "abs": 0.000244140625,
