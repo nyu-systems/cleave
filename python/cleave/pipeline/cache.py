@@ -82,7 +82,10 @@ SCHEMA = 31
 # cleave.runtime.inputs.ADVERSARIAL, which are not in the key by name.)
 # 3: the adversarial cases shape the logits of the exact softmax only; the operands of a
 #    plain exp written next to it are left alone (its reference overflowed on them).
-VALIDATION = 3
+# 4: logits that are an input are shaped through the view of a split as well: the partial
+#    of a program split over its softmax axis is held to every adversarial case (it was
+#    held to none of them).
+VALIDATION = 4
 
 
 @functools.lru_cache(maxsize=None)

@@ -22,7 +22,7 @@ from cleave.dynamic import reference as dyn
 from cleave.dynamic.workloads import ADVERSARIAL_WORKLOADS, MLA_SM_SCALE, WORKLOADS
 from cleave.ir.graph import OutputNode, PlaceHolderNode
 from cleave.ir.graph_utils import find_topo_sort
-from cleave.ir.ops import Exp
+from cleave.ir.ops import Exp, PermuteView, ReduceSum, SplitView, Stabilize
 from cleave.pipeline import EvalConfig
 from cleave.runtime import inputs as rt_inputs
 from cleave.runtime import reference as rt
@@ -396,6 +396,90 @@ def test_logits_that_are_an_input_are_shaped_along_their_softmax_axis(name):
     assert (shifted.exp() == 0).all()
     spread = shifted.amax(dim=-1) - shifted.amin(dim=-1)
     assert 1.0 * abs(scale) < float(spread.min()) and float(spread.max()) < 40.0
+
+
+def _viewed_logits_graph(view):
+    """``sum(exp(view(x)), -1)`` with the record of a softmax over the last axis: what the
+    partial of ``cl.softmax(x)`` looks like once the program is split over that axis."""
+    dims = tuple(int(s) for s in view.output_shape)
+    exp = Exp(dims, name="exp_0", dtype=DTYPE, out_dtype="float32", n_batch_dims=len(dims) - 2)
+    rowsum = ReduceSum(dims, name="rowsum_0", dtype="float32", out_dtype="float32")
+    g._connect(view, exp, 0, 0)
+    g._connect(exp, rowsum, 0, 0)
+    OutputNode(rowsum, dtype=DTYPE)
+    exp.stabilize = Stabilize(axes=(-1,), scaled=(("rowsum_0", 1),))
+    return g._finalize(rowsum)
+
+
+# name -> (input shape, split factor, the input's softmax axis, where the split dim sits)
+SPLIT_LOGITS = {
+    "rows": ((8, 96), 4, 1, 0),
+    "batched_rows": ((3, 8, 96), 4, 2, 1),  # the split dim behind the batch dim
+}
+
+
+@pytest.mark.parametrize("name", sorted(SPLIT_LOGITS))
+def test_logits_read_through_a_split_are_shaped_along_the_whole_softmax_axis(name):
+    """The partial of a program split over its softmax axis reads its logits through the
+    split: ``(split, rows, chunk)``. They are still an input, so the partial is held to
+    every case, and a case is written along the input's whole softmax axis: each split
+    holds the next slice of the ramp, and only the last one the spike.
+
+    It used to have no case at all ("its logits are neither the result of a score matmul
+    nor an input"), while the unsplit graph and the combine of the same program had six.
+    """
+    shape, factor, axis, split_pos = SPLIT_LOGITS[name]
+    graph = _viewed_logits_graph(
+        SplitView(shape, axis=axis, factor=factor, dtype=DTYPE, name="split_x"))
+    ((placeholder, found_axis, sign),) = logit_inputs(graph)
+    assert isinstance(placeholder, PlaceHolderNode)
+    assert tuple(int(s) for s in placeholder.get_shape(0)) == shape
+    assert (found_axis, sign) == (axis, 1.0)
+    assert adversarial_cases(graph) == DENSE_ADVERSARIAL and why_not_adversarial(graph) == ""
+
+    def logits(distribution):
+        (x,) = _inputs(graph, distribution)
+        assert tuple(x.shape) == shape and x.dtype == torch.float16
+        (scores,) = _scores(graph, (x,))
+        assert scores.shape[split_pos] == factor and scores.shape[-1] == shape[axis] // factor
+        # the splits side by side again: (..., rows, the whole softmax axis)
+        whole = scores.movedim(split_pos, -2).flatten(-2)
+        assert torch.equal(whole, x.float())
+        return scores.movedim(split_pos, 0), whole
+
+    base, base_whole = logits("normal")
+    up, up_whole = logits("increasing")
+    assert (up.diff(dim=-1) >= 0).all()
+    assert (up[1:, ..., 0] > up[:-1, ..., -1]).all(), "each split starts above the last one"
+    rise = up_whole[..., -1] - up_whole[..., 0]
+    assert float(rise.min()) > 0.4 * INCREASING_SPAN and float(rise.max()) > 88.7
+    down, down_whole = logits("decreasing")
+    assert torch.equal(down_whole, up_whole.flip(-1))
+
+    spiked, spiked_whole = logits("last_spike")
+    assert torch.equal(spiked[:-1], base[:-1]), "every split but the last is the normal one"
+    assert torch.equal(spiked_whole[..., :-1], base_whole[..., :-1])
+    assert float((spiked_whole[..., -1:] - spiked_whole[..., :-1]).min()) > 0.25 * INCREASING_SPAN
+
+    constant, _ = logits("constant")
+    assert (constant == constant[:1, ..., :1]).all()
+    shifted, _ = logits("offset")
+    assert float(shifted.max()) < -0.9 * LOGIT_OFFSET
+    _, large = logits("large_logits")
+    assert torch.allclose(large, LARGE_LOGIT_FACTOR * base_whole, rtol=1e-3, atol=1e-3)
+
+
+def test_logits_read_through_a_permute_are_shaped_along_the_axis_it_moved():
+    """A view that reindexes the input: the softmax axis of the exp (its last) is the axis
+    of the input the permute put there."""
+    graph = _viewed_logits_graph(PermuteView((96, 8), (1, 0), dtype=DTYPE, name="permute_x"))
+    ((placeholder, axis, sign),) = logit_inputs(graph)
+    assert (axis, sign) == (0, 1.0) and adversarial_cases(graph) == DENSE_ADVERSARIAL
+    (x,) = _inputs(graph, "increasing")
+    assert tuple(x.shape) == (96, 8) and (x.float().diff(dim=0) >= 0).all()
+    (scores,) = _scores(graph, (x,))
+    assert tuple(scores.shape) == (8, 96) and (scores.diff(dim=-1) >= 0).all()
+    assert float((scores[:, -1] - scores[:, 0]).max()) > 88.7
 
 
 def test_a_plain_exp_of_an_input_names_no_softmax_axis():

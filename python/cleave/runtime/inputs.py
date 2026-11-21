@@ -4,7 +4,8 @@
 rewrite that sample afterwards (so the normal stream never shifts), and only what the logits
 of a softmax are made of: the operands of the *score* matmuls (the matmuls an ``Exp`` is
 reached from without crossing another matmul), and an input that is the logits itself (a
-stabilized ``Exp`` that reads an input: ``cl.softmax(x)``).
+stabilized ``Exp`` that reads an input: ``cl.softmax(x)``; through the view of a split as
+well, so the partial of a program split over its softmax axis is held to the same cases).
 
 ``large_logits``  the query operand times 100, so every logit is 100 times larger;
 ``increasing``    logits that grow along the key axis for every query row, by more than
@@ -184,22 +185,71 @@ def score_matmuls(graph) -> list:
 def logit_inputs(graph) -> list:
     """``(placeholder, softmax axis, sign)`` for every stabilized ``Exp`` whose logits are an
     input: it reads a placeholder, directly or through constant scalings (``sign`` is
-    theirs). The softmax axis is the record's, which only a stabilized ``Exp`` has: a plain
-    ``exp(x)`` does not say what it is summed over.
+    theirs) and views that only reindex it -- the partial of a program split over its
+    softmax axis reads its logits through the split. The softmax axis is the record's,
+    which only a stabilized ``Exp`` has (a plain ``exp(x)`` does not say what it is summed
+    over), given as the axis of the placeholder one step along it moves along.
     """
     found = []
     for node in graph.nodes:
         record = getattr(node, "stabilize", None)
         if type(node) is not Exp or record is None or len(record.axes) != 1:
             continue
-        src, sign = node.inputs[0].src_node, 1.0
-        while type(src) in (Mul, Div) and src.const is not None \
-                and not getattr(src, "const_on_left", False):
-            sign = -sign if float(src.const) < 0 else sign
+        src, sign, views = node.inputs[0].src_node, 1.0, []
+        while True:
+            if isinstance(src, (SplitView, PermuteView)):
+                views.append(src)
+            elif type(src) in (Mul, Div) and src.const is not None \
+                    and not getattr(src, "const_on_left", False):
+                sign = -sign if float(src.const) < 0 else sign
+            else:
+                break
             src = src.inputs[0].src_node
-        if isinstance(src, PlaceHolderNode) and not any(src is p for p, _, _ in found):
-            found.append((src, record.axes[0] % len(src.get_shape(0)), sign))
+        if not isinstance(src, PlaceHolderNode) or any(src is p for p, _, _ in found):
+            continue
+        axis = _moved(_viewed(src, views[::-1]), record.axes[0], src)
+        if axis is not None:
+            found.append((src, axis, sign))
     return found
+
+
+def _viewed(placeholder, views):
+    """The flat index of every element of ``placeholder`` where the reindexing ``views``
+    (from the placeholder outwards) put it."""
+    import torch
+
+    shape = tuple(int(s) for s in placeholder.get_shape(0))
+    flat = torch.arange(int(torch.tensor(shape).prod())).reshape(shape)
+    for view in views:
+        if isinstance(view, PermuteView):
+            flat = flat.permute(*view.perm)
+        else:  # SplitView: the split axis is created before ``axis`` and moved to split_pos
+            axis = view.axis
+            dims = list(flat.shape)
+            flat = flat.reshape(dims[:axis] + [view.factor, view.inner_extent] + dims[axis + 1:])
+            flat = flat.movedim(axis, view.split_pos)
+    return flat
+
+
+def _moved(flat, axis, placeholder):
+    """The axis of ``placeholder`` that one step along ``axis`` of ``flat`` (its elements
+    as some value arranges them, ``_viewed``) moves along; ``None`` where that axis holds
+    one element, ``SpecError`` if the step is not along one axis of the input."""
+    import torch
+
+    if flat.shape[axis] < 2:
+        return None
+    shape = tuple(int(s) for s in placeholder.get_shape(0))
+    origin = [0] * flat.dim()
+    step = list(origin)
+    step[axis] = 1
+    a = torch.unravel_index(flat[tuple(origin)], shape)
+    b = torch.unravel_index(flat[tuple(step)], shape)
+    axes = [i for i, (x, y) in enumerate(zip(a, b)) if int(x) != int(y)]
+    if len(axes) != 1:
+        raise SpecError(f"cannot map axis {axis} of a value back to its input "
+                        f"{placeholder.name!r}")
+    return axes[0]
 
 
 def _operand(matmul, dst_id):
@@ -229,18 +279,7 @@ def _operand(matmul, dst_id):
 def _operand_axes(matmul, dst_id, placeholder, views):
     """``(row axis | None, contraction axis | None)`` of ``placeholder``: the axes one step
     along the operand's row (M for A, N for B) and contracted (K) axes moves along."""
-    import torch
-
-    shape = tuple(int(s) for s in placeholder.get_shape(0))
-    flat = torch.arange(int(torch.tensor(shape).prod())).reshape(shape)
-    for view in views:
-        if isinstance(view, PermuteView):
-            flat = flat.permute(*view.perm)
-        else:  # SplitView: the split axis is created before ``axis`` and moved to split_pos
-            axis = view.axis
-            dims = list(flat.shape)
-            flat = flat.reshape(dims[:axis] + [view.factor, view.inner_extent] + dims[axis + 1:])
-            flat = flat.movedim(axis, view.split_pos)
+    flat = _viewed(placeholder, views)
     if dst_id == 0:
         batch, transposed, rows = matmul.input_batch_dims_A, matmul.transpose_A, matmul.M
     else:  # B is (K, N) unless transposed
@@ -250,17 +289,11 @@ def _operand_axes(matmul, dst_id, placeholder, views):
     row_axis, contracted_axis = (-1, -2) if transposed else (-2, -1)
 
     def moved(operand_axis):
-        if flat.shape[operand_axis] < 2:
-            return None
-        origin = [0] * flat.dim()
-        step = list(origin)
-        step[operand_axis] = 1
-        a = torch.unravel_index(flat[tuple(origin)], shape)
-        b = torch.unravel_index(flat[tuple(step)], shape)
-        axes = [i for i, (x, y) in enumerate(zip(a, b)) if int(x) != int(y)]
-        if len(axes) != 1:
-            raise SpecError(f"{matmul.name}: cannot map operand {dst_id} back to its input")
-        return axes[0]
+        try:
+            return _moved(flat, operand_axis, placeholder)
+        except SpecError:
+            raise SpecError(
+                f"{matmul.name}: cannot map operand {dst_id} back to its input") from None
 
     return moved(row_axis), moved(contracted_axis)
 

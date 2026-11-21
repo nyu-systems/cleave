@@ -226,7 +226,9 @@ def test_kernel_cache_key_covers_validation():
                                                      "shift": cl.Tolerance(rtol=2e-6)}))
     assert key(declared) != key(declared.replace(distributions=("normal", "large_logits")))
     assert key(declared) == key(declared.replace(max_parallel=2, timeout_s=5.0))
-    assert cache.VALIDATION >= 3  # 1: elementwise assert_close with a 0.5/0.5 default
+    # 1: elementwise assert_close with a 0.5/0.5 default. 3: the partial of a program
+    # split over the softmax axis of an input was held to no adversarial case.
+    assert cache.VALIDATION >= 4
     before = key(declared)
     cache.VALIDATION += 1
     try:
