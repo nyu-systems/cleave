@@ -145,7 +145,8 @@ def test_partial_structure(operator):
     assert [n.name for n in stores] == ["partial_rowsum", "partial_value", "partial_max"]
     assert {n.name for n in partial.nodes if isinstance(n, Copy)} == {n.name for n in stores}
     assert all(type(n) is Copy for n in stores)
-    assert not [n for n in partial.nodes if isinstance(n, (Div, Log2, Lse2))]
+    assert not [n for n in partial.nodes
+                if isinstance(n, (Div, Log2, Lse2)) or "log2" in n.name]
     assert all(str(o.get_dtype(0)) == "float32" for o in outputs)
     assert tuple(partial.tmap[outputs[0]].shape) == (SPLIT, spec.batch_dim, heads)
     assert tuple(partial.tmap[outputs[0]].tile_size) == (1, 1, group)
@@ -244,7 +245,7 @@ def test_combine_structure(operator):
     div = next(n for n in combine.nodes if n.name == "div_0")
     lse = next(n for n in combine.nodes if n.name == "lse_0")
     assert type(div) is Div and div.denom_floor == 1e-30 and type(lse) is Lse2
-    assert not [n.name for n in combine.nodes if type(n) is Log2]
+    assert not [n.name for n in combine.nodes if type(n) is Log2 or "log2" in n.name]
     assert [(e.accum_node.name, e.src_id) for e in div.inputs] == [
         ("value_combine_0", 1), ("rowsum_combine_0", 0)]
     assert [(e.accum_node.name, e.src_id) for e in lse.inputs] == [
