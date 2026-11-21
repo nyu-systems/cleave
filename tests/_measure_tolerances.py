@@ -41,9 +41,9 @@ test operator by the GPU tests (always the whole list), a dynamic operator by it
 ``demo.dynamic`` run and by the GPU tests. The directory records what was run
 (``ran.json``), so ``--report DIR --pin`` pins the same operators later, and a directory
 that does not say, or that ran fewer than the three seeds, pins nothing. An operator no
-kernel validated at keeps its entry too, and is named: the one whose tests are deselected
-was measured once by hand (``rowsum_div_graph``); a pin without a declaration fails the
-declaration tests.
+kernel validated at keeps its entry too, and is named (``rowsum_div_graph`` was one while
+pytest.ini deselected its tests: it was measured once by hand; no operator is one today);
+a pin without a declaration fails the declaration tests.
 
     python -m tests._measure_tolerances --gpus 0,1,2,3 --out DIR --only tests --pin
     python -m tests._measure_tolerances --gpus 0,1,2,3 --out DIR --only demos \

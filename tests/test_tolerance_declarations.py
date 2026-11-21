@@ -640,8 +640,9 @@ def test_a_measurement_of_a_part_pins_the_operators_it_measured_in_full(tmp_path
     none of the others: a dynamic operator is also fed by its ``demo.dynamic`` run and a
     demo's by the demo. ``--pin`` replaces the entries of the first kind and leaves the
     others as they were pinned, also a test operator none of whose kernels validated in
-    this run (``rowsum_div_graph``: its test is deselected, its entry was measured by hand
-    once). (A subset used to be pinned by a script that merged keys by hand; ``--pin`` on
+    this run (``rowsum_div_graph`` was one while its test was deselected and its entry
+    measured by hand; it stands for any such operator here). (A subset used to be pinned
+    by a script that merged keys by hand; ``--pin`` on
     its directory would have overwritten every operator with the subset's counts.)"""
     import tests._measure_tolerances as tool
 
