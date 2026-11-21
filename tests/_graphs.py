@@ -740,8 +740,8 @@ def matmul_softmax_graph(B, H, S_Q, S_KV, D):
     """Scaled softmax over a QK matmul, no value matmul. Kernel params: Q,K (B*H,S,D).
 
     ``softmax(scale * (Q @ K^T))`` returning the full (B*H, S_Q, S_KV) attention
-    weights (the row-normalised exp). Mirrors ``_build_matmul_softmax_graph`` in
-    ``tests/graph/apply_tiling/test_matmul_softmax.py``.
+    weights (the row-normalised exp), in traced order: the divide reads the exp next to
+    its finished row sum (``tests/graph/apply_tiling/test_matmul_softmax.py``).
     """
     scale = 1 / (D**0.5)
     mma_0 = Matmul(

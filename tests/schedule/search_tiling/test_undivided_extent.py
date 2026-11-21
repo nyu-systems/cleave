@@ -1,4 +1,4 @@
-"""A reduction whose extent the tensor-core step does not divide (CPU).
+"""A reduction or an output axis whose extent the policy's step does not divide (CPU).
 
 The tensor-core policy used to start a matmul's reduction at 16 or at the tensor-core step
 whatever its extent was (``TCPolicy._assign_reduce_step``, "for the case of padding"), and
@@ -20,6 +20,24 @@ The attention at S_KV = 1000 is the case that showed it: the value matmul contra
 keys, in float16, and 1000 = 8 x 125. It is the same for the exact softmax and for a plain
 ``exp`` behind a constant shift written by hand, so the exact softmax still has no plan at
 such a length. That needs a padded last tile, which is not built here.
+
+Two more of the same kind:
+
+* any reduction over an odd extent above 64 (65, 257, 4099 columns under a row sum or a
+  ``cl.softmax``) was offered the powers of two below it, none of which divides it, and
+  never the extent itself. Every candidate then died on a bare ``assert`` in
+  ``apply_tiling`` -- ``ScheduleRejected: AssertionError:`` with no text -- and under
+  ``python -O`` a kernel was built whose loop never reads the tail of the axis. The steps
+  are the ones that divide the extent now (1 and the whole axis), and a step that does not
+  is a refusal with its reason, not an assert. (That does not give these shapes a kernel:
+  the whole row in one step is generated, and TileLang has no layout for a fragment of
+  such a row -- "no available layout found" on a GPU at 61, 65, 96, 130, 192 and 257
+  columns alike, with or without this change. A row the tile has to hold whole compiles
+  where its length is a power of two; any other needs a padded last tile, which is not
+  built here.);
+* the output tile of a tensor-core matmul starts at 64 rows and 32 columns whatever the
+  extents are, and the walk over the output tiles died on that start for 96 or 100 rows or
+  48 columns (``ValueError: 64 is not in list``). That is a refusal with its reason too.
 """
 
 import re
@@ -29,12 +47,17 @@ import pytest
 pytest.importorskip("tilelang")
 pytest.importorskip("tvm")
 
+import subprocess
+import sys
+import textwrap
+
 import cleave.lang as cl
 from cleave import pipeline as P
 from cleave.core.errors import ScheduleRejected
 from cleave.frontend import trace
 from cleave.pipeline.superopt import GraphSet
-from cleave.schedule import search_tiling
+from cleave.runtime.compile import build_candidate_code
+from cleave.schedule import apply_tiling, search_tiling
 from cleave.schedule.policy.default import TCPolicy
 
 from tests import _softmax as S
@@ -113,3 +136,153 @@ def test_the_walk_refuses_a_start_that_is_none_of_its_steps(monkeypatch):
     assert str(refusal.value) == (
         "mma_0: its reduction over 1024 elements starts at step 24, which does not "
         f"divide it; {NOT_PADDED}")
+
+
+# ------------------------------------------------ a reduction over an odd extent above 64
+
+
+def row_sum(x: cl.Tensor["R", "C"]):
+    return cl.sum(x, -1, keepdim=True)
+
+
+def softmax_rows(x: cl.Tensor["R", "C"]):
+    return cl.softmax(x, -1)
+
+
+def _reduction_steps(tile):
+    return sorted({int(step) for steps in tile.rstep_map.values() for step in (steps or {}).values()})
+
+
+@pytest.mark.parametrize("columns", [65, 255, 257])
+@pytest.mark.parametrize("fn", [row_sum, softmax_rows], ids=["row_sum", "softmax"])
+def test_a_reduction_over_an_odd_extent_is_stepped_by_the_whole_axis(fn, columns):
+    """65, 255 or 257 columns: the steps that divide such an extent are 1 and the whole
+    axis. Neither was what the policy proposed (64, 128, ...), so the row sum had
+    candidates that all died on the assert in ``apply_tiling`` and ``cl.softmax`` had 0
+    plans, refused with ``ScheduleRejected: AssertionError:``. Every plan now steps its
+    reduction by something that divides it and is generated or refused with a reason."""
+    plans = P.schedule(GraphSet.identity(trace(fn, dict(R=64, C=columns), cl.f16)),
+                       P.ScheduleConfig(topk=1000))
+    assert len(plans) >= 1, plans.summary()
+    assert not any("AssertionError" in r.reason for r in plans.refused), plans.summary()
+    built = 0
+    for plan in plans:
+        steps = _reduction_steps(plan.tile)
+        assert steps and all(columns % step == 0 for step in steps), plan.label
+        try:
+            build_candidate_code(plan.tile)
+        except ScheduleRejected:
+            continue  # a refusal with its reason (a single-row tile); anything else fails
+        built += 1
+        assert columns in steps, plan.label
+    assert built >= 1
+
+
+def test_a_long_odd_row_is_summed_in_one_step_or_refused_with_the_reason():
+    """4099 columns: the whole axis is still a step, and the tilings that hold it build."""
+    plans = P.schedule(GraphSet.identity(trace(row_sum, dict(R=64, C=4099), cl.f16)),
+                       P.ScheduleConfig(topk=1000))
+    assert len(plans) >= 1 and not any("AssertionError" in r.reason for r in plans.refused)
+    outcomes = []
+    for plan in plans:
+        assert all(4099 % step == 0 for step in _reduction_steps(plan.tile))
+        try:
+            build_candidate_code(plan.tile)
+            outcomes.append("built")
+        except ScheduleRejected as refusal:
+            assert str(refusal) and "AssertionError" not in str(refusal)
+            outcomes.append("refused")
+    assert "built" in outcomes
+
+
+def _stepped_by(columns, step):
+    """A tiling of the row sum over ``columns`` whose reduction is stepped by ``step``: one
+    the search proposes, with its step replaced."""
+    ir = S.lowered(row_sum, dict(R=64, C=columns))
+    cand = next(c for c in search_tiling(ir, topk=1000) if _reduction_steps(c) == [columns])
+    for steps in cand.rstep_map.values():
+        for name in steps:
+            steps[name] = step
+    return cand
+
+
+UNDIVIDED = (r"reduction_1_\d+: its reduction over 257 elements is stepped by 64, which does "
+             "not divide it; the last tile of a reduction is not padded")
+
+
+def test_a_step_that_does_not_divide_the_extent_is_a_refusal_not_an_assert():
+    with pytest.raises(ScheduleRejected, match=UNDIVIDED):
+        apply_tiling(_stepped_by(257, 64))
+    with pytest.raises(ScheduleRejected, match=UNDIVIDED):
+        build_candidate_code(_stepped_by(257, 64))
+
+
+def test_the_refusal_holds_without_asserts():
+    """``python -O`` drops an assert. The loop built then ran 4 steps of 64 over 257
+    columns and never read the last one."""
+    script = textwrap.dedent("""
+        import sys
+        assert False, "asserts are off"
+        from cleave.core.errors import ScheduleRejected
+        from cleave.runtime.compile import build_candidate_code
+        from tests.schedule.search_tiling.test_undivided_extent import _stepped_by
+        try:
+            build_candidate_code(_stepped_by(257, 64))
+        except ScheduleRejected as refusal:
+            print("REFUSED", refusal)
+        else:
+            print("BUILT")
+    """)
+    done = subprocess.run([sys.executable, "-O", "-c", script], capture_output=True, text=True,
+                          env={**__import__("os").environ, "CUDA_VISIBLE_DEVICES": ""})
+    assert done.returncode == 0, done.stderr[-2000:]
+    assert re.search("REFUSED " + UNDIVIDED, done.stdout), done.stdout[-500:]
+
+
+# ------------------------------------------- an output axis the tensor-core tile does not divide
+
+
+def plain_matmul(x: cl.Tensor["M", "K"], w: cl.Tensor["K", "N"]):
+    return x @ w
+
+
+def _no_tile(axis, extent, start):
+    return (rf"\w+: axis {axis} of the output has {extent} elements and its tile starts "
+            rf"at {start}, which is none of that axis's steps \[[\d, ]+\]; an output tile "
+            "is not padded")
+
+
+@pytest.mark.parametrize("shapes, reason", [
+    (dict(M=96, K=256, N=128), _no_tile(0, 96, 64)),
+    (dict(M=100, K=256, N=128), _no_tile(0, 100, 64)),
+    (dict(M=192, K=256, N=48), _no_tile(1, 48, 32)),
+], ids=["96_rows", "100_rows", "48_columns"])
+def test_an_output_axis_the_tensor_core_tile_does_not_divide_is_refused_with_its_reason(
+        shapes, reason):
+    """It ended the search with ``ValueError: 64 is not in list`` (``32`` for the columns):
+    the same list lookup as for the reduction axis, on the output axes."""
+    ir = S.lowered(plain_matmul, shapes)
+    for force in (False, True):
+        with pytest.raises(ScheduleRejected, match=reason):
+            list(search_tiling(ir, topk=16, force_fusion=force))
+    plans = P.schedule(GraphSet.identity(trace(plain_matmul, shapes, cl.f16)),
+                       P.ScheduleConfig(topk=16))
+    assert not plans and plans.refused
+    reasons = {str(r.error) for r in plans.refused}
+    assert len(reasons) == 1, reasons
+    (text,) = reasons
+    assert re.fullmatch(reason, text), text
+    assert "ValueError" not in text and "not in list" not in text and text in plans.summary()
+
+
+def test_attention_over_96_queries_is_refused_with_the_same_reason():
+    ir = S.lowered(S.flash_attention, dict(H=12, SQ=96, SKV=256, D=64))
+    with pytest.raises(ScheduleRejected, match=_no_tile(1, 96, 64)):
+        list(search_tiling(ir, topk=16))
+
+
+@pytest.mark.parametrize("shapes", [dict(M=128, K=256, N=128), dict(M=64, K=256, N=32),
+                                    dict(M=48, K=256, N=24)],
+                         ids=["128x128", "64x32", "48x24"])
+def test_output_axes_the_tile_divides_or_holds_whole_schedule_as_before(shapes):
+    assert len(list(search_tiling(S.lowered(plain_matmul, shapes), topk=16))) >= 1

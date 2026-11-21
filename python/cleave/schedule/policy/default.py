@@ -491,8 +491,10 @@ class DefaultPolicy:
         return base_tile
 
     def get_node_reduce_step_candidates(self, node):
-        # general idea : use factor first, since it does not require extra boundary check
-        #                for large prime number, which is rare case, use power of 2.
+        # The steps of a reduction axis divide its extent: nothing pads the last tile of a
+        # reduction. For an odd extent that leaves 1 and the extent itself (the whole axis
+        # in one step); a power of two below it divides nothing, and ``apply_tiling``
+        # refuses a step that does not divide.
         full_extent_axes = self._full_extent_reduction_axis_ids.get(node, set())
         results = {}
         for ax_id, k_iter in enumerate(node.raxis):
@@ -501,12 +503,7 @@ class DefaultPolicy:
                 # the fused reduction is computed over the whole axis.
                 results[k_iter.var.name] = [int(k_iter.dom.extent)]
                 continue
-            all_factors = get_all_round_factors(int(k_iter.dom.extent))
-            if len(all_factors) == 2 and int(k_iter.dom.extent) > 64:
-                all_factors = [1]
-                while all_factors[-1] * 2 < int(k_iter.dom.extent):
-                    all_factors.append(all_factors[-1] * 2)
-            results[k_iter.var.name] = all_factors
+            results[k_iter.var.name] = get_all_round_factors(int(k_iter.dom.extent))
         return results
 
     def _assign_reduce_step(self, node):
@@ -919,6 +916,17 @@ class DefaultPolicy:
     def dfs_smem_tile(self, init_tile, rstep_map):
         visible_shape = self._get_visible_output_shape(self.canonical_output_node)
         _steps = [get_all_round_factors(n) for n in visible_shape]
+        for axis, (step, t, n) in enumerate(zip(_steps, init_tile, visible_shape)):
+            if t not in step:
+                # The walk grows the tile through the steps of each axis (the powers of two
+                # that divide its extent, and the extent), from the base tile. The
+                # tensor-core policy starts at its own tile whatever the extent is: 64 rows
+                # for 96 or 100, 32 columns for 48. The lookup below would die on it.
+                raise ScheduleRejected(
+                    f"{self.canonical_output_node.name}: axis {axis} of the output has "
+                    f"{int(n)} elements and its tile starts at {int(t)}, which is none of "
+                    f"that axis's steps {[int(s) for s in step]}; an output tile is not padded"
+                )
         steps = [step[step.index(t) :] for step, t in zip(_steps, init_tile)]
         visible_batch_flags = self._get_visible_output_batch_dim_flags(
             self.canonical_output_node
@@ -1244,7 +1252,16 @@ class TCPolicy(DefaultPolicy):
                         "elements: a tensor-core matmul of 16-bit operands steps its "
                         "reduction axis in multiples of 16, and none divides that extent"
                     )
-                # A wider operand (float32: K blocks of 8) is stepped like any reduction.
+                # A wider operand (float32, multiplied as tf32) is contracted in K blocks
+                # of 8. Over a multiple of 8 it is stepped like any reduction; the steps of
+                # any other extent (4 and the extent itself, for 12 or 100) are none of
+                # them a multiple of 8, and TileLang refuses every kernel built on one.
+                if int(iter_dom) % 8:
+                    raise ScheduleRejected(
+                        f"{node.name} contracts {int(iter_dom)} {reduce_input_dtype} "
+                        "elements: a tensor-core matmul of float32 operands steps its "
+                        "reduction axis in multiples of 8, and none divides that extent"
+                    )
                 return super()._assign_reduce_step(node)
             elif iter_dom % basic == 0:
                 result[iter_name] = basic

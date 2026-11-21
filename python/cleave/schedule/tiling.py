@@ -994,6 +994,12 @@ def _refuse_loops_that_miscount_their_tiles(main: Graph):
         for node, it in tier.tmap.items():
             for dim, (extent, step) in enumerate(zip(it.shape, it.tile_size)):
                 tiles = int(extent) // int(step)
+                if tiles > 1 and int(extent) % int(step):
+                    # the count below is rounded down: the loop would stop short of the end
+                    raise ScheduleRejected(
+                        f"{owner.name} steps dim {dim} of {node.name} by {step}, which does "
+                        f"not divide its {extent} elements: the tail would never be read"
+                    )
                 cut = cut or tiles > 1
                 if tiles > 1 and tiles != tier.extent:
                     raise ScheduleRejected(
@@ -1218,7 +1224,52 @@ def schedule_kernel(cand) -> Graph:
     """
     tiled = apply_tiling(cand)
     refuse_unit_extents(tiled)
+    refuse_parts_of_computed_tiles(tiled)
     return tiled
+
+
+def refuse_parts_of_computed_tiles(main: Graph) -> None:
+    """Refuse a scheduled graph in which an elementwise op reads a part of a tile that its
+    own block computed.
+
+    An elementwise macro reads its operand at the indices it writes. That is right for an
+    input (the kernel hands the block the slice it was launched on) and for a computed
+    tile of the same extents. It is wrong for a computed tile that is wider than what the
+    op writes: attention weights ``exp / sum(exp)`` on an output tile of 32 of 256 columns
+    keep the whole row of ``exp`` in the block, because the row sum next to the divide
+    needs it, and the divide then read the first 32 of them in every block, whatever
+    columns the block was launched on. The row sums were right and 7 of 8 blocks returned
+    the weights of other keys (on a GPU: 12 of the 16 tilings of ``matmul_softmax_graph``
+    that hold the row in one step, off by the row maximum). Nothing here offsets a
+    fragment by the launch index, so such a tiling has no kernel; the tilings whose
+    output tile holds what the block computes are unaffected.
+
+    The default build's check (``schedule_kernel``), like ``refuse_unit_extents``.
+    """
+    from ..ir.ops.elementwise import BinaryElementwise, UnaryElementwise
+
+    for tier, _ in graph_tiers(main):
+        for node in tier.nodes:
+            if not isinstance(node, (BinaryElementwise, UnaryElementwise)):
+                continue
+            it = tier.tmap.get(node)
+            if not isinstance(it, Iterator):
+                continue
+            written = tuple(int(t) for t in it.tile_size)
+            for edge in node.inputs:
+                src = edge.src_node
+                if src.is_placeholder() or isinstance(src, GraphNode):
+                    continue
+                held = tier.tmap.get(src)
+                if not isinstance(held, Iterator):
+                    continue
+                read = tuple(int(t) for t in held.tile_size)
+                if len(read) == len(written) and any(r > w for r, w in zip(read, written)):
+                    raise ScheduleRejected(
+                        f"{node.name} writes a tile {written} and reads {src.name}, which "
+                        f"its block holds as {read}: it would read the first elements of "
+                        "that tile in every block, wherever the block is launched"
+                    )
 
 
 def apply_tiling(cand: List) -> List[Graph]:
@@ -1405,7 +1456,14 @@ def apply_tiling(cand: List) -> List[Graph]:
             )
             raxis = node.raxis[0]
             node_rstep = _get_rstep_for_axis(node, cand.rstep_map[node])
-            assert raxis.dom.extent % node_rstep == 0
+            if int(raxis.dom.extent) % int(node_rstep):
+                # A refusal, not an assert: ``python -O`` drops an assert, and the loop
+                # built then never reads the tail of the axis (4 steps of 64 over 257).
+                raise ScheduleRejected(
+                    f"{node.name}: its reduction over {int(raxis.dom.extent)} elements is "
+                    f"stepped by {int(node_rstep)}, which does not divide it; "
+                    "the last tile of a reduction is not padded"
+                )
             inner_graph.extent = int(
                 raxis.dom.extent // node_rstep
             )

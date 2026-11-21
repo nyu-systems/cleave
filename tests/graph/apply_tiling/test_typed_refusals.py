@@ -674,7 +674,11 @@ def test_the_pipeline_reports_the_policys_refusal_as_it_is():
 def test_a_float32_matmul_over_such_an_axis_starts_at_a_step_it_has(K):
     """float32 operands are contracted in K blocks of 8, so these extents have kernels;
     they had no tiling for the same ``ValueError``. The first step is one of the axis's
-    own candidates, picked like any other reduction's."""
+    own candidates, picked like any other reduction's: a multiple of 8, which TileLang
+    lowers."""
+    from cleave.runtime.compile import build_candidate_code
+    from tests._lowering import lower_to_cuda
+
     ir = _identity_graph(plain_matmul, dict(M=128, K=K, N=128), cl.f32)
     matmul = _one(ir, Matmul)
     policy = TCPolicy([n for n in ir.nodes if isinstance(n, OutputNode)], get_arch("cuda"),
@@ -684,8 +688,32 @@ def test_a_float32_matmul_over_such_an_axis_starts_at_a_step_it_has(K):
     assert policy._assign_reduce_step(node)[name] in policy.get_node_reduce_step_candidates(node)[name]
     cands = search_tiling(ir, topk=1000)
     assert cands and all(K % _step(c, matmul) == 0 for c in cands)
+    assert all(_step(c, matmul) % 8 == 0 for c in cands)
     built, refused = _outcomes(cands)
     assert len(built) == len(cands) and not refused
+    assert "main_kernel" in lower_to_cuda(build_candidate_code(cands[0]))
+
+
+@pytest.mark.parametrize("K", [4, 12, 20, 100, 257, 1004])
+def test_a_float32_matmul_over_an_axis_no_multiple_of_8_divides_is_a_typed_refusal(K):
+    """The steps of such an axis are 4 (where it divides) and the extent itself, and
+    TileLang lowers neither: a K block that is no multiple of 8 fails its layout check
+    (``stride == 4 || stride % 8 == 0``), and a block of 4 is taken for a float64 matmul.
+    These graphs were given 12 tilings, each built and each refused by TileLang one by
+    one, with no reason on the graph; the float16 sibling was already refused here."""
+    from cleave import pipeline as P
+
+    reason = (f"mma_2 contracts {K} float32 elements: a tensor-core matmul of float32 "
+              "operands steps its reduction axis in multiples of 8, and none divides that "
+              "extent")
+    ir = _identity_graph(plain_matmul, dict(M=128, K=K, N=128), cl.f32)
+    with pytest.raises(ScheduleRejected) as refusal:
+        search_tiling(ir, topk=1000)
+    assert str(refusal.value) == reason
+    prog = trace(plain_matmul, dict(M=128, K=K, N=128), cl.f32)
+    plans = P.schedule(GraphSet.identity(prog), P.ScheduleConfig(topk=8))
+    assert not list(plans) and plans.refused
+    assert {str(r.reason) for r in plans.refused} == {"ScheduleRejected: " + reason}
 
 
 # ------------------------------------------ what starting siblings together leaves alone
