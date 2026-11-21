@@ -74,15 +74,43 @@ All demos share the same flags (`python demo/<name>.py --help`):
 | `{mha,gqa,mqa,mla}_prefill.py`, `mla_decode.py`, `qknorm.py` | prefill / MLA / QK-norm attention |
 | `staged.py` | the pipeline one stage at a time (research view) |
 
+`--split` is parsed by every demo, but not every demo has a split run: `mla_prefill.py` and
+`qknorm.py` declare a single tolerance and end on that with `--split SKV` (a split partial of
+an exact softmax also returns its shift, which needs a bound of its own; their docstrings say
+why none is declared), and `mla_decode.py` has no split plan at its search budget, so the
+flag leaves its run as it is.
+
 `demo/dynamic/` holds the paged-KV dynamic-shape demos.
 
-`cl.softmax` is the exact softmax, `exp(s - max(s)) / sum`, at any row length: the search
-sees `exp / sum / div` and no max, and every schedule gets the shift it needs (the row max
-where a tile holds the row, a running max over a looped row as in FlashAttention, the max of
-each split under split-KV as in FlashDecoding; the paged kernels carry a running max too).
-Kernels of such a program are validated on adversarial logits as well as on normal ones,
-wherever the logits can be shaped through an input: every attention demo but `qknorm.py`,
-whose logits are computed from the normalized `q` and `k` (its report says so).
+`cl.softmax` is the exact softmax, `exp(s - max(s)) / sum`: the search sees `exp / sum / div`
+and no max, and every schedule gets the shift it needs (the row max where a tile holds the
+row, a running max over a looped row as in FlashAttention, the max of each split under
+split-KV as in FlashDecoding; the paged kernels carry a running max too). Where the softmax
+is contracted over its row (a sum or a matmul, as in attention's `softmax(...) @ V`) that
+holds at any row length. A program that returns the softmax itself (a standalone softmax,
+attention weights) is exact too, but is served only while its row fits one tile: nothing
+recomputes the exp for the output once the row sum is looped. Shapes that have no kernel yet
+(each is refused with its reason, or fails in TileLang, never served wrongly):
+
+- attention with a single query row (`S_Q = 1`): a unit dim that is not a batch dim has no tile;
+- for 16-bit dtypes, a matmul that contracts a length no multiple of 16 divides (float16
+  attention at `S_KV = 1000`), and for float32 one no multiple of 8 divides;
+- a row that a tile has to hold whole and whose length is not a power of two (a standalone
+  softmax or a row sum over 96 or 257 columns): the last tile of a reduction is not padded;
+- a matmul output with more than 64 rows that 64 does not divide, or more than 32 columns
+  that 32 does not divide (`M = 96`, `N = 48`).
+
+`cl.softmax(x)` next to another `exp` of the same tensor (`cl.softmax(x) + cl.exp(x)`, two
+softmaxes of `x` over different axes) compiles: the search computes `exp(x)` once, and the
+lowering computes it again for the softmax.
+
+Kernels of a program whose softmax is exact are validated on adversarial logits as well as
+on normal ones, wherever the logits can be shaped through an input: every attention demo but
+`qknorm.py`, whose logits are computed from the normalized `q` and `k` (its report says so,
+as it does for any softmax of a program that no case shapes). A paged program gets its
+adversarial workloads when it is one of the registry operators (`cleave.dynamic.registry`)
+compiled on its registry workloads; any other paged program, and any `workloads=` of the
+caller (the paged demos' `--synthetic`), is validated on the workloads as given.
 
 ## Search-to-Kernel Path
 
@@ -173,6 +201,48 @@ Generated code is pinned two ways: `tests/graph/handwritten/expected_kernels`
 `tests/pipeline/snapshots` (hashes of every candidate from search through
 codegen). Regenerate them after an intended change with `--update-expected` or
 `--update-snapshots`, and review the diff.
+
+### Rebuilding the native search
+
+`cleave.superoptimizer.core` is a compiled extension (`python/cleave/superoptimizer/core*.so`,
+not tracked): the C++ search under `src/` and `include/`, bound by
+`python/cleave/superoptimizer/_cython/core.pyx` and built as `CMakeLists.txt` says. It is
+built once by the install and is not rebuilt on import, so after any change or pull that
+touches those files, run the install again from the repository root:
+
+```bash
+pip install -e . -v
+```
+
+(the command of Quick Installation; `MAX_JOBS` applies). An editable install always relinks
+the extension. In an environment that already holds the build requirements of
+`pyproject.toml` (`setuptools>=77`, `cmake>=3.24`, `cython`, `z3-solver==4.15.4`),
+`pip install -e . -v --no-build-isolation` builds against that environment's z3 instead of a
+temporary one; either way `ldd python/cleave/superoptimizer/core*.so` must name the
+`libz3.so.4.15` of the environment the tests run in.
+
+With a library older than the sources the search still runs, with the behaviour of the old
+sources: it is not reproducible across processes and saved checkpoints are searched again.
+Check the library that is loaded with
+
+```bash
+pytest -n 0 tests/superoptimizer/python/search/test_search_reproducible.py
+```
+
+(each failure names the file it loaded). Every cache key holds a digest of the compiled
+extension, so nothing saved with another build is reused.
+
+The C++ unit tests (`tests/superoptimizer/cpp`) are not part of the pytest run:
+
+```bash
+cmake -S . -B build/native_tests -DBUILD_TESTS=ON
+cmake --build build/native_tests --parallel
+ctest --test-dir build/native_tests --output-on-failure
+```
+
+CMake takes the z3 headers and library from the `z3-solver` of the Python interpreter it
+finds (`find_package(Python3)`); `-DZ3_CXX_INCLUDE_DIRS=...` and `-DZ3_LIBRARIES=...` name
+another.
 
 Useful environment variables:
 

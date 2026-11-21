@@ -103,67 +103,7 @@ def test_cache_schema_retires_kernels_built_before_a_scheduler_fix(monkeypatch):
 
     prog = trace(P.matmul, dict(M=128, N=128, K=4096), cl.f16)
     cfgs = resolve_configs(prog)
-    # 1: a reduction absorbed into another's loop was sliced with that loop's counter, and
-    # demo/mha_prefill.py's saved winner was such a kernel.
-    # 2: `e / sum(e, 0)` on equal extents divided by the row sums, and a saved kernel fed two
-    # inputs of one shape in graph order (`b / a` computed `a / b`).
-    # 3: an unused `a + x` declared the live input `x` with the shape of `a`.
-    # 4: a sum that is not looped, over an axis other than the last, was emitted with its
-    # flat `dim` and reduced the next axis of the stored tile.
-    # 5: a candidate with an absorbed reduction was rated, and cut at top-k, on the steps it
-    # names instead of as the kernel that is built for it.
-    # 6: a loop tier carried dims its block does not store; single-row loop kernels did not
-    # build.
-    # 7: a split combine built only with both of its sums in one loop.
-    # 8: no static split-attention partial validated and the partial -> combine Kernel was
-    # unrunnable, so the saved winner of a split program could only be a solo kernel.
-    # 9: gqa_paged_decode_h32_kv8_d128_ps1 built the unshifted exp, with no running max.
-    # 10: cl.softmax traced an opaque max; a program that made the request by hand was
-    # validated on normal inputs only.
-    # 11: a running max rescaled its accumulators on every iteration, also where they are
-    # too wide for a thread's registers (the exact MLA decode).
-    # 12: a softmax over an axis other than the last had no in-place max behind a squeezed
-    # unit dim or in a loop that does not tile that axis (such tilings were refused).
-    # 13: eight of the nine paged layers built the unshifted exp, and a split-KV pair handed
-    # its combine two partials, without the running max.
-    # 14: the Kernel saved for a program with an input written in keepdim form could not be
-    # called (the input was not bound).
-    # 15: a split partial whose sums take the whole per-split extent in one step was refused.
-    # 16: sibling reductions over one axis started at different steps, so the loop they
-    # share miscounted its tiles; a float32 flash-form softmax had no tiling.
-    # 17: an un-looped split partial was launched with an input in the place of an output.
-    # 18: a factor computed elementwise from a sum of lower rank was not staged through
-    # shared memory (the RMSNorm split-K combine).
-    # 19: a tiling whose kernel cannot compile for a unit extent was built.
-    # 20: an output next to the canonical one was launched on an axis it was paired with by
-    # extent only, and wrote wrong values.
-    # 21: a matmul operand that lost a batch axis the output has one entry of was refused,
-    # and one that a reduction left in a fragment had no layout.
-    # 22: a tile of unit extents only was allocated as a scalar; single-row tilings of a
-    # rank-1 value had no kernel.
-    # 23: every loop of a kernel was pipelined, and TileLang pipelines one.
-    # 24: a tensor-core matmul over an extent no multiple of 16 divides had no tiling and no
-    # reason (float16), or no tiling at all (float32).
-    # 25: the softmax accept filter kept tilings the build then refused for a unit extent.
-    # 26: a loop that loads no slice wide enough to transfer was pipelined.
-    # 27: a loop that loads a tensor tile off its 128-byte boundary was pipelined; such a
-    # kernel faulted on launch.
-    # 28: a rolling softmax loop that weights a loaded slice in registers was pipelined; the
-    # slice could be reloaded before its last use.
-    # 29: the split graphs of a program whose softmax is exact were refused; its saved
-    # winner could only be a solo kernel.
-    # 30: every looped tiling of a reduction that reads an input through a split was
-    # refused, and one built with its axis counted from the front reduced another axis.
-    # 31: every split graph of one-head attention with S_Q == D was refused at lowering.
-    # 32: on two warp groups a matmul read its first operand from a fragment TileLang lays
-    # out for other rows than each instruction computes.
-    # 33: reductions that share nothing were put in one loop by equal steps alone.
-    # 34: a loop that transfers a slice no multiple of 128 bytes was pipelined (27 again).
-    # 35: a program that returns a value another op reads had no tiling, for an assertion.
-    # 36: the quotient of an input by its row sum was laid out like the sum, a row per thread.
-    # 37: ... and so was the quotient by anything computed elementwise from such a sum.
-    # 38: a matmul staged an input slice by copying its fragment into a second shared buffer.
-    assert cache.SCHEMA >= 39
+    assert cache.SCHEMA >= 40
     key = _kernel_key(prog, *cfgs)
     monkeypatch.setattr(cache, "SCHEMA", 1)
     assert _kernel_key(prog, *cfgs) != key

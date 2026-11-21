@@ -78,10 +78,7 @@ KERNELS = {
 }
 
 # The SCHEMA these digests were generated under, and the digests. Re-pin both together.
-# (27: the merge of three packages. The eight texts are the ones pinned under 13: none of
-# the bumps 14 .. 27 changes a kernel of these programs.
-# 39: the merge of split-exact and bugs-2. The same eight texts again: none of the bumps
-# 28 .. 39 changes a kernel of these programs.)
+# (A bump that changes none of these eight texts leaves both as they are.)
 PINNED_SCHEMA = 39
 PINNED = {
     'softmax_64x1024/in-tile': ('tile=[2, 1024] rstep=[1024]', '8211bb6438573d68'),
@@ -131,7 +128,7 @@ def stale(got: dict, schema: int) -> str | None:
         return (
             f"the generated text of {moved} changed, but pipeline.cache.SCHEMA is still "
             f"{schema}: a kernel saved before this change would be returned as it is. Bump "
-            "SCHEMA (say what changed in its comment), then pin it and these digests in "
+            "SCHEMA (say what changed in the commit message), then pin it and these digests in "
             f"tests/pipeline_api/test_schema_guard.py:\n{table}")
     return (
         f"the generated text of {moved} changed and pipeline.cache.SCHEMA was bumped to "

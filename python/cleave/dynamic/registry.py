@@ -70,9 +70,17 @@ def _tolerance(out_rtol, lse_rtol):
     and the reference 3.2e-6 away.
 
     ``out`` follows the same rule at 2x: bf16 has 8 significand bits, so one ulp is 7.8e-3
-    of the row max, every kernel measures 1 ulp (7.8e-3), and 4x would be the 5e-2 ceiling,
-    looser than the elementwise 0.01 + 0.01|ref| these operators were held to before for any
-    row whose max is above 0.25. 2e-2 is 2.56 ulps.
+    of the row max, every kernel measures 1 ulp (7.8e-3), and 4x would be the 5e-2 ceiling
+    itself. 2e-2 is 2.56 ulps.
+
+    Against an elementwise ``0.01 + 0.01 |ref|`` (the bound these operators had before they
+    declared one of the row): ``2e-2 * rowmax`` with no absolute part is tighter for a row
+    whose max is below 0.5 and exact for an empty row, which must be zeros; it is looser
+    from a row max of 0.5 on the near-zero entries of the row and from 1.0 on at its
+    largest entry (0.04 against 0.03 at a max of 2, 0.08 against 0.05 at 4). The rows of
+    the captured workloads with few keys have maxima of 1 to 4, so for them it is the
+    looser of the two; 2x was chosen because every kernel measures one ulp and 4x is the
+    ceiling, not because 2x is nowhere looser.
     (``python -m tests._measure_tolerances`` re-measures; ``tests/measured_errors.json``
     is the measurement these values are pinned to.)
     """

@@ -27,11 +27,10 @@ def _gpu_lock_key() -> str:
     The lock serializes the processes that agree on its name, so the first process of a
     run that asks hands its answer down to the ones it starts (``_LOCK_KEY_ENV``, with the
     ``CUDA_VISIBLE_DEVICES`` it holds for; a process that sees other devices asks for
-    itself). Every worker used to ask ``nvidia-smi`` again. The driver answers that query
-    behind every other process that is entering it -- 157 s were measured on this machine
-    while several hundred processes initialised CUDA at once -- and a worker whose query
-    took more than its 30 s fell back to another name than its siblings: it then held "the
-    device lock" next to them.
+    itself). A worker that asks ``nvidia-smi`` itself can get another answer: the driver
+    serves that query behind every process that is initialising CUDA, which can take
+    minutes while hundreds do, and a query that times out falls back to another name than
+    the worker's siblings use. It would then hold "the device lock" next to them.
     """
     visible = os.environ.get("CUDA_VISIBLE_DEVICES")
     key = _inherited_lock_key(visible)
@@ -195,12 +194,11 @@ def _gpu_exec_guard():
     The context is made under the lock as well (``_ensure_cuda_context`` launches a fill).
     A generated kernel that is running while another process launches anything on the same
     device can go on running for good, its launcher waiting in ``synchronize`` with the
-    device at 100%. Measured on an H100 with one kernel of demo/swiglu.py launched in a
-    loop: alone it returned from 59,960 launches in 150 s; next to four processes that each
-    launched a one-element fill twenty times a second it stopped returning after 55 s, and
-    next to four that ran small matmuls after 29 s. Every worker used to make its context
-    before it waited for the lock, that is while the first kernels of its run were validated
-    and timed: the candidate "that never returns" (1 or 2 of 80 runs of that demo).
+    device at 100%: a kernel that returns from tens of thousands of launches in a loop on
+    its own stops returning within a minute next to processes that launch one-element
+    fills. A worker that made its context before it waited for the lock would do that while
+    another worker's kernel is validated or timed, which then looks like a candidate that
+    never returns.
     """
     _create_parallel_env()
     os.makedirs(os.path.dirname(_GPU_LOCK_PATH), exist_ok=True)

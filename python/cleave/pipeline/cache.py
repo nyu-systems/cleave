@@ -8,105 +8,15 @@ import json
 from pathlib import Path
 
 # In every key. Bump it when the layout changes, or when the same program and configs would
-# now build a different kernel: a kernel-cache hit returns the saved one as it is.
-# 2: a reduction absorbed into another's loop is scheduled over its whole axis.
-# 3: lowering takes broadcast and reduction axes from the structure (not from extents that
-#    happen to agree), and a kernel's inputs are bound in the program's declaration order.
-# 4: an op that no output reads is not lowered (it used to hand its shape to the inputs it
-#    read), and a divisor over two unit axes is broadcast along the one the program names.
-# 5: a reduction that is not looped reduces its own axis of the stored tile.
-# 6: a candidate with an absorbed reduction is rated (and cut at top-k) as its kernel.
-# 7: a loop tier carries the dims its block stores (single-row loop kernels now build).
-# 8: a split combine builds wherever its two sums are placed; work no loop reads is
-#    emitted behind the loops.
-# 9: split partials validate (in their stored layout) and chain into the combine, so a
-#    program's best kernel can now be a split variant; saved stages carry that layout.
-# 10: gqa_paged_decode_h32_kv8_d128_ps1 builds the exact (running-max) softmax: the same
-#     paged program now emits a different kernel. (Paged kernels are not kernel-cached, so
-#     no stale one can be returned today.)
-# 11: cl.softmax records the exact softmax as a request on its exp (no max in the program),
-#     every schedule of such a program gets its own shift (in-tile max or running max), and
-#     its kernels are validated on the adversarial softmax inputs as well.
-#     tests/pipeline_api/test_schema_guard.py pins the text of a few such kernels next to
-#     this number: text that changes without a bump here fails there.
-# 12: a running max whose accumulators are too wide for a thread's registers is rescaled
-#     lazily (shift on a grid, guarded rescale): the exact MLA decode builds another kernel.
-# 13: a softmax over an axis that is not the last one takes its max in place wherever a
-#     tile holds that axis (in a loop that does not tile it, behind a squeezed unit dim):
-#     tilings that were refused now build, so a program's top-k and best kernel can change.
-# 14: every paged layer builds the exact softmax, and a split-KV pair hands the partials'
-#     running max to its combine as a third partial: every paged program emits a different
-#     kernel, and every split pair a different parameter list.
-# 15: an input the graph declares without its unit axes is bound to its program input (the
-#     Kernel saved for such a program could not be called).
-# 16: the outputs next to the canonical one are launched on its axes: a split partial whose sums
-#     take the whole per-split extent in one step now builds (it was refused), so a program's
-#     best partial can be one of those.
-# 17: sibling reductions over one axis start at one step, so the loop they share counts its
-#     tiles: a float32 flash-form softmax now has tilings (every one was refused).
-# 18: a kernel takes its inputs first and its outputs last, also where an output is finished
-#     before a later input is read (un-looped split partials: they were launched with an
-#     input in the place of an output).
-# 19: a factor (or divisor) computed elementwise from a sum of lower rank is staged through
-#     shared memory, as that sum itself already was (the RMSNorm split-K combine).
-# 20: a tiling whose kernel cannot compile for a unit extent (a reduction stepped one element
-#     at a time, an elementwise op or a matmul on a single row) is refused at build.
-# 21: an output next to the canonical one is refused where the grid walks an axis it was
-#     paired with by extent only (such kernels were built, and wrote wrong values).
-# 22: a matmul operand that lost a batch axis the output has one entry of lowers again, and
-#     one that a reduction left in a fragment is staged through shared memory.
-# 23: a tile of unit extents only is allocated 1-D, as its slices and parameters spell it:
-#     single-row tilings of a rank-1 value have kernels.
-# 24: the second and later loops of a kernel are emitted as plain loops (TileLang pipelines
-#     one loop per kernel): a split combine with each sum in a loop of its own has a kernel.
-# 25: a 16-bit tensor-core matmul over an extent no multiple of 16 divides is refused with a
-#     reason; a float32 one gets tilings (both had none, for a ValueError).
-# 26: the softmax accept filter schedules a candidate exactly as the build does, so the
-#     top-k of a program with a marked softmax holds no tiling the build refuses.
-# 27: a loop that loads no slice wide enough to transfer is a plain loop too: the split
-#     combines' tilings on a few rows or columns have kernels.
-# 28: a loop whose slices a pipeline would load off their 128-byte boundary is a plain loop:
-#     the split combines' tilings on 8 or 16 rows (they faulted on launch) have kernels.
-# 29: a loop with a running max that multiplies a slice it loads into the softmax's output
-#     is a plain loop (in a pipeline the slice could be overwritten while still in use).
-# 30: a split graph of a program that requested a softmax lowers to an exact pair (the
-#     partial returns its shift as a third output, the combine weights the partials by it);
-#     such graphs were refused, so the best kernel of the program can now be a split variant.
-# 31: a reduction that reads an input through a split is given that input's tile in the
-#     input's own dims: its looped tilings have kernels (they were refused as loops over
-#     single elements) and one built with its axis counted from the front reduces that axis.
-# 32: the split graphs of a program with a unit batch dim and equal trailing extents (one
-#     head, S_Q == D) lower; they were refused at the combine's division, so the best kernel
-#     of such a program can now be a split variant.
-# 33: on a block two warp groups tall, a matmul reads its first operand from shared memory
-#     where it used to read a fragment: 256-thread kernels on tiles of 256 rows or more
-#     computed half or more of their rows from the wrong operand rows, and the same
-#     tilings of attention had no kernel at all.
-# 34: reductions that share no operand are put in one loop only where it steps both alike;
-#     with equal steps over axes of different length each gets a loop (they were refused).
-# 35: a loop that would transfer a slice that is no multiple of 128 bytes is a plain loop:
-#     such kernels faulted when they were launched (misaligned address). (The fault of 28,
-#     found a second time: 28's rule is the one in the tree, and no text moves at 35.)
-# 36: a program that returns a value another op also reads has tilings (the search of such
-#     a graph ended on an assertion of the policy's shared-memory model).
-# 37: a loop's accumulator broadcast over an operand in global memory is read from shared
-#     memory, so the result is laid out across the threads: in the kernels of x / sum(x, -1)
-#     with the sum looped in narrow steps, every thread computed and kept whole rows.
-# 38: ... and so is what a chain of elementwise ops made of such an accumulator: the
-#     kernels of x / sqrt(sum(x * x, -1)) kept whole rows per thread as well.
-# 39: a staged matmul operand that is an input slice is read from the shared buffer the
-#     slice was loaded through, not from a second copy of its fragment.
-SCHEMA = 39
+# now build a different kernel: a kernel-cache hit returns the saved one as it is. (What
+# changed belongs in the commit message. tests/pipeline_api/test_schema_guard.py fails when
+# the generated text of a softmax kernel moves without a bump.)
+SCHEMA = 40
 # What "validated" means for a saved kernel. A kernel-cache hit returns without validating,
 # so bump this whenever the comparison or its inputs change: saved kernels are then rebuilt.
 # (The inputs include the adversarial cases a program with an exact softmax is held to,
 # cleave.runtime.inputs.ADVERSARIAL, which are not in the key by name.)
-# 3: the adversarial cases shape the logits of the exact softmax only; the operands of a
-#    plain exp written next to it are left alone (its reference overflowed on them).
-# 4: logits that are an input are shaped through the view of a split as well: the partial
-#    of a program split over its softmax axis is held to every adversarial case (it was
-#    held to none of them).
-VALIDATION = 4
+VALIDATION = 5
 
 
 @functools.lru_cache(maxsize=None)
