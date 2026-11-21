@@ -49,6 +49,10 @@ def softmax_times_exp(x: cl.Tensor["R", "C"]):
     return cl.softmax(x, -1) * cl.exp(x)
 
 
+def softmax_alone(x: cl.Tensor["R", "C"]):
+    return cl.softmax(x, -1)
+
+
 def softmax_next_to_its_own_exp(x: cl.Tensor["R", "C"], y: cl.Tensor["R", "C"]):
     e = cl.exp(y)  # exp / sum written out by hand: no request
     return cl.softmax(x) + cl.exp(x), e / cl.sum(e, -1, keepdim=True)
@@ -108,6 +112,48 @@ def test_search_a_softmax_next_to_an_exp_of_its_logits_has_plans(name):
         assert _records(plan.tile.flat_graph) == records
         (got,) = run_lowered(plan.tile.flat_graph, prog, inputs)
         _close(got, want, plan.label)
+
+
+def _plans(fn, rows, cols):
+    prog = trace(fn, dict(R=rows, C=cols), cl.f16)
+    return P.schedule(P.superoptimize(prog, SEARCH), P.ScheduleConfig(topk=8))
+
+
+def _output_tiles(plans):
+    tiles = set()
+    for plan in plans:
+        (out,) = [n for n in plan.tile.flat_graph.nodes if n.is_output()]
+        tiles.add(tuple(int(t) for t in plan.tile.tile_map[out.inputs[0].src_node]))
+    return tiles
+
+
+def _reasons(plans):
+    assert plans.refused
+    return [str(refusal.error) for refusal in plans.refused]
+
+
+def test_search_where_a_softmax_next_to_an_exp_of_its_logits_has_plans():
+    """The sizes README and the ``cl.softmax`` docstring name. These programs return their
+    softmax, and a softmax that is returned is served while its row is in one tile: the
+    exp is not computed again for the output once the row sum is looped."""
+    looped = "is computed per iteration of"
+    # softmax + exp: whole rows in every tile; 4096 columns have a plan, 8192 have none
+    plans = _plans(softmax_plus_exp, 64, 4096)
+    assert len(plans) >= 1 and {tile[1] for tile in _output_tiles(plans)} == {4096}
+    plans = _plans(softmax_plus_exp, 64, 8192)
+    assert len(plans) == 0 and all(looped in reason for reason in _reasons(plans))
+    # ... where the softmax alone still has one
+    plans = _plans(softmax_alone, 64, 8192)
+    assert len(plans) >= 1 and {tile[1] for tile in _output_tiles(plans)} == {8192}
+    # two softmaxes, over the rows and over the columns: the tile is the whole tensor
+    for rows, cols in ((16, 32), (64, 128)):
+        plans = _plans(dual_softmax, rows, cols)
+        assert len(plans) >= 1 and _output_tiles(plans) == {(rows, cols)}, plans.summary()
+    plans = _plans(dual_softmax, 64, 256)
+    assert len(plans) == 0, plans.summary()
+    reasons = _reasons(plans)
+    assert all(reason.startswith("no tiling candidates") for reason in reasons), reasons
+    assert any(looped in reason for reason in reasons), reasons
 
 
 def test_search_two_softmaxes_of_one_input_are_exact_at_large_logits():

@@ -66,8 +66,11 @@ def softmax(x, dim: int = -1):
     A row of any length is served where the softmax feeds a sum or a matmul over that row
     (attention's ``softmax(...) @ v``). A softmax that is returned itself -- a standalone
     softmax, attention weights -- is served while its row fits one block. Next to another
-    ``exp`` of the same tensor (``cl.softmax(x) + cl.exp(x)``, a second softmax of ``x`` over
-    another axis) the search computes that ``exp`` once and the lowering computes it again
-    for the softmax (``cleave.lower.unmerge``)."""
+    ``exp`` of the same tensor the search computes that ``exp`` once and the lowering
+    computes it again for the softmax (``cleave.lower.unmerge``); the softmax is a returned
+    one there too. ``cl.softmax(x) + cl.exp(x)`` has plans for float16 rows of 4096 and none
+    at 8192 (where a softmax alone still has one). A second softmax of ``x`` over another
+    axis needs a row and a column in one block, which is the whole tensor: 16x32 and 64x128
+    have plans, 64x256 has none."""
     e = x.program._stable_exp(x, dim) if _traced(x) else exp(x - max(x, dim, keepdim=True))
     return e / sum(e, dim, keepdim=True)

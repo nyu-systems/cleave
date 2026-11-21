@@ -100,9 +100,12 @@ recomputes the exp for the output once the row sum is looped. Shapes that have n
 - a matmul output with more than 64 rows that 64 does not divide, or more than 32 columns
   that 32 does not divide (`M = 96`, `N = 48`).
 
-`cl.softmax(x)` next to another `exp` of the same tensor (`cl.softmax(x) + cl.exp(x)`, two
-softmaxes of `x` over different axes) compiles: the search computes `exp(x)` once, and the
-lowering computes it again for the softmax.
+`cl.softmax(x)` next to another `exp` of the same tensor is served under the limit of a
+softmax that is returned: the search computes `exp(x)` once, the lowering computes it again
+for the softmax, and the row still has to fit one tile. `cl.softmax(x) + cl.exp(x)` has
+plans for float16 rows of 4096 and none at 8192 (where a softmax alone still has one). Two
+softmaxes of `x` over different axes need a row and a column in one tile, which is the
+whole tensor: 16x32 and 64x128 have plans, 64x256 has none.
 
 Kernels of a program whose softmax is exact are validated on adversarial logits as well as
 on normal ones, wherever the logits can be shaped through an input: every attention demo but
