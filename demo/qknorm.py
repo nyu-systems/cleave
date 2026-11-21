@@ -6,7 +6,9 @@ The softmax is exact (see demo/mha_decode.py). The demo is unsplit and declares 
 tolerance, for the outputs of its solo kernels. Splitting k/v along S_KV (``--split SKV``)
 is not offered: the split search of this 25-op program runs for more than an hour, and a
 split partial of an exact softmax also returns its shift, which needs a tolerance declared
-by boundary role (see demo/mha_prefill.py).
+by boundary role (see demo/mha_prefill.py). The flag is still parsed, as for every demo; a
+run that got through that search would stop before it builds a kernel, with one line that
+says which plan the tolerance does not cover.
 """
 import cleave
 import cleave.lang as cl

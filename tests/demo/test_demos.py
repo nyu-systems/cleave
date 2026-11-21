@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 import cleave.examples as examples
+from cleave.core.errors import SpecError
 from cleave.runtime.validate import Tolerance
 
 from .._measure_tolerances import MEASURED, expected_tolerance, expected_tolerances_by_role
@@ -220,6 +221,71 @@ def test_demo_cli_help(monkeypatch, capsys, name):
         runpy.run_path(str(DEMO / f"{name}.py"), run_name="__main__")
     assert e.value.code == 0
     assert "usage:" in capsys.readouterr().out
+
+
+def _run_to_exit(monkeypatch, name, argv):
+    """Run the demo as ``__main__`` to the ``SystemExit`` it ends on; its message."""
+    monkeypatch.setattr(examples, "_target", lambda: "cpu")
+    monkeypatch.setattr(sys, "argv", [str(DEMO / f"{name}.py"), *argv])
+    monkeypatch.syspath_prepend(str(DEMO))
+    with pytest.raises(SystemExit) as e:
+        runpy.run_path(str(DEMO / f"{name}.py"), run_name="__main__")
+    return str(e.value.code)
+
+
+def test_a_declaration_that_does_not_fit_ends_a_demo_in_one_line(monkeypatch):
+    """A flag can ask for plans the demo's declaration does not cover: ``--split`` on a
+    demo that declares one ``Tolerance``, whose split partials return a shift. That is a
+    ``SpecError`` of the pipeline, and the demo ends on its message, behind the demo's name:
+    it says what to declare, and a traceback through the pipeline says nothing more.
+    ``-v`` keeps the traceback."""
+    reason = ("build(): plan 'g4 split-k=4 partial #0' (partial): one Tolerance covers the "
+              "outputs a program or its cut defines, and this kernel also returns outputs of "
+              "role ['shift']")
+
+    def refuse(program, **kw):
+        raise SpecError(reason)
+
+    monkeypatch.setattr(examples, "_compile", refuse)
+    args = ["--split", "SKV", "--max-ops", "13"]
+    assert _run_to_exit(monkeypatch, "mla_prefill", args) == f"mla_prefill: {reason}"
+    monkeypatch.setattr(sys, "argv", [str(DEMO / "mla_prefill.py"), *args, "-v"])
+    with pytest.raises(SpecError, match="one Tolerance covers"):
+        runpy.run_path(str(DEMO / "mla_prefill.py"), run_name="__main__")
+
+    # any other error without a report is not the demo's to reword
+    def broken(program, **kw):
+        raise examples.CleaveError("something else")
+
+    monkeypatch.setattr(examples, "_compile", broken)
+    monkeypatch.setattr(sys, "argv", [str(DEMO / "mla_prefill.py")])
+    with pytest.raises(examples.CleaveError, match="something else"):
+        runpy.run_path(str(DEMO / "mla_prefill.py"), run_name="__main__")
+
+
+def test_search_split_of_a_demo_that_declares_one_tolerance_stops_before_it_builds(
+        monkeypatch, tmp_path):
+    """demo/mla_prefill.py declares one ``Tolerance`` and offers no split (its docstring
+    says why). Asked for one anyway, with the budget the split graphs need, the run
+    searches and schedules them and then ends on one line that names the plan the
+    declaration does not cover -- before a kernel or a reference is built: the pipeline
+    refuses the declaration first, so ``run_candidates`` is never reached. (Small shapes;
+    the real search and scheduler, no GPU.)"""
+    import cleave.runtime.evaluate as evaluate_mod
+
+    monkeypatch.setenv("CLEAVE_CACHE_ROOT", str(tmp_path))
+    reached = []
+    monkeypatch.setattr(evaluate_mod, "run_candidates",
+                        lambda *a, **kw: reached.append(1) or [])
+    message = _run_to_exit(monkeypatch, "mla_prefill", [
+        "--H", "4", "--SQ", "64", "--SKV", "1024", "--D", "32", "--DV", "16",
+        "--split", "SKV:4", "--max-ops", "13", "--preset", "fast", "--topk", "4",
+        "--no-cache"])
+    assert message.startswith("mla_prefill: build(): plan 'g") and "\n" not in message
+    assert "split-k=4 partial #0" in message and "(partial): one Tolerance covers" in message
+    assert message.endswith("declare the tolerance by role, "
+                            "tolerance={'': Tolerance(...), 'shift': Tolerance(...)}")
+    assert not reached
 
 
 def test_demo_cli_overrides(monkeypatch):

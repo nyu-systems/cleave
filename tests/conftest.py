@@ -39,6 +39,7 @@ _MARKERS = {
         "tests/pipeline/",
         "tests/superoptimizer/python/search/",
         "tests/graph/apply_paging/test_searched_tiling.py",
+        "tests/demo/test_demos.py::test_search_",
         "tests/frontend/test_exact_softmax.py::test_search_",
         "tests/frontend/test_exact_softmax.py::test_gpu_",
         "tests/lower/test_broadcast_axis.py::test_search_",
