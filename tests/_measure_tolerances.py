@@ -34,6 +34,17 @@ Declare that value (``demo/<name>.py``,
 ``tests/test_tolerance_declarations.py`` and ``tests/demo/test_demos.py`` hold every
 declaration to what the rule gives for that file, so after re-measuring the failing tests
 list exactly the declarations to change.
+
+A measurement of a part (``--only``, ``--names``) pins the operators it measured in full
+and leaves the others as they are pinned: a demo's operator is fed by that demo's runs, a
+test operator by the GPU tests (always the whole list), a dynamic operator by its
+``demo.dynamic`` run and by the GPU tests. The directory records what was run
+(``ran.json``), so ``--report DIR --pin`` pins the same operators later, and a directory
+that does not say, or that ran fewer than the three seeds, pins nothing.
+
+    python -m tests._measure_tolerances --gpus 0,1,2,3 --out DIR --only tests --pin
+    python -m tests._measure_tolerances --gpus 0,1,2,3 --out DIR --only demos \
+        --names mha_decode,gqa_decode --pin
 """
 
 from __future__ import annotations
@@ -56,6 +67,9 @@ from tests._tolerances import CEILING, FP32_CEILING  # no operator may declare a
 
 ROOT = Path(__file__).resolve().parents[1]
 MEASURED = ROOT / "tests" / "measured_errors.json"  # what the declarations are pinned to
+RAN = "ran.json"  # in a measurement directory: what the measurement ran
+SEEDS = ("default", "1", "2")  # what a pinned measurement covers
+KINDS = ("demos", "dynamic", "tests")
 SAFETY = 4.0  # declared tolerance >= SAFETY x the largest valid error
 # ... except for bf16. It has 8 significand bits, so one ulp is 7.8e-3 of the row max, and
 # that is what a valid kernel measures (7.8e-3 .. 9.4e-3). 4x it is the ceiling itself, which
@@ -298,6 +312,56 @@ def measure(out: Path, gpus, seeds, only, names=None):
             _run("", "tests", seed,
                  [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *GPU_TESTS],
                  out, {"CLEAVE_GPU_POOL": ",".join(gpus)})
+    (out / RAN).write_text(json.dumps(
+        {"seeds": list(seeds), "only": sorted(only), "names": names}) + "\n")
+
+
+def measured_in_full(ran):
+    """``operator -> bool``: whether a measurement that ran ``ran`` (the ``ran.json`` of its
+    directory) ran everything that feeds that operator's entry."""
+    only, names = set(ran["only"]), ran["names"]
+
+    def in_full(operator: str) -> bool:
+        kind, _, name = operator.partition(":")
+        named = names is None or name in names
+        if kind == "demo":
+            return "demos" in only and named
+        if kind == "test":  # the GPU tests run as one list, whatever --names says
+            return "tests" in only
+        # a dynamic operator: its demo.dynamic run, and the GPU tests that validate it
+        return {"dynamic", "tests"} <= only and named
+
+    return in_full
+
+
+def pin(out: Path, measured: dict) -> dict:
+    """Pin ``measured`` (``measured_errors`` of the measurement in ``out``) in ``MEASURED``;
+    the pinned file's content.
+
+    Only what was measured in full is pinned: the operators every feeder of which the
+    measurement ran (``measured_in_full``), over the three seeds. Such an operator's entry
+    is replaced, or dropped if nothing validated at it any more; every other operator
+    keeps the entry it has. A measurement that ran everything therefore replaces the file.
+    """
+    record = out / RAN
+    if not record.exists():
+        raise SystemExit(f"{out} does not say what was run (no {RAN}): it pins nothing. "
+                         "Measure again with --out.")
+    ran = json.loads(record.read_text())
+    if sorted(ran["seeds"]) != sorted(SEEDS):
+        raise SystemExit(f"{out} ran the seeds {ran['seeds']}; a pinned measurement covers "
+                         f"{list(SEEDS)}")
+    in_full = measured_in_full(ran)
+    pinned = json.loads(MEASURED.read_text()) if MEASURED.exists() else {}
+    kept = {operator: entry for operator, entry in pinned.items() if not in_full(operator)}
+    fresh = {operator: entry for operator, entry in measured.items() if in_full(operator)}
+    partial = sorted(set(measured) - set(fresh))
+    content = {**kept, **fresh}
+    MEASURED.write_text(json.dumps(content, indent=1, sort_keys=True) + "\n")
+    print(f"pinned {len(fresh)} operator(s) measured in full; {len(kept)} keep their entry"
+          + (f"; measured in part and not pinned: {', '.join(partial)}" if partial else ""),
+          file=sys.stderr)
+    return content
 
 
 # ----------------------------------------------------------------------------- reporting
@@ -541,22 +605,25 @@ def main(argv=None):
     ap.add_argument("--names", default=None,
                     help="comma-separated demos / dynamic operators to restrict the runs to")
     ap.add_argument("--pin", action="store_true",
-                    help=f"also write the measurement to {MEASURED.relative_to(ROOT)}, which "
+                    help=f"also pin what was measured in full in tests/{MEASURED.name}, which "
                          "the declaration tests hold every declared tolerance to")
     args = ap.parse_args(argv)
     out = args.report or args.out
     if out is None:
         ap.error("give --out DIR to measure or --report DIR")
     if args.report is None:
-        measure(out, args.gpus.split(","), args.seeds.split(","), args.only.split(","),
+        only = args.only.split(",")
+        if not set(only) <= set(KINDS):
+            ap.error(f"--only takes {', '.join(KINDS)}, got {args.only!r}")
+        measure(out, args.gpus.split(","), args.seeds.split(","), only,
                 args.names.split(",") if args.names else None)
     table = load(out)
     text = markdown(table)
     (out / "tolerances.md").write_text(text + "\n")
-    pinned = json.dumps(measured_errors(table), indent=1, sort_keys=True) + "\n"
-    (out / MEASURED.name).write_text(pinned)
+    measured = measured_errors(table)
+    (out / MEASURED.name).write_text(json.dumps(measured, indent=1, sort_keys=True) + "\n")
     if args.pin:
-        MEASURED.write_text(pinned)
+        pin(out, measured)
     print(text)
 
 

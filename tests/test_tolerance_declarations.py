@@ -517,6 +517,101 @@ def test_an_output_with_a_boundary_role_is_measured_apart(tmp_path):
         expected_tolerances_by_role(entries[:2])
 
 
+def _measurement(directory, ran, *, tests=(), demos=()):
+    """A measurement directory: validation logs of GPU tests and of demo runs (``(node id or
+    demo name, row-relative error)`` each, on every seed) and the record of what was run."""
+    (directory / "validation").mkdir(parents=True)
+
+    def line(context, rel):
+        entry = dict(shape=[8, 8], dtype="float16", rtol=5e-3, atol=0.0, kind=None, rel=rel,
+                     abs=rel / 4)
+        return json.dumps({"context": context, "what": "", "kind": None, "outputs": [entry]})
+
+    for seed in ("default", "1", "2"):
+        if tests:
+            (directory / "validation" / f"tests__{seed}.jsonl").write_text(
+                "".join(line(f"{node} (call)", rel) + "\n" for node, rel in tests))
+        for name, rel in demos:
+            (directory / "validation" / f"demo-{name}-0__{seed}.jsonl").write_text(
+                line(f"demo:{name}", rel) + "\n")
+    if ran is not None:
+        (directory / "ran.json").write_text(json.dumps(ran) + "\n")
+
+
+ALL_SEEDS = ["default", "1", "2"]
+E2E = "tests/pipeline_api/test_e2e.py::test_compile_end_to_end"  # the operator "matmul"
+
+
+def test_a_measurement_of_a_part_pins_the_operators_it_measured_in_full(tmp_path, monkeypatch):
+    """``--only tests`` runs every GPU test, so it measures every test operator in full and
+    none of the others: a dynamic operator is also fed by its ``demo.dynamic`` run and a
+    demo's by the demo. ``--pin`` replaces the entries of the first kind, drops one nothing
+    validates at any more, and leaves the others as they were pinned. (A subset used to be
+    pinned by a script that merged keys by hand; ``--pin`` on its directory would have
+    overwritten every operator with the subset's counts.)"""
+    import tests._measure_tolerances as tool
+
+    old = [{"dtype": "float16", "rel": 1e-3, "abs": 1e-4, "absolute": False, "seeds": 3,
+            "validated": 7}]
+    pinned = tmp_path / "measured_errors.json"
+    pinned.write_text(json.dumps({"demo:matmul": old, "dynamic:gqa_paged_decode_h32_kv8_d128_ps1": old,
+                                  "test:matmul": old, "test:no_longer_validated": old}))
+    monkeypatch.setattr(tool, "MEASURED", pinned)
+    handwritten = "tests/graph/handwritten/test_splitkv_decode.py::test_splitkv_decode"
+    run = tmp_path / "run"
+    _measurement(run, {"seeds": ALL_SEEDS, "only": ["tests"], "names": None},
+                 tests=[(E2E, 4e-4), (f"{handwritten}[2-gqa_paged_decode_h32_kv8_d128_ps1]", 5e-4)])
+    tool.main(["--report", str(run), "--pin"])
+    now = json.loads(pinned.read_text())
+    assert sorted(now) == ["demo:matmul", "dynamic:gqa_paged_decode_h32_kv8_d128_ps1",
+                           "test:matmul"]
+    assert now["demo:matmul"] == old and now["dynamic:gqa_paged_decode_h32_kv8_d128_ps1"] == old
+    assert (now["test:matmul"][0]["rel"], now["test:matmul"][0]["validated"]) == (4e-4, 3)
+    # what the directory itself keeps is the whole table of what it measured
+    assert sorted(json.loads((run / "measured_errors.json").read_text())) == [
+        "dynamic:gqa_paged_decode_h32_kv8_d128_ps1", "test:matmul"]
+
+    # demos by name: the named demo's operator, and no other demo's
+    named = tmp_path / "named"
+    _measurement(named, {"seeds": ALL_SEEDS, "only": ["demos"], "names": ["matmul"]},
+                 demos=[("matmul", 6e-4)])
+    tool.main(["--report", str(named), "--pin"])
+    now = json.loads(pinned.read_text())
+    assert now["demo:matmul"][0]["rel"] == 6e-4 and now["test:matmul"][0]["rel"] == 4e-4
+    in_full = tool.measured_in_full({"only": ["demos"], "names": ["matmul"]})
+    assert in_full("demo:matmul") and not in_full("demo:lora") and not in_full("test:matmul")
+    # a dynamic operator needs its demo run and the GPU tests
+    for only, complete in ((["dynamic"], False), (["tests"], False), (["dynamic", "tests"], True)):
+        in_full = tool.measured_in_full({"only": only, "names": None})
+        assert in_full("dynamic:gqa_paged_decode_h32_kv8_d128_ps1") is complete
+
+    # everything: the file is what was measured
+    full = tmp_path / "full"
+    _measurement(full, {"seeds": ALL_SEEDS, "only": ["demos", "dynamic", "tests"], "names": None},
+                 tests=[(E2E, 3e-4)])
+    tool.main(["--report", str(full), "--pin"])
+    assert sorted(json.loads(pinned.read_text())) == ["test:matmul"]
+
+
+@pytest.mark.parametrize(
+    ("ran", "why"),
+    [(None, "does not say what was run"),
+     ({"seeds": ["default"], "only": ["tests"], "names": None}, "a pinned measurement covers")],
+    ids=["no record of what was run", "one seed"],
+)
+def test_a_measurement_that_cannot_say_what_it_covers_pins_nothing(tmp_path, monkeypatch, ran, why):
+    import tests._measure_tolerances as tool
+
+    pinned = tmp_path / "measured_errors.json"
+    pinned.write_text("{}\n")
+    monkeypatch.setattr(tool, "MEASURED", pinned)
+    _measurement(tmp_path / "run", ran, tests=[(E2E, 4e-4)])
+    with pytest.raises(SystemExit, match=why):
+        tool.main(["--report", str(tmp_path / "run"), "--pin"])
+    assert pinned.read_text() == "{}\n"
+    tool.main(["--report", str(tmp_path / "run")])  # the table alone needs no record
+
+
 def test_a_tiling_test_of_a_file_with_several_builders_has_its_own_operator(tmp_path):
     """A validation a tiling test logs is measured under the graph builder that test passed
     to ``tolerance_for``. Two files validate at several builders (and import them in one
