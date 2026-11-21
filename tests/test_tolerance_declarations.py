@@ -70,6 +70,9 @@ def test_every_declared_tolerance_follows_from_the_pinned_measurement():
             assert all(o["seeds"] >= 3 for o in outputs), name
         else:
             assert tolerance == expected_tolerance(outputs), name
+            # ... measured over three seeds, as the rule says (the row-sum quotient was
+            # pinned from one run by hand while pytest.ini deselected its end2end case)
+            assert all(o["seeds"] >= 3 for o in outputs), name
     # Every declared operator has a measurement: none declares a bound nothing was
     # measured for (the RMSNorm split-K combine did, the one-ulp floor, while no kernel of
     # it validated).

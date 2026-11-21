@@ -779,9 +779,9 @@
    "abs": 1.430511474609375e-06,
    "absolute": false,
    "dtype": "float16",
-   "rel": 0.0038961039390414953,
-   "seeds": 1,
-   "validated": 22
+   "rel": 0.003931847866624594,
+   "seeds": 3,
+   "validated": 93
   }
  ],
  "test:rowsum_graph": [

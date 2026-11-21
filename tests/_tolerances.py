@@ -44,8 +44,6 @@ TOLERANCES = {
     "matmul_matmul_bshd_graph": Tolerance(rtol=5e-3),
     "matmul_rowsum_graph": Tolerance(rtol=5e-3),
     "rowsum_graph": Tolerance(rtol=2e-3),
-    # Measured once, by running its end2end case by hand while pytest.ini deselected it
-    # (22 valid candidates).
     "rowsum_div_graph": Tolerance(rtol=2e-2),
     "rmsnorm_matmul_graph": Tolerance(rtol=5e-3),
     "rmsnorm_matmul_split_partial_graph": Tolerance(rtol=5e-3),

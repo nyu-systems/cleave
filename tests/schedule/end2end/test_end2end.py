@@ -39,7 +39,9 @@ CASES = {
     "rmsnorm_matmul_split_combine": (g.rmsnorm_matmul_split_combine_graph, (4, 1024, 6144, 4096), 1, {}),
     "rmsnorm_matmul_split_partial": (g.rmsnorm_matmul_split_partial_graph, (4, 1024, 6144, 1024), 1, {}),
     "rowsum": (g.rowsum_graph, (4096, 4096), 28, {}),
-    "rowsum_div": (g.rowsum_div_graph, (4096, 4096), 1, {}),
+    # All 28 tilings that are built validate. While every thread kept a whole row of the
+    # quotient, 4 to 7 of them were lost to device memory in each run.
+    "rowsum_div": (g.rowsum_div_graph, (4096, 4096), 24, {}),
     "swiglu": (g.swiglu_graph, (4096, 14336, 4096), 21, {}),
 }
 

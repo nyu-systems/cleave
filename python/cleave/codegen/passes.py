@@ -8,7 +8,7 @@ from ..ir.graph import (
     ViewOpNode,
 )
 from ..ir.graph_utils import find_topo_sort
-from ..ir.ops import Div, Exp, Matmul, Mul, ReduceSum
+from ..ir.ops import Add, Div, Exp, Matmul, Mul, ReduceSum, Sub
 from .operands import kept_extents
 
 # A Hopper warp-group gemm (WGMMA): four warps make a group, and one instruction computes
@@ -236,6 +236,17 @@ def annotate_fragment_layout_conflicts(graph: Graph) -> Graph:
 
     And for the first operand of a matmul whose block is two warp groups tall, wherever
     that operand is a fragment (``stage_misplaced_register_operands``).
+
+    And for a loop's accumulator of lower rank that is broadcast over an operand read
+    straight from global memory: ``x / sum(x, -1)`` with the sum looped, where the
+    quotient's tile is the whole row and the kernel's input is read where it lies. The
+    quotient is then the only other fragment of the op, and TileLang gives it the layout
+    of the sum, which is the layout of the slices the sum was reduced from: with slices
+    of 512 columns or fewer on 128 threads, one or a few rows per thread, each held whole.
+    On 4096 columns every thread computed and kept 4096 to 32768 elements -- up to 32
+    times the work, a frame of 8 to 64 KiB, 512-fold unrolled loops that take the device
+    compiler two minutes and more, and 4.3 GiB of thread stacks at launch. With the sum
+    read from shared memory the quotient is laid out across the threads of the block.
     """
 
     def reset_graph(cur_graph: Graph) -> None:
@@ -319,6 +330,30 @@ def annotate_fragment_layout_conflicts(graph: Graph) -> Graph:
 
         return True
 
+    def accumulator_broadcast_over_input(cur_node, cur_graph: Graph) -> bool:
+        """``x <op> f`` with ``x`` read from global memory and ``f`` a loop's accumulator
+        that lacks an axis of it.
+
+        The accumulator has the layout TileLang gave the slices it was reduced from, and
+        a narrow slice puts each row on a few threads only. (A fragment computed in the
+        tier of the op from the whole tile -- the max of an in-tile softmax -- is held by
+        every thread, and next to a first operand in shared memory, the weight of a paged
+        split combine, the result is laid out across the threads as it is.)
+        """
+        if cur_node.const is not None or cur_node.broadcast == -1:
+            return False
+        if len(cur_node.inputs) != 2:
+            return False
+        lhs_edge, rhs_edge = cur_node.inputs
+        if not isinstance(rhs_edge.src_node, GraphNode):
+            return False
+        if getattr(rhs_edge, "accum_node", None) is None:
+            return False
+        return (
+            get_input_scope(cur_graph, lhs_edge) == "g"
+            and get_input_scope(cur_graph, rhs_edge) == "r"
+        )
+
     def reduced_operands(cur_node, cur_graph: Graph) -> set:
         """The operands of a matmul that are fragments a reduction filled: the sum itself
         (in this tier, or a loop's accumulator) or what a chain of one-operand,
@@ -341,6 +376,10 @@ def annotate_fragment_layout_conflicts(graph: Graph) -> Graph:
             if isinstance(cur_node, (Div, Mul)) and is_independent_reduction_div(
                 cur_node, cur_graph
             ):
+                cur_node.resolve_operand_layout = "rhs"
+            if isinstance(
+                cur_node, (Add, Sub, Mul, Div)
+            ) and accumulator_broadcast_over_input(cur_node, cur_graph):
                 cur_node.resolve_operand_layout = "rhs"
             if isinstance(cur_node, Matmul) and len(cur_node.inputs) == 2:
                 staged = set(cur_node.stage_fragment_operands_in_shared)

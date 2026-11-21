@@ -89,7 +89,10 @@ from pathlib import Path
 #     found a second time: 28's rule is the one in the tree, and no text moves at 35.)
 # 36: a program that returns a value another op also reads has tilings (the search of such
 #     a graph ended on an assertion of the policy's shared-memory model).
-SCHEMA = 36
+# 37: a loop's accumulator broadcast over an operand in global memory is read from shared
+#     memory, so the result is laid out across the threads: in the kernels of x / sum(x, -1)
+#     with the sum looped in narrow steps, every thread computed and kept whole rows.
+SCHEMA = 37
 # What "validated" means for a saved kernel. A kernel-cache hit returns without validating,
 # so bump this whenever the comparison or its inputs change: saved kernels are then rebuilt.
 # (The inputs include the adversarial cases a program with an exact softmax is held to,
