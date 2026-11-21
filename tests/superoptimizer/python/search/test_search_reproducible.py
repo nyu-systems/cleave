@@ -286,3 +286,40 @@ def test_paged_plan_labels_name_the_same_graphs_in_every_process(tmp_path):
     assert all(label.split()[0] in ("g0", "g1") and label.split()[1] == "solo"
                for label in first["labels"]), first["labels"]
     assert other == first
+
+
+def test_the_text_of_a_searched_kernel_does_not_depend_on_the_process(tmp_path):
+    """Lowering names a kernel's inputs after the guids of the searched structure, and a
+    guid is a number of the process: a solo graph came back with other guids from a fresh
+    search than from its checkpoint, and with others again when another program had been
+    searched first. Same kernel, three texts (``PlaceHolder_input_10002646`` /
+    ``..._10000006`` / ``..._10000016``): ``Kernel.source`` was not reproducible, and
+    TileLang's compile cache, which is keyed on the text, missed. The structures are
+    renumbered where they leave the search."""
+    search = """
+        import hashlib
+        from cleave.runtime.compile import build_candidate_code
+
+        cfg = SuperoptConfig(threads=2)
+        for i in range(int(sys.argv[1])):
+            superoptimize(Q(i + 1), cfg)  # other programs first: each moves the guid counter
+        graphs = superoptimize(Q(), cfg)
+        plans = schedule(graphs, ScheduleConfig(topk=2))
+        texts = [build_candidate_code(p.tile) for p in plans]
+        print("RESULT " + json.dumps(dict(
+            from_cache=graphs.from_cache, structures=[g.structure for g in graphs],
+            inputs=sorted({name for text in texts for name in __import__("re").findall(
+                r"PlaceHolder_input_\\d+", text)}),
+            texts=[hashlib.sha256(text.encode()).hexdigest() for text in texts])))
+        """
+    cache = tmp_path / "cache"
+    fresh, _ = _child(search, "0", cache=cache)
+    again, _ = _child(search, "0", cache=cache)
+    later, _ = _child(search, "2", cache=cache)
+    assert [r["from_cache"] for r in (fresh, again, later)] == [False, True, True]
+    assert len(fresh["texts"]) == 2 and len(fresh["structures"]) >= 1
+    # the two inputs, numbered from the first tensor of the structure (a staged copy of an
+    # input is named after it, with one more character)
+    assert {name[:len("PlaceHolder_input_10000001")] for name in fresh["inputs"]} == {
+        "PlaceHolder_input_10000001", "PlaceHolder_input_10000002"}
+    assert again == dict(fresh, from_cache=True) and later == again

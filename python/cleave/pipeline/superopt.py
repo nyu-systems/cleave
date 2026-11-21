@@ -95,7 +95,7 @@ class GraphSet(Sequence):
 
 def superoptimize(program, config: SuperoptConfig | None = None) -> GraphSet:
     import cleave.superoptimizer as csopt
-    from ..lower.split import Rejected, _contains_split_ops, cut_split_graph
+    from ..lower.split import Rejected, _contains_split_ops, _renumber_graph, cut_split_graph
 
     config = config or SuperoptConfig()
     max_ops = config.resolve_max_ops(program)
@@ -113,7 +113,12 @@ def superoptimize(program, config: SuperoptConfig | None = None) -> GraphSet:
             ckpt = str(cache.checkpoint_path(key))
             from_cache = _checkpoint_valid(symbolic, ckpt, config.concat_matmul, search_cfg)
         found = symbolic.search_tile_graph(ckpt, config.concat_matmul, False, search_cfg)
-        structures = [g.get_graph_structure() for g in found]
+        # A tensor's guid is drawn from a counter of the whole process: a searched graph
+        # carries other numbers after a fresh search than after a checkpoint read, or
+        # after another program was searched first. Lowering names a kernel's inputs after
+        # them, so the tensors are renumbered here, in the order the structure defines
+        # them: one program, one structure, one kernel text.
+        structures = [_renumber_graph(g.get_graph_structure()) for g in found]
     except Exception as e:  # noqa: BLE001
         raise SuperoptError(f"superoptimizer search failed: {type(e).__name__}: {e}") from e
     graphs = []
