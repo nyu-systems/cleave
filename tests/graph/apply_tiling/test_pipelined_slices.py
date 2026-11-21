@@ -1,4 +1,4 @@
-"""A loop is pipelined only where every slice it transfers fills whole 128-byte buffers.
+"""A loop is pipelined only where every tensor tile it transfers fills whole 128-byte buffers.
 
 ``T.Pipelined`` lets TileLang load the slices of an iteration as asynchronous bulk
 transfers into one shared-memory buffer per pipeline stage. It lays those buffers out
@@ -16,6 +16,11 @@ nothing short of a launch found them, and each launch is a fault in the driver.
 
 Such a loop is emitted as a plain loop now, like the loops TileLang cannot pipeline at
 all (``schedule.tiling._pipeline_one_loop``): it computes the same thing and validates.
+
+Every slice here is a tensor tile: a part of its tensor that is not one run of consecutive
+elements. A slice that is one run is loaded as a flat range, which needs 16 bytes only, and
+stays in its pipeline at any size (``test_split_combine_placement.py``:
+``test_a_slice_that_is_one_run_of_its_tensor_keeps_the_pipeline`` and its GPU test).
 """
 
 import re

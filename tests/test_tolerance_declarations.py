@@ -761,7 +761,9 @@ def test_a_tiling_test_of_a_file_with_several_builders_has_its_own_operator(tmp_
 def test_every_tiling_test_that_passes_a_tolerance_has_an_operator():
     """Every test under tests/graph/apply_tiling and tests/reference that passes a declared
     tolerance resolves to a declared operator: its file imports one graph builder on a line
-    of its own, or names the builder of each such test in ``SEVERAL_BUILDERS``."""
+    of its own, or the test names its operator (``tolerance_for(<builder>)``,
+    ``tolerance_for("<program>")``), or the file names the builder of each such test in
+    ``SEVERAL_BUILDERS``."""
     import ast
     import re
     from pathlib import Path

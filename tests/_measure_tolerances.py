@@ -381,10 +381,17 @@ def _single_row_builder(param):
     return SINGLE_ROW[param][0].__name__
 
 
+def _misaligned_slice_builder(param):
+    from tests.graph.apply_tiling.test_pipelined_slices import MISALIGNED
+
+    return MISALIGNED[param][0][0].__name__
+
+
 # Tiling test files that validate at more than one operator: test -> the graph builder it
 # passes to ``tolerance_for`` (a name, or a function of the test's parameter id). Every
 # other file under tests/graph/apply_tiling and tests/reference imports its one builder on
-# a line of its own.
+# a line of its own, or names the operator in each test that validates
+# (``tolerance_for(<builder>)``, ``tolerance_for("<program>")``): ``builder_of``.
 SEVERAL_BUILDERS = {
     "tests/graph/apply_tiling/test_reduction_axes.py": {
         "test_unlooped_sum_over_a_front_named_axis_validates":
@@ -397,6 +404,9 @@ SEVERAL_BUILDERS = {
     },
     "tests/graph/apply_tiling/test_rmsnorm_matmul_split_combine.py": {
         "test_apply_tiling_rmsnorm_matmul_split_combine": "rmsnorm_matmul_split_combine_graph",
+    },
+    "tests/graph/apply_tiling/test_pipelined_slices.py": {
+        "test_gpu_the_plain_loop_validates": _misaligned_slice_builder,
     },
 }
 
