@@ -135,6 +135,15 @@ def pytest_collection_modifyitems(config, items):
                 item.add_marker(getattr(pytest.mark, name))
 
 
+@pytest.fixture(autouse=True)
+def _validation_context(request, monkeypatch):
+    """Every comparison a test logs (``CLEAVE_VALIDATION_LOG``) is filed under the test's
+    node id: ``tests._measure_tolerances`` reads the operator off it. The library takes
+    the label it is given and knows nothing of the test runner; candidate workers inherit
+    it with the environment."""
+    monkeypatch.setenv("CLEAVE_VALIDATION_CONTEXT", request.node.nodeid)
+
+
 def _root_entries():
     return {p.name for p in ROOT.iterdir()} - _ROOT_IGNORED
 

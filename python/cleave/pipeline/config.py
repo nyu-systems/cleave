@@ -75,7 +75,9 @@ class EvalConfig(_Replace):
     timeout_s: float | None = None  # None -> Settings.compile_timeout_secs
     # Input distributions every candidate is validated on (cleave.runtime.inputs.DISTRIBUTIONS);
     # it is timed on the first. A program whose softmax is exact is held to its adversarial
-    # cases as well, whether they are listed here or not (cleave.pipeline.build).
+    # cases as well, whether they are listed here or not (cleave.pipeline.build). Not read
+    # for a paged program: its inputs are its workloads (cleave.pipeline.dynamic), and the
+    # adversarial ones are the registry's, for a registry operator on its registry workloads.
     distributions: tuple[str, ...] = ("normal",)
 
     def __post_init__(self):

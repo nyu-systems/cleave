@@ -247,6 +247,60 @@ def test_offset_moves_every_logit_far_below_zero_and_keeps_them_exact(name):
         assert all(torch.equal(a, b) for a, b in zip(forward, backward)) is same
 
 
+def attention_over_the_queries(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
+                               v: cl.Tensor["H", "SKV", "D"]):
+    """Every key's column of weights sums to 1: the softmax axis is the query axis."""
+    return cl.softmax((q @ k.mT) / q.shape[-1] ** 0.5, dim=-2) @ v
+
+
+def test_a_softmax_over_the_queries_is_shaped_along_the_queries():
+    """The softmax axis of ``cl.softmax(q @ k.mT, dim=-2)`` is the first operand's row
+    axis. The cases were laid along the second operand's rows whatever the softmax axis
+    was, so along the softmax axis the "increasing" logits rose and fell, the "constant"
+    ones differed by 3 to 7 and the spike sat on the last query of one column in fifty,
+    while the build reported every case."""
+    from cleave.runtime.inputs import key_operand, score_matmuls
+
+    shapes = dict(H=2, SQ=96, SKV=8, D=16)
+    graph = lowered(attention_over_the_queries, shapes)
+    (matmul,) = score_matmuls(graph)
+    assert key_operand(graph, matmul) == 0
+    over_keys = lowered(programs.attention, dict(HQ=2, HKV=2, SQ=8, SKV=96, D=16))
+    assert key_operand(over_keys, score_matmuls(over_keys)[0]) == 1
+    assert adversarial_cases(graph) == DENSE_ADVERSARIAL and why_not_adversarial(graph) == ""
+
+    (rising,) = _scores(graph, _inputs(graph, "increasing"))
+    assert tuple(rising.shape) == (2, 96, 8)
+    assert (rising.diff(dim=-2) >= 0).all(), "logits must never fall along the query axis"
+    assert (rising[..., 16:, :] > rising[..., :-16, :]).all()
+    span = rising[..., -1, :] - rising[..., 0, :]
+    assert float(span.min()) > 0.4 * INCREASING_SPAN and float(span.max()) > 88.7
+
+    (falling,) = _scores(graph, _inputs(graph, "decreasing"))
+    assert torch.equal(falling, rising.flip(-2))
+
+    (spiked,) = _scores(graph, _inputs(graph, "last_spike"))
+    last, rest = spiked[..., -1, :], spiked[..., :-1, :]
+    assert float((last[..., None, :] - rest).min()) > 0.25 * INCREASING_SPAN
+    assert float(last.max()) > 88.7
+
+    (constant,) = _scores(graph, _inputs(graph, "constant"))
+    assert (constant == constant[..., :1, :]).all(), "one logit per column, bit for bit"
+    assert constant[..., 0, :].unique().numel() > 1
+
+    normal = _inputs(graph, "normal")
+    (large,) = _scores(graph, _inputs(graph, "large_logits"))
+    (plain,) = _scores(graph, normal)
+    assert float(large.abs().max()) > 50 * float(plain.abs().max())
+    (shifted,) = _scores(graph, _inputs(graph, "offset"))
+    assert float(shifted.max()) < -0.5 * OFFSET and (shifted.exp() == 0).all()
+    # the values are never touched, the queries and the keys in every case but "constant"
+    for case in DENSE_ADVERSARIAL:
+        changed = [i for i, (a, b) in enumerate(zip(normal, _inputs(graph, case)))
+                   if not torch.equal(a, b)]
+        assert len(changed) == (1 if case in ("constant", "large_logits") else 2), case
+
+
 def test_adversarial_cases_are_what_the_inputs_of_a_graph_can_be_shaped_into():
     for build, _ in ATTENTION.values():
         assert adversarial_cases(build()) == DENSE_ADVERSARIAL
@@ -693,6 +747,61 @@ def test_build_says_when_an_exact_program_is_held_to_fewer_cases(monkeypatch):
     assert "inputs: normal [exact softmax not held to every adversarial case: " in validate
     (entry,) = report.to_dict()["validation"]["inputs"]
     assert entry["cases"] == ["normal"] and entry["note"] == built[0].cases_note
+
+
+def attention_plus_softmax_of_a_sum(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
+                                    v: cl.Tensor["H", "SKV", "D"], x: cl.Tensor["H", "SQ", "D"],
+                                    y: cl.Tensor["H", "SQ", "D"]):
+    return cl.softmax((q @ k.mT) / q.shape[-1] ** 0.5) @ v + cl.softmax(x + y)
+
+
+def attention_plus_softmax_of_an_input(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
+                                       v: cl.Tensor["H", "SKV", "D"], z: cl.Tensor["H", "SQ", "D"]):
+    return cl.softmax((q @ k.mT) / q.shape[-1] ** 0.5) @ v + cl.softmax(z)
+
+
+def test_a_softmax_no_case_shapes_is_named_next_to_the_cases(monkeypatch):
+    """Two exact softmaxes, one whose logits are a score matmul and one whose logits are
+    computed (``x + y``). The cases shape the first; the second sees its normal logits in
+    every one of them, and the note names it: the cases are what the first softmax is held
+    to, not the program."""
+    from cleave import pipeline as P
+    from cleave.frontend import trace
+
+    small = dict(H=2, SQ=8, SKV=96, D=16)
+    graph = lowered(attention_plus_softmax_of_a_sum, small)
+    attention_exp, summed_exp = [n for n in graph.nodes if type(n) is Exp]
+    assert attention_exp.stabilize is not None and summed_exp.stabilize is not None
+    assert type(summed_exp.inputs[0].src_node).__name__ == "Add"
+    assert adversarial_cases(graph) == DENSE_ADVERSARIAL
+    note = why_not_adversarial(graph)
+    assert note == (f"the logits of {summed_exp.name!r} are neither the result of a score "
+                    "matmul nor an input: no case shapes them")
+    # ... and it is true: the second softmax reads the same logits in every case
+    normal = _scores(graph, _inputs(graph, "normal"))[1]
+    for case in DENSE_ADVERSARIAL:
+        _, second = _scores(graph, _inputs(graph, case))
+        assert torch.equal(second, normal), case
+    assert float(_scores(graph, _inputs(graph, "large_logits"))[0].abs().max()) > 100.0
+
+    # both softmaxes shaped (a score matmul, a logit input): nothing to say
+    both = lowered(attention_plus_softmax_of_an_input, small)
+    assert adversarial_cases(both) == DENSE_ADVERSARIAL and why_not_adversarial(both) == ""
+
+    shapes = dict(H=4, SQ=64, SKV=256, D=64)
+    built, published = _stubbed_build(
+        monkeypatch, trace(attention_plus_softmax_of_a_sum, shapes, cl.f16))
+    assert set(published) == {("normal",) + DENSE_ADVERSARIAL}
+    assert len(built) >= 1 and all(r.cases == ("normal",) + DENSE_ADVERSARIAL for r in built)
+    assert all("neither the result of a score matmul nor an input: no case shapes them"
+               in r.cases_note for r in built)
+    report = P.evaluate(built)
+    validate = dict((stage, text) for stage, text, _ in report.stage_lines())["validate"]
+    assert ("inputs: normal, " + ", ".join(DENSE_ADVERSARIAL)
+            + " [exact softmax not held to every adversarial case: ") in validate
+    (entry,) = report.to_dict()["validation"]["inputs"]
+    assert entry["cases"] == ["normal", *DENSE_ADVERSARIAL]
+    assert entry["note"] == built[0].cases_note
 
 
 # ----------------------------------------------------------------------------- dynamic

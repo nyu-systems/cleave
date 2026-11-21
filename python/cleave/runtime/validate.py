@@ -94,7 +94,8 @@ def tolerances_of(tolerance, roles):
     (``cleave.runtime.reference.output_roles``): ``""`` for an output the program or its
     cut defines, a name for a tensor a rewrite added to the cut. Today that is ``"shift"``,
     the max a split partial of an exact softmax returns next to its sums: a float32
-    statistic, with an error of its own, next to outputs in the program's dtype. ``None``
+    statistic, with an error of its own, next to sums computed at the precision of the
+    program's dtype (they cross the cut in float32 too, so as not to overflow). ``None``
     when the outputs are not known (a kernel without a graph).
 
     * A mapping from role to ``Tolerance`` declares one bound per role, whatever the plan:
@@ -221,13 +222,13 @@ def _compare_one(index, actual, reference, tol):
 
 
 def _log_validation(what, actual, tolerances, results, roles=None):
-    path = Settings.from_env().validation_log
+    settings = Settings.from_env()
+    path = settings.validation_log
     if path is None:
         return
     roles = roles or ("",) * len(actual)
     record = {
-        "context": os.environ.get("CLEAVE_VALIDATION_CONTEXT")
-        or os.environ.get("PYTEST_CURRENT_TEST", ""),
+        "context": settings.validation_context,
         "what": what,
         "kind": next((kind for _, kind, _ in results if kind), None),
         "outputs": [

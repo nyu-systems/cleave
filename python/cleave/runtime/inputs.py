@@ -7,6 +7,12 @@ reached from without crossing another matmul), and an input that is the logits i
 stabilized ``Exp`` that reads an input: ``cl.softmax(x)``; through the view of a split as
 well, so the partial of a program split over its softmax axis is held to the same cases).
 
+The cases are laid along the softmax axis of the scores. The operand of the score matmul
+whose rows are that axis is called the key operand here and the other the query operand,
+after attention, where the softmax runs over the keys (the second operand's rows). For a
+softmax over the queries (``cl.softmax(q @ k.mT, dim=-2)``) the first operand's rows are
+the softmax axis, and the two operands change places.
+
 ``large_logits``  the query operand times 100, so every logit is 100 times larger;
 ``increasing``    logits that grow along the key axis for every query row, by more than
                   fp32 ``exp`` can hold, so a running max changes at every tile;
@@ -95,19 +101,25 @@ def adversarial_cases(graph) -> tuple:
     operand of a score matmul is computed (nothing here can shape it through what computes
     it), or when a shaped input also feeds a plain ``exp``. :func:`why_not_adversarial`
     gives the reason for every case that is missing.
+
+    The cases shape the logits that can be shaped. A graph with a second exact softmax
+    whose logits are neither a score matmul nor an input (``cl.softmax(x + y)``) keeps the
+    cases of the first, and :func:`why_not_adversarial` names the softmax they do not reach.
     """
     return _cases(graph)[0]
 
 
 def why_not_adversarial(graph) -> str:
-    """Why ``graph`` is not held to every adversarial case; ``""`` when it is."""
+    """Why ``graph`` is not held to every adversarial case, or why the cases it is held to
+    do not reach every exact softmax of it; ``""`` when they are all there and reach all."""
     return _cases(graph)[1]
 
 
 def _cases(graph) -> tuple:
     scores = score_matmuls(graph)
     try:
-        operands = [(_operand(m, 0)[0], _operand(m, 1)[0]) for m in scores]
+        operands = [(_operand(m, 1 - key)[0], _operand(m, key)[0])  # (query, key) inputs
+                    for m, key in ((m, key_operand(graph, m)) for m in scores)]
     except SpecError as e:
         return (), str(e)
     logits = [node for node, _, _ in logit_inputs(graph)]
@@ -124,18 +136,33 @@ def _cases(graph) -> tuple:
             f"input {placeholder.name!r} also feeds {exp.name!r}, an exp that is not "
             "stabilized: on shaped logits its reference overflows"
         )
+    # A softmax the cases cannot reach is validated on its normal logits whatever the other
+    # softmaxes of the graph are shaped into: the cases stand, and the note names it.
+    unshaped = _unshaped(graph, logits) if exact else []
+    rest = ""
+    if unshaped:
+        rest = ("the logits of " + ", ".join(repr(n.name) for n in unshaped)
+                + " are neither the result of a score matmul nor an input: no case shapes them")
     both = {id(q) for q, _ in operands} & {id(k) for _, k in operands}
     if both:
         name = next(q.name for q, _ in operands if id(q) in both)
         return ("large_logits",), (
             f"input {name!r} is both a query and a key of the scores: it can be scaled, "
-            "not ramped"
+            "not ramped" + ("; " + rest if rest else "")
         )
-    return ADVERSARIAL, ""
+    return ADVERSARIAL, rest
 
 
 def _stabilized(node) -> bool:
     return getattr(node, "stabilize", None) is not None
+
+
+def _unshaped(graph, logits) -> list:
+    """The stabilized ``Exp`` nodes no case shapes: no score matmul behind them, and what
+    they read is not one of the ``logits`` inputs."""
+    wanted = {id(p) for p in logits}
+    return [n for n in graph.nodes if isinstance(n, Exp) and _stabilized(n)
+            and not _score_matmuls_of([n]) and id(_read(n)[0]) not in wanted]
 
 
 def _plain_exp_fed_by(graph, placeholders):
@@ -165,10 +192,44 @@ def score_matmuls(graph) -> list:
     In a graph whose softmax is exact (some ``Exp`` carries a ``Stabilize`` record) only the
     stabilized ones count: the logits of a plain ``exp`` are not softmax logits.
     """
-    found, seen = [], set()
     stack = [n for n in graph.nodes if isinstance(n, Exp)]
     if any(_stabilized(n) for n in stack):
         stack = [n for n in stack if _stabilized(n)]
+    return _score_matmuls_of(stack)
+
+
+def key_operand(graph, matmul) -> int:
+    """Which operand of a score matmul has the softmax axis for its rows: 1, the second
+    (attention over the keys), unless the stabilized ``Exp`` the scores feed says the
+    softmax runs over the first operand's rows.
+
+    The scores are ``(batch.., M, N)`` with ``M`` the rows of the first operand and ``N``
+    those of the second. The softmax axis is read off the ``Exp``'s record where the
+    ``Exp`` reads the scores through constant scalings only, which keep the axes in
+    place. Anywhere else -- no record, another op on the way, another shape -- it is
+    taken to be the last axis, as for a graph that makes no claim.
+    """
+    node, seen = matmul, set()
+    while id(node) not in seen:
+        seen.add(id(node))
+        readers = [edge.dst_node for edge in node.outputs]
+        if len(readers) != 1:
+            return 1
+        (node,) = readers
+        if type(node) is Exp:
+            record = getattr(node, "stabilize", None)
+            same = tuple(node.get_shape(0)) == tuple(matmul.get_shape(0))
+            if record is None or len(record.axes) != 1 or not same:
+                return 1
+            return 0 if record.axes[0] % len(node.get_shape(0)) == len(node.get_shape(0)) - 2 else 1
+        if not (type(node) in (Mul, Div) and node.const is not None
+                and not getattr(node, "const_on_left", False)):
+            return 1
+    return 1
+
+
+def _score_matmuls_of(exps) -> list:
+    found, seen, stack = [], set(), list(exps)
     while stack:
         for edge in stack.pop().inputs:
             src = edge.src_node
@@ -195,22 +256,28 @@ def logit_inputs(graph) -> list:
         record = getattr(node, "stabilize", None)
         if type(node) is not Exp or record is None or len(record.axes) != 1:
             continue
-        src, sign, views = node.inputs[0].src_node, 1.0, []
-        while True:
-            if isinstance(src, (SplitView, PermuteView)):
-                views.append(src)
-            elif type(src) in (Mul, Div) and src.const is not None \
-                    and not getattr(src, "const_on_left", False):
-                sign = -sign if float(src.const) < 0 else sign
-            else:
-                break
-            src = src.inputs[0].src_node
+        src, sign, views = _read(node)
         if not isinstance(src, PlaceHolderNode) or any(src is p for p, _, _ in found):
             continue
         axis = _moved(_viewed(src, views[::-1]), record.axes[0], src)
         if axis is not None:
             found.append((src, axis, sign))
     return found
+
+
+def _read(exp):
+    """``(node, sign, views)``: what ``exp`` reads behind the views that only reindex it and
+    the constant scalings (``sign`` is theirs); ``views`` from the ``Exp`` inwards."""
+    src, sign, views = exp.inputs[0].src_node, 1.0, []
+    while True:
+        if isinstance(src, (SplitView, PermuteView)):
+            views.append(src)
+        elif type(src) in (Mul, Div) and src.const is not None \
+                and not getattr(src, "const_on_left", False):
+            sign = -sign if float(src.const) < 0 else sign
+        else:
+            return src, sign, views
+        src = src.inputs[0].src_node
 
 
 def _viewed(placeholder, views):
@@ -318,12 +385,14 @@ def apply_distribution(graph, inputs, distribution):
         out[index[id(node)]] = _logits(inputs[index[id(node)]], axis, sign, distribution)
     if not scores:
         return tuple(out)
+    # per input: the matmul, the placeholder, its views, [the sign,] which operand it is
     queries, keys = {}, {}
     for matmul in scores:
-        q_node, q_views, q_sign = _operand(matmul, 0)
-        k_node, k_views, k_sign = _operand(matmul, 1)
-        queries[index[id(q_node)]] = (matmul, q_node, q_views)
-        keys[index[id(k_node)]] = (matmul, k_node, k_views, q_sign * k_sign)
+        k_id = key_operand(graph, matmul)
+        q_node, q_views, q_sign = _operand(matmul, 1 - k_id)
+        k_node, k_views, k_sign = _operand(matmul, k_id)
+        queries[index[id(q_node)]] = (matmul, q_node, q_views, 1 - k_id)
+        keys[index[id(k_node)]] = (matmul, k_node, k_views, q_sign * k_sign, k_id)
 
     if distribution == "large_logits":
         for i in queries:
@@ -337,31 +406,31 @@ def apply_distribution(graph, inputs, distribution):
             f"the {distribution!r} inputs need them to be separate inputs"
         )
     if distribution == "constant":
-        for i, (matmul, node, views, _) in keys.items():
-            key_axis, _ = _operand_axes(matmul, 1, node, views)
+        for i, (matmul, node, views, _, k_id) in keys.items():
+            key_axis, _ = _operand_axes(matmul, k_id, node, views)
             if key_axis is not None:  # the first key, for every key
                 out[i] = inputs[i].narrow(key_axis, 0, 1).expand_as(inputs[i]).contiguous()
         return tuple(out)
     if distribution in ("last_spike", "offset"):
         shape = _spike if distribution == "last_spike" else _offset
-        for i, (matmul, node, views) in queries.items():
-            _, contracted = _operand_axes(matmul, 0, node, views)
+        for i, (matmul, node, views, q_id) in queries.items():
+            _, contracted = _operand_axes(matmul, q_id, node, views)
             out[i] = shape(inputs[i], contracted, matmul.K)
-        for i, (matmul, node, views, sign) in keys.items():
-            key_axis, contracted = _operand_axes(matmul, 1, node, views)
+        for i, (matmul, node, views, sign, k_id) in keys.items():
+            key_axis, contracted = _operand_axes(matmul, k_id, node, views)
             out[i] = shape(inputs[i], contracted, matmul.K, key=(key_axis, sign))
         return tuple(out)
 
-    for i, (matmul, node, views) in queries.items():
-        _, contracted = _operand_axes(matmul, 0, node, views)
+    for i, (matmul, node, views, q_id) in queries.items():
+        _, contracted = _operand_axes(matmul, q_id, node, views)
         x = inputs[i].float()
         # One positive magnitude per query row, constant along the contracted axis.
         magnitude = x.abs() + 0.5
         if contracted is not None:
             magnitude = magnitude.narrow(contracted, 0, 1)
         out[i] = (magnitude / matmul.K ** 0.5).expand_as(x).to(inputs[i].dtype).contiguous()
-    for i, (matmul, node, views, sign) in keys.items():
-        key_axis, _ = _operand_axes(matmul, 1, node, views)
+    for i, (matmul, node, views, sign, k_id) in keys.items():
+        key_axis, _ = _operand_axes(matmul, k_id, node, views)
         x = inputs[i]
         shape = [1] * x.dim()
         ramp = torch.zeros(1, device=x.device)
