@@ -260,6 +260,16 @@ def test_symbolic_rule_table():
     assert rule((1, 20, 12, 8), (1, 20, 12, 1), 3) == 0
     assert rule((1, 20, 12, 8), (1, 20, 1, 8), 3) == 1
     assert rule((1, 20, 12, 8), (1, 20, 12, 1), 4) == 0  # ... unless the value has rank 4
+    # ... and a unit batch axis next to the reduced one (one head): the dims do not say
+    # which of the two the value still has, and it does not matter
+    assert rule((1, 1, 12, 8), (1, 1, 12, 1), 3) == 0
+    assert rule((1, 1, 12, 8), (1, 1, 1, 8), 3) == 1
+    assert rule((1, 5, 1, 7), (1, 5, 1, 1), 3) == 0
+    assert rule((1, 1, 1, 12, 8), (1, 1, 1, 12, 1), 3) == 0  # two reduced, one unit axis
+    # ... unless it does: without the first unit the operand spans the last axis, without
+    # the other one it spans nothing the lhs has
+    assert rule((1, 7, 1, 7), (1, 1, 1, 7), 3) is None
+    assert rule((1, 1, 12, 8), (1, 1, 12, 1), 1) is None  # more axes dropped than are listed
     # nothing to go by
     assert rule((8, 8), (8,), 2) is None and rule((8, 8), (1, 1), 2) is None
     assert rule((20, 12, 8), (1, 12, 8), 3) is None  # a reduced batch axis
@@ -293,6 +303,44 @@ def test_split_combine_divides_by_the_row_sums():
     order = [tuple(int(v) for v in n.get_shape(0)) for n in placeholder_order(ir)]
     (got,) = execute(ir, [by_shape[shape] for shape in order])
     want = by_shape[(4, 4, 64, 64)].sum(1) / by_shape[(4, 4, 64)].sum(1).unsqueeze(-1)
+    torch.testing.assert_close(got.reshape(want.shape), want, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("sq, d", [(64, 64), (64, 128)], ids=["SQ == D", "SQ != D"])
+def test_split_combine_with_one_head_divides_by_the_row_sums(sq, d):
+    """The same combine for one head, as the search writes it: a unit dim is the literal
+    ``1``, like the dim a reduction leaves behind, so the two structure tensors are
+    ``(1, 1, SQ, D)`` and ``(1, 1, SQ, 1)`` for values of rank 3 and 2.
+
+    With S_Q == D the value shapes do not say which axis the row sums span, and the dims
+    used to be read with both units taken for reduced axes: every split graph of one-head
+    attention (the decode demo's shape with H = 1) was refused, "cannot tell which axis of
+    (1, 64, 64) the operand (1, 64) is broadcast along".
+    """
+    split, s_q, s_d = 2, 12, 8  # symbols; a unit dim has none
+    structure = [
+        {"op_type": "kn_input_op", "input_tensors": [], "output_tensors": [_t(1, (1, split, s_q))]},
+        {"op_type": "kn_input_op", "input_tensors": [],
+         "output_tensors": [_t(2, (1, split, s_q, s_d))]},
+        {"op_type": "kn_reduce_sum_1_op", "input_tensors": [_t(1, (split, 1, s_q, 1))],
+         "output_tensors": [_t(3, (1, 1, s_q, 1))]},
+        {"op_type": "kn_reduce_sum_1_op", "input_tensors": [_t(2, (split, 1, s_q, s_d))],
+         "output_tensors": [_t(4, (1, 1, s_q, s_d))]},
+        {"op_type": "kn_div_op",
+         "input_tensors": [_t(4, (1, 1, s_q, s_d)), _t(3, (1, 1, s_q, 1))],
+         "output_tensors": [_t(5, (1, 1, s_q, s_d))]},
+        {"op_type": "kn_output_op", "input_tensors": [_t(5, (1, 1, s_q, s_d))],
+         "output_tensors": []},
+    ]
+    ir = to_ir(structure, dtype="float32", out_dtype="float32",
+               symbol_map={split: 4, s_q: sq, s_d: d, 1: 1})
+    (div,) = [n for n in ir.nodes if type(n) is Div]
+    assert div.broadcast == 0
+    torch.manual_seed(0)
+    by_shape = {(1, 4, sq): torch.rand(1, 4, sq) + 0.5, (1, 4, sq, d): torch.randn(1, 4, sq, d)}
+    order = [tuple(int(v) for v in n.get_shape(0)) for n in placeholder_order(ir)]
+    (got,) = execute(ir, [by_shape[shape] for shape in order])
+    want = by_shape[(1, 4, sq, d)].sum(1) / by_shape[(1, 4, sq)].sum(1).unsqueeze(-1)
     torch.testing.assert_close(got.reshape(want.shape), want, rtol=1e-5, atol=1e-6)
 
 

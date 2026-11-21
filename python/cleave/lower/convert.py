@@ -6,6 +6,7 @@ is a rewrite pass over the ops that runs before conversion.
 
 from __future__ import annotations
 
+import itertools
 import math
 from collections import Counter
 from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
@@ -48,11 +49,29 @@ def _broadcast_from_symbols(lhs: Tuple[int, ...], rhs: Tuple[int, ...], rank: in
     reduction leaves its axis behind as a literal ``1``: the axis the operand does not span.
     ``rank`` is the rank of the lhs *value*, which has dropped the axes reduced before it
     (a split combine divides ``(1, BH, SQ, D)`` by ``(1, BH, SQ, 1)``: values of rank 3 and 2).
+
+    The dims both tensors list as ``1`` are the candidates for those dropped axes. A value
+    axis of extent 1 is written the same way (one head: ``(1, 1, SQ, D)`` by
+    ``(1, 1, SQ, 1)``), so there can be more candidates than dropped axes, and the dims do
+    not say which of them the value still has. Every choice is read; they have to agree.
     """
     lhs, rhs = tuple(lhs), tuple(rhs)
-    if len(lhs) != rank and len(lhs) == len(rhs):
-        kept = [i for i in range(len(lhs)) if not lhs[i] == rhs[i] == 1]
-        lhs, rhs = tuple(lhs[i] for i in kept), tuple(rhs[i] for i in kept)
+    if len(lhs) > rank and len(lhs) == len(rhs):
+        units = [i for i in range(len(lhs)) if lhs[i] == rhs[i] == 1]
+        dropped = len(lhs) - rank
+        if len(units) < dropped:
+            return None
+        readings = set()
+        for gone in itertools.combinations(units, dropped):
+            kept = [i for i in range(len(lhs)) if i not in gone]
+            readings.add(_broadcast_from_aligned(tuple(lhs[i] for i in kept),
+                                                 tuple(rhs[i] for i in kept), rank))
+        return readings.pop() if len(readings) == 1 else None
+    return _broadcast_from_aligned(lhs, rhs, rank)
+
+
+def _broadcast_from_aligned(lhs: Tuple[int, ...], rhs: Tuple[int, ...], rank: int) -> Optional[int]:
+    """``_broadcast_from_symbols`` for dims that list the axes of the lhs value, one each."""
     if len(lhs) != rank or rank < 2:
         return None
     if len(rhs) == len(lhs):  # keepdim form

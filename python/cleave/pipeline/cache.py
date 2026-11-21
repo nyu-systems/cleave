@@ -75,7 +75,10 @@ from pathlib import Path
 # 31: a reduction that reads an input through a split is given that input's tile in the
 #     input's own dims: its looped tilings have kernels (they were refused as loops over
 #     single elements) and one built with its axis counted from the front reduces that axis.
-SCHEMA = 31
+# 32: the split graphs of a program with a unit batch dim and equal trailing extents (one
+#     head, S_Q == D) lower; they were refused at the combine's division, so the best kernel
+#     of such a program can now be a split variant.
+SCHEMA = 32
 # What "validated" means for a saved kernel. A kernel-cache hit returns without validating,
 # so bump this whenever the comparison or its inputs change: saved kernels are then rebuilt.
 # (The inputs include the adversarial cases a program with an exact softmax is held to,
