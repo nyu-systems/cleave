@@ -12,11 +12,9 @@ from cleave.ir.ops import (
     Copy,
     Div,
     Exp2,
-    Log2,
     Lse2,
     MaskedDiv,
     MaskedExp,
-    MaskedLog2,
     MaskedLse2,
     MaskedScore,
     Mul,
@@ -42,11 +40,6 @@ def _run(node, *inputs):
 def _rand(positive=False):
     x = torch.randn(SHAPE)
     return x.abs() + 0.5 if positive else x
-
-
-def test_log2():
-    x = _rand(positive=True)
-    torch.testing.assert_close(_run(Log2(SHAPE), x), torch.log2(x))
 
 
 def test_div_denom_floor_tensor():
@@ -82,11 +75,6 @@ def test_mul_broadcast_over_the_last_axis_of_a_three_dim_tile():
 def test_masked_div_is_refused_not_unmasked():
     with pytest.raises(NotImplementedError, match="MaskedDiv"):
         _run(MaskedDiv(SHAPE), _rand(), _rand(positive=True))
-
-
-def test_masked_log2_is_refused_not_plain_log2():
-    with pytest.raises(NotImplementedError, match="MaskedLog2"):
-        _run(MaskedLog2(SHAPE), _rand(positive=True))
 
 
 def test_exp2():

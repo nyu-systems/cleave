@@ -17,7 +17,7 @@ from cleave.core.errors import LoweringRejected
 from cleave.frontend import trace
 from cleave.frontend.program import Op
 from cleave.ir.graph import OutputNode, PlaceHolderNode
-from cleave.ir.ops import (Copy, Div, Exp, Log2, MaskedDiv, Matmul, Mul, ReduceMax, ReduceSum,
+from cleave.ir.ops import (Copy, Div, Exp, Exp2, MaskedDiv, Matmul, Mul, ReduceMax, ReduceSum,
                            Stabilize)
 from cleave.lower import scale as S
 from cleave.lower.scale import Reduction, Scale, ScaleError, analyse, annotate, exps, record_for
@@ -510,8 +510,8 @@ def test_hand_built_softmax_is_recognised():
 
 def test_unknown_class_on_a_scaled_value_has_no_identity_fall_through():
     exp = Exp((4, 16), name="exp_0")
-    with pytest.raises(ScaleError, match="log2_0: Log2 has no scale rule"):
-        record_for(_normalized(exp, Log2((4, 16), name="log2_0")), exp)
+    with pytest.raises(ScaleError, match="exp2_0: Exp2 has no scale rule"):
+        record_for(_normalized(exp, Exp2((4, 16), name="exp2_0")), exp)
     exp = Exp((4, 16), name="exp_0")
     with pytest.raises(ScaleError, match="copy_0: Copy has no scale rule"):
         record_for(_normalized(exp, Copy((4, 16), name="copy_0")), exp)
@@ -537,7 +537,7 @@ def test_any_class_is_fine_on_an_unscaled_value():
     G._connect(exp, rowsum, 0, 0)
     G._connect(exp, div, 0, 0)
     G._connect(rowsum, div, 0, 1)
-    graph = _chain(div, Copy((4, 16), name="copy_0"), Log2((4, 16), name="log2_0"))
+    graph = _chain(div, Copy((4, 16), name="copy_0"), Exp2((4, 16), name="exp2_0"))
     assert record_for(graph, exp).axes == (-1,)
 
 

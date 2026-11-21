@@ -34,10 +34,8 @@ from cleave.ir.ops import (
     Copy,
     Div,
     Exp2,
-    Log2,
     Lse2,
     MaskedExp,
-    MaskedLog2,
     MaskedLse2,
     MaskedScore,
     Matmul,
@@ -105,7 +103,7 @@ def test_access_layer_structure(operator):
     assert type(div) is Div and div.denom_floor == 1e-30
     lse = outputs[1].inputs[0].src_node
     assert (type(lse), lse.name) == (Lse2, "lse_0")
-    assert not [n.name for n in graph.nodes if isinstance(n, Log2) or n.name == "log2_0"]
+    assert not [n.name for n in graph.nodes if n.name == "log2_0"]
 
     loop = _loop(graph)
     inner = loop.graph
@@ -280,10 +278,11 @@ def test_every_operator_has_an_exact_softmax(operator):
         (rows, kv) if is_mla else (rows,), (rows, width), (rows,)]
     assert tuple(inner.tmap[score].tile_size) == (rows, kv)
     # The lse is log2(l) + m, row-predicated in the prefill layers; it reads the max
-    # through the loop's accumulators, and no layer takes a plain log2 any more.
+    # through the loop's accumulators. It is the only node that takes a log: the plain
+    # log2 ops the layers used before are gone from the IR.
     lse = next(n for n in graph.nodes if n.name == "lse_0")
     assert type(lse) is (MaskedLse2 if causal else Lse2)
-    assert not [n.name for n in graph.nodes if type(n) in (Log2, MaskedLog2)]
+    assert [n.name for n in graph.nodes if "log2" in n.name or "lse" in n.name] == ["lse_0"]
     row_sum, carried = lse.inputs
     assert isinstance(carried, AccumEdge) and carried.src_node is loop
     assert (carried.accum_node.name, carried.src_id) == ("exp_0_max", 2)
@@ -371,7 +370,7 @@ def test_exact_kernel_without_the_lse():
 
     graph = build_paged_graph(replace(SPEC, emit_lse=False))
     assert _exact(graph)
-    assert not [n for n in graph.nodes if isinstance(n, (Log2, Lse2))]
+    assert not [n for n in graph.nodes if isinstance(n, Lse2) or "log2" in n.name]
     assert [n.name for n in graph.args if isinstance(n, OutputNode)] == ["OutputNode_0"]
     source = TilelangCodeGen().gen(graph)
     assert "lse2" not in source and "T.fill(t_exp_0_max, -3.4028234663852886e38)" in source

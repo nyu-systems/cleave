@@ -23,12 +23,10 @@ from cleave.ir.ops import (
     Exp2,
     IndexGather,
     IndptrTileScan,
-    Log2,
     Lse2,
     MacroOp,
     MaskedDiv,
     MaskedExp,
-    MaskedLog2,
     MaskedLse2,
     MaskedScore,
     Matmul,
@@ -58,12 +56,11 @@ def _variants():
         op.resolve_operand_layout = "rhs"
         yield op
     yield Div((16, 32), const=2.0, const_on_left=True, denom_floor=1e-6)
-    for cls in (Silu, Exp, Exp2, RSqrt, Sqrt, Log2, Copy, GridFloor):
+    for cls in (Silu, Exp, Exp2, RSqrt, Sqrt, Copy, GridFloor):
         yield cls((16, 32))
         yield cls((16, 32), name="other", dtype="float16")
         yield cls((2, 16, 32), n_batch_dims=0)
     yield MaskedDiv((16, 32), row_group=2)
-    yield MaskedLog2((16, 32), row_group=2, fuse_dst=False)
     yield MaskedExp((16, 32), 0.5)
     yield MaskedExp((16, 32), None, scalar_args=("a", "b", "c"))
     yield CausalMaskedExp((16, 32), 0.5, row_group=2)
@@ -176,7 +173,6 @@ def test_shift_and_mask_are_part_of_the_key():
     assert MaskedScore((16, 32)).macro_key() != CausalMaskedScore((16, 32)).macro_key()
     assert Lse2((16,)).macro_key() != MaskedLse2((16,)).macro_key()
     assert Exp((16,)).macro_key() != Exp2((16,)).macro_key()
-    assert Lse2((16,)).macro_key() != Log2((16,)).macro_key()
 
 
 def test_rescale_is_emitted_for_register_operands():

@@ -336,10 +336,6 @@ class Sqrt(UnaryElementwise):
     kind, _te, _tl = "sqrt", te.sqrt, "T.sqrt({a})"
 
 
-class Log2(UnaryElementwise):
-    kind, _te, _tl = "log2", te.log2, "T.log2({a})"
-
-
 class Exp2(UnaryElementwise):
     """Base-2 exponential: the base the paged softmax works in (``exp2`` is one instruction
     where ``exp`` is a call). Its rescale factor ``alpha = exp2(m_prev - m)`` is built from
@@ -808,69 +804,8 @@ class MaskedDiv(Div):
         return f"{prefix}_{kwargs['mem_scope']}"
 
 
-class MaskedLog2(Log2):
-    _macro_attrs = ("dims", "n_batch_dims", "scalar_args", "row_group", "fuse_dst")
-
-    def __init__(
-        self,
-        dims: tuple[int],
-        scalar_args: tuple[str, ...] = ("n_rows",),
-        row_group: int = 1,
-        fuse_dst: bool = True,
-        name: str = "maskedlog2",
-        dtype: str = "float32",
-        out_dtype: str = "float32",
-        n_batch_dims: int = None,
-    ):
-        assert (
-            len(scalar_args) == 1
-        ), f"MaskedLog2 takes a single row-count scalar, got {scalar_args}"
-        super().__init__(
-            dims,
-            name=name,
-            dtype=dtype,
-            out_dtype=out_dtype,
-            n_batch_dims=n_batch_dims,
-        )
-        # See MaskedDiv: the source row axis is fused, the destination is not.
-        self.row_group = int(row_group)
-        self.fuse_dst = bool(fuse_dst)
-        assert self.row_group >= 1, f"row_group must be positive, got {row_group}"
-        assert self.fuse_dst or self.row_group > 1, (
-            "fuse_dst only means something for a fused row axis"
-        )
-        self.scalar_args = tuple(scalar_args)
-
-    def gen_macro(self, **kwargs) -> str:
-        _idxs = [f"i{d}" for d in range(len(self.dims) - self.n_batch_dims)]
-        _idxs_str = ", ".join(_idxs)
-        n_rows = self.scalar_args[0]
-        if self.row_group == 1:
-            loop_src, row, dst = "B", _idxs[0], f"B[{_idxs_str}]"
-        else:
-            loop_src = "A"
-            row = mgroup_row(_idxs[0], self.row_group)
-            slot = mgroup_slot(_idxs[0], self.row_group)
-            head = [row, slot] if self.fuse_dst else [slot]
-            dst = f"B[{', '.join(head + _idxs[1:])}]"
-        macro_str = f"""\
-        @T.macro
-        def {self.get_macro_name(**kwargs)}(A, {n_rows}, B):
-            for {_idxs_str} in T.Parallel(*{loop_src}.shape):
-                if {row} < {n_rows}:
-                    {dst} = T.log2(A[{_idxs_str}])"""
-        return self._format_code(macro_str)
-
-    def get_macro_name(self, **kwargs) -> str:
-        prefix = "ukernel_masked_log2"
-        prefix += f"_mgrp{self.row_group}" if self.row_group != 1 else ""
-        prefix += "" if self.fuse_dst else "_dst2"
-        prefix += f"_{len(self.dims) - self.n_batch_dims}dims"
-        return f"{prefix}_{kwargs['mem_scope']}"
-
-
 class MaskedLse2(Lse2):
-    """``Lse2`` written the way ``MaskedLog2`` writes: only the rows below ``n_rows``,
+    """``Lse2`` written the way ``MaskedDiv`` writes: only the rows below ``n_rows``,
     through the same destination indexing (``row_group``, ``fuse_dst``)."""
 
     _macro_attrs = ("dims", "n_batch_dims", "scalar_args", "row_group", "fuse_dst")

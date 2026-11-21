@@ -17,10 +17,8 @@ from cleave.ir.ops import (
     Div,
     Exp,
     Exp2,
-    Log2,
     Lse2,
     MaskedExp,
-    MaskedLog2,
     MaskedLse2,
     MaskedScore,
     Matmul,
@@ -424,7 +422,6 @@ def test_lse2_macro_names_and_bodies():
     assert len(lse.inputs) == 2
     name = _emit(cg, lse, "rrg", clear=True)
     assert name == "ukernel_lse2_1dims_rrg"
-    assert name != _emit(cg, Log2((4,), n_batch_dims=0), "rg", clear=True)
     assert cg.generated_macros[name] == (
         "@T.macro\n"
         "def ukernel_lse2_1dims_rrg(A, M, B):\n"
@@ -455,10 +452,12 @@ def test_lse2_macro_names_and_bodies():
         "        if i0 // 4 < n_rows:\n"
         "            B[i0 // 4, i0 % 4] = T.log2(A[i0]) + M[i0]\n"
     )
-    assert "B[i0 % 4] = T.log2(A[i0]) + M[i0]" in cg.generated_macros[slot]
-    # the destination indexing is MaskedLog2's, token for token
-    for kw in (dict(), dict(row_group=4), dict(row_group=4, fuse_dst=False)):
-        log2 = MaskedLog2((64,), n_batch_dims=0, **kw).gen_macro(mem_scope="rg", clear=True)
-        lse2 = MaskedLse2((64,), n_batch_dims=0, **kw).gen_macro(mem_scope="rrg", clear=True)
-        dst = lambda text: text.split("\n")[-2].split(" = ")[0]  # noqa: E731
-        assert dst(log2) == dst(lse2) and log2.split("\n")[2:4] == lse2.split("\n")[2:4]
+    # a head group whose destination is one token's slots: the loop still walks the fused
+    # source rows and the predicate is the token's, only the destination loses its row
+    assert cg.generated_macros[slot] == (
+        "@T.macro\n"
+        "def ukernel_masked_lse2_mgrp4_dst2_1dims_rrg(A, M, n_rows, B):\n"
+        "    for i0 in T.Parallel(*A.shape):\n"
+        "        if i0 // 4 < n_rows:\n"
+        "            B[i0 % 4] = T.log2(A[i0]) + M[i0]\n"
+    )
