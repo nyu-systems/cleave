@@ -74,7 +74,7 @@ class ConstFill(MacroOp, Node):
         """Destination subscript, matching what the op this stands in for writes.
 
         With a row group the leading axis is a fused (token, head-slot) pair, so it
-        splits back into two subscripts exactly as ``MaskedDiv``/``MaskedLse2`` split it;
+        splits back into two subscripts exactly as ``MaskedDiv``/``MaskedLog2`` split it;
         the two paths have to address the same elements or the output depends on which
         branch ran.
         """
