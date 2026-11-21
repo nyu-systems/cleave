@@ -1,6 +1,6 @@
 """One program is one search problem, whatever the process did before, and one result list.
 
-Two things used to depend on the process (PB9):
+Two things used to depend on the process:
 
 * the symbols of a program's extent groups followed the iteration order of tables hashed on
   tensor guids, and guids come from a counter that the whole process draws from, the threads
@@ -254,9 +254,9 @@ def test_two_fresh_searches_list_the_same_graphs_in_the_same_order(tmp_path):
     assert [g[0] for g in first["graphs"]] == list(range(12))
     assert len({label.split()[0] for label in first["labels"]}) > 4  # "g<index> ..." of several graphs
     # The same list in every process and for every thread count. The list is in depth-first
-    # order of the search tree, which the search establishes by sorting once it is done; no run
-    # is the reference for it (the old library returned another order on one thread as well),
-    # so the one-thread search checks that the thread count does not matter, and nothing more.
+    # order of the search tree, which the search establishes by sorting once it is done. No
+    # run is a reference for that order (one thread does not find the graphs in it either), so
+    # the one-thread search checks that the thread count does not matter, and nothing more.
     for other in others:
         assert [g[1] for g in other["graphs"]] == [g[1] for g in first["graphs"]]  # the kind at each index
         assert other["labels"] == first["labels"]
