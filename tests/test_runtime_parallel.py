@@ -283,6 +283,55 @@ def test_lock_state_names_the_holder_and_the_waiters(tmp_path):
     assert child.exitcode == 0 and lock_state(str(path)) == (None, frozenset())
 
 
+def test_the_processes_of_a_run_agree_on_the_device_lock(monkeypatch, tmp_path):
+    """The device lock is named after the device's UUID, which ``nvidia-smi`` is asked for,
+    and after ``CUDA_VISIBLE_DEVICES`` where that query fails or takes too long. A lock
+    only serializes the processes that agree on its name, so the process that asks first
+    hands its answer to the processes it starts. (Each worker used to ask again: one whose
+    query timed out -- the driver answers it behind everything else that enters it -- named
+    its lock differently and ran on the device next to its siblings.)"""
+    import json
+    import subprocess
+    import sys
+
+    from cleave.runtime import gpu
+
+    asked = []
+
+    def smi(cmd, **kw):
+        asked.append(cmd[0])
+        if len(asked) > 1:  # every later query: the driver is busy
+            raise subprocess.TimeoutExpired(cmd, kw.get("timeout"))
+        return SimpleNamespace(stdout="0, GPU-aaaa\n3, GPU-dddd\n")
+
+    monkeypatch.setattr(gpu.subprocess, "run", smi)
+    monkeypatch.delenv(gpu._LOCK_KEY_ENV, raising=False)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "3")
+    assert gpu._gpu_lock_key() == "GPU-dddd" and asked == ["nvidia-smi"]
+    assert json.loads(os.environ[gpu._LOCK_KEY_ENV]) == ["3", "GPU-dddd"]
+    # a process started from here asks nobody: it has the answer (and so does this one)
+    assert gpu._gpu_lock_key() == "GPU-dddd" and len(asked) == 1
+    stub = tmp_path / "nvidia-smi"  # what the child would be told if it asked: nothing
+    stub.write_text("#!/bin/sh\nexit 1\n")
+    stub.chmod(0o755)
+    code = "from cleave.runtime import gpu; print('key', gpu._gpu_lock_key())"
+    child = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True,
+                             env={**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"})
+    assert child.communicate(timeout=300)[0].splitlines()[-1] == "key GPU-dddd"
+    # the answer holds for the devices it was found for: a process that sees another one
+    # asks for itself (here the query times out, and it falls back to what it sees)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
+    assert gpu._gpu_lock_key() == "0" and len(asked) == 2
+    assert json.loads(os.environ[gpu._LOCK_KEY_ENV]) == ["0", "0"]
+    # ... and something else in the variable is not an answer
+    for junk in ("", "GPU-dddd", '["0"]', '["0", ""]', '["0", 7]', "[1, 2, 3]"):
+        monkeypatch.setenv(gpu._LOCK_KEY_ENV, junk)
+        assert gpu._inherited_lock_key("0") is None, junk
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES")
+    monkeypatch.setenv(gpu._LOCK_KEY_ENV, json.dumps([None, "GPU-aaaa"]))
+    assert gpu._gpu_lock_key() == "GPU-aaaa" and len(asked) == 2
+
+
 @pytest.mark.parametrize("failing", [1, 0, 2])
 def test_a_reference_that_cannot_be_built_fails_the_candidates_of_its_graph(pool, failing):
     """... and only those, wherever the graph comes in the run. (As the first candidate's

@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import ctypes
 import fcntl
+import json
 import os
 import subprocess
 from typing import Optional
@@ -13,12 +14,43 @@ _PARALLEL_ENV_CONFIGURED = False
 _GPU_LOCK_PATH: Optional[str] = None
 
 
+# The lock's key as the first process of a run found it, handed down to the processes it
+# starts: ``[CUDA_VISIBLE_DEVICES it was found for, key]`` as JSON.
+_LOCK_KEY_ENV = "CLEAVE_GPU_LOCK_KEY"
+
+
 def _gpu_lock_key() -> str:
     """Physical identity (UUID) of the device this process runs on (visible device 0).
 
     Falls back to the raw ``CUDA_VISIBLE_DEVICES`` string when the UUID is unavailable.
+
+    The lock serializes the processes that agree on its name, so the first process of a
+    run that asks hands its answer down to the ones it starts (``_LOCK_KEY_ENV``, with the
+    ``CUDA_VISIBLE_DEVICES`` it holds for; a process that sees other devices asks for
+    itself). Every worker used to ask ``nvidia-smi`` again. The driver answers that query
+    behind every other process that is entering it -- 157 s were measured on this machine
+    while several hundred processes initialised CUDA at once -- and a worker whose query
+    took more than its 30 s fell back to another name than its siblings: it then held "the
+    device lock" next to them.
     """
     visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    key = _inherited_lock_key(visible)
+    if key is None:
+        key = _query_lock_key(visible)
+        os.environ[_LOCK_KEY_ENV] = json.dumps([visible, key])
+    return key
+
+
+def _inherited_lock_key(visible) -> Optional[str]:
+    """The key a parent process found for these visible devices, or None."""
+    try:
+        found_for, key = json.loads(os.environ[_LOCK_KEY_ENV])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return key if found_for == visible and isinstance(key, str) and key else None
+
+
+def _query_lock_key(visible) -> str:
     fallback = (visible or "all").replace(",", "_")
     if visible == "":
         return fallback
