@@ -143,8 +143,8 @@ def test_search_the_partial_loops_over_the_keys_of_its_split(cache_root):
             partial, combine = lower(graph, factor)
             crossing = boundary_signature(output_order(partial))
             assert crossing == boundary_signature(placeholder_order(combine)) == (
-                (0, "", (factor, SHAPES["R"]), "float16"),
-                (1, "", (factor, SHAPES["R"], SHAPES["D"]), "float16"),
+                (0, "", (factor, SHAPES["R"]), "float32"),
+                (1, "", (factor, SHAPES["R"], SHAPES["D"]), "float32"),
                 (2, "shift", (factor, SHAPES["R"]), "float32"))
             assert output_roles(partial) == ("shift", "", "") and output_roles(combine) == ("",)
             assert bind_inputs(partial, prog) is not None
@@ -208,7 +208,7 @@ def test_gpu_exact_split_rows(cache_root):
         kernel = report.best(variant)
         assert kernel.unrunnable is None and kernel.variant == variant
         assert [s.role for s in kernel.stages] == ["partial", "combine"]
-        assert [p.dtype for p in kernel.kernels[0].outputs] == ["float32", "float16", "float16"]
+        assert [p.dtype for p in kernel.kernels[0].outputs] == ["float32", "float32", "float32"]
         for case in EVERY_CASE:
             for seed in (1, 2):
                 inputs = _program_inputs(prog, case, seed)

@@ -12,8 +12,9 @@ kernel returns the statistics of its own split, ``(m_i, l_i, o_i)`` with ``l_i``
   axis, a spike on its last entry, constant rows, a common offset). For the combine the
   softmax axis is the split axis: maxima that rise along the splits, one split that
   dominates;
-* the chained ``Kernel`` against the Program's own reference, on normal inputs and on the
-  adversarial cases;
+* the chained ``Kernel`` against the Program's own reference, on normal inputs and on
+  every adversarial case, and on flat rows over values with a common offset, where a
+  split's own sums are past float16;
 * a combine fed by hand: maxima spread over hundreds of units, and a split that saw no key
   (it returns the start value of its carried max and sums of zero).
 
@@ -43,7 +44,6 @@ from tests._tolerances import tolerance_for
 
 TOLERANCE = tolerance_for("exact_split_attention")  # by boundary role: "" and "shift"
 EVERY_CASE = ("normal",) + ADVERSARIAL
-CHAINED = ("large_logits", "increasing", "decreasing", "last_spike", "constant")
 
 
 def mha(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"], v: cl.Tensor["H", "SKV", "D"]):
@@ -145,8 +145,8 @@ def test_search_every_split_graph_lowers_to_an_exact_pair(kind, cache_root):
             partial, combine = lower(graph, factor)
             crossing = boundary_signature(output_order(partial))
             assert crossing == boundary_signature(placeholder_order(combine)) == (
-                (0, "", (heads, factor, shapes["SQ"]), "float16"),
-                (1, "", (heads, factor, shapes["SQ"], shapes["D"]), "float16"),
+                (0, "", (heads, factor, shapes["SQ"]), "float32"),
+                (1, "", (heads, factor, shapes["SQ"], shapes["D"]), "float32"),
                 (2, "shift", (heads, factor, shapes["SQ"]), "float32"))
             assert output_roles(partial) == ("shift", "", "") and output_roles(combine) == ("",)
             assert bind_inputs(partial, prog) is not None
@@ -158,6 +158,50 @@ def test_search_every_split_graph_lowers_to_an_exact_pair(kind, cache_root):
         whole = {("partial", "in-tile")} if shapes["SKV"] // factor <= 256 else set()
         assert cases == {("partial", "rolling"), ("combine", "rolling"),
                          ("combine", "in-tile")} | whole, (factor, cases)
+
+
+# What a split's sums come to relative to its own max: name -> (shapes, split factor, the
+# common offset of the values). Flat rows (every score equal) weight every key by 1, so a
+# split's row sum is the number of its keys and its value sum that many times the values.
+OVERFLOW = {
+    "value_sums": (dict(H=2, SQ=4, SKV=4096, D=8), 16, 300.0),  # 256 keys x 300
+    "row_sums": (dict(H=2, SQ=4, SKV=262144, D=8), 4, 0.0),  # 65536 keys
+}
+
+
+@pytest.mark.parametrize("name", sorted(OVERFLOW))
+def test_search_the_sums_of_a_split_cross_the_cut_in_float32(name, cache_root, monkeypatch):
+    """CPU, reference level: the pair computes the program where a split's own sums are
+    past what the program's dtype holds. They crossed the cut in float16: the partial
+    handed over ``inf``, the combine returned ``inf`` (or 0, where only the row sums
+    overflow), and each stage still agreed with its own reference, which was cast the same
+    way. The solo kernel divides in float32 before it casts; so does the pair now."""
+    from cleave.runtime.reference import build_inputs_and_reference
+    from cleave.runtime.validate import Tolerance
+    from tests._softmax import chained_reference
+
+    # (References and made-up tensors, no kernel: nothing here belongs in a measurement.)
+    monkeypatch.delenv("CLEAVE_VALIDATION_LOG", raising=False)
+    shapes, factor, offset = OVERFLOW[name]
+    prog = trace(mha, shapes, cl.f16)
+    split = P.superoptimize(prog, SPLIT).filter(lambda g: g.is_split)
+    assert len(split) >= 1
+    q, k, v = prog.random_inputs(seed=0, device="cpu")
+    q, v = torch.zeros_like(q), (v.float() + offset).to(v.dtype)
+    (want,) = prog.reference(q, k, v)
+    assert torch.isfinite(want).all()
+    for graph in split:
+        partial, combine = lower(graph, factor)
+        crossing, (out,) = chained_reference(partial, combine, prog, [q, k, v])
+        assert [str(x.dtype) for x in crossing] == ["torch.float32"] * 3
+        assert all(torch.isfinite(x).all() for x in crossing)
+        # ... and float16 would not hold them
+        assert max(float(x.abs().max()) for x in crossing[:2]) > torch.finfo(torch.float16).max
+        compare_outputs([out], [want], Tolerance(rtol=5e-3))
+        # the inputs validation makes for the partial: on constant rows its reference is finite
+        _, reference, _ = build_inputs_and_reference(partial, "float16", device="cpu",
+                                                     distribution="constant")
+        assert all(torch.isfinite(r).all() for r in reference)
 
 
 @pytest.mark.parametrize("kind", sorted(DECODE))
@@ -192,17 +236,17 @@ def test_gpu_exact_split_attention(kind, cache_root):
                       and list(r.plan.tile.output_tile)[1] in (8, 16, 64)]
         assert once_wrong and all("for i0 in T.serial(" in r.source for r in once_wrong)
 
-        # The chained Kernel against the Program, on normal inputs and on the adversarial
-        # ones: finite, and within the bound of the program's own outputs.
+        # The chained Kernel against the Program, on normal inputs and on every adversarial
+        # case: finite, and within the bound of the program's own outputs.
         kernel = report.best(variant)
         assert kernel.unrunnable is None and kernel.variant == variant
         assert [s.role for s in kernel.stages] == ["partial", "combine"]
         partial, combine = kernel.kernels
-        assert [p.dtype for p in partial.outputs] == ["float32", "float16", "float16"]
+        assert [p.dtype for p in partial.outputs] == ["float32", "float32", "float32"]
         assert sorted(p.shape for p in kernel.stages[1].params) == [
             (heads, factor, 64), (heads, factor, 64), (heads, factor, 64, 64)]
         assert all(p.source == "stage" and p.layout is not None for p in kernel.stages[1].params)
-        for case in ("normal",) + CHAINED:
+        for case in EVERY_CASE:
             for seed in (1, 2):
                 inputs = _program_inputs(prog, case, seed)
                 reference = prog.reference(*inputs)
@@ -210,6 +254,22 @@ def test_gpu_exact_split_attention(kind, cache_root):
                 (measured,) = compare_outputs([kernel(*inputs)], reference, TOLERANCE[""],
                                               what=_what(case, f"chained {variant}"))
                 assert measured.rel <= TOLERANCE[""].rtol
+
+        # Flat rows over values with a common offset. Relative to its own max a split's
+        # sums are then the number of its keys times the values: more than float16 holds,
+        # where the program's result (the mean of the values) is nowhere near it. The sums
+        # cross the cut in float32. (Constant logits: logged as that case, held to the
+        # bound and no input to it.)
+        keys = shapes["SKV"] // factor
+        offset = 16.0 * round(1.25 * float(torch.finfo(torch.float16).max) / keys / 16.0)
+        assert keys * (offset - 8.0) > torch.finfo(torch.float16).max
+        q, k, v = prog.random_inputs(seed=3)
+        flat = [torch.zeros_like(q), k, (v.float() + offset).to(v.dtype)]
+        reference = prog.reference(*flat)
+        assert torch.isfinite(reference[0]).all()
+        (measured,) = compare_outputs([kernel(*flat)], reference, TOLERANCE[""],
+                                      what=_what("constant", f"chained {variant}"))
+        assert measured.rel <= TOLERANCE[""].rtol
 
         # The combine fed by hand: maxima spread over hundreds of units, and one split
         # that saw no key at all.
@@ -221,7 +281,7 @@ def test_gpu_exact_split_attention(kind, cache_root):
         o = torch.randn((heads, factor, 64, 64), generator=gen)
         m = torch.randn((heads, factor, 64), generator=gen) * 100.0
         l[:, 1], o[:, 1], m[:, 1] = 0.0, 0.0, NEG_FLT_MAX
-        by_index = {0: l.to(torch.float16), 1: o.to(torch.float16), 2: m}
+        by_index = {0: l, 1: o, 2: m}
         feed = {p.name: by_index[p.boundary.index].cuda() for p in placeholder_order(graph)}
         out = compiled(*order_inputs_for_kernel(feed, compiled))
         assert torch.isfinite(out).all()

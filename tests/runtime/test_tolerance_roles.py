@@ -2,7 +2,7 @@
 
 One ``Tolerance`` is the bound of the outputs a program or its cut defines. A rewrite can
 add a tensor to the cut: the split partial of an exact softmax returns its shift, a float32
-max, next to its float16 sums. Such an output carries a boundary role, and its bound is
+max, next to its sums. Such an output carries a boundary role, and its bound is
 declared under that role: ``{"": Tolerance(...), "shift": Tolerance(...)}``. Nothing falls
 back to another output's bound, in either direction.
 """

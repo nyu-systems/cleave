@@ -41,7 +41,7 @@ VALID = (1, 2, 3, 4, 5)  # the stored structures that cut into a partial and a c
 # the stored structures' symbols: 64 query heads over 16 key heads, 64 queries, 256 keys
 SHAPES = dict(HQ=64, HKV=16, SQ=64, SKV=256, D=64)
 ROWSUM, VALUE, MAX = (64, FACTOR, 64), (64, FACTOR, 64, 64), (64, FACTOR, 64)
-CROSSING = ((0, "", ROWSUM, "float16"), (1, "", VALUE, "float16"), (2, SHIFT, MAX, "float32"))
+CROSSING = ((0, "", ROWSUM, "float32"), (1, "", VALUE, "float32"), (2, SHIFT, MAX, "float32"))
 
 
 def attention(q: cl.Tensor["HQ", "SQ", "D"], k: cl.Tensor["HKV", "SKV", "D"],
@@ -424,6 +424,60 @@ def test_an_exp_the_program_never_wrote_is_not_left_plain():
         "exp_shift": True, "exp_9": False}
 
 
+def test_a_plain_exp_of_the_requested_logits_is_not_the_split_softmax():
+    """The one softmax of a pair is found by the analysis, not by the request: next to a
+    plain exp the program wrote, an exp that cancels across the cut is taken for it. Where
+    the request names an input, the exp that reads that input must be the one: here the
+    queries go through an exp before they are scored, the program requested a softmax of
+    the queries, and the pair would have served the scores' exp and left that one plain."""
+    from cleave.frontend.program import Op
+
+    def with_exp_of_the_queries():
+        partial, combine = _plain_pair(1)
+        q = next(n for n in partial.nodes if isinstance(n, PlaceHolderNode)
+                 and n.input_index == 0)
+        (edge,) = q.outputs
+        reader, slot = edge.dst_node, edge.dst_id
+        first = Exp(tuple(int(s) for s in q.get_shape(0)), name="exp_q", dtype="float16",
+                    out_dtype="float16", n_batch_dims=1)
+        q._out_edges[:] = []
+        wire_input(q, first, 0)
+        wire_input(first, reader, slot)
+        outs = [n for n in partial.nodes if isinstance(n, OutputNode)]
+        return Graph(nodes=find_topo_sort(outs)), combine
+
+    class Program:
+        stabilize_requests = ((0, 2),)
+        ops = [Op("input", (), (("name", "q"),), 0),
+               Op("exp", (0,), (("stabilize", 2),), 3), Op("exp", (5,), (), 6)]
+
+    partial, combine = with_exp_of_the_queries()
+    assert sorted(e.name for e in exps(partial))[-1] == "exp_q" and len(exps(partial)) == 2
+    with pytest.raises(ScaleError, match="^exp_q reads 'q', the logits of a softmax the "
+                                         "program requested, and stays a plain exp$"):
+        stabilize_split(partial, combine, Program)
+    assert [e.stabilize for e in exps(partial)] == [None, None]
+
+    # the same pair for a program that requested the softmax of the scores (a computed
+    # value, which names no input) and wrote the exp of the queries plain: served
+    class Scores(Program):
+        stabilize_requests = ((5, 2),)
+        ops = [Op("input", (), (("name", "q"),), 0), Op("exp", (0,), (), 3),
+               Op("exp", (5,), (("stabilize", 2),), 6)]
+
+    partial, _ = stabilize_split(*with_exp_of_the_queries(), Scores)
+    assert {e.name: e.stabilize is not None for e in exps(partial)}["exp_q"] is False
+    assert sum(e.stabilize is not None for e in exps(partial)) == 1
+
+    # ... and a pair with fewer exps than the program wrote apart leaves none of them plain
+    class Merged(Scores):
+        ops = Scores.ops + [Op("exp", (7,), (), 8)]
+
+    with pytest.raises(ScaleError, match="^the program wrote 3 different exps and this pair "
+                                         r"has 2, \['exp_q'\] of them left plain"):
+        stabilize_split(*with_exp_of_the_queries(), Merged)
+
+
 def test_a_refused_pair_is_refused_with_the_reason_at_lowering():
     graph = SearchedGraph(0, _structure(1), dict(PL.SYMBOL_MAPS["gqa"]), True,
                           _Requests(2), ("SKV",))
@@ -457,7 +511,7 @@ def test_the_chained_references_compute_the_program(n, scale):
     q, k, v = (torch.randn(s.shape).to(torch.float16) for s in program.inputs)
     q = (q.float() * scale).to(torch.float16)
     crossing, (out,) = chained_reference(partial, combine, program, [q, k, v])
-    assert [str(x.dtype) for x in crossing] == ["torch.float16", "torch.float16",
+    assert [str(x.dtype) for x in crossing] == ["torch.float32", "torch.float32",
                                                "torch.float32"]
     assert all(torch.isfinite(x).all() for x in (*crossing, out))
     # the shift is the max of the scores of each split, exactly as the kernel has to return it

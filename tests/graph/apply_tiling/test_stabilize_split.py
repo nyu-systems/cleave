@@ -110,12 +110,13 @@ def test_every_partial_tiling_reuses_the_exported_max(pair):
             assert site.step == site.block == site.full == 64
             assert edge.src_node is m and layouts == LOGICAL
             assert "-3.4028234663852886e38" not in code and "_max_prev" not in code
-        # three stores, in the order the kernel returns its outputs: the float32 shift,
-        # then the two sums under the names the cut gave them
+        # three stores, in the order the kernel returns its outputs: the shift, then the
+        # two sums under the names the cut gave them. All three in float32: relative to a
+        # split's own max its sums are not small, and float16 would not hold them
         signature = code[code.index("def main_kernel("):code.index("with T.Kernel")]
         outs = re.findall(r"(OutputNod\w): T\.Tensor\(\(.*?\), \"(\w+)\"\)", signature)
-        assert outs == [("OutputNodg", "float32"), ("OutputNode", "float16"),
-                        ("OutputNodf", "float16")]
+        assert outs == [("OutputNodg", "float32"), ("OutputNode", "float32"),
+                        ("OutputNodf", "float32")]
     assert cases == {"rolling": 8, "in-tile": 8}
 
 
@@ -197,8 +198,8 @@ def test_the_rolling_combine_weights_each_partial_by_its_shift(pair):
     """``M = max(M, max_i m_i)``, ``w = exp(m - M)``, both sums rescaled by
     ``alpha = exp(M_prev - M)`` and fed ``w * l`` / ``w * o``: the weights are float32, and
     the value partials take theirs by the lead broadcast (one weight per row of the tile).
-    The shift is loaded once for its two readers; the partials are cast to float32 on the
-    way to their product."""
+    The shift is loaded once for its two readers; the partials arrive in float32 and are
+    multiplied as they are loaded."""
     _, combine = pair
     cand = next(c for c, t in _tilings(combine) if not isinstance(t, ScheduleRejected)
                 and sites(t)[0].case == "rolling" and list(c.output_tile) == [1, 16, 64])
@@ -212,16 +213,14 @@ def test_the_rolling_combine_weights_each_partial_by_its_shift(pair):
         "ukernel_sub_broadcast_1_2dims_rrr(PlaceHolder_shiftt, t_exp_shift_max, "
         "t_exp_shift_shifted)",
         "ukernel_exp_2dims_rr(t_exp_shift_shifted, t_exp_shift)",
-        "T.copy(PlaceHolder_input_100000011, PlaceHolder_input_100000011_cast)",
-        "ukernel_mul_2dims_rrr(PlaceHolder_input_100000011_cast, t_exp_shift, "
+        "ukernel_mul_2dims_srr(PlaceHolder_input_100000011, t_exp_shift, "
         "t_reduction_1_2_weighted)",
         "ukernel_sub_1dims_rrr(t_exp_shift_max_prev, t_exp_shift_max, t_exp_shift_max_step)",
         "ukernel_exp_1dims_rr(t_exp_shift_max_step, t_exp_shift_alpha)",
         "ukernel_rescale_1dims_rr(t_exp_shift_alpha, t_reduction_1_2)",
         "ukernel_reduction_axis0_rr(t_reduction_1_2_weighted, t_reduction_1_2)",
         "T.copy(PlaceHolder_input_10000002, PlaceHolder_input_100000022)",
-        "T.copy(PlaceHolder_input_100000022, PlaceHolder_input_100000022_cast)",
-        "ukernel_mul_broadcast_0_3dims_rrr(PlaceHolder_input_100000022_cast, t_exp_shift, "
+        "ukernel_mul_broadcast_0_3dims_srr(PlaceHolder_input_100000022, t_exp_shift, "
         "t_reduction_1_3_weighted)",
         "ukernel_rescale_lead1_2dims_rr(t_exp_shift_alpha, t_reduction_1_3)",
         "ukernel_reduction_axis0_rr(t_reduction_1_3_weighted, t_reduction_1_3)",
@@ -243,12 +242,10 @@ def test_the_combine_that_holds_every_partial_takes_the_max_in_place(pair):
         "ukernel_sub_broadcast_1_2dims_grr(PlaceHolder_shift, t_exp_shift_max, "
         "t_exp_shift_shifted)",
         "ukernel_exp_2dims_rr(t_exp_shift_shifted, t_exp_shift)",
-        "T.copy(PlaceHolder_input_10000002, PlaceHolder_input_10000002_cast)",
-        "ukernel_mul_broadcast_0_3dims_rrr(PlaceHolder_input_10000002_cast, t_exp_shift, "
+        "ukernel_mul_broadcast_0_3dims_grr(PlaceHolder_input_10000002, t_exp_shift, "
         "t_reduction_1_3_weighted)",
         "ukernel_reduction_axis0_rr_clear(t_reduction_1_3_weighted, t_reduction_1_3)",
-        "T.copy(PlaceHolder_input_10000001, PlaceHolder_input_10000001_cast)",
-        "ukernel_mul_2dims_rrr(PlaceHolder_input_10000001_cast, t_exp_shift, "
+        "ukernel_mul_2dims_grr(PlaceHolder_input_10000001, t_exp_shift, "
         "t_reduction_1_2_weighted)",
         "ukernel_reduction_axis0_rr_clear(t_reduction_1_2_weighted, t_reduction_1_2)",
         "ukernel_div_broadcast_0_resolve_rhs_layout_2dims_rrr(t_reduction_1_3, "

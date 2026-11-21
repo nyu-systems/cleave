@@ -36,7 +36,9 @@ why not; ``annotate`` applies it to a whole solo graph on behalf of a requesting
 
 A split pair cannot cancel the factor inside the partial: every output of a partial keeps
 degree 1, each split relative to its own max. ``stabilize_split`` makes the pair exact
-instead. The partial exports that max as one more output (``export_shift``); the combine,
+instead. The partial exports that max as one more output (``export_shift``) and hands its
+sums over in float32 (``_widen_cut``: relative to a split's own max they are not small);
+the combine,
 which the same analysis proves to cancel the factor when its inputs are seeded with the
 partial's output scales (``analyse_split``), weights every partial by ``exp(m_i)`` before
 it sums them over the split axis (``exact_combine``): a softmax over the split axis, marked
@@ -46,6 +48,8 @@ and served like any other.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+
+from tvm import DataType
 
 from ..ir.analysis import _map_input_axes_to_consumer_axes
 from ..ir.graph import Boundary, ComputeOpNode, Graph, OutputNode, PlaceHolderNode
@@ -316,13 +320,61 @@ def _record(exp, report: ScaleReport, export=None) -> Stabilize:
                      rolling=_rolling_obstacle(exp, report, reducers), export=export)
 
 
+def written_exps(program) -> int:
+    """How many different exps ``program`` wrote: its ``exp`` records, counted once per
+    operand and request. (Two records of one operand that make the same request, or none,
+    are one value; a search may merge them, and nothing is lost when it does.)"""
+    return len({(r.args[0], r.attr("stabilize")) for r in program.ops if r.kind == "exp"})
+
+
+def _requested_inputs(program) -> list:
+    """``(input position, name)`` of every program input that is the logits of a requested
+    softmax (``cl.softmax(x)`` of an input ``x``), in request order, once each."""
+    positions = {r.out: (i, r.attr("name")) for i, r in enumerate(
+        r for r in getattr(program, "ops", ()) if r.kind == "input")}
+    found = []
+    for value, _ in program.stabilize_requests:
+        if value in positions and positions[value] not in found:
+            found.append(positions[value])
+    return found
+
+
+def _plain_requested_exp(graph, program, recorded) -> str:
+    """Why ``graph`` does not serve a softmax the program requested of one of its inputs,
+    or ``""``.
+
+    The request is a record of the program, not a node of the searched graph, so in
+    general it cannot be told which Exp it means: that is why records are derived. Where
+    the logits are an input it can: the input is a placeholder of the graph. If an Exp
+    reads that placeholder and none of the Exps that read it carries a record, the
+    requested softmax is computed with a plain exp, whatever other exp cancels elsewhere.
+    """
+    placeholders = {getattr(n, "input_index", None): n for n in graph.nodes
+                    if isinstance(n, PlaceHolderNode)}
+    for position, name in _requested_inputs(program):
+        logits = placeholders.get(position)
+        if logits is None:
+            continue
+        readers = [e for e in exps(graph) if e.inputs[0].src_node is logits]
+        if readers and not any(e is r for e in readers for r in recorded):
+            return (f"{readers[0].name} reads {name!r}, the logits of a softmax the program "
+                    "requested, and stays a plain exp")
+    return ""
+
+
 def annotate(graph, program) -> list:
     """Mark the softmax exps of a solo graph for a program that requested them.
 
     Every Exp whose scale cancels gets its ``Stabilize`` record; the others stay plain.
     ``ScaleError`` (and nothing is marked) when the graph cannot honour the program's
-    requests: no Exp cancels, fewer cancel than were requested, or an Exp is left plain
-    although every ``exp`` of the program is a softmax exp.
+    requests: no Exp cancels, fewer cancel than were requested, an Exp is left plain
+    although every ``exp`` of the program is a softmax exp, or an Exp that may be a
+    requested one is left plain. That is one of a graph with fewer exps than the program
+    wrote apart (the search merged a requested exp with a plain exp of the same value,
+    and the merged one no longer cancels), and one that reads the input a softmax was
+    requested of while no reader of that input is stabilized. Counting the records alone
+    would let an exp the program never asked for, ``exp / sum`` written by hand, stand in
+    for the requested one.
     """
     records, reasons = [], []
     for exp in exps(graph):
@@ -340,6 +392,15 @@ def annotate(graph, program) -> list:
                          f"can be stabilized{why}")
     if reasons and not plain_exp:
         raise ScaleError(reasons[0])
+    wrote = written_exps(program)
+    if reasons and len(exps(graph)) < wrote:
+        raise ScaleError(
+            f"the program wrote {wrote} different exps and this graph has {len(exps(graph))}, "
+            "one of them left plain: it may be a requested softmax exp merged with a plain "
+            f"exp of the same value ({reasons[0]})")
+    unserved = _plain_requested_exp(graph, program, [exp for exp, _ in records])
+    if unserved:
+        raise ScaleError(unserved)
     # A reduction scaled by two softmaxes would need both factors: no rolling form.
     owners: dict = {}
     for exp, record in records:
@@ -577,13 +638,43 @@ def stabilize_split(partial, combine, program):
     if requests != 1:
         raise ScaleError(f"{requests} softmax requests; a split carries one softmax")
     exp, report, combined = analyse_split(partial, combine)
-    if not any(r.kind == "exp" and r.attr("stabilize") is None for r in program.ops):
-        plain = [n.name for graph in (partial, combine) for n in exps(graph) if n is not exp]
-        if plain:
+    plain = [n.name for graph in (partial, combine) for n in exps(graph) if n is not exp]
+    if plain:
+        if not any(r.kind == "exp" and r.attr("stabilize") is None for r in program.ops):
             raise ScaleError(f"{plain} would stay plain exps, and the program wrote none")
+        # As for a solo graph (``annotate``): an exp left plain must not be the requested one.
+        wrote = written_exps(program)
+        if 1 + len(plain) < wrote:
+            raise ScaleError(
+                f"the program wrote {wrote} different exps and this pair has {1 + len(plain)}, "
+                f"{plain} of them left plain: one may be the requested softmax exp merged "
+                "with a plain exp of the same value")
+        unserved = _plain_requested_exp(partial, program, [exp])
+        if unserved:
+            raise ScaleError(unserved)
     (axis,), (split,) = report.const, combined.const
     rows = tuple(a for a in range(report.rank) if a != axis)  # the Exp axes of the shift
     dims = _shape(exp)
     partial, _ = export_shift(partial, exp, report)
     combine = exact_combine(combine, tuple(dims[a] for a in rows), rows.index(split))
+    _widen_cut(partial, combine)
     return partial, combine
+
+
+def _widen_cut(partial, combine) -> None:
+    """The sums of an exact pair cross the cut in float32, like the shift they are relative
+    to: the partial's outputs the cut produced, and the combine's inputs that read them.
+
+    Relative to the max of its own split a partial's sums are not small: the row sum is
+    between 1 and the number of keys of the split, and the weighted values reach that many
+    times the values. In the program's dtype they overflow where the program's own result
+    does not -- flat rows over 256 keys with values around 300 are past float16's 65504,
+    and so is the row sum of any split of 65520 keys -- and the combine would divide
+    ``inf`` by ``inf``. The solo kernel divides in float32 before it casts; so does the
+    pair, with the cut in float32. (Validation cannot see such an overflow: a partial is
+    compared with its own reference, which is cast the same way.)
+    """
+    wide = DataType(STAT_DTYPE)
+    for node in _outputs(partial) + _placeholders(combine):
+        if node.boundary is not None and not node.boundary.role:
+            node._dtypes[0] = wide

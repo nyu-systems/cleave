@@ -141,7 +141,7 @@ def test_split_graph_of_a_requesting_program_lowers_to_an_exact_pair():
     partial, combine = lower(_split_graph(requesting), 4)
     (exp,), (weights,) = _exps(partial), _exps(combine)
     assert [(o.boundary.role, str(o.get_dtype(0))) for o in output_order(partial)] == [
-        ("shift", "float32"), ("", "float16"), ("", "float16")]
+        ("shift", "float32"), ("", "float32"), ("", "float32")]
     assert exp.stabilize.axes == (-1,) and exp.stabilize.export == output_order(
         partial)[0].inputs[0].src_node.name
     assert sorted(p.boundary.role for p in placeholder_order(combine)) == ["", "", "shift"]
