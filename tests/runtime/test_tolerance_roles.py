@@ -22,6 +22,7 @@ from cleave.runtime.validate import MeasuredError, Tolerance, tolerances_of
 from cleave.runtime.workers import WorkerPool
 
 OUT, SHIFT = Tolerance(rtol=5e-3), Tolerance(rtol=2e-6)
+GIB = 2**30
 BY_ROLE = {"": OUT, "shift": SHIFT}
 SOLO, PARTIAL = ("",), ("", "", "shift")
 
@@ -103,21 +104,44 @@ def _check(code_str, *, out_idx, reference_cache_dir, tolerance=None, benchmark=
 def test_every_candidate_is_checked_at_the_bounds_of_its_own_outputs(monkeypatch):
     """One declaration for the plans of a program; each kernel gets what it comes to for
     the outputs it returns. A kernel left without a bound fails at validate, with the
-    reason, and the others are not affected."""
+    reason, and the others are not affected.
+
+    The reference of a graph whose kernels have no bound is not built either (it used to
+    be, for candidates that then all failed), and such a graph has no say in how many
+    workers the run gets: that follows the largest reference that was built. This is what
+    a caller of ``run_candidates`` gets; ``pipeline.build`` refuses a declaration that
+    leaves a plan without a bound before it starts (``tests/pipeline_api/test_config.py``)."""
     roles = {"solo": SOLO, "partial": PARTIAL, "combine": SOLO}
+    footprint = {"solo": 1 * GIB, "partial": 3 * GIB, "combine": 2 * GIB}
     monkeypatch.setattr(evaluate_mod, "output_roles", lambda graph: roles[graph.name])
     cands = [SimpleNamespace(code=name, rstep_map={}, output_tile=(i,),
                              flat_graph=SimpleNamespace(name=name, nodes=[]))
              for i, name in enumerate(roles)]
 
+    built, sized_for = [], []
+
+    def reference(cache_dir, graph, dtype):
+        built.append(graph.name)
+        return [-1], footprint[graph.name]
+
+    def cap(max_parallel, io_bytes):
+        sized_for.append(io_bytes)
+        return 1
+
+    monkeypatch.setattr(evaluate_mod, "_effective_compile_and_run_parallelism", cap)
+
     def run(tolerance):
+        built.clear()
+        sized_for.clear()
         with WorkerPool(mp.get_context("fork")) as pool:
             return run_candidates(cands, "float16", build_fn=lambda c: c.code, check_fn=_check,
-                                  reference_fn=lambda d, g, dt: ([-1], 0), pool=pool,
+                                  reference_fn=reference, pool=pool,
                                   max_parallel=1, tolerance=tolerance)
 
     solo, partial, combine = run(BY_ROLE)
     assert (solo.ok, partial.ok, combine.ok) == (True, True, True)
+    assert built == ["solo", "partial", "combine"]
+    assert sized_for == [footprint["partial"]]  # the largest, not the first
     # the roles go with the task (for the validation log) only where an output has one
     assert solo.cuda_src == combine.cuda_src == repr(((OUT,), None))
     assert partial.cuda_src == repr(((OUT, OUT, SHIFT), PARTIAL))
@@ -127,11 +151,24 @@ def test_every_candidate_is_checked_at_the_bounds_of_its_own_outputs(monkeypatch
     assert solo.cuda_src == repr((OUT, None))
     assert partial.stage == "validate" and isinstance(partial.error, ValidationError)
     assert "returns outputs of role ['shift']" in str(partial.error)
+    assert partial.code == "partial"  # it is still built: the failure names its source
+    assert built == ["solo", "combine"]  # ... and no reference was made for it
+    assert sized_for == [footprint["combine"]]  # the largest of those that were
 
     solo, partial, combine = run({"": OUT})
     assert (solo.ok, partial.ok, combine.ok) == (True, False, True)
     assert "no validation tolerance declared for the outputs of role ['shift']" in str(
         partial.error)
+    assert built == ["solo", "combine"]
+    assert sized_for == [footprint["combine"]]
+
+    # a run whose first graph is the one without a bound is sized like any other (the
+    # first candidate's graph used to size it: 0 bytes here, which switched the cap off)
+    cands.insert(0, cands.pop(1))
+    partial, solo, combine = run(OUT)
+    assert (partial.ok, solo.ok, combine.ok) == (False, True, True)
+    assert built == ["solo", "combine"]
+    assert sized_for == [footprint["combine"]]
 
 
 # ------------------------------------------------------------------------------------ log

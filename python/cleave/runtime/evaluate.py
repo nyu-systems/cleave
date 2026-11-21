@@ -248,10 +248,22 @@ def run_candidates(
         parent would wait for that lock in the middle of the run -- and a worker whose
         kernel never returns holds it for good. The parent is the one that times a
         candidate out, so it would wait with it forever.
+
+        A graph whose outputs the declared tolerance does not cover has no reference built:
+        none of its candidates reaches a worker (each fails for the missing bound, in
+        ``launch_until_full``). This is for a caller that hands candidates over itself.
+        ``pipeline.build`` never gets here with such a graph: it refuses the declaration
+        before it starts (``_check_tolerance_fits``), so no program compiled through the
+        pipeline had a reference built for nothing.
         """
         for cand in candidates:
             key = id(cand.flat_graph)
             if key in graph_refs:
+                continue
+            try:
+                declared_for(cand)
+            except SpecError:
+                graph_refs[key] = (None, None, 0)  # nothing of it is used: no worker gets it
                 continue
             cache_dir = os.path.join(reference_root, f"g{len(graph_refs)}")
             os.makedirs(cache_dir, exist_ok=True)
@@ -267,6 +279,22 @@ def run_candidates(
         if isinstance(reference, Exception):
             raise reference
         return reference
+
+    def widest_reference():
+        """The largest input + output footprint among the graphs that have a reference:
+        what the run's parallelism is sized for.
+
+        A worker loads the inputs and the reference of its candidate's graph onto the
+        device, and the graphs of one run differ (a split partial returns ``splits`` times
+        the program's output, and its combine reads that), so the cap has to hold for the
+        largest. A graph without a reference sends nothing to a worker and has no say:
+        one whose reference could not be built (its candidates report why), one no bound
+        covers. The first candidate's graph used to speak for all of them: with no bound
+        its footprint was 0 and the cap was off for the whole run, and with a reference
+        that failed the run itself ended on that error, every candidate unreported.
+        """
+        return max((ref[2] for ref in graph_refs.values() if not isinstance(ref, Exception)),
+                   default=0)
 
     def declared_for(cand):
         """``(declaration, roles)``: the declaration as it applies to this candidate's
@@ -404,8 +432,7 @@ def run_candidates(
 
     try:
         publish_references()
-        _, _, io_bytes = reference_for(candidates[0])
-        max_parallel = _effective_compile_and_run_parallelism(max_parallel, io_bytes)
+        max_parallel = _effective_compile_and_run_parallelism(max_parallel, widest_reference())
 
         with tqdm(total=total_candidates) as pbar:
             launch_until_full(pbar)

@@ -283,7 +283,11 @@ def test_lock_state_names_the_holder_and_the_waiters(tmp_path):
     assert child.exitcode == 0 and lock_state(str(path)) == (None, frozenset())
 
 
-def test_a_reference_that_cannot_be_built_fails_the_candidates_of_its_graph(pool):
+@pytest.mark.parametrize("failing", [1, 0, 2])
+def test_a_reference_that_cannot_be_built_fails_the_candidates_of_its_graph(pool, failing):
+    """... and only those, wherever the graph comes in the run. (As the first candidate's
+    it used to end the run: the run was sized from that graph's reference, so the error
+    was raised to the caller and no candidate was reported, of this graph or another.)"""
     good, bad = object(), object()
 
     def reference(cache_dir, graph, dtype):
@@ -292,10 +296,54 @@ def test_a_reference_that_cannot_be_built_fails_the_candidates_of_its_graph(pool
         return [-1], 0
 
     cands = _candidates("a", "b", "c")
-    cands[0].flat_graph = cands[2].flat_graph = good
-    cands[1].flat_graph = bad
+    for i, cand in enumerate(cands):
+        cand.flat_graph = bad if i == failing else good
     results = run_candidates(cands, "float16", build_fn=_build, check_fn=_check,
                              reference_fn=reference, pool=pool, max_parallel=2)
-    assert [r.ok for r in results] == [True, False, True]
-    assert results[1].stage == "codegen" and "no reference for this graph" in str(results[1].error)
+    assert [r.ok for r in results] == [i != failing for i in range(3)]
+    failed = results[failing]
+    assert failed.stage == "codegen" and "no reference for this graph" in str(failed.error)
+
+
+GIB = 2**30
+
+
+@pytest.mark.parametrize("order, sized_for", [
+    ("small large mid", 3 * GIB),
+    ("large small mid", 3 * GIB),
+    ("small mid large", 3 * GIB),
+    ("broken small mid", 2 * GIB),  # a graph without a reference has no say ...
+    ("small broken", 1 * GIB),
+    ("broken", 0),                   # ... and a run without any is not capped
+])
+def test_a_run_is_sized_for_its_largest_reference(pool, monkeypatch, order, sized_for):
+    """Workers load the inputs and the reference of their candidate's graph onto the
+    device, so the number of workers is capped by what the largest of them takes -- not by
+    the first candidate's, whose graph need not be the largest (a split partial returns
+    ``splits`` times the program's output) and need not have a reference at all."""
+    from cleave.runtime import evaluate
+
+    footprint = {"small": 1 * GIB, "mid": 2 * GIB, "large": 3 * GIB}
+    graphs = {name: SimpleNamespace(name=name) for name in (*footprint, "broken")}
+
+    def reference(cache_dir, graph, dtype):
+        if graph.name == "broken":
+            raise ValueError("no reference for this graph")
+        return [-1], footprint[graph.name]
+
+    sized = []
+
+    def cap(max_parallel, io_bytes):
+        sized.append((max_parallel, io_bytes))
+        return 2
+
+    monkeypatch.setattr(evaluate, "_effective_compile_and_run_parallelism", cap)
+    names = order.split()
+    cands = _candidates(*names)
+    for cand, name in zip(cands, names):
+        cand.flat_graph = graphs[name]
+    results = run_candidates(cands, "float16", build_fn=_build, check_fn=_check,
+                             reference_fn=reference, pool=pool, max_parallel=5)
+    assert sized == [(5, sized_for)]
+    assert [r.ok for r in results] == [name != "broken" for name in names]
 
