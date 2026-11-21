@@ -3,6 +3,7 @@
 #include "cleave/superoptimizer/type.h"
 
 #include <functional>
+#include <memory>
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
@@ -33,12 +34,21 @@ struct DimensionID {
 
   // Hash function for use in unordered containers
   struct Hash {
-    // Added to the tensor guid before hashing (see DimensionGrouper).
-    type::GuidType guid_offset = 0;
+    // Tensor guid -> the number hashed in its place (see DimensionGrouper).
+    // Empty: the guid itself is hashed.
+    std::shared_ptr<std::unordered_map<type::GuidType, type::GuidType> const>
+        positions;
 
     size_t operator()(DimensionID const &id) const {
-      // Combine tensor_guid and dim_idx using standard hash combination
-      size_t h1 = std::hash<type::GuidType>{}(id.tensor_guid + guid_offset);
+      type::GuidType tensor = id.tensor_guid;
+      if (positions) {
+        auto it = positions->find(tensor);
+        if (it != positions->end()) {
+          tensor = it->second;
+        }
+      }
+      // Combine the tensor and dim_idx using standard hash combination
+      size_t h1 = std::hash<type::GuidType>{}(tensor);
       size_t h2 = std::hash<int>{}(id.dim_idx);
       return h1 ^ (h2 << 1);
     }
@@ -52,8 +62,9 @@ struct DivisibilityRelation {
 
 class DimensionGrouper {
 public:
-  // first_guid: the guid of the first tensor of the graph being grouped.
-  explicit DimensionGrouper(type::GuidType first_guid);
+  // tensor_guids: the guid of every tensor of the graph being grouped, in the
+  // order the graph defines them (operator order).
+  explicit DimensionGrouper(std::vector<type::GuidType> const &tensor_guids);
   void touch(DimensionID d);
   void merge(DimensionID d1, DimensionID d2);
   DimensionID find(DimensionID d);
@@ -71,11 +82,12 @@ public:
 private:
   // get_groups() returns the groups in the iteration order of `parent` and of
   // a table of representatives, and the symbolizer numbers them in that order.
-  // Guids come from a process-wide counter, so hashing a dimension by its guid
-  // made that order, and with it the symbols and the checkpoint key of a
-  // graph, depend on what the process had built before. The two tables hash a
-  // dimension by the place of its tensor in the graph instead: its guid
-  // relative to the graph's first tensor, counted from the counter's start.
+  // Guids come from a process-wide counter that every thread draws from, so
+  // hashing a dimension by its guid made that order, and with it the symbols
+  // and the checkpoint key of a graph, depend on what the process had built
+  // before and on what other threads built meanwhile. The two tables hash a
+  // dimension by the place of its tensor in the graph instead: the n-th tensor
+  // the graph defines is hashed as the n-th guid of a process.
   // Every graph then gets the symbols it gets as the first graph of a process.
   // (Which group gets which symbol does not change what the search finds, but
   // it prunes by comparing symbols, so it changes how many states it visits.)

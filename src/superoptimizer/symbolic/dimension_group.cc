@@ -12,8 +12,26 @@ namespace symbolic {
 // DimensionGrouper Implementation
 // ============================================================================
 
-DimensionGrouper::DimensionGrouper(type::GuidType first_guid)
-    : position_hash{kernel::DTensor::FIRST_GUID - first_guid},
+namespace {
+
+DimensionID::Hash hash_by_position(
+    std::vector<type::GuidType> const &tensor_guids) {
+  auto positions =
+      std::make_shared<std::unordered_map<type::GuidType, type::GuidType>>();
+  for (type::GuidType guid : tensor_guids) {
+    positions->emplace(
+        guid,
+        kernel::DTensor::FIRST_GUID +
+            static_cast<type::GuidType>(positions->size()));
+  }
+  return DimensionID::Hash{positions};
+}
+
+} // namespace
+
+DimensionGrouper::DimensionGrouper(
+    std::vector<type::GuidType> const &tensor_guids)
+    : position_hash(hash_by_position(tensor_guids)),
       parent(0, position_hash) {}
 
 void DimensionGrouper::touch(DimensionID d) {
