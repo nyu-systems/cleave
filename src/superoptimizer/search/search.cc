@@ -556,9 +556,9 @@ bool KernelGraphGenerator::verify(kernel::Graph &g,
 }
 
 // The tasks finish in any order, so generated_graphs is in completion order
-// and differs from run to run. Put it in search-tree order (depth first, each
-// state's branches in enumeration order), which is the order one thread walking
-// the tree finds the graphs in: a search then returns the same list every time.
+// and differs from run to run. Put it in depth-first order of the search tree
+// (each state's branches in enumeration order): the list then depends neither
+// on the thread count nor on timing, and a search returns it every time.
 void KernelGraphGenerator::sort_generated_graphs() {
   std::vector<size_t> order(generated_graphs.size());
   std::iota(order.begin(), order.end(), size_t{0});
