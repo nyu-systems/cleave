@@ -239,6 +239,67 @@ def test_the_refusal_holds_without_asserts():
     assert re.search("REFUSED " + UNDIVIDED, done.stdout), done.stdout[-500:]
 
 
+def two_row_sums(x: cl.Tensor["R", "C"], y: cl.Tensor["R", "D"]):
+    return cl.sum(x, -1, keepdim=True) + cl.sum(y, -1, keepdim=True)
+
+
+def _both_stepped_by(shapes, step):
+    """A tiling of ``two_row_sums`` the search proposes -- the sum over 256 columns stepped
+    by ``step``, the one over 257 by the whole axis -- with the sum over 257 stepped by
+    ``step`` as well: its entry of the step map and the inner tile of the input it reads."""
+    ir = S.lowered(two_row_sums, shapes)
+
+    def steps(cand, extent):
+        (node,) = [n for n in cand.rstep_map if n.raxis and int(n.raxis[0].dom.extent) == extent]
+        return node, sorted(cand.rstep_map[node].values())
+
+    cand = next(c for c in search_tiling(ir, topk=1000)
+                if steps(c, 256)[1] == [step] and steps(c, 257)[1] == [257]
+                and int(c.tile_map[steps(c, 257)[0]][0]) == 16)
+    odd, _ = steps(cand, 257)
+    cand.rstep_map[odd] = {name: step for name in cand.rstep_map[odd]}
+    source = odd.inputs[0].src_node
+    assert [int(t) for t in cand.itile_map[source]] == [16, 257]
+    cand.itile_map[source] = [16, step]
+    return cand
+
+
+JOINED = (r"GraphNode_reduction_1_\d+ steps dim 1 of PlaceHolder_input_\d+ by 64, which does "
+          "not divide its 257 elements: the tail would never be read")
+
+
+def test_a_sum_that_joins_another_sums_loop_is_held_to_a_dividing_step_too():
+    """``apply_tiling`` checks the step of the reduction that opens a loop. A second
+    reduction with the same step and the same number of whole steps joins that loop
+    without passing the check: 256 columns and 257 columns, both stepped by 64, are 4
+    iterations each, rounded down. The search proposed exactly that, and the kernel summed
+    ``x[64 * i : 64 * i + 64]`` for ``i`` below 4: the last column of the 257 was never
+    read. The policy's steps divide the extent now, so the search no longer proposes it;
+    stepped by hand, the loop is refused once every merge is done, for the dim that the
+    step does not divide."""
+    # x has the 257 columns: its sum comes first in the graph, the sum over y opens the
+    # loop and the sum over x joins it
+    with pytest.raises(ScheduleRejected, match=JOINED):
+        apply_tiling(_both_stepped_by(dict(R=64, C=257, D=256), 64))
+    with pytest.raises(ScheduleRejected, match=JOINED):
+        build_candidate_code(_both_stepped_by(dict(R=64, C=257, D=256), 64))
+    # y has them: its sum opens the loop, and that is the check in apply_tiling itself
+    with pytest.raises(ScheduleRejected, match=UNDIVIDED):
+        apply_tiling(_both_stepped_by(dict(R=64, C=256, D=257), 64))
+
+
+def test_two_row_sums_are_stepped_by_what_divides_each():
+    """What the search proposes for the same program: every step divides its own axis."""
+    for shapes in (dict(R=64, C=257, D=256), dict(R=64, C=256, D=257)):
+        cands = list(search_tiling(S.lowered(two_row_sums, shapes), topk=1000))
+        assert cands
+        for cand in cands:
+            for node, steps in cand.rstep_map.items():
+                for step in (steps or {}).values():
+                    assert int(node.raxis[0].dom.extent) % int(step) == 0, (node.name, step)
+            apply_tiling(cand)
+
+
 # ------------------------------------------- an output axis the tensor-core tile does not divide
 
 
