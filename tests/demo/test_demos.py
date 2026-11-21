@@ -288,6 +288,37 @@ def test_search_split_of_a_demo_that_declares_one_tolerance_stops_before_it_buil
     assert not reached
 
 
+def test_qknorm_says_which_inputs_its_kernels_are_validated_on():
+    """The adversarial softmax cases shape inputs. qknorm's logits are computed from the
+    normalized q and k, so its kernels are held to the normal inputs only (the build's
+    report gives that reason): the demo and the README say so and do not claim the
+    adversarial cases for it."""
+    from cleave.lower import to_ir
+    from cleave.pipeline.build import _reference_fn
+
+    doc = " ".join((DEMO / "qknorm.py").read_text().split('"""')[1].split())
+    assert "this demo's kernels are validated on normal inputs" in doc
+    readme = " ".join((DEMO.parent / "README.md").read_text().split())
+    assert ("wherever the logits can be shaped through an input: every attention demo but "
+            "`qknorm.py`") in readme
+    # ... which is what the build does with the demo's program
+    sys.path.insert(0, str(DEMO))
+    try:
+        qknorm = runpy.run_path(str(DEMO / "qknorm.py"), run_name="_demo")["qknorm"]
+    finally:
+        sys.path.remove(str(DEMO))
+    program = qknorm.trace(HQ=4, HKV=2, SQ=16, SKV=64, D=32)
+    held = []
+    reference = _reference_fn(("normal",), program,
+                              lambda cache_dir, graph, dtype, distributions:
+                              held.append(distributions) or "published")
+    graph = to_ir(program.to_graph_structure(), dtype="float16", out_dtype="float16")
+    assert reference("dir", graph, "float16") == "published"
+    assert held == [("normal",)]
+    cases, note = reference.held[id(graph)]
+    assert tuple(cases) == ("normal",) and "not read from an input" in note
+
+
 def test_demo_cli_overrides(monkeypatch):
     seen = run_demo(monkeypatch, "mha_decode", ["--SKV", "2048", "--preset", "fast", "--topk", "20",
                                                 "--split", "SKV:8", "--max-ops", "15"])

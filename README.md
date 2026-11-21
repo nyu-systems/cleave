@@ -80,7 +80,9 @@ All demos share the same flags (`python demo/<name>.py --help`):
 sees `exp / sum / div` and no max, and every schedule gets the shift it needs (the row max
 where a tile holds the row, a running max over a looped row as in FlashAttention, the max of
 each split under split-KV as in FlashDecoding; the paged kernels carry a running max too).
-Kernels of such a program are validated on adversarial logits as well as on normal ones.
+Kernels of such a program are validated on adversarial logits as well as on normal ones,
+wherever the logits can be shaped through an input: every attention demo but `qknorm.py`,
+whose logits are computed from the normalized `q` and `k` (its report says so).
 
 ## Search-to-Kernel Path
 
