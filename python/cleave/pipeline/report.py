@@ -118,7 +118,8 @@ class Result:
     kernel: Any = None  # pipeline.build.BuiltKernel, when codegen produced source
     # The input cases the reference of its graph was built for (cleave.runtime.inputs): what
     # a kernel had to pass to be ok. ``cases_note`` says why a program whose softmax is exact
-    # was held to fewer than every adversarial case ("" when it was held to all of them).
+    # was held to fewer than every adversarial case, or which of its softmaxes the cases do
+    # not shape ("" when it was held to all of them and they reach every softmax).
     cases: tuple | None = None
     cases_note: str = ""
 
@@ -533,11 +534,13 @@ def _fmt(rows, header) -> str:
 
 
 def _make_kernel(win: VariantResult, report: Report):
-    from .kernel import Kernel, stages_for
+    from .kernel import Kernel, declared_output_order, stages_for
 
     plans = [m.plan for m in win.members]
     program = plans[0].program
     stages, problem = stages_for([(m.plan, m.run, m.kernel) for m in win.members], program)
+    order, misordered = declared_output_order(plans[-1], program)
+    problem = problem or misordered
     inputs = list(getattr(program, "inputs", []) or [])
     outputs = getattr(program, "outputs", None)
     out_shapes = None
@@ -558,4 +561,4 @@ def _make_kernel(win: VariantResult, report: Report):
     return Kernel(stages, name=getattr(program, "name", "kernel"), input_names=[s.name for s in inputs],
                   input_shapes=[tuple(int(x) for x in s.shape) for s in inputs], output_shapes=out_shapes,
                   variant=win.variant, label=label, latency_us=win.latency_us, report=report,
-                  plans=plans, unrunnable=problem, meta=meta)
+                  plans=plans, unrunnable=problem, meta=meta, output_order=order)

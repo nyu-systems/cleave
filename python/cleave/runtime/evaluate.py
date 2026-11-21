@@ -41,6 +41,7 @@ from .reference import (
     make_inputs,
     order_inputs_for_kernel,
     output_order,
+    declared_output_places,
     output_roles,
     with_hand_off,
 )
@@ -155,6 +156,25 @@ def _parent_error(error_cls, label, what, exc):
     error = error_cls(f"{label} {what} failed with {type(exc).__name__}\n{exc}\n{tb}")
     error.__cause__ = exc
     return error
+
+
+def declared_bounds(tolerance, graph):
+    """``(declaration, roles)``: the declaration ``tolerance`` as it applies to the outputs
+    of a candidate of ``graph``, and their boundary roles when one of them has a role. (The
+    roles are only known for a candidate that comes with its lowered graph.)
+
+    A sequence is one bound per output of the program, in the program's order. A kernel
+    returns its outputs in the order its graph lists them, which need not be that order
+    (``reference.declared_output_places``), so the sequence is handed on in the kernel's.
+    """
+    known = tolerance is not None and getattr(graph, "nodes", None) is not None
+    roles = output_roles(graph) if known else None
+    declared = tolerances_of(tolerance, roles)
+    if known and isinstance(tolerance, (list, tuple)):
+        places = declared_output_places(graph)
+        if places is not None and len(places) == len(tolerance):
+            declared = tuple(tolerance[k] for k in places)
+    return declared, roles if roles and any(roles) else None
 
 
 def run_candidates(
@@ -297,13 +317,7 @@ def run_candidates(
                    default=0)
 
     def declared_for(cand):
-        """``(declaration, roles)``: the declaration as it applies to this candidate's
-        outputs, and their boundary roles when one of them has a role. (The roles are only
-        known for a candidate that comes with its lowered graph.)"""
-        graph = cand.flat_graph
-        known = tolerance is not None and getattr(graph, "nodes", None) is not None
-        roles = output_roles(graph) if known else None
-        return tolerances_of(tolerance, roles), roles if roles and any(roles) else None
+        return declared_bounds(tolerance, cand.flat_graph)
 
     def finish(job, result, pbar):
         results[job["idx"] - 1] = result

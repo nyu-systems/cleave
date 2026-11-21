@@ -87,6 +87,22 @@ def output_roles(graph):
                  for node in output_order(graph))
 
 
+def declared_output_places(graph):
+    """Per output in :func:`output_order`, which output of the program it is, or None.
+
+    ``to_ir`` rebuilds a graph by a walk from its first output, so a kernel returns its
+    outputs in the order that walk finds them; the declared place of each is the record
+    its ``OutputNode`` carries (``Boundary.index``). None when the outputs do not carry
+    exactly the places ``0 .. n-1`` once each, without a role: a hand-built graph, or a
+    split partial (which returns the tensors of its cut, not the program's outputs).
+    """
+    records = [getattr(node, "boundary", None) for node in output_order(graph)]
+    if any(r is None or r.role for r in records):
+        return None
+    places = [int(r.index) for r in records]
+    return places if sorted(places) == list(range(len(places))) else None
+
+
 def graph_out_indices(graph):
     """``out_idx`` for ``tl.compile``: the trailing ``n_out`` kernel arguments."""
     n_out = len(output_order(graph))

@@ -42,10 +42,14 @@ class Kernel:
     def __init__(self, stages: list[Stage], *, name: str, input_names: list[str],
                  input_shapes: list[tuple], output_shapes: list[tuple] | None = None,
                  variant: str = "solo", label: str = "", latency_us: float | None = None,
-                 report=None, plans=(), unrunnable: str | None = None, meta: dict | None = None):
+                 report=None, plans=(), unrunnable: str | None = None, meta: dict | None = None,
+                 output_order: list[int] | None = None):
         self.stages, self.name, self.variant, self.label = stages, name, variant, label
         self.input_names, self.input_shapes = list(input_names), [tuple(s) for s in input_shapes]
         self.output_shapes = None if output_shapes is None else [tuple(s) for s in output_shapes]
+        # Where each declared output is among the outputs the last stage's kernel returns
+        # (``declared_output_order``). None: a kernel of hand-built graphs, returned as it is.
+        self.output_order = None if output_order is None else [int(i) for i in output_order]
         self.latency_us, self.report, self.plans = latency_us, report, list(plans)
         self.unrunnable, self.meta = unrunnable, dict(meta or {})
         self._compiled = None
@@ -114,6 +118,11 @@ class Kernel:
                                 else to_logical(x, p.layout, p.shape))
             res = kernel(*order_inputs_for_kernel(feed, kernel))
             outs = list(res) if isinstance(res, (list, tuple)) else [res]
+        if self.output_order is not None:
+            # A kernel returns its outputs in the order its graph lists them, which is the
+            # order a walk from the first output finds them, not the order the program
+            # returns them in.
+            outs = [outs[i] for i in self.output_order]
         if self.output_shapes is not None:
             outs = [_fit(o, s) for o, s in zip(outs, self.output_shapes)]
         return outs[0] if len(outs) == 1 else tuple(outs)
@@ -134,6 +143,7 @@ class Kernel:
         meta = {"format": FORMAT, "name": self.name, "variant": self.variant, "label": self.label,
                 "latency_us": self.latency_us, "input_names": self.input_names,
                 "input_shapes": self.input_shapes, "output_shapes": self.output_shapes,
+                "output_order": self.output_order,
                 "unrunnable": self.unrunnable, "stages": stages, "meta": self.meta}
         (p / "kernel.json").write_text(json.dumps(meta, indent=1, default=str))
         if self.report is not None and hasattr(self.report, "to_dict"):
@@ -161,10 +171,16 @@ def load(path) -> Kernel:
         built = None if "kernel" not in d else BuiltKernel.from_dict(d["kernel"], source)
         stages.append(Stage(d["role"], source, list(d["out_idx"]), params,
                             d.get("label", ""), d.get("latency_us"), built))
+    if "output_order" not in m and stages and len(stages[-1].out_idx) > 2:
+        # Without the record the outputs come back in the kernel's own order, which for
+        # three or more outputs need not be the program's.
+        raise ValueError(f"{p}: saved without the order of its {len(stages[-1].out_idx)} "
+                         "outputs; compile the program again")
     return Kernel(stages, name=m["name"], input_names=m["input_names"],
                   input_shapes=m["input_shapes"], output_shapes=m.get("output_shapes"),
                   variant=m["variant"], label=m["label"], latency_us=m["latency_us"],
-                  unrunnable=m.get("unrunnable"), meta=dict(m.get("meta") or {}, loaded_from=str(p)))
+                  unrunnable=m.get("unrunnable"), meta=dict(m.get("meta") or {}, loaded_from=str(p)),
+                  output_order=m.get("output_order"))
 
 
 def _fit(x, shape):
@@ -190,6 +206,36 @@ def boundary_of(plan):
     graph = getattr(getattr(plan, "tile", None), "flat_graph", None)
     order = {"partial": output_order, "combine": placeholder_order}.get(plan.role)
     return None if graph is None or order is None else boundary_signature(order(graph))
+
+
+def declared_output_order(plan, program=None):
+    """``(order, problem)`` for the plan whose kernel returns a Kernel's outputs (a solo
+    plan, or the combine of a split pair): ``order[k]`` is the place of the program's
+    output ``k`` among the outputs that kernel returns.
+
+    ``to_ir`` rebuilds a graph by a walk from its first output, so the kernel's outputs
+    come in the order that walk finds them. Every ``OutputNode`` it makes records the
+    position of its output op (``Boundary.index``): that is the declared place. A graph
+    without any record (a hand-built one) has no declared order, and its outputs are
+    returned as the kernel returns them (``order`` is None). Records that are not exactly
+    the program's outputs are a problem: the Kernel is unrunnable instead of guessing.
+    """
+    from ..runtime.reference import output_order
+
+    outs = output_order(plan.tile.flat_graph)
+    records = [getattr(o, "boundary", None) for o in outs]
+    if all(r is None for r in records):
+        return None, None
+    declared = getattr(program, "outputs", None)
+    count = len(declared) if declared else len(outs)
+    if (any(r is None or r.role for r in records)
+            or sorted(r.index for r in records) != list(range(count))):
+        found = ", ".join("none" if r is None else f"#{r.index}{':' + r.role if r.role else ''}"
+                          for r in records)
+        return None, (f"{plan.label}: its kernel returns the outputs [{found}], not the "
+                      f"program's {count} output(s) once each")
+    place = {r.index: i for i, r in enumerate(records)}
+    return [place[k] for k in range(count)], None
 
 
 def _combine_params(plan, phs, partial_plan, partial_layouts):
