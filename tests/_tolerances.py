@@ -88,6 +88,9 @@ TOLERANCES = {
     # (test_returned_intermediates.py): next to a second matmul, and next to its double
     "product_and_chain": Tolerance(rtol=5e-3),
     "product_and_double": Tolerance(rtol=5e-3),
+    # rows divided by the root of their looped sum of squares, every tiling that is built
+    # (test_broadcast_over_input.py)
+    "l2_normalize": Tolerance(rtol=5e-3),
     # ---- the one float32 operator (tests/reference/test_matmul_tf32.py)
     # A float32 matmul on operands TF32 holds exactly, against their float32 product. On
     # ordinary float32 operands the same kernels are 1e-3 off, the TF32 instruction's

@@ -193,6 +193,54 @@ def test_any_operator_that_broadcasts_a_looped_sum_over_the_input_stages_it(fn, 
     assert staged >= 20 and len(lowered) >= 5
 
 
+def l2_normalize(x: cl.Tensor["R", "C"]):
+    """Rows of unit length: the divisor is the root of a sum, not the sum."""
+    return x / cl.sqrt(cl.sum(x * x, -1, keepdim=True))
+
+
+def mean_center(x: cl.Tensor["R", "C"]):
+    return x - cl.sum(x, -1, keepdim=True) / 4096.0
+
+
+def scaled_quotient(x: cl.Tensor["R", "C"]):
+    return x / (cl.sum(x, -1, keepdim=True) * 2.0)
+
+
+CHAINED = dict(R=64, C=4096)
+
+
+def _chained(fn):
+    (graph,) = list(GraphSet.identity(trace(fn, CHAINED, cl.f16)))
+    (ir,) = lower(graph)
+    return ir
+
+
+@pytest.mark.parametrize("fn, op, looped_tilings", [(l2_normalize, Div, 21), (mean_center, Sub, 24),
+                                                    (scaled_quotient, Div, 18)],
+                         ids=["l2_normalize", "mean_center", "scaled_quotient"])
+def test_what_is_computed_from_a_looped_sum_is_staged_like_the_sum(fn, op, looped_tilings):
+    """One or two elementwise ops away from the sum the fragment still has the sum's
+    layout: with only the sum itself staged, these kernels kept 4096 elements per thread
+    where a thread's share of the tile is 64."""
+    staged, lowered = 0, set()
+    for cand in search_tiling(_chained(fn), topk=1000):
+        try:
+            tiled = _annotated(cand)
+        except ScheduleRejected:
+            continue
+        ((node, lhs, rhs),) = _broadcasts(tiled)
+        looped = _steps(cand) != [4096]
+        assert (type(node), lhs, rhs) == (op, "g", "r")
+        assert node.resolve_operand_layout == ("rhs" if looped else None)
+        staged += looped
+        rows = int(cand.output_tile[0])
+        if rows not in lowered:
+            lowered.add(rows)
+            arrays, _ = _frame(build_candidate_code(cand))
+            assert max(arrays.values()) == rows * 4096 // cand.n_threads, arrays
+    assert staged == looped_tilings and len(lowered) >= 3
+
+
 def test_a_fragment_broadcast_over_a_fragment_is_left_where_it_is():
     """The rule is for an operand with no layout of its own. ``P / l`` of an attention
     divides a fragment by the row sum: the quotient takes the layout of ``P``."""
@@ -208,3 +256,23 @@ def test_a_fragment_broadcast_over_a_fragment_is_left_where_it_is():
                          ids=["4_rows", "8_rows", "16_rows_one_step"])
 def test_gpu_the_quotient_validates(tile, step):
     assert_candidate_compiles_and_runs(_candidate(tile, step), tolerance_for(rowsum_div_graph))
+
+
+def test_gpu_the_quotient_by_the_root_of_a_looped_sum_validates():
+    """GPU: every tiling of the row normalization that is built, at the bound it declares."""
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required to compile and run candidates.")
+    from cleave.runtime.evaluate import run_candidates
+
+    cands = []
+    for cand in search_tiling(_chained(l2_normalize), topk=1000):
+        try:
+            schedule_kernel(cand)
+        except ScheduleRejected:
+            continue
+        cands.append(cand)
+    results = run_candidates(cands, "float16", max_parallel=8,
+                             tolerance=tolerance_for("l2_normalize"))
+    assert len(results) == 23
+    assert all(r.ok for r in results), [str(r.error)[:300] for r in results if not r.ok]

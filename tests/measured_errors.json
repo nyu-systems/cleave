@@ -522,6 +522,16 @@
    "validated": 6
   }
  ],
+ "test:l2_normalize": [
+  {
+   "abs": 3.0517578125e-05,
+   "absolute": false,
+   "dtype": "float16",
+   "rel": 0.0006226649857126176,
+   "seeds": 3,
+   "validated": 69
+  }
+ ],
  "test:lora_graph": [
   {
    "abs": 1.0,

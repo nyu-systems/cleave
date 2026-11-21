@@ -92,7 +92,9 @@ from pathlib import Path
 # 37: a loop's accumulator broadcast over an operand in global memory is read from shared
 #     memory, so the result is laid out across the threads: in the kernels of x / sum(x, -1)
 #     with the sum looped in narrow steps, every thread computed and kept whole rows.
-SCHEMA = 37
+# 38: ... and so is what a chain of elementwise ops made of such an accumulator: the
+#     kernels of x / sqrt(sum(x * x, -1)) kept whole rows per thread as well.
+SCHEMA = 38
 # What "validated" means for a saved kernel. A kernel-cache hit returns without validating,
 # so bump this whenever the comparison or its inputs change: saved kernels are then rebuilt.
 # (The inputs include the adversarial cases a program with an exact softmax is held to,

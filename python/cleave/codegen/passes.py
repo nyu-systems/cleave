@@ -247,6 +247,7 @@ def annotate_fragment_layout_conflicts(graph: Graph) -> Graph:
     times the work, a frame of 8 to 64 KiB, 512-fold unrolled loops that take the device
     compiler two minutes and more, and 4.3 GiB of thread stacks at launch. With the sum
     read from shared memory the quotient is laid out across the threads of the block.
+    The same holds one or more elementwise ops away from the sum: ``x / sqrt(sum(x * x))``.
     """
 
     def reset_graph(cur_graph: Graph) -> None:
@@ -332,7 +333,7 @@ def annotate_fragment_layout_conflicts(graph: Graph) -> Graph:
 
     def accumulator_broadcast_over_input(cur_node, cur_graph: Graph) -> bool:
         """``x <op> f`` with ``x`` read from global memory and ``f`` a loop's accumulator
-        that lacks an axis of it.
+        that lacks an axis of it, or computed from one elementwise.
 
         The accumulator has the layout TileLang gave the slices it was reduced from, and
         a narrow slice puts each row on a few threads only. (A fragment computed in the
@@ -345,9 +346,12 @@ def annotate_fragment_layout_conflicts(graph: Graph) -> Graph:
         if len(cur_node.inputs) != 2:
             return False
         lhs_edge, rhs_edge = cur_node.inputs
-        if not isinstance(rhs_edge.src_node, GraphNode):
+        # The accumulator itself, or what a chain of one-operand, shape-keeping ops made
+        # of it: ``x / sqrt(sum(x * x, -1))`` divides by a fragment with the sum's layout.
+        accum_edge = through_elementwise_chain(rhs_edge)
+        if not isinstance(accum_edge.src_node, GraphNode):
             return False
-        if getattr(rhs_edge, "accum_node", None) is None:
+        if getattr(accum_edge, "accum_node", None) is None:
             return False
         return (
             get_input_scope(cur_graph, lhs_edge) == "g"
