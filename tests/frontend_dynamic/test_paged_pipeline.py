@@ -89,12 +89,30 @@ def _hold_to_the_declared_bound(kernel, outputs, want, what):
     return compare_outputs(list(outputs), list(want), OPERATORS[kernel.name].tolerance, what=what)
 
 
+def _hold_to_a_percent(outputs, want):
+    """The same, elementwise, at 1e-2 + 1e-2 |ref|."""
+    import torch
+
+    torch.testing.assert_close(outputs[0].float(), want[0].float(), rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(outputs[1], want[1], rtol=1e-2, atol=1e-2)
+
+
+def _hold_to_both_bounds(kernel, outputs, want, what):
+    """Neither bound implies the other for ``out``. The declared one is a fraction (2e-2)
+    of the row's largest entry: the tighter of the two while that entry is below 0.5, and
+    the looser one at every entry once it is above 1 -- a request with a single key returns
+    the value row itself, with entries of 2 and more."""
+    measured = _hold_to_the_declared_bound(kernel, outputs, want, what)
+    _hold_to_a_percent(outputs, want)
+    return measured
+
+
 @pytest.mark.parametrize("page", [1, 64])
-def test_the_returned_kernel_is_held_to_the_declared_bound_not_to_a_percent(page, monkeypatch):
+def test_the_returned_kernel_is_held_to_both_bounds(page, monkeypatch):
     """``test_compile_end_to_end`` is the one check of what ``cleave.compile`` returns for a
-    paged program, on requests the compile did not validate. It compared both outputs
-    elementwise at 1e-2 + 1e-2 |ref|, the bound the operators had before they declared
-    their own: an lse off by 1e-4 passed, and so did an output off by 4% of its row."""
+    paged program, on requests the compile did not validate. The elementwise percent alone
+    accepts an lse off by 1e-4 and an output off by 4% of its row; the declared bound alone
+    accepts an entry off by 5% of itself in a row whose largest entry is 3.2 times it."""
     import torch
 
     from cleave.core.errors import OutputMismatch
@@ -105,13 +123,27 @@ def test_the_returned_kernel_is_held_to_the_declared_bound_not_to_a_percent(page
     gen = torch.Generator().manual_seed(page)
     out = (torch.randn(4, 32, 128, generator=gen) * 0.07).to(torch.bfloat16)
     lse = torch.randn(4, 32, generator=gen) + 8.0
-    _hold_to_the_declared_bound(kernel, (out, lse), (out, lse), "the reference itself")
+    _hold_to_both_bounds(kernel, (out, lse), (out, lse), "the reference itself")
     for wrong in ((out, lse + 1e-4), ((out.float() + 9e-3).to(torch.bfloat16), lse)):
-        # the comparison this replaces accepts both
-        torch.testing.assert_close(wrong[0].float(), out.float(), rtol=1e-2, atol=1e-2)
-        torch.testing.assert_close(wrong[1], lse, rtol=1e-2, atol=1e-2)
+        _hold_to_a_percent(wrong, (out, lse))
         with pytest.raises(OutputMismatch):
             _hold_to_the_declared_bound(kernel, wrong, (out, lse), "off by less than a percent")
+        with pytest.raises(OutputMismatch):
+            _hold_to_both_bounds(kernel, wrong, (out, lse), "off by less than a percent")
+
+    # One key: the output is the value row, unit normal. Every row here has an entry of
+    # exactly 4 and one of exactly 1.25; the wrong output moves that one by 0.0625.
+    row = torch.randn(4, 32, 128, generator=gen).clamp(-3.0, 3.0)
+    row[..., 0], row[..., 1] = 4.0, 1.25
+    row = row.to(torch.bfloat16)
+    wrong = row.clone()
+    wrong[..., 1] = 1.3125
+    _hold_to_both_bounds(kernel, (row, lse), (row, lse), "the reference itself")
+    _hold_to_the_declared_bound(kernel, (wrong, lse), (row, lse), "1.6% of the row's max")
+    with pytest.raises(AssertionError, match="Tensor-likes are not close"):
+        _hold_to_a_percent((wrong, lse), (row, lse))
+    with pytest.raises(AssertionError, match="Tensor-likes are not close"):
+        _hold_to_both_bounds(kernel, (wrong, lse), (row, lse), "and 5% of the entry")
 
 
 @pytest.mark.gpu
@@ -140,8 +172,9 @@ def test_compile_end_to_end(page, tmp_path):
     want = reference.gqa_paged_decode_reference(dims, lens, page_size=page)(*inputs)
     args = inputs if page > 1 else [*inputs[:5], None, inputs[5]]
     out, lse = kernel(*args)
-    # requests the compile did not validate (700 keys, 1 key), at the operator's own bound
-    _hold_to_the_declared_bound(kernel, (out, lse), want, f"kv lens {lens}")
+    # requests the compile did not validate (700 keys, 1 key): at the operator's own bound
+    # and, elementwise, within a percent
+    _hold_to_both_bounds(kernel, (out, lse), want, f"kv lens {lens}")
     named = dict(zip(["q", "k_cache", "v_cache", "kv_indptr", "kv_indices", "kv_last_page_len",
                       "sm_scale"], args))
     out2, lse2 = kernel(**named)
