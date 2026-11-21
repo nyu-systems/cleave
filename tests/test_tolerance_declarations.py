@@ -216,6 +216,11 @@ def test_the_measuring_tool_knows_the_operator_of_every_validating_test():
     for node, operator in tests:
         assert operator in TOLERANCES, node
         assert operator_of(node) == operator, node
+    # A program that declares a bound of its own is validated at it: none of these tests
+    # borrows the bound of another operator (the two matmuls over axes of different length
+    # were held to the plain matmul's, and measured under its name).
+    assert {"two_matmuls", "sum_of_matmuls", "product_and_chain", "product_and_double",
+            "l2_normalize", "matmul_tf32"} <= {operator for _, operator in tests}
     # a test that validates nothing is left under its own name, not under an operator
     plain = "tests/graph/apply_tiling/test_typed_refusals.py::test_grid_dim_without_one_launch_axis_is_a_typed_refusal"
     assert operator_of(plain) == plain
