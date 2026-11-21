@@ -19,7 +19,10 @@ it, so a value cannot be edited by hand in either direction: re-measure and ``--
 
 An operator whose kernels return an output with a boundary role declares one bound per
 role instead of one ``Tolerance``: the split partial of an exact softmax returns its float32
-shift next to its float16 sums, and the rule gives each role the bound of its own outputs.
+shift next to its sums, and the rule gives each role the bound of its own outputs. (The sums
+cross the cut in float32 as well, so that a sum over a whole split cannot overflow; they are
+computed from operands in the program's dtype and held to its bound:
+``tests/_measure_tolerances.judged_dtypes``.)
 """
 
 from __future__ import annotations
@@ -62,8 +65,9 @@ TOLERANCES = {
     "gqa_split_partial_graph": Tolerance(rtol=5e-3),
     "mha_split_partial_graph": Tolerance(rtol=5e-3),
     "mha_split_combine_graph": Tolerance(rtol=5e-3),
-    # (matmul_softmax_graph has no entry: its test is ignored because apply_tiling cannot
-    # schedule it, so no kernel exists to measure. Measure it when that changes.)
+    # attention weights, the softmax in traced order: the tilings that hold a row of 256
+    # weights in one tile (test_matmul_softmax.py; the looped ones are refused)
+    "matmul_softmax_graph": Tolerance(rtol=2e-3),
     # ---- cleave.dynamic.dense
     "flash_attention_sd_graph": Tolerance(rtol=5e-3),
     # ---- traced test programs (tests/frontend/_programs.py, test_exact_softmax.py)
@@ -71,12 +75,16 @@ TOLERANCES = {
     "softmax": Tolerance(rtol=1e-3),
     "softmax_mid": Tolerance(rtol=2e-3),  # over the middle axis of a batched input
     "exact_attention": Tolerance(rtol=5e-3),
+    # cl.softmax(x) next to another exp of x (tests/frontend/test_merged_exps.py): the
+    # search computes exp(x) once and the lowering computes it again for the softmax
+    "softmax_plus_exp": Tolerance(rtol=2e-3),
+    "dual_softmax": Tolerance(rtol=5e-3),
     # the attention with its softmax written out by hand on a constant shift (a plain exp, no
     # request), split: partials, combines and the chained Kernel
     "attention": Tolerance(rtol=5e-3),
     # the exact attention, split: partials, combines and the chained Kernel. By boundary
     # role: a partial returns its shift (the max of its split, float32) next to its sums.
-    "exact_split_attention": {"": Tolerance(rtol=1e-2), "shift": Tolerance(rtol=5e-6)},
+    "exact_split_attention": {"": Tolerance(rtol=5e-3), "shift": Tolerance(rtol=5e-6)},
     # the exact softmax of an input, split over the softmax axis: the partial reads its
     # logits from storage, so its shift is the max of stored values
     "exact_split_rows": {"": Tolerance(rtol=5e-3), "shift": Tolerance(rtol=2e-7)},

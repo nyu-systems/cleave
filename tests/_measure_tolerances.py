@@ -78,9 +78,10 @@ SEEDS = ("default", "1", "2")  # what a pinned measurement covers
 KINDS = ("demos", "dynamic", "tests")
 SAFETY = 4.0  # declared tolerance >= SAFETY x the largest valid error
 # ... except for bf16. It has 8 significand bits, so one ulp is 7.8e-3 of the row max, and
-# that is what a valid kernel measures (7.8e-3 .. 9.4e-3). 4x it is the ceiling itself, which
-# for any row whose max is above 0.25 is looser than the elementwise 0.01 + 0.01|ref| the
-# paged operators were held to before. 2x gives 2e-2, i.e. 2.56 ulps.
+# that is what a valid kernel measures (7.8e-3 .. 9.4e-3). 4x it is the ceiling itself. 2x
+# gives 2e-2, i.e. 2.56 ulps. (Against an elementwise 0.01 + 0.01|ref| that is tighter for
+# a row whose max is below 0.5 and looser from 0.5 on its near-zero entries and from 1.0
+# at its largest: cleave.dynamic.registry._tolerance.)
 COARSE_SAFETY = {"bfloat16": 2.0}
 WRONG = 1e-1
 ULP = {"float16": 2.0**-10, "bfloat16": 2.0**-7, "float32": 2.0**-23}
@@ -504,19 +505,34 @@ def _test_operators():
         if path == "tests/frontend/test_exact_softmax.py":
             if "middle_axis" in test:
                 return "softmax_mid"
+            if "next_to_an_exp" in test:
+                return "softmax_plus_exp"
+            if "two_softmaxes" in test:
+                return "dual_softmax"
             return "softmax" if "standalone" in test else "exact_attention"
         return node
 
     return operator
 
 
+def node_of(context: str) -> str:
+    """The pytest node id a test's comparison was logged under. ``tests/conftest.py``
+    labels every test's comparisons with its node id; a log written before it did carries
+    the runner's own variable, the node id followed by the phase (``" (call)"``)."""
+    for phase in (" (setup)", " (call)", " (teardown)"):
+        if context.endswith(phase):
+            return context[: -len(phase)]
+    return context
+
+
 def load(out: Path) -> dict:
-    """operator -> output -> list of (dtype, absolute part?, rel, abs, kind, seed).
+    """operator -> output -> list of (dtype, absolute part?, rel, abs, kind, seed, sum?).
 
     An output is its place among the outputs of its kernel that have no boundary role, or
     the role of one that has: a split partial's ``"shift"`` is one output of the operator,
     wherever the kernel returns it, and the sums next to it are numbered as in a partial
-    without it."""
+    without it. ``sum?`` marks those sums: the outputs without a role of a kernel that
+    returns one with a role (``rows`` says what dtype they are judged in)."""
     operator_of = _test_operators()
     table = defaultdict(lambda: defaultdict(list))
     for path in sorted((out / "validation").glob("*.jsonl")):
@@ -525,7 +541,7 @@ def load(out: Path) -> dict:
             record = json.loads(line)
             context = record["context"]
             if not context.startswith(("demo:", "dynamic:")):
-                node = context.rpartition(" (")[0]
+                node = node_of(context)
                 if not node.startswith("tests/") or "test_compare_outputs" in node \
                         or node.startswith("tests/test_runtime_tolerance.py") \
                         or "threaded_into_workers" in node \
@@ -541,6 +557,7 @@ def load(out: Path) -> dict:
             # operator on one of its adversarial softmax workloads
             hard = is_adversarial(context, record.get("what", ""))
             place = 0
+            partial = any(o.get("role") for o in record["outputs"])
             for o in record["outputs"]:
                 # Every output is judged by its row-relative error, whatever bound it was
                 # validated at when this was logged; "absolute" only records that the
@@ -549,8 +566,38 @@ def load(out: Path) -> dict:
                 key = o.get("role") or place
                 place += not o.get("role")
                 table[context][key].append(
-                    (o["dtype"], o["atol"] > 0, o["rel"], o["abs"], kind, seed))
+                    (o["dtype"], o["atol"] > 0, o["rel"], o["abs"], kind, seed,
+                     partial and not o.get("role")))
     return table
+
+
+def judged_dtypes(outputs: dict) -> dict:
+    """output -> ``(dtype it is judged in, dtypes its kernels return it in)`` for the
+    outputs of one operator (``load``).
+
+    An output is judged in the dtype its kernels return it in, with one exception: the
+    sums a split partial of an exact softmax returns next to its shift. They cross the cut
+    in float32, so that a sum over a whole split cannot overflow the program's dtype, but
+    they are computed from operands in that dtype (the weights of the value matmul are
+    tensor-core operands), so their error is the program dtype's, hundreds of float32 ulps.
+    They are judged in the program's dtype: the dtype of the operator's outputs that no
+    partial returns (its combines, its solo kernels, the chained pair). The float32 shift
+    next to them has a role and a float32 bound of its own.
+    """
+    program = {entry[0] for key, entries in outputs.items() if not isinstance(key, str)
+               for entry in entries if not entry[6]}
+    judged = {}
+    for key, entries in outputs.items():
+        stored = sorted({entry[0] for entry in entries})
+        own = sorted({entry[0] for entry in entries if not entry[6]})
+        if isinstance(key, str) or own or len(program) != 1:
+            # a role, an output some kernel returns outside a partial, or an operator with
+            # nothing but partials: judged as it is returned
+            dtype = (own or stored)[0]
+        else:
+            (dtype,) = program
+        judged[key] = (dtype, stored)
+    return judged
 
 
 _DECADES = [(f"<1e-{k}", 10.0**-k) for k in (6, 5, 4, 3, 2, 1)]
@@ -569,15 +616,16 @@ def _bucket(value, kind):
 
 def rows(table):
     for context in sorted(table, key=lambda c: (c.split(":")[0] != "demo", c)):
+        judged = judged_dtypes(table[context])
         # numbered outputs first, then the ones under a role
         for i, entries in sorted(table[context].items(),
                                  key=lambda item: (isinstance(item[0], str), item[0])):
-            dtype = entries[0][0]
+            dtype, stored = judged[i]
             absolute = any(e[1] for e in entries)
             counts = defaultdict(int)
-            for _, _, rel, _, kind, _ in entries:
+            for _, _, rel, _, kind, _, _ in entries:
                 counts[_bucket(rel, kind)] += 1
-            measured = [(rel, abs_, kind) for _, _, rel, abs_, kind, _ in entries
+            measured = [(rel, abs_, kind) for _, _, rel, abs_, kind, _, _ in entries
                         if rel is not None and kind != "non_finite"]
             limit = valid_limit(dtype)
             # Adversarial comparisons the rtol has to cover: like any other, one within the
@@ -592,6 +640,8 @@ def rows(table):
             largest = max(feeding, default=0.0 if valid else None)
             yield {
                 "operator": context, "output": i, "dtype": dtype, "absolute": absolute,
+                # the dtypes it is returned in, where that is not only the one it is judged in
+                "stored": stored if stored != [dtype] else None,
                 "seeds": sorted({e[5] for e in entries}), "n": len(entries),
                 "histogram": {b: counts[b] for b in BUCKETS if counts[b]},
                 "largest_valid": largest,
@@ -609,7 +659,8 @@ def measured_errors(table) -> dict:
     """operator -> per output ``{dtype, rel, abs, absolute, seeds, validated}``: the largest
     clearly-valid error of each output, which is all the rule needs (``MEASURED``). The
     numbered outputs come first, in order; an output under a boundary role follows, with
-    its ``role``.
+    its ``role``. ``dtype`` is the one the output is judged in (``judged_dtypes``); where
+    some kernel returns it in another, ``stored`` lists the dtypes it is returned in.
 
     ``rel`` is taken over the comparisons that feed the rtol (``feeds_rtol``, and for a
     dense program or a dynamic operator its normal inputs only: ``ADVERSARIAL_CASE``); ``abs``
@@ -622,6 +673,7 @@ def measured_errors(table) -> dict:
             "dtype": r["dtype"], "rel": r["largest_valid"], "abs": r["largest_valid_abs"],
             "absolute": r["absolute"], "seeds": len(r["seeds"]), "validated": r["n"],
             **({"role": role} if role else {}),
+            **({"stored": r["stored"]} if r["stored"] else {}),
         })
     return dict(out)
 
@@ -649,6 +701,8 @@ def markdown(table) -> str:
         if r["ambiguous"]:
             tol += f" (AMBIGUOUS: {len(r['ambiguous'])} in ({valid_limit(r['dtype']):g}, " \
                    f"{WRONG:g}), max {r['ambiguous'][-1]:.2e})"
+        if r["stored"]:
+            tol += f" (returned as {', '.join(r['stored'])}, judged as {r['dtype']})"
         lines.append(f"| {r['operator']} | {r['output']} | {r['dtype']} | {len(r['seeds'])} | "
                      f"{r['n']} | {hist} | {largest} | {largest_abs} | {tol} |")
     return "\n".join(lines)

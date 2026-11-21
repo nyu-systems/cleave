@@ -47,6 +47,11 @@ def test_declared_tolerances_are_row_relative_bounds_within_the_ceiling():
             assert 0 < shift.rtol <= FP32_CEILING < tolerance.rtol and shift.atol == 0, name
             assert {o["dtype"] for o in outputs if o.get("role")} == {"float32"}, name
             outputs = [o for o in outputs if not o.get("role")]  # held to tolerance[""]
+            # the two sums a partial returns cross the cut in float32 as well, and are
+            # judged in the program's dtype: the first next to the float16 output of the
+            # combines and the chained pair, the second returned by partials only
+            assert [o.get("stored") for o in outputs] == [["float16", "float32"],
+                                                         ["float32"]], name
         assert isinstance(tolerance, Tolerance), name
         (dtype,) = {o["dtype"] for o in outputs}
         if dtype == "float32":
@@ -176,10 +181,6 @@ def _validating_tests():
                 if name in TOLERANCES:
                     found.append((f"{path}::{fn.name}", name))
                     continue
-                if name == "matmul_softmax_graph":
-                    # the one builder without a declared bound: pytest.ini ignores its file
-                    assert path == "tests/graph/apply_tiling/test_matmul_softmax.py"
-                    continue
                 # a builder looked up by the test's parameter: one node per table entry
                 module = importlib.import_module(path.removesuffix(".py").replace("/", "."))
                 (param,) = [a.arg for a in fn.args.args]
@@ -241,8 +242,7 @@ def test_the_rule_that_turns_a_measured_error_into_a_tolerance():
     assert recommend(0.02, "float16") == CEILING
     assert recommend(1e-4, "float32") == FP32_CEILING
     # bf16 is the exception to 4x. Its kernels sit at one ulp, 7.8e-3 of the row max, so 4x
-    # would be the ceiling itself: looser than the elementwise 0.01 + 0.01|ref| the paged
-    # operators were held to before. It gets 2x, which is 2.56 ulps.
+    # would be the ceiling itself. It gets 2x, which is 2.56 ulps.
     assert recommend(7.8e-3, "bfloat16") == 2e-2
     assert recommend(9.4e-3, "bfloat16") == 2e-2
     assert recommend(0.02, "bfloat16") == CEILING
@@ -274,7 +274,7 @@ def test_a_comparison_within_the_absolute_floor_does_not_feed_the_rtol():
     from tests._measure_tolerances import feeds_rtol, measured_errors, rows
 
     def table(*lse, absolute=True):
-        return {"dynamic:op": {0: [("float32", absolute, rel, abs_, None, "default")
+        return {"dynamic:op": {0: [("float32", absolute, rel, abs_, None, "default", False)
                                    for rel, abs_ in lse]}}
 
     scaled, near_zero = (4.112e-7, 2.44e-4), (6.845e-7, 4.768e-7)
@@ -301,7 +301,7 @@ def test_a_comparison_within_the_absolute_floor_does_not_feed_the_rtol():
     assert (row["largest_valid"], row["within_floor"]) == (0.0, 1)
     assert row["rtol"] == recommend(0.0, "float32") == 2e-7
     # no valid comparison at all: nothing was measured
-    (row,) = rows({"dynamic:op": {0: [("float32", True, None, None, "non_finite", "default")]}})
+    (row,) = rows({"dynamic:op": {0: [("float32", True, None, None, "non_finite", "default", False)]}})
     assert row["largest_valid"] is None and row["rtol"] is None and row["within_floor"] == 0
 
 
@@ -554,10 +554,17 @@ def test_a_paged_operators_adversarial_workloads_are_held_to_its_bound_and_do_no
 
 def test_an_output_with_a_boundary_role_is_measured_apart(tmp_path):
     """The split partial of an exact softmax returns its float32 shift in front of its two
-    float16 sums. The shift is one output of the operator, under its role, wherever a kernel
+    sums. The shift is one output of the operator, under its role, wherever a kernel
     returns it; the sums are numbered as in a partial without it, so the first is measured
     with the output of the solo and combine kernels as before. Each role gets the bound the
-    rule gives its own outputs: nothing of one dtype is held to the error of another."""
+    rule gives its own outputs.
+
+    The sums cross the cut in float32 as well (a sum over a whole split overflows float16
+    where the program's result does not), but they are not float32 results: the weights of
+    the value matmul are float16 tensor-core operands, and the partial of the value sum is
+    6e-4 of its row max off, hundreds of float32 ulps. They are judged in the program's
+    dtype, the one the operator's other kernels return, and the entry says how they are
+    returned."""
     from tests._measure_tolerances import load, markdown, measured_errors, rows
 
     path = "tests/pipeline_api/test_exact_split_attention.py::test_gpu_exact_split_attention"
@@ -571,15 +578,15 @@ def test_an_output_with_a_boundary_role_is_measured_apart(tmp_path):
         return json.dumps({"context": f"{path}[{kind}] (call)", "what": what, "kind": None,
                            "outputs": list(outputs)})
 
-    partial = [out("float32", 9.4e-7, role="shift"), out("float16", 6.5e-4),
-               out("float16", 1.1e-3, shape=(32, 16, 64, 64))]
+    partial = [out("float32", 9.4e-7, role="shift"), out("float32", 1.3e-6),
+               out("float32", 6.1e-4, shape=(32, 16, 64, 64))]
     lines = [
         record("", *partial),
         record("", out("float16", 3.3e-4, shape=(32, 64, 64))),  # a combine
         record("", out("float16", 9.8e-4, shape=(32, 64, 64))),  # the chained Kernel
         # adversarial cases: held to the bounds, no input to them
         record("increasing inputs", out("float32", 1.9e-6, role="shift"),
-               out("float16", 8.0e-4), out("float16", 1.6e-3, shape=(32, 16, 64, 64))),
+               out("float32", 8.9e-5), out("float32", 8.6e-4, shape=(32, 16, 64, 64))),
     ]
     (tmp_path / "validation").mkdir()
     (tmp_path / "validation" / "tests__default.jsonl").write_text("\n".join(lines) + "\n")
@@ -590,16 +597,26 @@ def test_an_output_with_a_boundary_role_is_measured_apart(tmp_path):
     assert list(by_output) == [0, 1, "shift"]  # the numbered outputs first
     assert (by_output[0]["dtype"], by_output[0]["n"], by_output[0]["largest_valid"]) == (
         "float16", 4, 9.8e-4)
-    assert (by_output[1]["dtype"], by_output[1]["largest_valid"]) == ("float16", 1.1e-3)
+    assert by_output[0]["stored"] == ["float16", "float32"]
+    # the value sums: only partials return them, in float32; judged as the program's dtype
+    assert (by_output[1]["dtype"], by_output[1]["largest_valid"]) == ("float16", 6.1e-4)
+    assert by_output[1]["stored"] == ["float32"] and by_output[1]["ambiguous"] == []
+    assert (by_output[1]["adversarial"], by_output[1]["largest_adversarial"]) == (1, 8.6e-4)
     shift = by_output["shift"]
     assert (shift["dtype"], shift["n"], shift["largest_valid"]) == ("float32", 2, 9.4e-7)
+    assert shift["stored"] is None
     assert (shift["adversarial"], shift["largest_adversarial"], shift["rtol"]) == (1, 1.9e-6, 5e-6)
 
     entries = measured_errors(table)["test:exact_split_attention"]
     assert [e.get("role") for e in entries] == [None, None, "shift"]
     assert [e["dtype"] for e in entries] == ["float16", "float16", "float32"]
+    assert [e.get("stored") for e in entries] == [["float16", "float32"], ["float32"], None]
     assert expected_tolerances_by_role(entries) == {
         "": Tolerance(rtol=5e-3), "shift": Tolerance(rtol=5e-6)}
+    # judged as float32 results, the value sums would have no bound at all: 6.1e-4 is
+    # far over the float32 ceiling, so nothing of theirs would count as valid
+    assert recommend(6.1e-4, "float32") == FP32_CEILING < 6.1e-4 < recommend(6.1e-4, "float16")
+    assert "(returned as float32, judged as float16)" in markdown(table)
     # an operator with such an output has no single bound to declare
     with pytest.raises(AssertionError, match="declare this operator by role"):
         expected_tolerance(entries)
@@ -766,21 +783,16 @@ def test_every_tiling_test_that_passes_a_tolerance_has_an_operator():
     ``tolerance_for("<program>")``), or the file names the builder of each such test in
     ``SEVERAL_BUILDERS``."""
     import ast
-    import re
     from pathlib import Path
 
     from tests._measure_tolerances import ROOT, SEVERAL_BUILDERS, _test_operators
 
     operator_of = _test_operators()
-    # a file pytest.ini leaves out of every run logs nothing
-    ignored = re.findall(r"--ignore=(\S+)", (Path(ROOT) / "pytest.ini").read_text())
     seen = 0
     for directory in ("tests/graph/apply_tiling", "tests/reference"):
         for path in sorted((Path(ROOT) / directory).glob("test_*.py")):
             source = path.read_text()
             rel = f"{directory}/{path.name}"
-            if rel in ignored:
-                continue
             for node in ast.parse(source).body:
                 if not isinstance(node, ast.FunctionDef) or not node.name.startswith("test_"):
                     continue
@@ -799,3 +811,69 @@ def test_every_tiling_test_that_passes_a_tolerance_has_an_operator():
             assert f"def {name}(" in source, (rel, name)
             if isinstance(builder, str):
                 assert builder in TOLERANCES and f"tolerance_for({builder})" in source
+
+
+def test_no_test_is_left_out_of_a_run():
+    """``pytest.ini`` names no test or file to leave out: a kernel nobody runs has no
+    measured error, and its operator no bound that follows from one. (It ignored
+    ``tests/graph/apply_tiling/test_matmul_softmax.py``, whose one tiling ``apply_tiling``
+    refuses, and deselected five tests whose kernels did not validate.)"""
+    import re
+
+    from tests._measure_tolerances import ROOT
+
+    text = (ROOT / "pytest.ini").read_text()
+    assert not re.findall(r"--(?:ignore|ignore-glob|deselect)\b", text)
+    assert not re.search(r"(?m)^\s*(?:-k|-m)\b", text)
+    assert "matmul_softmax_graph" in TOLERANCES
+
+
+def test_the_paged_output_bound_against_an_elementwise_percent():
+    """How ``rtol * rowmax`` of the paged bf16 output relates to an elementwise
+    ``0.01 + 0.01 |ref|``: tighter for a row whose max is below 0.5, looser from 0.5 on
+    the near-zero entries of a row and from 1.0 at its largest entry. The declaration's
+    docstring states this relation (``cleave.dynamic.registry._tolerance``); it holds for
+    the declared value and the row comparator, and moves if either does."""
+    from cleave.core.errors import OutputMismatch
+
+    ulp = 2.0 ** -7  # of a bf16 value in [1, 2)
+
+    def row(top):
+        reference = torch.zeros(1, 8)
+        reference[0, 0] = top
+        return reference.to(torch.bfloat16)
+
+    def elementwise(actual, reference):
+        try:
+            torch.testing.assert_close(actual.float(), reference.float(), rtol=0.01, atol=0.01)
+        except AssertionError:
+            return False
+        return True
+
+    for name, operator in OPERATORS.items():
+        out, _ = operator.tolerance
+        assert out.atol == 0, name
+        # where the two bounds cross: at a near-zero entry, and at the row's largest entry
+        assert 0.01 / out.rtol == 0.5 and 0.01 / (out.rtol - 0.01) == 1.0, name
+
+        def declared(actual, reference):
+            try:
+                compare_outputs([actual], [reference], out)
+            except OutputMismatch:
+                return False
+            return True
+
+        # a row of max 2: two bf16 ulps off at its largest entry, and 1.5% of the max off
+        # at an entry near zero, pass the declared bound and not the elementwise one
+        reference = row(2.0)
+        at_max = reference.clone()
+        at_max[0, 0] += 2 * 2 * ulp
+        assert declared(at_max, reference) and not elementwise(at_max, reference), name
+        near_zero = reference.clone()
+        near_zero[0, 5] = 0.03
+        assert declared(near_zero, reference) and not elementwise(near_zero, reference), name
+        # a row of max 0.25: three ulps off at its largest entry is the other way round
+        reference = row(0.25)
+        small = reference.clone()
+        small[0, 0] += 3 * ulp / 4
+        assert not declared(small, reference) and elementwise(small, reference), name
