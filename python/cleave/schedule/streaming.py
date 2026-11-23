@@ -297,13 +297,37 @@ def _refused(node, text) -> StreamingRefused:
     return StreamingRefused(f"{node.name}: {text}")
 
 
-def _locate(tier, owner, full, record):
+def _other_lead(flat_graph, full, acc):
+    """The first dim of ``full`` that is not the same dim of ``acc``, or None.
+
+    The repair multiplies ``acc`` by a factor tiled like ``full`` (``Rescale(lead)``):
+    element ``[i, ..., j]`` of the accumulator by element ``[i, ...]`` of the factor. That
+    is right only where the leading dims of the accumulator ARE the dims of ``full``, which
+    their tile extents cannot tell when two of them are equal (``(v @ e) / sum(e, 0)``
+    leads with the rows of ``v``; its max is indexed by its columns). It is read off the
+    output-axis provenance of the flat graph (which input dims each output dim is), as the
+    policy reads it."""
+    if flat_graph is None:
+        return None  # nothing is served without its flat graph anyway (R1)
+    from .tiling import _scheduled_axes
+
+    tokens = {(n.name, out): t for (n, out), t in _scheduled_axes(flat_graph).out_tokens.items()}
+    rows, lead = tokens.get((full.name, 0)), tokens.get((acc.name, 0))
+    if rows is None or lead is None:
+        return 0
+    for k, dim in enumerate(rows):
+        if k >= len(lead) or not (dim & lead[k]):
+            return k
+    return None
+
+
+def _locate(tier, owner, full, record, flat_graph=None):
     """Classify one recorded full-extent node from the tier that was built (read-only).
 
     ``None``: its dim is whole in the tile it is computed from (the main tier, or a loop
     that steps another dim): the flat graph's own max is right as it stands. A ``Site``:
     the tier's loop steps its dim. Anything a tiling can be refused for is decided here,
-    before a node is touched.
+    before a node is touched. ``flat_graph`` is the graph the tiling is of.
     """
     if owner is None:
         return None
@@ -355,6 +379,11 @@ def _locate(tier, owner, full, record):
         if _squeezed(acc_tile)[: len(rows)] != rows:
             raise _refused(full, f"accumulator {acc.name} tile {acc_tile} does not lead with "
                                  f"the row tile {tuple(rows)}")
+        other = _other_lead(flat_graph, full, acc)
+        if other is not None:
+            raise _refused(full, f"accumulator {acc.name} tile {acc_tile} does not lead with "
+                                 f"the row tile {tuple(rows)}: its dim {other} is not dim "
+                                 f"{other} of {full.name}")
         if len(_squeezed(acc_tile)) != len(acc_tile):
             raise _refused(full, f"accumulator {acc.name} has a unit extent in its tile "
                                  f"{acc_tile}")
@@ -472,7 +501,7 @@ def assemble(tiled: Graph, flat_graph=None) -> Graph:
     plan, claimed = [], set()
     for tier, owner, full in recorded(tiled):
         record = full.streaming
-        site = _locate(tier, owner, full, record)
+        site = _locate(tier, owner, full, record, flat_graph)
         if site is None:
             continue
         if not _honoured(record, flat_graph, full.name, record.loops):
