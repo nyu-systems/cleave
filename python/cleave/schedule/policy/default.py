@@ -742,6 +742,18 @@ class DefaultPolicy:
                 # TODO (david): add extra traffic whenever we need to load from higher-level memory again?
                 # e.g., nodes out of reduction block? this may happen when force_fusion is set to True.
             for edge in node.outputs:
+                if edge.dst_node.is_output() and (
+                    not list(output_shapes[edge.src_id]) or not list(node.get_shape(edge.src_id))
+                ):
+                    # A reduction of every dim of its operand (``sum(x, 0)`` of a vector,
+                    # ``sum(sum(x, -1), -2)``) is stored as a scalar: its output, or its
+                    # tile, has no dim, whatever the tiling. The traffic below would die
+                    # on it.
+                    raise ScheduleRejected(
+                        f"{node.name}: every dim of the output is reduced to one element, "
+                        "so its tile has no dim; a unit dim that is not a batch dim has "
+                        "no tile"
+                    )
                 if edge.dst_node.is_output() and self.accumulation.get(node) == INTER:
                     # summed across CTAs: an atomic add per element of the block
                     traffic += (

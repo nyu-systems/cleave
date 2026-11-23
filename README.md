@@ -100,6 +100,8 @@ Shapes that have no kernel yet (each is refused with its reason, or fails in Til
 served wrongly):
 
 - attention with a single query row (`S_Q = 1`): a unit dim that is not a batch dim has no tile;
+- an output that reduces every dim to one element (`sum(x, 0)` of a vector, the total of a
+  matrix): its tile has no dim, for the same reason;
 - for 16-bit dtypes, a matmul that contracts a length no multiple of 16 divides (float16
   attention at `S_KV = 1000`), and for float32 one no multiple of 8 divides;
 - a row that a tile has to hold whole and whose length is not a power of two (a standalone
