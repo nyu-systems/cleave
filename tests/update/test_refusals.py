@@ -338,9 +338,25 @@ def test_e14_one_sum_scaled_by_two_softmaxes():
 
 
 def test_t5_a_max_under_the_max_is_not_a_sum():
-    ir, ob, d = refused(max_normalized)
+    """S5 is a structural rule (DESIGN 4.2): ``obstacles`` refuses the obstacle with T5, so
+    lowering never asks the engine. The engine checks it again for an obstacle handed to it
+    as it is, with the same text."""
+    import dataclasses
+
+    from cleave.schedule.streaming import obstacles
+    from cleave.schedule.tiling import reduction_ancestors, scheduled_reductions
+
+    graph = identity(max_normalized, SHAPES)
+    ir = lowered(graph)
+    nodes, red = scheduled_reductions(ir)
+    (ob,) = obstacles(nodes, red, reduction_ancestors(nodes))
     inner = [n.name for n in ir.nodes if type(n).__name__ == "ReduceMax" and n.name != ob.full]
     assert set(inner) <= set(ob.loops)
-    assert d.refused == texts.T5.format(d=inner[0], cls="ReduceMax", full=ob.full)
-    assert d.refused == (f"{inner[0]} is a ReduceMax: the reductions that loop under {ob.full} "
-                         "must be sums or matmuls that start at zero")
+    want = texts.T5.format(d=inner[0], cls="ReduceMax", full=ob.full)
+    assert want == (f"{inner[0]} is a ReduceMax: the reductions that loop under {ob.full} "
+                    "must be sums or matmuls that start at zero")
+    assert ob.refused == want
+    ob = dataclasses.replace(ob, refused="")
+    with use_searched_updates():
+        d = engine.run(ir, ob, Recipe.of(graph), key=loop_key(ir, ob.full, ob.loops))
+    assert d.refused == want

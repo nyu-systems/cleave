@@ -314,7 +314,8 @@ WHY = {"T3": " reads ", "T4": ", computed from ", "T5": " is a ReduceMax: ", "E1
 def test_every_softmax_program_is_served_or_says_why(fn, shapes, want, tmp_path, monkeypatch):
     """Lowering under the switch: a record where the engine derives one, the reason
     otherwise -- the structural ones of the scheduler (T3: two passes, T4: a value of the
-    max read outside the loop) without asking the engine, the engine's own after."""
+    max read outside the loop, T5: a reduction under the max that is no sum) without asking
+    the engine, the engine's own after."""
     import cleave
     from cleave.frontend import trace
     from cleave.pipeline import plans
@@ -332,5 +333,5 @@ def test_every_softmax_program_is_served_or_says_why(fn, shapes, want, tmp_path,
         assert record.rules == tuple((a, FACTOR) for a in record.loops)
     for kind, why in zip([w for w in want if w != "record"], refusals):
         assert WHY[kind] in why, why
-    asked = [w for w in want if w not in ("T3", "T4")]
+    asked = [w for w in want if w not in ("T3", "T4", "T5")]
     assert len(getattr(ir, "derivations", [])) == len(asked)
