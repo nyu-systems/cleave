@@ -38,7 +38,6 @@ rebuild the dicts).
 from __future__ import annotations
 
 import functools
-import re
 from collections import Counter
 from dataclasses import dataclass
 
@@ -49,8 +48,10 @@ from ..core.target import current_target
 from ..ir.graph import AccumEdge, ComputeOpNode, Graph, Iterator
 from ..ir.graph_utils import edit_graph, graph_tiers, tmap_by_name
 from ..ir.offsets import TileOffset
-from ..ir.ops import NEG_FLT_MAX, Exp, Matmul, ReduceMax, Sub, wire_input
+from ..ir.ops import NEG_FLT_MAX, Exp, ReduceMax, Sub, wire_input
 from ..ir.rolling import STAT_DTYPE, lazy_rolling_nodes, rolling_nodes
+# What reads a tier is shared with the searched path, and lives there.
+from .streaming import _descends, _is, _reason_key, _squeezed, _stored_tile, _weighted_slices
 from .tiling import rebase_reduction_axis
 
 
@@ -110,22 +111,6 @@ def _stored_dtype(edge) -> str:
     """The dtype the value ``edge`` reads is stored in (what codegen casts from)."""
     src = edge.accum_node if isinstance(edge, AccumEdge) else edge.src_node
     return src.out_dtype if isinstance(src, ComputeOpNode) else str(src.get_dtype(0))
-
-
-def _stored_tile(tier, edge) -> Iterator:
-    """The tile of the value ``edge`` reads, in the tier that stores it: an accumulator's
-    buffer is the one its loop's own tier allocates."""
-    if isinstance(edge, AccumEdge):
-        return tmap_by_name(edge.src_node.graph)[edge.accum_node.name]
-    return tmap_by_name(tier)[edge.src_node.name]
-
-
-def _is(node, nodes) -> bool:
-    return any(node is n for n in nodes)
-
-
-def _squeezed(tile) -> list:
-    return [int(t) for t in tile if int(t) != 1]
 
 
 # --------------------------------------------------------------------------- classification
@@ -278,61 +263,6 @@ def _locate(tier, owner, exp, threads=None) -> Site:
     return Site(
         exp.name, where, "rolling", axis, full, block, step, tuple(n.name for n in accs), lazy
     )
-
-
-def _descends(node, ancestor, tier) -> bool:
-    """Whether ``node`` is computed from ``ancestor`` inside ``tier``."""
-    stack, seen = [node], set()
-    while stack:
-        n = stack.pop()
-        if n is ancestor:
-            return True
-        if id(n) in seen:
-            continue
-        seen.add(id(n))
-        stack.extend(e.src_node for e in n.inputs if _is(e.src_node, tier.nodes))
-    return False
-
-
-def _weighted_slices(tier, exp, accs) -> list:
-    """The slices the loop of ``tier`` loads that are multiplied into the softmax's output:
-    placeholders the loop cuts per iteration from which a rescaled accumulator of ``accs``
-    is computed without passing through ``exp``, read by something other than a matmul.
-
-    A pipelined loop keeps the slices of several iterations in one buffer and loads the
-    next ones while the body runs; the body says when it is done with a slice, and the
-    slot is loaded again. A matmul reads its slice in place, before that. Any other op
-    first copies the slice into registers, and what tells the loader that the slot is
-    free is not something the device compiler treats as touching memory: it may read the
-    slot later, where the values are used. Here they are used last by the sums over the
-    softmax axis, one cross-thread reduction per element, behind the running max and the
-    rescale. Measured on a split combine (8 partials, 64 value columns a thread, slots
-    reused after 3 iterations): columns 24 and up of every row came from a later
-    iteration's partials, a different count of them on every launch.
-
-    A plain loop loads one slice, waits for it and uses it; nothing is loaded behind its
-    back. The slices of the scores (which pass through the exp) and of a value matmul are
-    not in this list: every attention kernel keeps its pipeline.
-    """
-    tmaps = tmap_by_name(tier)
-    found, stack, seen = [], list(accs), set()
-    while stack:
-        node = stack.pop()
-        if id(node) in seen:
-            continue
-        seen.add(id(node))
-        for edge in node.inputs:
-            src = edge.src_node
-            if src is exp or not _is(src, tier.nodes):
-                continue
-            if not src.is_placeholder():
-                stack.append(src)
-                continue
-            it = tmaps[src.name]
-            cut = any(int(whole) != int(part) for whole, part in zip(it.shape, it.tile_size))
-            if cut and type(node) is not Matmul and not _is(src, found):
-                found.append(src)
-    return found
 
 
 def _exported_max(tier, where, exp, flat, *, carried: bool):
@@ -665,13 +595,6 @@ def overhead_bytes(tiled: Graph) -> int:
 
 
 # ---------------------------------------------------------------------------- accept filter
-
-
-def _reason_key(error) -> str:
-    """A refusal's first line with bare numbers folded, so one reason counts once whatever
-    the tile sizes were. Digits that belong to a name (``exp_5``) are kept."""
-    line = (str(error).splitlines() or [""])[0]
-    return re.sub(r"(?<![\w.\-])\d+(?![\w.])", "N", line)[:200]
 
 
 def stabilize_accept(flat_graph):

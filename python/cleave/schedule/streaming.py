@@ -15,7 +15,10 @@ The pair is a *streaming obstacle* when all of this holds (:func:`obstacles`):
      one loop counter steps all of them;
   3. no overlapped descendant is itself an ancestor of another one over that dim (that
      needs two passes: the traced order ``(exp / sum) @ v``);
-  4. nothing computed from the ancestor on the way to the descendants is read elsewhere.
+  4. nothing computed from the ancestor on the way to the descendants is read elsewhere;
+  5. every overlapped descendant is a plain sum or matmul (by exact type) that starts at
+     zero: the repair multiplies what such an accumulator holds, and nothing else is
+     modelled by the proof (a max of the scaled value starts at ``-inf``).
 
 It is *served* where, in addition, an update rule was found and PROVEN for every
 overlapped descendant (``cleave.pipeline.update``): the full-extent node carries a
@@ -33,12 +36,14 @@ this module is inert for it.
 
 from __future__ import annotations
 
+import re
 from collections import Counter
 from dataclasses import dataclass
 
 from ..core.errors import ScheduleRejected
-from ..ir.graph import ComputeOpNode, Graph, Iterator
+from ..ir.graph import AccumEdge, ComputeOpNode, Graph, Iterator
 from ..ir.graph_utils import edit_graph, graph_tiers, tmap_by_name
+from ..ir.ops import Copy, Exp, Matmul, ReduceSum, wire_input
 from ..ir.rolling import STAT_DTYPE, build_expression, check_expression
 from ..ir.update_rule import Obstacle, Streaming, loop_key
 
@@ -107,8 +112,23 @@ def obstacles(ordered_nodes, red_tokens, ancestors) -> list:
                            f"dim {full.name} reduces: that needs two passes over the row")
         if not refused:
             refused = _read_outside(full, loops, ancestors)
+        for d in loops:
+            if refused:
+                break
+            refused = _not_a_sum(full, d)
         found.append(Obstacle(full.name, tuple(d.name for d in loops), refused))
     return found
+
+
+def _not_a_sum(full, d) -> str:
+    """Why ``d`` cannot accumulate under a carried ``full``, or ``""``: the repair rescales
+    what an accumulator holds, which is right for a sum (or a contraction) that starts at
+    zero and nothing else the proof models. A subclass may accumulate otherwise (a max is
+    a ``ReduceSum``), so the type is asked exactly."""
+    if type(d) in (ReduceSum, Matmul) and getattr(d, "accum_init", None) is None:
+        return ""
+    return (f"{d.name} is a {type(d).__name__}: the reductions that loop under {full.name} "
+            "must be sums or matmuls that start at zero")
 
 
 def _read_outside(full, loops, ancestors) -> str:
@@ -176,10 +196,88 @@ def streamed(ordered_nodes, red_tokens, ancestors, flat_graph=None) -> dict:
 
 # ------------------------------------------------------------------------------ assembly
 #
-# Everything below edits a finished tiled graph. It is the mechanical half of what
-# ``schedule/stabilize.py`` does for the hand-derived pass and reuses that module's helpers.
-# It is much smaller: the max and the shifted scores already exist in the flat graph, so
-# only the carried state and the repair are added.
+# Everything below edits a finished tiled graph: the max and the shifted scores already
+# exist in the flat graph, so only the carried state and the repair are added. The helpers
+# that read a tier are shared with ``schedule/stabilize.py`` (the hand-derived pass), which
+# imports them from here.
+
+
+def _stored_tile(tier, edge) -> Iterator:
+    """The tile of the value ``edge`` reads, in the tier that stores it: an accumulator's
+    buffer is the one its loop's own tier allocates."""
+    if isinstance(edge, AccumEdge):
+        return tmap_by_name(edge.src_node.graph)[edge.accum_node.name]
+    return tmap_by_name(tier)[edge.src_node.name]
+
+
+def _is(node, nodes) -> bool:
+    return any(node is n for n in nodes)
+
+
+def _squeezed(tile) -> list:
+    return [int(t) for t in tile if int(t) != 1]
+
+
+def _descends(node, ancestor, tier) -> bool:
+    """Whether ``node`` is computed from ``ancestor`` inside ``tier``."""
+    stack, seen = [node], set()
+    while stack:
+        n = stack.pop()
+        if n is ancestor:
+            return True
+        if id(n) in seen:
+            continue
+        seen.add(id(n))
+        stack.extend(e.src_node for e in n.inputs if _is(e.src_node, tier.nodes))
+    return False
+
+
+def _weighted_slices(tier, exp, accs) -> list:
+    """The slices the loop of ``tier`` loads that are multiplied into the softmax's output:
+    placeholders the loop cuts per iteration from which a rescaled accumulator of ``accs``
+    is computed without passing through ``exp``, read by something other than a matmul.
+
+    A pipelined loop keeps the slices of several iterations in one buffer and loads the
+    next ones while the body runs; the body says when it is done with a slice, and the
+    slot is loaded again. A matmul reads its slice in place, before that. Any other op
+    first copies the slice into registers, and what tells the loader that the slot is
+    free is not something the device compiler treats as touching memory: it may read the
+    slot later, where the values are used. Here they are used last by the sums over the
+    softmax axis, one cross-thread reduction per element, behind the running max and the
+    rescale. Measured on a split combine (8 partials, 64 value columns a thread, slots
+    reused after 3 iterations): columns 24 and up of every row came from a later
+    iteration's partials, a different count of them on every launch.
+
+    A plain loop loads one slice, waits for it and uses it; nothing is loaded behind its
+    back. The slices of the scores (which pass through the exp) and of a value matmul are
+    not in this list: every attention kernel keeps its pipeline.
+    """
+    tmaps = tmap_by_name(tier)
+    found, stack, seen = [], list(accs), set()
+    while stack:
+        node = stack.pop()
+        if id(node) in seen:
+            continue
+        seen.add(id(node))
+        for edge in node.inputs:
+            src = edge.src_node
+            if src is exp or not _is(src, tier.nodes):
+                continue
+            if not src.is_placeholder():
+                stack.append(src)
+                continue
+            it = tmaps[src.name]
+            cut = any(int(whole) != int(part) for whole, part in zip(it.shape, it.tile_size))
+            if cut and type(node) is not Matmul and not _is(src, found):
+                found.append(src)
+    return found
+
+
+def _reason_key(error) -> str:
+    """A refusal's first line with bare numbers folded, so one reason counts once whatever
+    the tile sizes were. Digits that belong to a name (``exp_5``) are kept."""
+    line = (str(error).splitlines() or [""])[0]
+    return re.sub(r"(?<![\w.\-])\d+(?![\w.])", "N", line)[:200]
 
 
 @dataclass(frozen=True)
@@ -207,8 +305,6 @@ def _locate(tier, owner, full, record):
     the tier's loop steps its dim. Anything a tiling can be refused for is decided here,
     before a node is touched.
     """
-    from .stabilize import _descends, _is, _squeezed, _stored_tile
-
     if owner is None:
         return None
     where = owner.name
@@ -280,9 +376,6 @@ def _locate(tier, owner, full, record):
 def _exp_class(full, tier):
     """The exp between the max and what it feeds, or None: the repair uses the same base
     as the values it repairs."""
-    from ..ir.ops import Exp
-    from .stabilize import _is
-
     stack, seen = [full], set()
     while stack:
         n = stack.pop()
@@ -318,9 +411,6 @@ def carry_early(main, rstep_map) -> None:
 def _carry(tier, owner, full, record, site, taken):
     """Make ``full`` carried state of its loop and repair what was accumulated under it.
     Only called inside ``edit_graph``."""
-    from ..ir.ops import Copy, Exp, wire_input
-    from .stabilize import _weighted_slices
-
     rows = tuple(int(s) for s in full.get_shape())
     nb = full.n_batch_dims
     it = tmap_by_name(tier)[full.name]
@@ -379,7 +469,7 @@ def assemble(tiled: Graph, flat_graph=None) -> Graph:
     tiling; nothing has been edited then. A value whose dim is whole where it is computed
     needs nothing.
     """
-    plan = []
+    plan, claimed = [], set()
     for tier, owner, full in recorded(tiled):
         record = full.streaming
         site = _locate(tier, owner, full, record)
@@ -387,6 +477,14 @@ def assemble(tiled: Graph, flat_graph=None) -> Graph:
             continue
         if not _honoured(record, flat_graph, full.name, record.loops):
             raise _refused(full, FOREIGN_RECORD)
+        # One factor per accumulator (``Graph.accum_scale``): a sum that two carried values
+        # repair (``sum(pa * pb)`` under the maxes of two softmaxes) would keep the factor
+        # of the last one only. ``_locate`` reads the tier as it is, before either is added.
+        for name in site.repaired:
+            if (id(tier), name) in claimed:
+                raise _refused(full, f"accumulator {name} is already repaired; one repair "
+                                     "per accumulator")
+            claimed.add((id(tier), name))
         plan.append((tier, owner, full, site))
     if not plan:
         return tiled
@@ -410,7 +508,6 @@ def streaming_accept(flat_graph):
     """
     if not recorded(flat_graph) and not getattr(flat_graph, "streaming_refusals", None):
         return None
-    from .stabilize import _reason_key
     from .tiling import schedule_kernel
 
     def accept(cand) -> bool:

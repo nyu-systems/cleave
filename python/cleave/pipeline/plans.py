@@ -284,6 +284,10 @@ def describe_tile(t) -> str:
 # the advice is for a softmax that is summed or multiplied over its row.)
 MAX_ROW_LIMIT = ("a max written by hand needs its whole row in one block, and this row is longer; "
                  "cl.softmax carries a running max over any row it feeds to a sum or a matmul")
+# Where update rules are searched (``ir.update_rule.searched_updates``) a max is a max,
+# whoever wrote it, and a loop carries it wherever its obstacle is served: the advice above
+# does not hold. A graph with an obstacle says why it is not carried (``_schedule_once``).
+ROW_LIMIT = "a max needs its whole row in one block, and this row is longer"
 
 
 def _search(ir_graph, topk: int, force: bool, hints: dict | None,
@@ -337,11 +341,12 @@ def _schedule_once(graphs: GraphSet, config: ScheduleConfig, force: bool):
             refused.append(Refusal(g.index, variant, role, e))
             return
         if not tiles:
-            why = MAX_ROW_LIMIT if "max" in g.ops else "no tiling candidates"
+            why = "no tiling candidates"
+            if "max" in g.ops:
+                why = ROW_LIMIT if searched_updates() else MAX_ROW_LIMIT
             unstreamed = getattr(ir, "streaming_refusals", None)
             if unstreamed:  # why the max is not carried across a loop instead
-                why = ("a max needs its whole row in one block, and this row is longer; "
-                       "it is not carried across a loop: " + "; ".join(unstreamed))
+                why = f"{ROW_LIMIT}; it is not carried across a loop: " + "; ".join(unstreamed)
             if reasons:  # every tiling was refused by the softmax filter: say why
                 why += f" ({sum(reasons.values())} refused: " + "; ".join(
                     f"{n}x {reason}" for reason, n in reasons.most_common()) + ")"
