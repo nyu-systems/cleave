@@ -23,6 +23,7 @@ from ...ir.ops import (
     RowGather,
 )
 from ...ir.ops.gather import BUFFER_BOUND
+from .kinds import REGISTER_P_KINDS
 
 # exp2 is a single instruction where exp is a call, so the scale rides in the log2
 # domain: exp(x * s) == exp2(x * s * LOG2E).
@@ -93,11 +94,12 @@ def _exp(dense, rows: int, causal: bool = False, **kwargs):
     )
 
 
-def _gqa_body(spec, dense, rows: int, make_exp, stage_p: bool = True) -> tuple:
+def _gqa_body(spec, dense, rows: int, make_exp) -> tuple:
     """Q @ K^T -> exp -> {row sum, @ V}: ``(score_mma, exp, rowsum, value_mma)``.
 
-    ``stage_p`` stages P through shared for the value matmul; without it tilelang feeds the
-    fragment to the second gemm in place (wgmma_rs).
+    P is staged through shared for the value matmul unless the layer is one of
+    ``REGISTER_P_KINDS``, where tilelang feeds the fragment to the second gemm in place
+    (wgmma_rs).
     """
     bn, head_dim = dense.kv_tile, dense.head_dim
     score_mma = Matmul(
@@ -123,7 +125,7 @@ def _gqa_body(spec, dense, rows: int, make_exp, stage_p: bool = True) -> tuple:
         name="mma_1",
         warp_policy=spec.warp_policy,
     )
-    if stage_p:
+    if spec.kind not in REGISTER_P_KINDS:
         value_mma.stage_fragment_operands_in_shared = (0,)
     _connect(score_mma, exp, 0, 0)
     _connect(exp, rowsum, 0, 0)

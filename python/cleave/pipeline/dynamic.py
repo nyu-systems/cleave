@@ -51,7 +51,7 @@ def schedule_paged(graphs, spec, config, *, split_graphs=(), filter_before_topk=
     split-K MLA body), the pairs are derived from the single-kernel tilings."""
     from ..lower import to_ir
     from ..dynamic.paging import (SPLIT_KINDS, MLASpec, apply_paging, paging_accept, read_dense_attention,
-                          read_dense_mla)
+                          read_dense_mla, stage_as_layer)
     from ..schedule import apply_tiling
 
     t0 = time.perf_counter()
@@ -68,7 +68,8 @@ def schedule_paged(graphs, spec, config, *, split_graphs=(), filter_before_topk=
     read = read_dense_mla if isinstance(spec, MLASpec) else read_dense_attention
     accept = paging_accept(spec) if filter_before_topk else None
     for g in graphs:
-        ir = to_ir(g.structure, symbol_map=g.symbol_map, dtype=g.dtype, out_dtype=g.dtype)
+        ir = stage_as_layer(
+            to_ir(g.structure, symbol_map=g.symbol_map, dtype=g.dtype, out_dtype=g.dtype), spec)
         for rank, tile in enumerate(_tilings(ir, config.topk, accept)):
             try:
                 tiled = apply_tiling(tile)
@@ -91,7 +92,7 @@ def _schedule_split(g, spec, config, add, refused):
     """Split-KV pairs: the partial tilings the layer reads, each with the first combine tiling."""
     from ..lower.process import to_bundles
     from ..dynamic.paging import (MLASpec, apply_paging_split, read_dense_combine, read_dense_mla_partial,
-                          read_dense_partial)
+                          read_dense_partial, stage_as_layer)
     from ..schedule import apply_tiling
 
     read_partial = read_dense_mla_partial if isinstance(spec, MLASpec) else read_dense_partial
@@ -106,7 +107,7 @@ def _schedule_split(g, spec, config, add, refused):
             continue
         for partial_graph, combine_graph in bundles:
             partials, combine = {}, None
-            for tile in _tilings(partial_graph, config.topk):
+            for tile in _tilings(stage_as_layer(partial_graph, spec), config.topk):
                 try:
                     tiled = apply_tiling(tile)
                     dense, found = read_partial(tiled)

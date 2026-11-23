@@ -14,7 +14,14 @@ from cleave.dynamic.dense import (
 )
 from cleave.dynamic.registry import LSE_ATOL
 from cleave.dynamic.workloads import ADVERSARIAL_WORKLOADS, WORKLOADS
-from cleave.dynamic.paging import MLASpec, PagingRefusal, PagingSpec, apply_paging, can_page
+from cleave.dynamic.paging import (
+    MLASpec,
+    PagingRefusal,
+    PagingSpec,
+    apply_paging,
+    can_page,
+    stage_as_layer,
+)
 from cleave.schedule import apply_tiling, search_tiling
 from tests._tolerances import CEILING, FP32_CEILING
 
@@ -87,10 +94,13 @@ def _pinned(spec):
 
 
 def _searched(spec, *, keep=8):
-    """Up to ``keep`` searched tilings ``can_page`` accepts and ``keep`` it refuses."""
+    """Up to ``keep`` searched tilings ``can_page`` accepts and ``keep`` it refuses.
+
+    Searched as ``schedule_paged`` searches: the dense body marked as the layer builds it.
+    """
     rows = 16 if isinstance(spec, MLASpec) or "decode" in spec.kind else 64
     yes, no = [], []
-    for cand in search_tiling(_dense(spec, rows), topk=1000):
+    for cand in search_tiling(stage_as_layer(_dense(spec, rows), spec), topk=1000):
         try:
             graph = apply_tiling(cand)
         except Exception:  # noqa: BLE001

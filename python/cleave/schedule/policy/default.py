@@ -1519,7 +1519,9 @@ class TCPolicy(DefaultPolicy):
         p8b-rsgemm/repro_variants.py (32..256 threads x M 16..256), p13-merged/repro_rs_m32.py.
         A transposed A, or a gemm whose operands are both computed, is staged through
         shared memory by codegen, so it is not read from registers; so is MLA decode's
-        value gemm under ``mla_decode_pass``.
+        value gemm under ``mla_decode_pass``, and an A operand the graph already marks
+        ``stage_fragment_operands_in_shared`` (the paged layers' value matmul): staged, it
+        lowers at every M (scratch/p8c-paged/repro_policy.py).
         """
         if getattr(self.arch, "sm_version", None) != 90:
             return False
@@ -1531,6 +1533,10 @@ class TCPolicy(DefaultPolicy):
             if not isinstance(a_src, ComputeOpNode) or isinstance(b_src, ComputeOpNode):
                 continue
             if not self._reads_gemm_accumulator(a_src):
+                continue
+            if 0 in node.stage_fragment_operands_in_shared:
+                # Codegen copies A to shared first (a paged layer's value matmul, marked by
+                # cleave.dynamic.paging.stage_as_layer): no register A operand, no conflict.
                 continue
             if is_mla_value_gemm(node):
                 # CompilerPassOptions.mla_decode_pass stages this A operand through shared

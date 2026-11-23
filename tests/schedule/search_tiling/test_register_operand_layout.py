@@ -82,3 +82,24 @@ def test_refusal_is_specific_to_sm_90_and_two_warpgroups():
     policy.arch = copy.copy(policy.arch)
     policy.arch.sm_version = 80
     assert not policy._register_operand_layout_conflict(cand, 256)
+
+
+def test_a_operand_staged_through_shared_is_not_refused():
+    # The paged layers stage P through shared for the value matmul (all but ragged prefill), so
+    # their decode tilings at 16 query rows compile (tests/frontend_dynamic); `stage_as_layer`
+    # marks the dense body that way before the search. Unmarked, the same body keeps none.
+    from cleave.dynamic import OPERATORS
+    from cleave.dynamic.dense import KV_PROXY, flash_attention_sd_graph
+    from cleave.dynamic.paging import stage_as_layer
+
+    def threads(spec):
+        graph = flash_attention_sd_graph(16, KV_PROXY, 128, dtype=DTYPE, out_dtype=DTYPE)
+        if spec is not None:
+            graph = stage_as_layer(graph, spec)
+        return {c.n_threads for c in search_tiling(graph, topk=10000)}
+
+    decode = OPERATORS["gqa_paged_decode_h32_kv8_d128_ps1"].spec
+    ragged = OPERATORS["gqa_ragged_prefill_causal_h32_kv8_d128"].spec
+    assert threads(None) == set()
+    assert threads(decode) == {128, 256}
+    assert threads(ragged) == set()  # ragged prefill reads P from registers

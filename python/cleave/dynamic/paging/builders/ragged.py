@@ -31,10 +31,11 @@ def _build_ragged_prefill_causal(spec, dense) -> Graph:
     indptr_dim = spec.indptr_dim
 
     # No `row_group`: a row of this tile is a query token, not a (token, head slot) pair.
-    # P stays in its fragment rather than being staged through shared: tilelang then feeds
-    # it to the second matmul in place (wgmma_rs) instead of a stmatrix round trip.
+    # P stays in its fragment rather than being staged through shared (REGISTER_P_KINDS):
+    # tilelang then feeds it to the second matmul in place (wgmma_rs) instead of a stmatrix
+    # round trip.
     score_mma, exp, rowsum, value_mma = _gqa_body(
-        spec, dense, bm, lambda: _exp(dense, bm, causal=True), stage_p=False
+        spec, dense, bm, lambda: _exp(dense, bm, causal=True)
     )
     ph_q = score_mma.inputs[0].src_node
     ph_k = score_mma.inputs[1].src_node
