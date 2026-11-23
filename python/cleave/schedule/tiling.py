@@ -772,9 +772,10 @@ def _check_iterates_with_loop(
                 f"loop of {gnode.name}, which takes {gnode.graph.extent}."
             )
     if shares_nodes:
-        tokens = reduction_axis_tokens.get(node.name, set())
+        axis_tokens = reduction_axis_tokens()
+        tokens = axis_tokens.get(node.name, set())
         loop_tokens = set().union(
-            *(reduction_axis_tokens.get(r.name, set()) for r in loop_reductions)
+            *(axis_tokens.get(r.name, set()) for r in loop_reductions)
         )
         if tokens and loop_tokens and not tokens & loop_tokens:
             raise ScheduleRejected(
@@ -984,7 +985,8 @@ def apply_tiling(cand: List) -> List[Graph]:
         if accumulation.get(n.name) == INTRA
         for r in nearest_reductions(n, flat_ops)
     ]
-    reduction_axis_tokens = _reduction_axis_tokens(flat_ops)
+    # read lazily (only a sibling merge needs it), on the graph before it is restructured
+    reduction_axis_tokens = lambda: _reduction_axis_tokens(flat_ops)  # noqa: E731
     output_nodes = [n for n in cand.flat_graph.nodes if n.is_output()]
     output_node = _select_launch_output_node(output_nodes, accumulation)
 
