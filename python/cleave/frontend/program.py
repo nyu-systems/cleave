@@ -320,22 +320,28 @@ class Program:
         self._lowerable("to_tile_graph")
         flags = self.can_split(split)
         for s in self._unread_inputs():
-            if s.equals is None:  # the C++ symbolizer aborts on an input no op touches
+            # The C++ symbolizer aborts on a free input no op touches; an unread equals= input
+            # is fine (its definition gives it its dims, and it is no output).
+            if s.equals is None:
                 raise SpecError(f"{self.name}: input {s.name!r} is not read by any output")
-            raise SpecError(f"{self.name}: equals= input {s.name!r} is not read by any output; "
-                            "the search does not support declared inputs yet")
+        declared = [s.equals is not None for s in self.inputs]
+        if declared != sorted(declared):
+            raise SpecError(f"{self.name}: equals= inputs must come after every other input "
+                            f"(have {[s.name for s in self.inputs]})")
         graph = csopt.new_tile_graph(split_enabled=any(map(any, flags)))
         flags = iter(flags)
-        env = {}
+        env, inputs = {}, []
         val = lambda a: env[a] if isinstance(a, int) else a  # noqa: E731
         for r in self._live_records():
             if r.kind == "input":
                 t = self._values[r.out]
                 env[r.out] = graph.create_tiled_input(t.shape, next(flags), core.dtype(t.dtype.name))
-                if r.attr("equals") is not None:
-                    # THE point where an equals= declaration reaches C++ (the definition graph
-                    # and its source inputs ``r.attr("over")``). Not passed yet: a plain input.
-                    pass
+                spec = self.inputs[len(inputs)]
+                inputs.append(env[r.out])
+                if spec.equals is not None:
+                    # the search may read it wherever its definition occurs
+                    graph.declare_input(env[r.out], spec.equals.to_tile_graph(),
+                                        [inputs[j] for j in spec.over])
             elif r.kind == "output":
                 graph.create_tiled_output(env[r.args[0]])
             elif r.kind == "matmul":

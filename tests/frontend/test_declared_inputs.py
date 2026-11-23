@@ -304,9 +304,33 @@ def test_unread_input_does_not_abort_the_symbolizer():
     assert out.stdout.startswith("SpecError")
 
 
-def test_unread_equals_input_is_not_searchable_yet():
-    with pytest.raises(SpecError, match="does not support declared inputs yet"):
-        builder().to_tile_graph()  # the input graph does not read ``o``
+def test_an_unread_equals_input_reaches_the_search_declared():
+    # The input graph does not read ``o``: declared, it still gets its symbols (from its
+    # definition) and is no output; the same program with ``o`` free is refused.
+    import cleave.superoptimizer as csopt
+
+    g = builder().to_tile_graph()
+    assert g.has_declared_inputs()
+    symbolic, symbols = csopt.create_symbolic_tile_graph(g)
+    assert symbolic.has_declared_inputs()
+    dims = [op["output_tensors"][0]["dim"] for op in symbolic.get_graph_structure()
+            if op["op_type"] == "kn_input_op"]
+    q, k, v, dO, L, o = dims
+    assert o == dO and o[2] == v[2] != q[2]  # o = P @ v: the head dim of v (and dO), not of q, k
+    assert sorted(symbols.values()) == sorted([1, D, *SHAPES.values()])
+    with pytest.raises(SpecError, match="'o' is not read"):
+        builder(declared=False).to_tile_graph()
+
+
+def test_equals_inputs_come_last():
+    p = Program("order")
+    M, K = p.dims(M=16, K=32)
+    x = p.input("x", (M, K))
+    y = p.input("y", (M, K), equals=lambda x: x * 0.5)
+    z = p.input("z", (M, K))
+    p.output(y + x + z)
+    with pytest.raises(SpecError, match="must come after every other input"):
+        p.to_tile_graph()
 
 
 def test_read_declared_inputs_lower_as_plain_inputs():
@@ -332,4 +356,4 @@ def test_read_declared_inputs_lower_as_plain_inputs():
     y = q.input("y", (M, K), equals=lambda x: x * 0.5)
     q.output(y + x)
     g = q.to_tile_graph()
-    assert g is not None
+    assert g.has_declared_inputs()
