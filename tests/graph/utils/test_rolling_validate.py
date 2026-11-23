@@ -47,7 +47,7 @@ def test_a_carried_max_whose_update_rule_is_still_on_it_is_refused():
     """The loop carries the max (an accumulator of its tier): a ``Streaming`` record still
     on it means the assembly did not run, and the sums next to it would be relative to the
     max of one slice. (Where the max's dim is whole in its tile the flat graph's max is
-    right as it stands: ``tests/update/test_foundation.py``.)"""
+    right as it stands: ``tests/update/test_streamed_attention.py``.)"""
     t = _tier()
     t.m.streaming = Streaming(("rowsum_0", "psum_0"),
                               (("rowsum_0", FACTOR), ("psum_0", FACTOR)), "a key")

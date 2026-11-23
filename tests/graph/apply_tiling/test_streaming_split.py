@@ -148,7 +148,7 @@ def test_search_every_partial_tiling_serves_the_max_it_returns(pair):
 def test_search_the_looped_partial_emits_the_loop_of_an_attention_kernel(pair):
     """What the loop does with the max it returns: snapshot, fold in this tile's max, shift
     the scores by it, the proven factor, each sum repaired right before it accumulates.
-    1119's rolling kernel, with the flat graph's own names."""
+    The hand-derived pass's rolling kernel, with the flat graph's own names."""
     partial, _ = pair
     cand, tiled = next((c, t) for c, t in _tilings(partial)
                        if sites(t) and c.n_threads == 128 and list(c.output_tile) == [1, 64, 32])

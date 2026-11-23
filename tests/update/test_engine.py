@@ -1,4 +1,4 @@
-"""The engine on the programs the design measures it on (DESIGN 6, 8; 13.2 b, d). CPU only.
+"""The engine on MHA prefill and qknorm attention. CPU only.
 
 ``test_search_*`` run the superoptimizer first (marked ``search``). The derivations here
 are made by ``engine.run`` itself (no in-process memo, no store), so every list below is
@@ -74,7 +74,7 @@ def test_search_mha_prefill_has_one_right_update_per_hole_at_budget_4():
 
 
 def test_search_mha_prefill_lists_at_budget_5_and_the_ranking_rejects_three():
-    """The four matches per hole of DESIGN 6, all proved, two of them emittable; of the four
+    """The four matches per hole at budget 5, all proved, two of them emittable; of the four
     combinations of emittable rules the three with ``exp(m) / exp(m')`` are non-finite on
     ``offset @ 32`` (``0 / 0``), and the winner is the canonical pair."""
     d = mha((5,))

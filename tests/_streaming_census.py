@@ -21,8 +21,8 @@ job's options, no top-k cut) it checks what unit tests cannot afford to:
   (e) staging              with ``mla_decode_pass`` the value matmul still stages the exp
                            through shared memory, as in the plain twin;
   (f) counts               a ``demo:`` or ``program:`` job: the plans ``pipeline.schedule``
-                           keeps for the program equal the plans the hand-derived pass of
-                           1119 kept for the same program (``HAND_DERIVED_PLANS``, recorded
+                           keeps for the program equal the plans the hand-derived pass
+                           kept for the same program (``HAND_DERIVED_PLANS``, recorded
                            while that pass was in the tree; ``COUNTS_DIFFER`` where they
                            differ by design), and are the candidates the census accepted;
   (g) split                a ``split:`` job: where the partial loops over the keys of its
@@ -163,8 +163,8 @@ def first_axis(x: cl.Tensor["H", "K", "N"], y: cl.Tensor["H", "K", "N"]):
     return cl.sum(cl.softmax(x, 1) * y, 1, keepdim=True)
 
 
-# job -> the plans ``pipeline.schedule`` kept for the program with the hand-derived pass of
-# 1119 (no top-k cut), recorded by this census at the integration of the searched path
+# job -> the plans ``pipeline.schedule`` kept for the program with the hand-derived pass
+# (no top-k cut), recorded by this census at the integration of the searched path
 # (a60f5ed, where both paths were in the tree), before that pass was deleted.
 HAND_DERIVED_PLANS = {
     "demo:mha_prefill": 68, "demo:gqa_prefill": 68, "demo:mqa_prefill": 68,

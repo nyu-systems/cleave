@@ -3,9 +3,10 @@
 ``large_logits`` and ``increasing`` are shared by the dense programs and the dynamic
 operators. The dense programs have four more (``decreasing``, ``last_spike``, ``constant``,
 ``offset``), the dynamic operators two (``large_scale``, ``dominant_last``). A dense program
-is held to its adversarial cases where its softmax is exact, that is when ``cl.softmax``
-recorded the request (the reference of an ``exp / sum`` written out by hand is NaN on them);
-the softmax of every dynamic operator is exact.
+is held to its adversarial cases where its softmax is exact, that is where an exp reads
+``x - max(x)`` (``cl.softmax``, or the max written out by hand; the reference of an
+``exp / sum`` without the max is NaN on them); the softmax of every dynamic operator is
+exact.
 ``test_adversarial_inputs_are_switched_on_per_path`` pins both.
 """
 

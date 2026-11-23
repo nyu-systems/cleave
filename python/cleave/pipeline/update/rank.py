@@ -1,4 +1,4 @@
-"""Ranking of proven, emittable update rules (DESIGN 8): accuracy, stability, cost.
+"""Ranking of proven, emittable update rules: accuracy, stability, cost.
 
 A proof is over the reals; two rules that are the same real function can differ by orders
 of magnitude in floating point (``a * exp(m - m')`` against ``a * exp(m) / exp(m')``), so

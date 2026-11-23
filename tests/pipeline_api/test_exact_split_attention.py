@@ -98,8 +98,8 @@ def _split_plans(prog, factors):
     """Per factor: partial plans on 128 threads, two that loop over the keys of a split
     and two that take a split in one tile (where a tile holds one), two combines that loop
     over the splits, EVERY combine that takes the splits in one tile, and the combines that
-    step two partials at a time over 8, 16 or 64 rows (1119: the loops that had no right
-    kernel while they were pipelined)."""
+    step two partials at a time over 8, 16 or 64 rows (under the hand-derived pass, the
+    loops that had no right kernel while they were pipelined)."""
     graphs = P.superoptimize(prog, SPLIT)
     flash = _flash(graphs)
     plans = P.schedule(graphs, P.ScheduleConfig(topk=1000, split_k=factors))
@@ -183,7 +183,7 @@ def _tiers(tiled):
 
 @pytest.mark.parametrize("kind", sorted(DECODE))
 def test_search_partial_then_combine_is_the_solo_graph(kind, cache_root, monkeypatch):
-    """CPU, reference level (DESIGN 13.5 a): the partial of every demo factor, handed to
+    """CPU, reference level: the partial of every demo factor, handed to
     the combine by boundary record, computes the solo graph on normal inputs, on logits
     x100 and on a common offset of -1e4."""
     # (References on the CPU, no kernel: nothing here belongs in a measurement.)
@@ -342,9 +342,10 @@ def test_gpu_exact_split_attention(kind, cache_root):
 
 
 def test_gpu_a_combine_loop_over_the_splits_is_right_on_every_launch(cache_root):
-    """Two partials of 64 rows a step, 8 partials (1119: while such a loop was pipelined
-    its value partials were reloaded before their last use, a different count of them on
-    every launch). As a plain loop every launch gives the same, right, values."""
+    """Two partials of 64 rows a step, 8 partials (under the hand-derived pass, while such a
+    loop was pipelined its value partials were reloaded before their last use, a different
+    count of them on every launch). As a plain loop every launch gives the same, right,
+    values."""
     _gpu()
     fn, shapes, _ = DECODE["gqa"]
     prog = trace(fn, shapes, cl.f16)

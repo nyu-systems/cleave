@@ -1,4 +1,4 @@
-"""The derivation store (DESIGN 2.7; 13.2 i): one entry per loop structure on disk, every
+"""The derivation store: one entry per loop structure on disk, every
 stored rule proved again on load, a stored refusal trusted, the key moving with the engine.
 CPU only; every test has a cache root of its own.
 """

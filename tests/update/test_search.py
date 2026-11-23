@@ -1,4 +1,4 @@
-"""The bounded search itself (DESIGN 6): exact merging by value, finiteness, every match
+"""The bounded search itself: exact merging by value, finiteness, every match
 collected, determinism. Synthetic float32 blocks; CPU only, no superoptimizer.
 """
 

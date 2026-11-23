@@ -1,4 +1,4 @@
-"""Recipes: each program's own flat graph built again at small shapes (DESIGN 5.2; 13.2 e).
+"""Recipes: each program's own flat graph built again at small shapes.
 
 For every program of the design's list the recipe re-instantiates the flat graph with a
 signature equal to the program's (without dtypes in float32, with them in the program's

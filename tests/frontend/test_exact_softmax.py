@@ -480,7 +480,7 @@ def wide_value_attention(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", 
 
 def test_gpu_exact_softmax_wide_values_are_rescaled_every_iteration_and_validate(cache_root):
     """A 64 x 512 value accumulator over 128 threads is 256 elements a thread: more than a
-    thread's registers. (1119's hand-derived pass shifted such tilings by a max rounded down
+    thread's registers. (The hand-derived pass shifted such tilings by a max rounded down
     to a grid and rescaled only when that moved; the searched rule is checked against each
     accumulator's own reference, which that form does not meet, so it is not found.) Such a
     tiling repairs its accumulator every iteration, and is held to every adversarial case

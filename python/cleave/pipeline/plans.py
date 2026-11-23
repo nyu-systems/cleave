@@ -123,7 +123,7 @@ def state_pair(graph: SearchedGraph, ir, split_factor: int) -> list:
     """``[partial, combine]``: the split of solo graph ``graph`` (lowered to ``ir``, with
     its records derived) over the dim of ``graph.split`` that a max of the program reduces,
     built from the loop state of the streaming obstacle served over that dim
-    (``lower.state_split``; DESIGN 11).
+    (``lower.state_split``).
 
     The partial is the flat graph up to the loop state on a split of that dim: each split
     returns its accumulators and its own max, float32 at the cut. The combine takes the max

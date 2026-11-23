@@ -1,4 +1,4 @@
-"""The on-disk store of derivations (DESIGN 2.7, place 3).
+"""The on-disk store of derivations.
 
 One JSON file per loop structure, under ``cache.root() / "update"``, at the digest of
 

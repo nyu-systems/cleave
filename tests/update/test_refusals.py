@@ -1,4 +1,4 @@
-"""Every reason the engine gives an obstacle no rule, with its text (DESIGN 4.3; 13.2 f).
+"""Every reason the engine gives an obstacle no rule, with its text.
 
 Each program records its max explicitly and has one obstacle that passes the structural
 rules of ``schedule.streaming.obstacles``; the engine refuses it, and the refusal is the
@@ -336,7 +336,7 @@ def test_e14_one_sum_scaled_by_two_softmaxes():
 
 
 def test_t5_a_max_under_the_max_is_not_a_sum():
-    """S5 is a structural rule (DESIGN 4.2): ``obstacles`` refuses the obstacle with T5, so
+    """S5 is a structural rule: ``streaming.obstacles`` refuses the obstacle with T5, so
     lowering never asks the engine. The engine checks it again for an obstacle handed to it
     as it is, with the same text."""
     import dataclasses

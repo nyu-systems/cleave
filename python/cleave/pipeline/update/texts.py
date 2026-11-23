@@ -1,4 +1,4 @@
-"""The engine's typed refusals: why an obstacle keeps its pin (DESIGN 4.3, "Engine").
+"""The engine's typed refusals: why an obstacle keeps its pin.
 
 A refusal is an exception whose text is one of these, filled in. ``Derivation.refused``
 holds it, ``pipeline.plans`` puts it on the graph as ``"{full}: {text}"``
@@ -32,11 +32,11 @@ E11 = ("no proven update of {acc} of the form 'accumulator * factor + tile' with
        "ops ({matched} matched the references, {proved} proved)")
 E12 = "every proven update of {loops} is non-finite on an input case ({case})"
 E13 = "{type}: {message} (a bug in the update search)"
-# Not in DESIGN 4.3's list: what the proof takes as one free real per element must be the
+# Beyond E1-E13: what the proof takes as one free real per element must be the
 # same on every prefix of the loop.
 E14 = ("{node}, which {acc} reads, is computed from {other}, another reduction over the dim "
        "{full} reduces: it changes from one prefix of the loop to the next")
-# Not in DESIGN 4.3's list: the looped dim's symbol must size nothing else of the state (a
+# Beyond E1-E13: the looped dim's symbol must size nothing else of the state (a
 # self-attention whose queries and keys are both written ``S``: a prefix of the keys would
 # cut the queries too).
 E15 = ("{node} is {a} at {n} elements of the looped dim of {full} and {b} at {m}: its symbol "

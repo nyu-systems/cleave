@@ -1,4 +1,4 @@
-"""Proof of an update rule over the reals (Python z3; DESIGN 7).
+"""Proof of an update rule over the reals (Python z3).
 
 Float matching cannot tell a right update from one that is merely close on the sampled
 prefixes, so every survivor of the search is proved, or dropped.

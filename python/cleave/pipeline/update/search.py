@@ -1,4 +1,4 @@
-"""Bounded bottom-up enumeration of update expressions for one accumulator hole (DESIGN 6).
+"""Bounded bottom-up enumeration of update expressions for one accumulator hole.
 
 An expression (``cleave.ir.update_rule``) is a tree over
 

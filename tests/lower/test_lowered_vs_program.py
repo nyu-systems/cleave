@@ -153,11 +153,11 @@ def test_validation_reference_of_the_plain_twin_is_finite_on_constant_rows():
     assert all(torch.isfinite(r).all() for r in reference)
 
 
-# ------------------------------------------- programs 1119's scale analysis refused, served
+# ----------------------------------------- programs the scale analysis refused, served
 #
-# With a request on a plain exp, 1119 proved at lowering that the shift of every exp
-# cancels, and refused a program where it did not (the square of the numerator, a Gram
-# matrix of the weights, a nonlinear op of them, ...). With the max in the graph there is
+# With a request on a plain exp, the hand-derived pass proved at lowering that the shift of
+# every exp cancels, and refused a program where it did not (the square of the numerator, a
+# Gram matrix of the weights, a nonlinear op of them, ...). With the max in the graph there is
 # nothing to prove: such a program is an ordinary graph whose exp reads ``x - max(x)``, and
 # it is served where its rows fit one tile, like a softmax that is returned.
 
@@ -247,7 +247,7 @@ def test_a_program_the_scale_analysis_refused_is_the_program(name, scale):
 
 @pytest.mark.parametrize("name", FORMERLY_REFUSED)
 def test_a_program_the_scale_analysis_refused_has_plans_where_a_tile_holds_its_rows(name):
-    """At 64x256 in float16 (1119 refused each: "softmax cannot be stabilized: ...")."""
+    """At 64x256 in float16 (the scale analysis refused each: "softmax cannot be stabilized: ...")."""
     from cleave import pipeline as P
 
     fn, _, sizes, _ = FORMERLY_REFUSED[name]

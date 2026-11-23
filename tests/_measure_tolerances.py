@@ -21,12 +21,12 @@ unset) it runs
 The table has one row per operator and output: a histogram of the measured row-relative
 errors, the largest error of the candidates that are clearly valid, and the tolerance that
 follows from it by the rule in ``recommend``. An output with a boundary role (the float32
-shift a split partial of an exact softmax returns) has a row of its own, under its role,
-whatever place it has among a kernel's outputs; the other outputs are numbered among
-themselves. That is the operator's error on its normal
-inputs. Where its softmax is exact (a dense program that records the request, every
-dynamic operator) its kernels also run on adversarial softmax inputs, at the same bound,
-and those comparisons are counted without feeding it (``ADVERSARIAL_CASE``).
+max, role ``"shift"``, a split partial of an exact softmax returns) has a row of its own,
+under its role, whatever place it has among a kernel's outputs; the other outputs are
+numbered among themselves. That is the operator's error on its normal
+inputs. Where its softmax is exact (a dense program with an exp that reads ``x - max(x)``,
+every dynamic operator) its kernels also run on adversarial softmax inputs, at the same
+bound, and those comparisons are counted without feeding it (``ADVERSARIAL_CASE``).
 Declare that value (``demo/<name>.py``,
 ``cleave.dynamic.registry``, ``tests/_tolerances.py``); never one chosen to make a kernel pass.
 
@@ -108,12 +108,13 @@ def valid_limit(dtype: str) -> float:
 # pool: its first valid tiling ranks far below the top 32, and mha_backward's top 8 tilings
 # all fail to compile).
 # The attention demos declare their tolerance by boundary role, because ``cl.softmax`` is
-# exact and a split partial of it returns its shift. The decode demos split by default; the
-# MHA / GQA / MQA prefill demos get a second run with the split their docstrings name, so
-# that the "shift" bound they declare is measured like any other. (qknorm, mla_prefill and
-# mla_decode offer no split and declare one tolerance: the split search of qknorm's 25 ops
-# does not end within an hour, the references of mla_prefill's split graphs take about
-# 190 GB, and no split graph of mla_decode has a partial / combine cut.)
+# exact and a split partial of it returns its max (role "shift"). The decode demos split by
+# default; the MHA / GQA / MQA prefill demos get a second run with the split their
+# docstrings name, so that the "shift" bound they declare is measured like any other.
+# (qknorm, mla_prefill and mla_decode run unsplit and declare one tolerance: no pair is
+# built from the loop state of qknorm, whose queries are normalized on the way to it from
+# no split input; the references of mla_prefill's split pairs would take about 190 GB; and
+# mla_decode asks for no split.)
 #
 # Disk: a run writes the references of its graphs under <out>/cache/runtime while it lasts,
 # one file per graph with every input case. For a program whose softmax is exact that is

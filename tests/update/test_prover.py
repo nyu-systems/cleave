@@ -1,4 +1,4 @@
-"""The prover's controls (DESIGN 7, 13.2 a): every update of the table is put to z3 on the
+"""The prover's controls: every update of the table is put to z3 on the
 contributions read off three real flat graphs -- the row sum ``l`` and the value matmul
 ``acc`` of the flash form, and an accumulator of the split combine -- and a wrong one fails
 the obligation that names what is wrong with it. CPU only, no search.

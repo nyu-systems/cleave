@@ -213,7 +213,7 @@ def test_search_a_demo_job_censuses_the_searched_graphs(monkeypatch, tmp_path, c
     """The real thing, on the smallest demo: its own program (``cl.softmax`` records the
     explicit max), searched, lowered with the engine's records, and every tiling of both
     searched graphs censused. Flash form: every tiling is served, 24 of them looped; traced
-    order: only the ones that hold the row whole. The plans are 1119's 40."""
+    order: only the ones that hold the row whole. The plans are the hand-derived pass's 40."""
     monkeypatch.setenv("CLEAVE_CACHE_ROOT", str(tmp_path / "cache"))
     status, lines, report = _run(tmp_path, capsys, "demo:mha_decode@256")
     assert status == 0 and lines[-1] == "demo:mha_decode@256: ok", lines[-6:]
@@ -268,7 +268,7 @@ def test_search_a_split_job_censuses_the_partial_and_the_combine(monkeypatch, tm
     (combine,) = [rows for g, rows in by_graph.items() if g.endswith(".combine")]
     assert Counter(r["tiling"] for r in partial if r["accepted"]) == {"looped": 16, "one tile": 8}
     assert Counter(r["tiling"] for r in combine if r["accepted"]) == {"looped": 21, "one tile": 3}
-    # (raw candidates, accepted, looped, one tile): 1119's counts for its exact pair. The
+    # (raw candidates, accepted, looped, one tile): the hand-derived pass's counts. The
     # 12 combines that are not accepted step one partial at a time or hold a single row
     assert _split_counts(partial) == (24, 24, 16, 8)
     assert _split_counts(combine) == (36, 24, 21, 3)
@@ -289,8 +289,8 @@ def test_search_a_split_job_of_a_softmax_over_an_input(monkeypatch, tmp_path, ca
     """``softmax(x) @ v`` split over the softmax axis, 4 splits of 256 keys: the partial
     reads the logits through the view of the split. All 12 of its tilings are served: 8
     loop over the keys of a split with its returned max carried, 4 take a split in one
-    tile. (The 8 looped ones were refused once in 1119 and again here: the tile of the
-    input was asked for a dim of the split tensor.)"""
+    tile. (The 8 looped ones were once refused, by the hand-derived pass and on this path:
+    the tile of the input was asked for a dim of the split tensor.)"""
     monkeypatch.setenv("CLEAVE_CACHE_ROOT", str(tmp_path / "cache"))
     status, lines, report = _run(tmp_path, capsys, "split:rows@4")
     assert status == 0 and lines[-1] == "split:rows@4: ok", lines[-8:]
@@ -300,7 +300,7 @@ def test_search_a_split_job_of_a_softmax_over_an_input(monkeypatch, tmp_path, ca
     assert Counter(r["tiling"] for r in partial) == {"looped": 8, "one tile": 4}
     assert all(r["accepted"] for r in partial)
     assert _split_counts(partial) == (12, 12, 8, 4)
-    assert _split_counts(combine) == (21, 12, 6, 6)  # 1119's counts, as above
+    assert _split_counts(combine) == (21, 12, 6, 6)  # the hand-derived pass's counts, as above
     assert sorted(tool.PROGRAM_SPLITS) == ["rows@4", "rows@8"]
 
 
@@ -412,15 +412,15 @@ def test_importing_the_tool_leaves_the_process_alone():
     assert rest.count("os.environ") == 1 and rest.index("os.environ") < rest.index("\n\n")
 
 
-def test_every_job_of_the_design_is_listed():
-    """The census jobs of package 13.3 (a): MHA / GQA / MQA prefill and decode,
-    ``softmax(x) @ v``, the first-axis program, MLA decode at 14 (and MLA prefill)."""
+def test_every_census_job_is_listed():
+    """The census jobs: MHA / GQA / MQA prefill and decode, ``softmax(x) @ v``, the
+    first-axis program, MLA decode at 14 (and MLA prefill)."""
     jobs = set(tool.jobs())
     assert {"demo:mha_prefill", "demo:gqa_prefill", "demo:mqa_prefill", "demo:mha_decode",
             "demo:gqa_decode", "demo:mqa_decode", "demo:mla_decode", "demo:mla_prefill",
             "program:rows_v", "program:first_axis"} <= jobs
-    # ... and the split jobs of package 13.5: every decode demo at every factor it asks
-    # for, and softmax(x) @ v over its rows
+    # ... and the split jobs: every decode demo at every factor it asks for, and
+    # softmax(x) @ v over its rows
     assert {j for j in jobs if j.startswith("split:")} == {
         "split:mha_decode@16", "split:mha_decode@32", "split:gqa_decode@4",
         "split:gqa_decode@8", "split:gqa_decode@16", "split:mqa_decode@4",

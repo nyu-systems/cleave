@@ -5,10 +5,11 @@ computes, the logits here are an input: the partial reads them from storage, thr
 view of the split, and so does the max it carries and returns. Three things are pinned:
 
 * every tiling the policy proposes for the partial is scheduled, the ones that loop over
-  the keys of a split carrying the max (in 1119 they were all refused once, as "handed one
-  element of the axis it reduces per step", and again in this branch, as "the dim it
-  reduces is not in the tile of its operand": the tile of the input was asked for the dim
-  number of the split tensor), at the key steps the solo graph is offered;
+  the keys of a split carrying the max (under the hand-derived pass they were all refused
+  once, as "handed one element of the axis it reduces per step", and again on the searched
+  path, as "the dim it reduces is not in the tile of its operand": the tile of the input
+  was asked for the dim number of the split tensor), at the key steps the solo graph is
+  offered;
 * the partial is held to every adversarial softmax case, like the solo graph and the
   combine of the same program (its logits are still an input, read through the split);
 * on a GPU: the partial alone and the combine alone on normal inputs and on every

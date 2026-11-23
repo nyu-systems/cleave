@@ -3,11 +3,11 @@
 Each program below keeps its max in the flat graph, so a tiling that holds the whole row in
 one tile is served by the flat graph's own max (which may also run a loop of its own ahead
 of what reads it: two passes). None of them has a carried form, each for a
-different reason, and for each of them a design prototype of the hand-derived pass built
+different reason, and for each of them an early version of the hand-derived pass built
 rolling kernels that were wrong:
 
-``two_softmaxes``      one sum sits under two maxes; one factor per accumulator (the
-                       prototypes rescaled the shared sum for one of them).
+``two_softmaxes``      one sum sits under two maxes; one factor per accumulator (those
+                       versions rescaled the shared sum for one of them).
 ``column_weighted``    the max is indexed by the accumulator's TRAILING axis
                        (``O[m, n] *= alpha[m]`` was emitted for a factor indexed by ``n``).
 ``self_weighted``      the same with ``v = x^T``: one input dim is the accumulator's rows

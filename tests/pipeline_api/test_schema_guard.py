@@ -82,13 +82,14 @@ KERNELS = {
     "flash_wide_values/looped": (flash_wide_values, WIDE, "looped"),
 }
 # name -> the output tile of the pinned tiling, where it is not the first one of its kind:
-# the whole 64 x 512 value accumulator in one block (256 elements a thread), which 1119's
-# lazy form rescaled only when the max moved; here it is rescaled every iteration.
+# the whole 64 x 512 value accumulator in one block (256 elements a thread), which the
+# hand-derived pass's lazy form rescaled only when the max moved; here it is rescaled every
+# iteration.
 OUTPUT_TILE = {"flash_wide_values/looped": [1, 64, 512]}
 
 # The SCHEMA these digests were generated under, and the digests. Re-pin both together.
 # (A bump that changes none of these eight texts leaves both as they are.) Pinned again at
-# the switch-over to the searched update rules, where every softmax program gained its max.
+# the move to the searched update rules, where every softmax program gained its max.
 PINNED_SCHEMA = 42
 PINNED = {
     'softmax_64x1024/one-tile': ('tile=[2, 1024] rstep=[64, 1024]', 'f9936a0218828a65'),

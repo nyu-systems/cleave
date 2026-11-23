@@ -1,4 +1,4 @@
-"""Why the reference set is what it is (DESIGN 5.4, 5.5; 13.2 c), on MHA prefill's flash form.
+"""Why the reference set is what it is, on MHA prefill's flash form.
 
 On reference rows whose max did not move, the update "no repair" ``a + r`` is exact, so the
 loose filter passes it; the proof rejects it, and the adequacy check refuses such a set

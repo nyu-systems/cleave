@@ -1,4 +1,4 @@
-"""Ranking of proven rules (DESIGN 8; 13.2 g) and the no-float64 guards (5.7; 13.2 h).
+"""Ranking of proven rules and the no-float64 guards.
 
 The grade is accuracy at the resolution of the output, so rounding noise cannot put an
 unstable form first; only rules the assembly can emit are ranked; a value that is not
@@ -35,9 +35,9 @@ def row(rules, errors, stable):
 
 
 def test_one_ulp_of_the_output_does_not_put_an_unstable_form_first():
-    """The judge's scenario: on a case where the unstable form is exact, the stable one is
-    one float16 ulp off. At the output's resolution both are grade 0 and stability decides;
-    at float32's resolution (the prototype's floor) the ulp would have won."""
+    """On a case where the unstable form is exact, the stable one is one float16 ulp off.
+    At the output's resolution both are grade 0 and stability decides; at float32's
+    resolution (a floor of 1e-7) the ulp would have won."""
     stable = row({"l": CANONICAL}, {"normal@32": 2.0 ** -10, "constant@32": 0.0}, True)
     unstable = row({"l": UNSTABLE}, {"normal@32": 0.0, "constant@32": 0.0}, False)
     ranked, rejected = order([unstable, stable], FP16_RHO)

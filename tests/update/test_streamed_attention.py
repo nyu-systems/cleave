@@ -46,7 +46,7 @@ from ._attention import FACTOR, flash, flash_by_hand, lowered, mha, node_of, pic
 from ._attention import traced as traced_order
 
 TOPK = 100000  # every tiling
-# The tiling of the differential test and of the GPU test (design 13.1 d, e).
+# The tiling whose kernel text and GPU validation are pinned below.
 KERNEL = dict(tile=[1, 128, 64], threads=128, d_step=64, kv_step=32)
 
 

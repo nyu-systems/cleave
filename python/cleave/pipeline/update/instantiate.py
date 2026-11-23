@@ -1,4 +1,4 @@
-"""Recipes: the program's own flat graph, built again at other extents (DESIGN 5.2).
+"""Recipes: the program's own flat graph, built again at other extents.
 
 The references of an update rule are the flat graph evaluated on prefixes of the looped
 dim, so the graph has to be built again with the looped dim at a handful of elements and

@@ -1,4 +1,4 @@
-"""Prefix references: the flat graph itself, re-instantiated at small shapes (DESIGN 5).
+"""Prefix references: the flat graph itself, re-instantiated at small shapes.
 
 ``F(prefix)`` is the state the flat graph computes when it is evaluated on a prefix of the
 looped dim. Nothing here knows what an online softmax is: the flat graph is built again by
@@ -424,8 +424,9 @@ class References:
 
 
 def reference_set(flat: Flat, *, check: bool = True) -> References:
-    """The reference set of DESIGN 5.4, with its adequacy checked (E10; ``check=False``
-    leaves the check to the caller, which then has the cases for its report)."""
+    """The reference set (per normal seed the first iteration and the prefixes, then the
+    shaped sample), with its adequacy checked (E10; ``check=False`` leaves the check to the
+    caller, which then has the cases for its report)."""
     cases = []
     for seed in SEEDS_NORMAL:
         inputs = flat.sample(N, seed)
