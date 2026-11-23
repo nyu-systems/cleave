@@ -1,7 +1,7 @@
 {
  "demo:gqa_decode": [
   {
-   "abs": 0.001953125,
+   "abs": 0.009449005126953125,
    "absolute": false,
    "dtype": "float16",
    "rel": 0.0010615711798891425,
@@ -10,32 +10,32 @@
     "float16",
     "float32"
    ],
-   "validated": 2688
+   "validated": 1176
   },
   {
-   "abs": 0.009449005126953125,
+   "abs": 0.000274658203125,
    "absolute": false,
    "dtype": "float16",
-   "rel": 0.0007759561412967741,
+   "rel": 1.4482170627161395e-06,
    "seeds": 3,
    "stored": [
     "float32"
    ],
-   "validated": 2016
+   "validated": 504
   },
   {
    "abs": 3.814697265625e-06,
    "absolute": false,
    "dtype": "float32",
-   "rel": 7.450024099853181e-07,
+   "rel": 6.51817970265256e-07,
    "role": "shift",
    "seeds": 3,
-   "validated": 2016
+   "validated": 504
   }
  ],
  "demo:gqa_prefill": [
   {
-   "abs": 0.001953125,
+   "abs": 0.009449005126953125,
    "absolute": false,
    "dtype": "float16",
    "rel": 0.0010615711798891425,
@@ -44,27 +44,27 @@
     "float16",
     "float32"
    ],
-   "validated": 2856
+   "validated": 1344
   },
   {
-   "abs": 0.009449005126953125,
+   "abs": 0.000274658203125,
    "absolute": false,
    "dtype": "float16",
-   "rel": 0.0007759561412967741,
+   "rel": 1.4482170627161395e-06,
    "seeds": 3,
    "stored": [
     "float32"
    ],
-   "validated": 2016
+   "validated": 504
   },
   {
    "abs": 3.814697265625e-06,
    "absolute": false,
    "dtype": "float32",
-   "rel": 7.450024099853181e-07,
+   "rel": 6.51817970265256e-07,
    "role": "shift",
    "seeds": 3,
-   "validated": 2016
+   "validated": 504
   }
  ],
  "demo:lora": [
@@ -135,7 +135,7 @@
  ],
  "demo:mha_decode": [
   {
-   "abs": 0.00048828125,
+   "abs": 0.004916667938232422,
    "absolute": false,
    "dtype": "float16",
    "rel": 0.0009765625,
@@ -144,18 +144,18 @@
     "float16",
     "float32"
    ],
-   "validated": 2184
+   "validated": 1176
   },
   {
-   "abs": 0.005115509033203125,
+   "abs": 6.4849853515625e-05,
    "absolute": false,
    "dtype": "float16",
-   "rel": 0.0006969851674512029,
+   "rel": 1.3890618220102624e-06,
    "seeds": 3,
    "stored": [
     "float32"
    ],
-   "validated": 1344
+   "validated": 336
   },
   {
    "abs": 2.384185791015625e-06,
@@ -164,12 +164,12 @@
    "rel": 5.912488063586352e-07,
    "role": "shift",
    "seeds": 3,
-   "validated": 1344
+   "validated": 336
   }
  ],
  "demo:mha_prefill": [
   {
-   "abs": 0.001953125,
+   "abs": 0.008251667022705078,
    "absolute": false,
    "dtype": "float16",
    "rel": 0.0009765625,
@@ -178,35 +178,35 @@
     "float16",
     "float32"
    ],
-   "validated": 2856
+   "validated": 1344
   },
   {
-   "abs": 0.010113239288330078,
+   "abs": 0.000274658203125,
    "absolute": false,
    "dtype": "float16",
-   "rel": 0.0007584518752992153,
+   "rel": 1.607669332770456e-06,
    "seeds": 3,
    "stored": [
     "float32"
    ],
-   "validated": 2016
+   "validated": 504
   },
   {
    "abs": 3.814697265625e-06,
    "absolute": false,
    "dtype": "float32",
-   "rel": 7.221372015919769e-07,
+   "rel": 6.375506700351252e-07,
    "role": "shift",
    "seeds": 3,
-   "validated": 2016
+   "validated": 504
   }
  ],
  "demo:mla_decode": [
   {
-   "abs": 0.001953125,
+   "abs": 0.0009765625,
    "absolute": false,
    "dtype": "float16",
-   "rel": 0.0009708738070912659,
+   "rel": 0.0009541984763927758,
    "seeds": 3,
    "validated": 210
   }
@@ -223,7 +223,7 @@
  ],
  "demo:mqa_decode": [
   {
-   "abs": 0.001953125,
+   "abs": 0.007924079895019531,
    "absolute": false,
    "dtype": "float16",
    "rel": 0.0009765625,
@@ -232,32 +232,32 @@
     "float16",
     "float32"
    ],
-   "validated": 2688
+   "validated": 1176
   },
   {
-   "abs": 0.007834672927856445,
+   "abs": 0.000244140625,
    "absolute": false,
    "dtype": "float16",
-   "rel": 0.000796551292296499,
+   "rel": 1.4372694749908987e-06,
    "seeds": 3,
    "stored": [
     "float32"
    ],
-   "validated": 2016
+   "validated": 504
   },
   {
-   "abs": 3.337860107421875e-06,
+   "abs": 3.814697265625e-06,
    "absolute": false,
    "dtype": "float32",
-   "rel": 6.385525921359658e-07,
+   "rel": 7.49953244394419e-07,
    "role": "shift",
    "seeds": 3,
-   "validated": 2016
+   "validated": 504
   }
  ],
  "demo:mqa_prefill": [
   {
-   "abs": 0.001953125,
+   "abs": 0.007924079895019531,
    "absolute": false,
    "dtype": "float16",
    "rel": 0.0009765625,
@@ -266,27 +266,27 @@
     "float16",
     "float32"
    ],
-   "validated": 2856
+   "validated": 1344
   },
   {
-   "abs": 0.007834672927856445,
+   "abs": 0.000244140625,
    "absolute": false,
    "dtype": "float16",
-   "rel": 0.000796551292296499,
+   "rel": 1.4372694749908987e-06,
    "seeds": 3,
    "stored": [
     "float32"
    ],
-   "validated": 2016
+   "validated": 504
   },
   {
-   "abs": 3.337860107421875e-06,
+   "abs": 3.814697265625e-06,
    "absolute": false,
    "dtype": "float32",
-   "rel": 6.385525921359658e-07,
+   "rel": 7.49953244394419e-07,
    "role": "shift",
    "seeds": 3,
-   "validated": 2016
+   "validated": 504
   }
  ],
  "demo:qknorm": [
@@ -541,12 +541,12 @@
  ],
  "test:dual_softmax": [
   {
-   "abs": 3.0517578125e-05,
+   "abs": 0.0001220703125,
    "absolute": false,
    "dtype": "float16",
    "rel": 0.000965250947047025,
    "seeds": 3,
-   "validated": 87
+   "validated": 1389
   }
  ],
  "test:exact_attention": [
@@ -554,9 +554,9 @@
    "abs": 0.001953125,
    "absolute": false,
    "dtype": "float16",
-   "rel": 0.0009756097570061684,
+   "rel": 0.0010615711798891425,
    "seeds": 3,
-   "validated": 639
+   "validated": 1080
   }
  ],
  "test:exact_split_attention": [
@@ -1025,12 +1025,12 @@
  ],
  "test:softmax": [
   {
-   "abs": 3.814697265625e-06,
+   "abs": 1.9073486328125e-06,
    "absolute": false,
    "dtype": "float16",
-   "rel": 0.00024108003708533943,
+   "rel": 0.0001559575757710263,
    "seeds": 3,
-   "validated": 87
+   "validated": 675
   }
  ],
  "test:softmax_first_axis": [
@@ -1050,7 +1050,7 @@
    "dtype": "float16",
    "rel": 0.0004273504309821874,
    "seeds": 3,
-   "validated": 129
+   "validated": 675
   }
  ],
  "test:softmax_plus_exp": [

@@ -76,7 +76,10 @@ TOLERANCES = {
     "softmax_mid": Tolerance(rtol=2e-3),  # over the middle axis of a batched input
     "exact_attention": Tolerance(rtol=5e-3),
     # cl.softmax(x) next to another exp of x (tests/frontend/test_softmax_next_to_exp.py):
-    # the softmax's exp reads x - max(x), the other one x
+    # the softmax's exp reads x - max(x), the other one x. Its pin is still the measurement
+    # of the hand-derived pass (largest valid 3.4e-4, 18 kernels): with the max in the flat
+    # graph three seeds measure 9.7e-4 (33 kernels, all within 2e-3), for which the rule gives
+    # 5e-3. That would loosen the bound, so it is left to a decision, not edited.
     "softmax_plus_exp": Tolerance(rtol=2e-3),
     "dual_softmax": Tolerance(rtol=5e-3),
     # the attention with its softmax written out by hand on a constant shift (a plain exp, no
