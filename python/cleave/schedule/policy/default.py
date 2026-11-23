@@ -1490,6 +1490,48 @@ class TCPolicy(DefaultPolicy):
                 return True
         return False
 
+    @staticmethod
+    def _reads_gemm_accumulator(node):
+        """Does ``node`` compute (through register ops only) from a gemm accumulator?"""
+        stack, seen = [node], set()
+        while stack:
+            current = stack.pop()
+            if isinstance(current, Matmul):
+                return True
+            if current in seen or not isinstance(current, (ComputeOpNode, ViewOpNode)):
+                continue
+            seen.add(current)
+            stack.extend(edge.src_node for edge in current.inputs)
+        return False
+
+    def _register_operand_layout_conflict(self, candidate, n_threads):
+        """Would a gemm read its A operand from registers in a layout TileLang cannot match?
+
+        TileLang 0.1.13 limitation on sm_90 (the vendored TileLang cannot be patched):
+        with two warpgroups (256 threads) the accumulator layout of a gemm and the
+        register A-operand layout of a later gemm fed from it (directly or through
+        elementwise ops, e.g. FlashAttention's ``exp(q k^T) @ v``) differ unless the
+        block's M is 128 = 64 * warpgroups; lowering fails with ``Layout infer conflict
+        between <frag> and <frag>/A_ptr``. An A operand computed only from loaded tiles
+        lowers at every M. Repro (lowering only, no GPU): cleave-attn-bwd-evidence
+        scratch/p8-staging/repro_rs_gemm_layout.py, scratch/p8b-rsgemm/repro_variants.py.
+        A transposed A, or a gemm whose operands are both computed, is staged through
+        shared memory by codegen, so it is not read from registers.
+        """
+        if n_threads != 256 or getattr(self.arch, "sm_version", None) != 90:
+            return False
+        for node in self.ordered_nodes:
+            if not isinstance(node, Matmul) or node.transpose_A:
+                continue
+            a_src, b_src = (edge.src_node for edge in node.inputs)
+            if not isinstance(a_src, ComputeOpNode) or isinstance(b_src, ComputeOpNode):
+                continue
+            if not self._reads_gemm_accumulator(a_src):
+                continue
+            if int(candidate.get_tile(node)[-2]) != 128:
+                return True
+        return False
+
     def get_num_threads(self, candidates):
         expanded_candidates = []
         for candidate in candidates:
@@ -1497,6 +1539,8 @@ class TCPolicy(DefaultPolicy):
             if self._requires_low_thread_counts(candidate):
                 n_threads_options.extend(self.LOW_N_THREADS)
             for n_threads in n_threads_options:
+                if self._register_operand_layout_conflict(candidate, n_threads):
+                    continue
                 expanded = copy.copy(candidate)
                 expanded.n_threads = n_threads
                 expanded_candidates.append(expanded)
