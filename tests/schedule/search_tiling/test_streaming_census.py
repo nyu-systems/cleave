@@ -10,6 +10,7 @@ accepted, a device compile that found no kernel to compile. Each of those ends
 """
 
 import json
+from collections import Counter
 
 import pytest
 
@@ -246,6 +247,72 @@ def test_search_the_demo_at_its_own_shape_is_all_looped(monkeypatch, tmp_path, c
     assert len(heads) == 2 and sum(" 0 raw candidates" in line for line in heads) == 1
 
 
+# ------------------------------------------------------------------------------ split jobs
+
+
+def test_search_a_split_job_censuses_the_partial_and_the_combine(monkeypatch, tmp_path,
+                                                                 capsys):
+    """MHA decode, searched with the demo's own split, its pair built from the loop state
+    at 32 splits of 128 keys. Every tiling of the partial is served with the max it
+    returns (the looped ones carry it, the ones that take a split in one tile keep the
+    flat graph's own), every combine that loops over the splits is a plain loop; the
+    traced graph has no pair and says why."""
+    monkeypatch.setenv("CLEAVE_CACHE_ROOT", str(tmp_path / "cache"))
+    status, lines, report = _run(tmp_path, capsys, "split:mha_decode@32")
+    assert status == 0 and lines[-1] == "split:mha_decode@32: ok", lines[-8:]
+    assert not report["unchecked"] and not report["problems"]
+    by_graph = {}
+    for row in report["rows"]:
+        by_graph.setdefault(row["graph"], []).append(row)
+    (partial,) = [rows for g, rows in by_graph.items() if g.endswith(".partial")]
+    (combine,) = [rows for g, rows in by_graph.items() if g.endswith(".combine")]
+    assert Counter(r["tiling"] for r in partial if r["accepted"]) == {"looped": 16, "one tile": 8}
+    assert Counter(r["tiling"] for r in combine if r["accepted"]) == {"looped": 21, "one tile": 3}
+    assert any("no pair: LoweringRejected" in line
+               and "carries no proven update over that dim: reduce_max_2_5" in line
+               for line in lines)
+
+
+def test_search_a_split_job_of_a_softmax_over_an_input(monkeypatch, tmp_path, capsys):
+    """``softmax(x) @ v`` split over the softmax axis, 4 splits of 256 keys: the partial
+    reads the logits through the view of the split. All 12 of its tilings are served: 8
+    loop over the keys of a split with its returned max carried, 4 take a split in one
+    tile. (The 8 looped ones were refused once in 1119 and again here: the tile of the
+    input was asked for a dim of the split tensor.)"""
+    monkeypatch.setenv("CLEAVE_CACHE_ROOT", str(tmp_path / "cache"))
+    status, lines, report = _run(tmp_path, capsys, "split:rows@4")
+    assert status == 0 and lines[-1] == "split:rows@4: ok", lines[-8:]
+    partial = [r for r in report["rows"] if r["graph"].endswith(".partial")]
+    assert Counter(r["tiling"] for r in partial) == {"looped": 8, "one tile": 4}
+    assert all(r["accepted"] for r in partial)
+
+
+def test_the_split_check_fails_a_pipelined_loop_over_the_splits(monkeypatch, tmp_path,
+                                                                capsys):
+    """Check (g) has teeth: a combine whose loop over the splits stays pipelined."""
+    real = tool._split_check
+
+    def pipelined(role):
+        check = real(role)
+        if role != "combine":
+            return check
+
+        def loose(tiled):
+            for tier, owner in tool.graph_tiers(tiled):
+                if owner is not None:
+                    tier.loop_kind = "pipelined"
+            return check(tiled)
+
+        return loose
+
+    monkeypatch.setenv("CLEAVE_CACHE_ROOT", str(tmp_path / "cache"))
+    monkeypatch.setattr(tool, "_split_check", pipelined)
+    status, lines, report = _run(tmp_path, capsys, "split:rows@4")
+    assert status == 1 and lines[-1].startswith("split:rows@4: FAILED")
+    assert report["problems"] and all(
+        p.startswith("(g) ") and "the loop over the splits is" in p for p in report["problems"])
+
+
 def test_importing_the_tool_leaves_the_process_alone():
     """The tool is importable (this module does it): the environment and ``sys.path`` are
     only touched when it runs as a script, and a demo job puts back what it borrowed."""
@@ -269,6 +336,12 @@ def test_every_job_of_the_design_is_listed():
     assert {"demo:mha_prefill", "demo:gqa_prefill", "demo:mqa_prefill", "demo:mha_decode",
             "demo:gqa_decode", "demo:mqa_decode", "demo:mla_decode", "demo:mla_prefill",
             "program:rows_v", "program:first_axis"} <= jobs
+    # ... and the split jobs of package 13.5: every decode demo at every factor it asks
+    # for, and softmax(x) @ v over its rows
+    assert {j for j in jobs if j.startswith("split:")} == {
+        "split:mha_decode@16", "split:mha_decode@32", "split:gqa_decode@4",
+        "split:gqa_decode@8", "split:gqa_decode@16", "split:mqa_decode@4",
+        "split:mqa_decode@8", "split:mqa_decode@16", "split:rows@4", "split:rows@8"}
     assert set(tool.HAND_DERIVED_PLANS) == {j for j in jobs if j.startswith(("demo:", "program:"))}
     # MLA decode is censused at the budget its demo pins, the one its graphs need with the
     # max in them

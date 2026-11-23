@@ -49,6 +49,7 @@ _MARKERS = {
         "tests/frontend/test_softmax_next_to_exp.py::test_search_",
         "tests/graph/apply_tiling/test_streaming_gpu.py::test_gpu_",
         "tests/graph/apply_tiling/test_streaming_regressions.py::test_search_",
+        "tests/graph/apply_tiling/test_streaming_split.py::test_search_",
         "tests/runtime/test_explicit_softmax_inputs.py::test_search_",
         "tests/lower/test_broadcast_axis.py::test_search_",
         "tests/pipeline_api/test_bind_inputs.py::test_search_",

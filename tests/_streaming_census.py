@@ -24,9 +24,15 @@ job's options, no top-k cut) it checks what unit tests cannot afford to:
                            keeps for the program equal the plans the hand-derived pass of
                            1119 kept for the same program (``HAND_DERIVED_PLANS``, recorded
                            while that pass was in the tree; ``COUNTS_DIFFER`` where they
-                           differ by design), and are the candidates the census accepted.
+                           differ by design), and are the candidates the census accepted;
+  (g) split                a ``split:`` job: where the partial loops over the keys of its
+                           split, the max it returns is the carried max (an accumulator of
+                           that loop, started at the most negative float32, one lag copy,
+                           both sums repaired, read by the output through the loop), else
+                           the flat graph's own; it returns that max first and its two sums,
+                           all float32. The combine loops over the splits in a plain loop.
 
-Jobs come from three sources.
+Jobs come from four sources.
 
 ``fixture`` jobs: the programs of ``tests/_explicit_softmax.py`` (the max written out),
 lowered as identity graphs; a classified obstacle gets a record by hand (the rule the
@@ -38,6 +44,13 @@ engine derives.
 
 ``program:`` jobs: the same for a program that is no demo (``softmax(x) @ v`` with an fp16
 logits input, the first-axis program ``sum(softmax(x, 1) * y, 1)``).
+
+``split:`` jobs: a decode demo's program, searched with the demo's own split, and the pair
+built from the loop state of each solo graph at one factor (``split:mha_decode@16``): the
+partial and the combine, each with the records the engine derives for it.
+``split:rows@4`` is the same for ``softmax(x) @ v`` split over the softmax axis, whose
+partial reads its logits from storage. A solo graph without a pair (the traced order) is
+printed with its reason.
 
 Exit status, also the last line printed:
 
@@ -181,6 +194,21 @@ PROGRAM_JOBS = {
     "first_axis": (first_axis, dict(H=4, K=4096, N=64), None),
 }
 
+# ``split:`` jobs: the pair built from the loop state of a program's flash graph at one
+# factor (``pipeline.plans.state_pair``), both stages censused.
+# job -> (demo, split factor): the decode demos at the factors they split their keys by
+SPLITS = {
+    f"{demo}@{factor}": (demo, factor)
+    for demo, factors in (("mha_decode", (16, 32)), ("gqa_decode", (4, 8, 16)),
+                          ("mqa_decode", (4, 8, 16)))
+    for factor in factors
+}
+# job -> (program, shapes, split dim, split factor): a softmax whose logits are an input,
+# split over the softmax axis (its partial reads them through the view of the split)
+PROGRAM_SPLITS = {
+    f"rows@{factor}": (rows_v, dict(R=64, C=1024, D=64), "C", factor) for factor in (4, 8)
+}
+
 
 def _traced_demo(name, flags=()):
     """``(program, superopt config, schedule config)`` of a demo, as the demo itself traces
@@ -267,6 +295,87 @@ def _searched_graphs(job):
     return graphs, options, notes, (new, old)
 
 
+def _split_graphs(job):
+    """``(graphs, search options, notes, info)`` for a split job: the partial and the
+    combine of every solo graph whose pair is built from its loop state (``lower(g, f)``),
+    each as ``(label, ir, where its records come from, check)``; ``notes`` is what the job
+    could not check (no pair at all), ``info`` why the other solo graphs have none (the
+    traced order: P1 with its two-pass reason)."""
+    from cleave.core.errors import LoweringRejected
+    from cleave.frontend import trace
+    from cleave.pipeline import SuperoptConfig, superoptimize
+    from cleave.pipeline.plans import lower
+
+    name = job[6:]
+    if name in SPLITS:
+        demo, factor = SPLITS[name]
+        program, so, sc = _traced_demo(demo)
+    else:
+        fn, shapes, dim, factor = PROGRAM_SPLITS[name]
+        program, so, sc = trace(fn, shapes, cl.f16), SuperoptConfig(split=(dim,)), None
+    graphs, notes, info = [], [], []
+    for g in superoptimize(program, so):
+        try:
+            partial, combine = lower(g, factor)
+        except LoweringRejected as e:
+            info.append(f"graph g{g.index}: no pair: {_first(e)}")
+            continue
+        for role, ir in (("partial", partial), ("combine", combine)):
+            where = "engine" if recorded(ir) else "refused: " + "; ".join(
+                getattr(ir, "streaming_refusals", None) or ["no obstacle"])[:200]
+            graphs.append((f"g{g.index}.{role}", ir, where, _split_check(role)))
+    if not graphs:
+        notes.append("no solo graph of the program has a pair built from its loop state")
+    options = {"force_fusion": True} if sc is not None and sc.fusion == "force" else {}
+    return graphs, options, notes, info
+
+
+def _split_check(role):
+    """Check (g) of a split stage, on each tiling that builds: ``(tiled) -> problem | None``.
+
+    partial  where the keys of a split are looped, the max it returns is the carried max:
+             an accumulator of that loop behind the sums it repairs, started at the most
+             negative float32, snapshotted by one lag copy, and read by its output through
+             the loop; where a tile holds the split, the flat graph's own max. Either way
+             it returns the max first, then the two sums, all float32.
+    combine  where it loops over the splits, the loop is plain (it weights the partials it
+             loads: ``streaming._weighted_slices``).
+    """
+    from cleave.ir.graph import AccumEdge
+    from cleave.ir.ops import NEG_FLT_MAX
+    from cleave.runtime.reference import output_order
+
+    def check(tiled):
+        found = sites(tiled)
+        tiers = {o.name: t for t, o in graph_tiers(tiled) if o is not None}
+        if role == "combine":
+            kinds = {s.tier: tiers[s.tier].loop_kind for s in found}
+            loose = {k: v for k, v in kinds.items() if v != "serial"}
+            return f"the loop over the splits is {loose}" if loose else None
+        outs = output_order(tiled)
+        if [(o.boundary.role, str(o.get_dtype(0))) for o in outs] != [
+                ("shift", "float32"), ("", "float32"), ("", "float32")]:
+            return "the partial does not return its float32 max first, then two float32 sums"
+        (edge,) = outs[0].inputs
+        if not found:
+            return "the returned max is carried" if isinstance(edge, AccumEdge) else None
+        (site,) = found
+        tier = tiers[site.tier]
+        (full,) = [n for n in tier.nodes if n.name == site.full]
+        if not (isinstance(edge, AccumEdge) and edge.accum_node is full):
+            return "the returned max is not the carried one"
+        if full not in tier.accum_nodes or full.accum_init != NEG_FLT_MAX:
+            return "the max is not carried from the most negative float32"
+        if [n.name for n in tier.lag_nodes] != [f"{full.name}_prev"]:
+            return f"lag copies {[n.name for n in tier.lag_nodes]}"
+        if sorted(a.name for a in tier.accum_scale) != sorted(site.repaired) \
+                or len(site.repaired) != 2:
+            return f"repairs {sorted(a.name for a in tier.accum_scale)}"
+        return None
+
+    return check
+
+
 def _first(e):
     return f"{type(e).__name__}: {(str(e).splitlines() or [''])[0][:160]}"
 
@@ -318,7 +427,7 @@ def _lower(code, device_compile=False):
         return _first(e)
 
 
-def census(ir, search, options, n_lower, nvcc, focus=None):
+def census(ir, search, options, n_lower, nvcc, focus=None, check=None):
     options = options or CompilerPassOptions()
     problems, rows = [], []
     force = search.get("force_fusion", False)
@@ -353,6 +462,10 @@ def census(ir, search, options, n_lower, nvcc, focus=None):
         rows.append((cand, row))
 
     kept = [(c, r) for c, r in rows if r["build"] == "ok"]
+    for cand, row in kept:  # (g): a split stage
+        problem = None if check is None else check(apply_tiling(cand))
+        if problem is not None:
+            problems.append(f"(g) {row['label']}: {problem}")
     for cand, row in kept:  # (e), and the plain twin's text
         row["staged"] = _staged(_passes(apply_tiling(cand), options))
         with _Plain():
@@ -423,23 +536,30 @@ def run(job, n_lower="8", with_nvcc=False):
     and could not: neither list empty means the job is not ``ok``.
     """
     unchecked, counts = [], None
-    if job.startswith(("demo:", "program:")):
+    if job.startswith("split:"):
+        graphs, search, notes, info = _split_graphs(job)
+        options, nvcc, focus = None, None, None
+        unchecked += notes
+        for line in info:
+            print(f"    {line[:300]}")
+    elif job.startswith(("demo:", "program:")):
         graphs, search, notes, counts = _searched_graphs(job)
+        graphs = [g + (None,) for g in graphs]
         options, nvcc, focus = DEMOS[job[5:]] if job.startswith("demo:") else (None,) * 3
         unchecked += notes
     else:
         build, search, options, nvcc, focus = (FIXTURES[job] + (None,))[:5]
         irs = build()
-        graphs = [("" if len(irs) == 1 else str(k), ir, "by hand: the engine's rule")
+        graphs = [("" if len(irs) == 1 else str(k), ir, "by hand: the engine's rule", None)
                   for k, ir in enumerate(irs)]
     all_rows, all_problems = [], []
-    for label, ir, records in graphs:
+    for label, ir, records, check in graphs:
         name = f"{job}[{label}]" if label else job
         if not recorded(ir) and not getattr(ir, "streaming_refusals", None):
             unchecked.append(f"graph {name}: no streaming obstacle")
             continue
         rows, problems = census(ir, dict(search), options, n_lower,
-                                nvcc if with_nvcc else None, focus)
+                                nvcc if with_nvcc else None, focus, check)
         summarize(name, rows, problems, records)
         all_rows += [dict(r, graph=label) for r in rows]
         all_problems += problems
@@ -474,7 +594,8 @@ def run(job, n_lower="8", with_nvcc=False):
 
 def jobs() -> list:
     return (list(FIXTURES) + [f"demo:{d}" for d in DEMOS]
-            + [f"program:{p}" for p in PROGRAM_JOBS])
+            + [f"program:{p}" for p in PROGRAM_JOBS]
+            + [f"split:{s}" for s in list(SPLITS) + list(PROGRAM_SPLITS)])
 
 
 def main(argv):
