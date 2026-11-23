@@ -75,8 +75,9 @@ def valid_limit(dtype: str) -> float:
 
 
 # demo -> the runs that cover its plans (fast settings; lora and qknorm keep the fast
-# preset's topk because few of their tilings survive, and mla_decode needs its whole
-# tiling pool: its first valid tiling ranks far below the top 32).
+# preset's topk because few of their tilings survive, mla_decode needs its whole tiling
+# pool: its first valid tiling ranks far below the top 32, and mha_backward's top 8 tilings
+# all fail to compile).
 FAST = ["--preset", "fast", "--topk", "8"]
 SPLIT = ["--topk", "8", "--warmup", "4", "--iters", "100"]
 DEMOS = {
@@ -96,6 +97,7 @@ DEMOS = {
     "mqa_prefill": [FAST],
     "mla_decode": [["--preset", "fast", "--topk", "1000"]],
     "mla_prefill": [FAST],
+    "mha_backward": [["--preset", "fast"]],
     "staged": [["--topk", "8"]],
 }
 GPU_TESTS = [

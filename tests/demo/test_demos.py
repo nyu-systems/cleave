@@ -64,6 +64,7 @@ CASES = [
     *[(f"{v}_prefill", f"{v}_prefill", []) for v in ("mha", "gqa", "mqa", "mla")],
     ("mla_decode", "mla_decode", []),
     ("qknorm", "qknorm", []),
+    ("mha_backward", "mha_backward", []),
 ]
 
 
