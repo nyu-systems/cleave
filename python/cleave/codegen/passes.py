@@ -101,6 +101,23 @@ def annotate_tinfo(graph: Graph, is_main: bool = False) -> Graph:
                             graph.tinfo_map[smallest_placeholder][0],
                             "s",
                         )
+                # A computed operand read transposed (``P^T @ dO``) cannot be used from
+                # registers: TileLang's gemm wants the fragment in the untransposed
+                # operand layout its producer loop did not use. Stage it through
+                # shared memory, like the two-fragment case above.
+                transposed = {
+                    i
+                    for i, (edge, flag) in enumerate(
+                        zip(node.inputs, (node.transpose_A, node.transpose_B))
+                    )
+                    if flag
+                    and isinstance(edge.src_node, (ComputeOpNode, GraphNode))
+                    and input_tinfos[i] == "r"
+                }
+                if transposed:
+                    node.stage_fragment_operands_in_shared = tuple(
+                        sorted(set(node.stage_fragment_operands_in_shared) | transposed)
+                    )
         elif isinstance(node, ViewOpNode):
             src_tinfo = graph.tinfo_map[node.inputs[0].src_node]
             graph.tinfo_map[node] = (getname("v_" + node.name), src_tinfo[1])
