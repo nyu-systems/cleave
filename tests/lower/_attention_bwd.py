@@ -29,7 +29,22 @@ def dk(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"], v: cl.Tensor
     return (_p(q, k, L) * (dO @ v.mT - D) * C).mT @ q
 
 
-PROGRAMS = {"dv": dv, "dq": dq, "dk": dk}
+def dkdv(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"], v: cl.Tensor["H", "SKV", "D"],
+         dO: cl.Tensor["H", "SQ", "D"], L: cl.Tensor["H", "SQ", 1, cl.f32], D: cl.Tensor["H", "SQ", 1]):
+    p = _p(q, k, L)
+    return (p * (dO @ v.mT - D) * C).mT @ q, p.mT @ dO
+
+
+def dkdv_o(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"], v: cl.Tensor["H", "SKV", "D"],
+           dO: cl.Tensor["H", "SQ", "D"], L: cl.Tensor["H", "SQ", 1, cl.f32],
+           o: cl.Tensor["H", "SQ", "D"]):
+    """dK, dV with D = sum_D(dO * o) computed in the loop body."""
+    p = _p(q, k, L)
+    d = (dO * o).sum(dim=-1, keepdim=True)
+    return (p * (dO @ v.mT - d) * C).mT @ q, p.mT @ dO
+
+
+PROGRAMS = {"dv": dv, "dq": dq, "dk": dk, "dkdv": dkdv, "dkdv_o": dkdv_o}
 
 
 def program(name, shapes=SMALL):

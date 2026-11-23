@@ -8,6 +8,7 @@ from ..ir.graph import (
 )
 from ..ir.graph_utils import find_topo_sort
 from ..ir.ops import Div, Exp, Matmul, ReduceSum
+from ..ir.ops.elementwise import BinaryElementwise
 
 
 # TODO: have all levels of the graph with OutputNode (this should make this function smoother)
@@ -219,6 +220,38 @@ def annotate_fragment_layout_conflicts(graph: Graph) -> Graph:
 
         return True
 
+    def has_matmul_ancestor(cur_node, cur_graph: Graph) -> bool:
+        stack, seen = [cur_node], set()
+        while stack:
+            n = stack.pop()
+            if id(n) in seen or n not in cur_graph.nodes:
+                continue
+            seen.add(id(n))
+            if isinstance(n, Matmul):
+                return True
+            stack.extend(e.src_node for e in getattr(n, "inputs", []))
+        return False
+
+    def is_independent_row_broadcast(cur_node, cur_graph: Graph) -> bool:
+        """``C = A <op> rowsum(X)`` in one loop body, A from a gemm, X from no gemm.
+
+        TileLang must give the reduction result the gemm accumulator's row layout and
+        X's reduction its own; when X comes from plain loads (``sum_D(dO * o)``) it can
+        find no layout for both ("no available layout found").
+        """
+        if not isinstance(cur_node, BinaryElementwise) or cur_node.const is not None:
+            return False
+        if cur_node.broadcast == -1 or len(cur_node.inputs) != 2:
+            return False
+        lhs, rhs = (e.src_node for e in cur_node.inputs)
+        if not isinstance(rhs, ReduceSum) or rhs not in cur_graph.nodes:
+            return False
+        if cur_graph.tinfo_map.get(rhs, (None, None))[1] != "r":
+            return False
+        return has_matmul_ancestor(lhs, cur_graph) and not has_matmul_ancestor(
+            rhs, cur_graph
+        )
+
     def annotate_graph(cur_graph: Graph) -> None:
         for cur_node in cur_graph.nodes:
             if isinstance(cur_node, GraphNode):
@@ -228,6 +261,11 @@ def annotate_fragment_layout_conflicts(graph: Graph) -> Graph:
                 cur_node, cur_graph
             ):
                 cur_node.resolve_operand_layout = "rhs"
+            if isinstance(cur_node, BinaryElementwise):
+                # Stage the reduced row through shared memory (``_resolve_operand``).
+                cur_node.stage_fragment_operands_in_shared = (
+                    (1,) if is_independent_row_broadcast(cur_node, cur_graph) else ()
+                )
 
     reset_graph(graph)
     annotate_graph(graph)

@@ -1,5 +1,7 @@
 """CPU-only: lowering, scheduling and codegen of the single-group attention-backward kernels."""
 
+import re
+
 import pytest
 
 from cleave.codegen.tensor_codegen import gen_tensor_allocation_str
@@ -47,3 +49,16 @@ def test_transposed_register_operand_is_staged_in_shared():
     # P^T @ dO: P is computed in registers and read transposed
     assert "ukernel_mma_ssr_transA" in code
     assert "ukernel_mma_rsr_transA" not in code
+
+
+def test_in_loop_row_sum_broadcast_into_gemm_is_staged_in_shared():
+    # dP - sum_D(dO * o): the row sum of plain loads broadcast into a gemm accumulator
+    code = build_candidate_code(_plans("dkdv_o", 1)[0].tile)
+    assert re.search(r"(t_reduction_\w+)_intermediate = T\.alloc_shared\(\(32,\).*\n"
+                     r"\s*T\.copy\(\1, \1_intermediate\)\n"
+                     r"\s*ukernel_sub_broadcast_0_\w+\(t_mma_\d+, \1_intermediate,", code)
+
+
+def test_given_row_operand_is_not_staged():
+    code = build_candidate_code(_plans("dkdv", 1)[0].tile)
+    assert "_intermediate = T.alloc_shared((32,)" not in code
