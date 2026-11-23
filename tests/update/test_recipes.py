@@ -34,8 +34,12 @@ from ._programs import (
     lowered,
     mla_decode,
     searched,
+    softmax_rows,
     the_obstacle,
+    traced_attention,
+    two_softmaxes,
 )
+from .test_refusals import column_weighted, max_normalized
 
 
 def flash(graphs):
@@ -245,3 +249,85 @@ def test_e4_an_input_that_carries_the_looped_dim_twice():
     assert d.refused == texts.E4.format(input=x.name, k=2)
     assert d.refused == (f"{x.name} carries the looped dim on 2 axes: a prefix of the loop is "
                          "not a prefix of it")
+
+
+def split_keys(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SK", "D"],
+               v: cl.Tensor["H", "SV", "D"]):
+    """Keys and values declared with dims of their own names: the value matmul ties them."""
+    s = (q @ k.mT) / q.shape[-1] ** 0.5
+    e = cl.exp(s - _max(s))
+    return (e @ v) / cl.sum(e, -1, keepdim=True)
+
+
+def test_symbols_tied_by_a_contraction_are_looped_together():
+    ir = lowered(graph := identity(split_keys, dict(H=4, SQ=8, SK=64, SV=64, D=16)))
+    d = derivation(graph, ir)
+    assert d.flat.looped == frozenset({"SK", "SV"})
+    assert_derives(d, ir)
+    assert d.flat.small == {"D": 2, "H": 3, "SQ": 2}
+
+
+# ------------------------------------------- the softmax programs of the rewrite tests
+
+
+def unscaled_attention(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
+                       v: cl.Tensor["H", "SKV", "D"]):
+    s = q @ k.mT
+    e = cl.exp(s - _max(s))
+    return (e / cl.sum(e, -1, keepdim=True)) @ v
+
+
+def traced_rows(x: cl.Tensor["R", "C"], v: cl.Tensor["C", "D"]):
+    return cl.softmax(x) @ v
+
+
+def sum_next_to_exp(x: cl.Tensor["R", "C"]):
+    e = cl.exp(x - _max(x))
+    total = cl.sum(e, -1, keepdim=True)
+    return cl.sum(e + total, -1, keepdim=True) / total
+
+
+_ATT = dict(H=4, SQ=8, SKV=64, D=16)
+_ROWS = dict(R=16, C=64, D=8)
+CENSUS = [  # program, shapes, what lowering under the switch says for each obstacle
+    (flash_attention, _ATT, ["record"]),
+    (traced_attention, _ATT, ["T3"]),
+    (unscaled_attention, _ATT, ["T3"]),
+    (softmax_rows, dict(R=16, C=64), ["T4"]),
+    (flash_rows, _ROWS, ["record"]),
+    (traced_rows, _ROWS, ["T3"]),
+    (column_average, dict(H=4, K=64, N=8), ["record"]),
+    (column_average_2d, dict(K=64, N=8), ["record"]),
+    (two_softmaxes, dict(R=16, C=64), ["E14", "E14"]),
+    (max_normalized, _ROWS, ["T5"]),
+    (column_weighted, dict(M=8, K=64, N=16), ["E6"]),
+    (sum_next_to_exp, dict(R=16, C=64), ["T3"]),
+]
+WHY = {"T3": " reads ", "T4": ", computed from ", "T5": " is a ReduceMax: ", "E14": ", which ",
+       "E6": " of one row changes with "}
+
+
+@pytest.mark.parametrize("fn, shapes, want", CENSUS, ids=[c[0].__name__ for c in CENSUS])
+def test_every_softmax_program_is_served_or_says_why(fn, shapes, want, tmp_path, monkeypatch):
+    """Lowering under the switch: a record where the engine derives one, the reason
+    otherwise -- the structural ones of the scheduler (T3: two passes, T4: a value of the
+    max read outside the loop) without asking the engine, the engine's own after."""
+    import cleave
+    from cleave.frontend import trace
+    from cleave.pipeline import plans
+    from cleave.pipeline import update as update_package
+    from cleave.pipeline.superopt import GraphSet
+
+    monkeypatch.setattr(update_package, "_DERIVED", {})
+    with use_searched_updates(), cleave.Session(cache_root=tmp_path):
+        (graph,) = list(GraphSet.identity(trace(fn, shapes, cl.f16)))
+        (ir,) = plans.lower(graph)
+    records = [n.streaming for n in ir.nodes if getattr(n, "streaming", None) is not None]
+    refusals = ir.streaming_refusals
+    assert len(records) == want.count("record") and len(refusals) == len(want) - len(records)
+    for record in records:
+        assert record.rules == tuple((a, FACTOR) for a in record.loops)
+    for kind, why in zip([w for w in want if w != "record"], refusals):
+        assert WHY[kind] in why, why
+    asked = [w for w in want if w not in ("T3", "T4")]
+    assert len(getattr(ir, "derivations", [])) == len(asked)

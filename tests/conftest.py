@@ -57,6 +57,10 @@ _MARKERS = {
         "tests/update/test_foundation.py::test_search_",
         "tests/update/test_foundation.py::test_gpu_",
         "tests/update/test_state_split.py::test_search_",
+        "tests/update/test_engine.py::test_search_",
+        "tests/update/test_recipes.py::test_search_",
+        "tests/update/test_ablation.py::test_search_",
+        "tests/update/test_ranking.py::test_search_",
     ),
     "slow": (
         "tests/schedule/end2end/",
