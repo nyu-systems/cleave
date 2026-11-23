@@ -14,7 +14,7 @@ from ...ir.analysis import (
     find_orthogonal_reduction_groups,
     get_output_axis_tokens,
 )
-from ...codegen.passes import is_mla_value_gemm
+from ...ir.analysis import is_mla_value_gemm
 from ...ir.ops import Copy, Div, Matmul, Mul, ReduceSum
 from ...ir.ops.elementwise import BinaryElementwise
 

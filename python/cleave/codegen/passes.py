@@ -6,6 +6,7 @@ from ..ir.graph import (
     ComputeOpNode,
     ViewOpNode,
 )
+from ..ir.analysis import is_mla_value_gemm
 from ..ir.graph_utils import find_topo_sort
 from ..ir.ops import Div, Exp, Matmul, ReduceSum
 from ..ir.ops.elementwise import BinaryElementwise
@@ -323,34 +324,6 @@ def annotate_fragment_layout_conflicts(graph: Graph) -> Graph:
     reset_graph(graph)
     annotate_graph(graph)
     return graph
-
-
-def is_mla_value_gemm(node) -> bool:
-    """The value gemm ``exp(...) @ kv`` of MLA decode, whose kv also feeds the score gemm.
-
-    ``annotate_mla_accumulation_layout_conflict`` stages its softmax operand through shared.
-    """
-    if not isinstance(node, Matmul) or len(node.inputs) != 2:
-        return False
-    lhs_node = node.inputs[0].src_node
-    rhs_node = node.inputs[1].src_node
-    if not isinstance(lhs_node, Exp) or not isinstance(rhs_node, PlaceHolderNode):
-        return False
-    if not any(isinstance(edge.dst_node, ReduceSum) for edge in lhs_node.outputs):
-        return False
-    worklist = [edge.src_node for edge in lhs_node.inputs]
-    visited = set()
-    while worklist:
-        cur_node = worklist.pop()
-        cur_node_id = id(cur_node)
-        if cur_node_id in visited:
-            continue
-        visited.add(cur_node_id)
-        if isinstance(cur_node, Matmul) and len(cur_node.inputs) == 2:
-            if cur_node.transpose_B and cur_node.inputs[1].src_node is rhs_node:
-                return True
-        worklist.extend(edge.src_node for edge in getattr(cur_node, "inputs", []))
-    return False
 
 
 def annotate_mla_accumulation_layout_conflict(graph: Graph) -> Graph:
