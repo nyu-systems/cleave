@@ -8,11 +8,10 @@ inputs, cannot reach them: this demo's kernels are validated on normal inputs, a
 report says so.
 
 The demo is unsplit and declares one tolerance, for the outputs of its solo kernels.
-Splitting k/v along S_KV (``--split SKV``) is not offered: the split search of this 25-op
-program runs for more than an hour, and a split partial of an exact softmax also returns
-its shift, which needs a tolerance declared by boundary role (see demo/mha_prefill.py). The
-flag is still parsed, as for every demo; a run that got through that search would stop
-before it builds a kernel, with one line that says which plan the tolerance does not cover.
+Splitting k/v along S_KV (``--split SKV``) is not offered: a split partial of an exact
+softmax also returns its max, which needs a tolerance declared by boundary role (see
+demo/mha_prefill.py). The flag is still parsed, as for every demo, and the run is the
+unsplit one: the split of a softmax is not built yet (see demo/mha_decode.py).
 """
 import cleave
 import cleave.lang as cl

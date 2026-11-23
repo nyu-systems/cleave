@@ -4,13 +4,9 @@ The softmax is exact (see demo/mha_decode.py). The demo is unsplit and declares 
 tolerance, for the outputs of its solo kernels. Splitting k/v along S_KV (``--split SKV``)
 is not offered at this shape: a split partial returns 128 x splits x 4096 x 128 values
 (2 GB at 16 splits) and is validated on seven input cases, which comes to about 190 GB of
-references on disk for the split graphs; and its shift would need a tolerance declared by
-boundary role (see demo/mha_prefill.py, whose split graphs take about 20 GB). The flag is
-still parsed, as for every demo. With the budget of this demo no searched graph is split
-and the run is the unsplit one; with the budget the split graphs need (``--split SKV
---max-ops 13``) the run searches and schedules them (about half a minute), then stops
-before it builds a kernel or a reference, with one line that says which plan the declared
-tolerance does not cover.
+references on disk; and its max would need a tolerance declared by boundary role (see
+demo/mha_prefill.py). The flag is still parsed, as for every demo, and the run is the
+unsplit one: the split of a softmax is not built yet (see demo/mha_decode.py).
 """
 import cleave
 import cleave.lang as cl

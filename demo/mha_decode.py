@@ -1,17 +1,19 @@
-"""MHA decode, BHSD (B*H=32, S_Q=64, S_KV=4096, D=64, fp16), split S_KV by 16,32.
+"""MHA decode, BHSD (B*H=32, S_Q=64, S_KV=4096, D=64, fp16); asks for a split of S_KV by 16,32.
 
-``cl.softmax`` is the exact softmax, exp(s - max(s)) / sum: the search sees ``exp / sum /
-div`` and no max, and each schedule gets the shift it needs. A tile that holds a whole S_KV
-row takes the row max in place; a row that is looped over carries a running max and rescales
-what it has accumulated (the online softmax of FlashAttention). At S_KV=4096 every unsplit
-plan is of the second kind; ``--SKV 256`` has both. Split over the keys (the split-KV of
-FlashDecoding), each partial kernel returns the max of its own split next to its sums, and
-the combine kernel weights the partials by it. The kernels are validated on adversarial
+``cl.softmax`` is the exact softmax, exp(s - max(s)) / sum, and records its max: an ordinary
+reduction of the searched graph. A tile that holds a whole S_KV row takes the row max in
+place; where a tiling loops over the row, the loop carries the max and repairs what it has
+accumulated with an update rule that is searched for and proven on the program's own graph
+(the online softmax of FlashAttention, found rather than written). At S_KV=4096 every plan
+is of the second kind; ``--SKV 256`` has both. The kernels are validated on adversarial
 logits as well (x100, increasing / decreasing along the keys, a spike on the last key,
 constant rows, a common offset of -1e4).
 
-The tolerance is declared by boundary role: ``"shift"`` is the float32 max a partial
-returns, ``""`` every other output.
+Split over the keys (the split-KV of FlashDecoding): the search does not split a graph whose
+max reduces the split dim, and the partial / combine pair built from the loop state is not
+wired in yet, so this demo runs unsplit for now and its report refuses each split factor
+with that reason. The tolerance is declared by boundary role for that split: ``"shift"`` for
+the float32 max a partial returns, ``""`` for every other output (all of them, unsplit).
 
     python demo/mha_decode.py
     python demo/mha_decode.py --split none          # solo kernels only
