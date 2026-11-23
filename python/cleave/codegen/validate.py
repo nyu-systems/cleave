@@ -294,7 +294,7 @@ class GraphValidator:
         cast to ``dtype`` afterwards; the runtime (``runtime.compile._compile``) reads this
         to do both around every launch. Nothing is emitted for any other kernel.
         """
-        from .kernel import inter_nodes
+        from .kernel import inter_nodes, inter_output_layout
 
         outputs = inter_nodes(graph)
         if not outputs:
@@ -305,6 +305,14 @@ class GraphValidator:
             if n in outputs
         )
         self.pass_code += f"INTER_OUTPUTS = {{\n{entries}}}\n"
+        # buffers stored in another layout than row-major (``kernel.inter_blocked_width``)
+        layouts = "".join(
+            f'    "{n.name}": "{layout}",\n'
+            for n in graph.args
+            if n in outputs and (layout := inter_output_layout(n)) is not None
+        )
+        if layouts:
+            self.pass_code += f"INTER_LAYOUTS = {{\n{layouts}}}\n"
 
     def _declare_dyn_dims(self, graph):
         """Emit ``name = T.symbolic("name")`` for every symbolic extent in the graph.

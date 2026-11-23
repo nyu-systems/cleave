@@ -13,6 +13,7 @@ from ..ir.ops.base import const_literal
 from ..ir.graph_utils import find_topo_sort
 from ..schedule.policy.hint import INTER
 from .tensor_codegen import (
+    INTER_BLOCK,
     gen_atomic_add,
     gen_copy,
     gen_tensor_allocation_str,
@@ -49,12 +50,50 @@ def _iter_sargs(graph):
 # An inter output is summed across CTAs in a global buffer of this dtype; the runtime
 # zeroes it before every launch and casts it to the output's dtype afterwards.
 INTER_DTYPE = "float32"
+# ``INTER_LAYOUTS`` value of a buffer stored in 8x8 blocks (``inter_blocked_width``).
+BLOCKED_LAYOUT = "blocked8x8"
 
 
 def inter_nodes(graph) -> set:
     """The nodes ``graph.accumulation`` sums across CTAs: OutputNodes of the main graph,
     accum nodes of a loop graph. Empty for every graph without accumulation contexts."""
     return {n for n, context in graph.accumulation.items() if context == INTER}
+
+
+def inter_blocked_width(tmap):
+    """The last extent N when an inter accum node's buffer is stored 8x8-blocked, else None.
+
+    Blocked (see ``tensor_codegen.gen_atomic_add``) when every iteration adds whole rows
+    (the tile spans the block's last dim), 8-row aligned (tile rows a multiple of 8 that
+    divides the block's rows), N a multiple of 8, all static. The CTA block of an inter
+    output spans its whole ``[M, N]`` planes, so the layout is the buffer's own and the
+    runtime undoes it while casting (``INTER_LAYOUTS``).
+    """
+    try:
+        shape = [int(d) for d in tmap.shape]
+        tile = [int(d) for d in tmap.tile_size]
+    except TypeError:
+        return None
+    if len(shape) < 2 or len(kept_extents(tile)) < 2 or kept_extents(tile)[-2:] != tile[-2:]:
+        return None
+    (rows, width), (tile_rows, tile_width) = shape[-2:], tile[-2:]
+    if (
+        tile_width != width
+        or width % INTER_BLOCK
+        or tile_rows % INTER_BLOCK
+        or rows % tile_rows
+    ):
+        return None
+    return width
+
+
+def inter_output_layout(out) -> str | None:
+    """``INTER_LAYOUTS`` entry of an inter OutputNode: its loop accumulator's layout."""
+    edge = out.inputs[0]
+    if not isinstance(edge, AccumEdge):
+        return None
+    tmap = edge.src_node.graph.tmap[edge.accum_node]
+    return BLOCKED_LAYOUT if inter_blocked_width(tmap) is not None else None
 
 
 def _inter_dst(graph, node) -> str:
@@ -511,7 +550,9 @@ class KernelEmitter:
         )
         buf.block(_call(func_name, call_args))
         if inter:
-            buf.block(gen_atomic_add(tname, _inter_dst(graph, node)))
+            tile = kept_extents(graph.tmap[node].tile_size)
+            width = inter_blocked_width(graph.tmap[node])
+            buf.block(gen_atomic_add(tname, _inter_dst(graph, node), width, len(tile)))
 
     def _emit_subgraph(self, graph, node, buf, is_main_iter, name_prefix):
         sub = node.graph

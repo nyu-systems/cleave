@@ -8,6 +8,7 @@ import tempfile
 import tilelang as tl
 
 from .gpu import _create_parallel_env, _gpu_exec_guard
+from .inter_layout import BLOCKED_LAYOUT, unblock_kernel
 from .reference import graph_out_indices
 from .validate import (
     BenchOptions,
@@ -48,7 +49,12 @@ def _compile(prim_func, out_idx):
         out_idx=[i for i in _normalized_out_idx(prim_func, out_idx) if i not in positions],
         pass_configs=configs or None,
     )
-    return InterOutputKernel(kernel, prim_func, out_idx, positions)
+    names = {prim_func.buffer_map[prim_func.params[i]].name: i for i in positions}
+    layouts = {
+        names[name]: layout
+        for name, layout in getattr(prim_func, "_cleave_inter_layouts", {}).items()
+    }
+    return InterOutputKernel(kernel, prim_func, out_idx, positions, layouts)
 
 
 def _normalized_out_idx(prim_func, out_idx) -> list[int]:
@@ -88,13 +94,23 @@ class InterOutputKernel:
     and the cast too: timing covers them, and no replay sees a previous launch's sums.
     Callers see TileLang's interface: inputs in, outputs (declared dtypes) out, and an
     ``adapter`` whose ``result_idx`` counts the inter outputs as results.
+
+    ``layouts`` (``{param index: layout}``, from ``INTER_LAYOUTS``) names the buffers the
+    kernel stores in another layout than row-major; their cast also restores the order
+    (see ``unblock_kernel``). It is compiled here, never inside a CUDA-graph capture.
     """
 
-    def __init__(self, kernel, prim_func, out_idx, positions):
+    def __init__(self, kernel, prim_func, out_idx, positions, layouts=None):
         self.kernel = kernel
         self.positions = positions
         self.out_idx = _normalized_out_idx(prim_func, out_idx)
         self.adapter = _InterAdapter(kernel.adapter, prim_func, self.out_idx)
+        self.casts = {}
+        for idx, layout in (layouts or {}).items():
+            if layout != BLOCKED_LAYOUT:
+                raise ValueError(f"unknown inter output layout {layout!r}")
+            shape, acc, dtype = positions[idx]
+            self.casts[idx] = unblock_kernel(shape, acc, dtype)
 
     def __call__(self, *inputs):
         import torch
@@ -109,10 +125,17 @@ class InterOutputKernel:
             res = []
         own = iter(res if isinstance(res, (list, tuple)) else [res])
         outs = [
-            sums[idx].to(self.positions[idx][2]) if idx in sums else next(own)
+            self._cast(idx, sums[idx]) if idx in sums else next(own)
             for idx in self.out_idx
         ]
         return outs[0] if len(outs) == 1 else outs
+
+    def _cast(self, idx, buffer):
+        cast = self.casts.get(idx)
+        if cast is None:
+            return buffer.to(self.positions[idx][2])
+        shape = buffer.shape
+        return cast(buffer.view(-1, 8, 8)).view(shape)
 
     def __getattr__(self, name):
         return getattr(self.kernel, name)
@@ -152,6 +175,8 @@ def _load_main_kernel_from_code(code_str):
         main_kernel._cleave_pass_configs = getattr(tmp_module, "PASS_CONFIGS", {})
         # Outputs summed across CTAs, ``{param name: output dtype}`` (see _compile).
         main_kernel._cleave_inter_outputs = getattr(tmp_module, "INTER_OUTPUTS", {})
+        # Their buffers stored in another layout than row-major, ``{param name: layout}``.
+        main_kernel._cleave_inter_layouts = getattr(tmp_module, "INTER_LAYOUTS", {})
 
     return main_kernel
 

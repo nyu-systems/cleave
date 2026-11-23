@@ -94,3 +94,35 @@ def test_positions_come_from_the_generated_module():
     k = SimpleNamespace(adapter=_InterAdapter(None, prim_func, _normalized_out_idx(prim_func, out_idx)))
     feed = {ph.name: ph.name for ph in placeholder_order(cand.flat_graph)}
     assert sorted(order_inputs_for_kernel(feed, k)) == sorted(feed)
+
+
+def test_blocked_buffers_are_cast_by_their_layout_kernel(monkeypatch):
+    """A buffer named in INTER_LAYOUTS is cast by the layout's kernel (built once, at
+    construction), every other one by ``.to``; unknown layouts are refused."""
+    import cleave.runtime.compile as compile_mod
+
+    built = []
+
+    def fake_unblock(shape, acc, dtype):
+        built.append((shape, acc, dtype))
+        return lambda flat: (flat.reshape(shape) * 10).to(dtype).reshape(-1, shape[-1])
+
+    monkeypatch.setattr(compile_mod, "unblock_kernel", fake_unblock)
+    prim_func = SimpleNamespace(params=list(range(5)))
+    positions = {3: ((8, 8), torch.float32, torch.float16)}
+    k = InterOutputKernel(FakeKernel(), prim_func, [2, 3, 4], positions, {3: "blocked8x8"})
+    assert built == [((8, 8), torch.float32, torch.float16)]
+    a, b = torch.ones(8, 8, dtype=torch.float16), torch.ones(8, 8, dtype=torch.float16)
+    for _ in range(2):
+        _, sum1, _ = k(a, b)
+        assert sum1.shape == (8, 8) and torch.equal(sum1, torch.full((8, 8), 20.0).half())
+    assert len(built) == 1
+    with pytest.raises(ValueError, match="unknown inter output layout"):
+        InterOutputKernel(FakeKernel(), prim_func, [2, 3, 4], positions, {3: "swizzled"})
+
+
+def test_layouts_come_from_the_generated_module():
+    cand = next(c for c in candidates(inter_pair()) if contexts(c) == ("intra", "inter"))
+    prim_func = _load_main_kernel_from_code(build_candidate_code(cand))
+    assert prim_func._cleave_inter_layouts == {
+        name: "blocked8x8" for name in prim_func._cleave_inter_outputs}

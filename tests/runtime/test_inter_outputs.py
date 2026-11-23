@@ -128,3 +128,22 @@ def test_pipeline_validates_and_returns_declared_dtypes(program, inputs, referen
     outs = best(*inputs)
     assert [o.dtype for o in outs] == [torch.float16, torch.float16]
     compare_outputs(outs, reference, TOLERANCE, what="inter_pair")
+
+
+def test_kernels_store_blocked_buffers(kernel):
+    k, _ = kernel
+    assert set(k.casts) == set(k.positions)  # every inter buffer of the pair is blocked
+
+
+@pytest.mark.parametrize("shape", [(1024, 64), (2, 256, 64), (3, 40, 128), (16, 24)])
+def test_unblock_kernel_restores_row_major_order(shape):
+    """``unblock_kernel`` = cast of the buffer read in the order gen_atomic_add stores it."""
+    from cleave.runtime.inter_layout import unblock_kernel
+
+    *lead, rows, width = shape
+    x = torch.randn(shape, device="cuda")
+    planes = x.reshape(-1, rows // 8, 8, width // 8, 8)
+    blocked = planes.permute(0, 1, 3, 2, 4).contiguous()  # [.., m // 8, n // 8, m % 8, n % 8]
+    cast = unblock_kernel(shape, torch.float32, torch.float16)
+    out = cast(blocked.view(-1, 8, 8)).view(shape)
+    assert out.dtype == torch.float16 and torch.equal(out, x.half())

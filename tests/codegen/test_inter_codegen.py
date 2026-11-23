@@ -106,19 +106,26 @@ def test_inter_output_is_atomically_added_per_iteration(pair_cands, assignment):
     block = [int(e) for e in loop.graph.tmap[acc].shape]
     tile = [int(e) for e in loop.graph.tmap[acc].tile_size]
 
-    # declared for the runtime, with the output's own dtype
+    # declared for the runtime, with the output's own dtype and the buffer's layout
     assert f'INTER_OUTPUTS = {{\n    "{inter_out.name}": "float16",\n}}' in code
+    assert f'INTER_LAYOUTS = {{\n    "{inter_out.name}": "blocked8x8",\n}}' in code
     # the kernel parameter is the fp32 accumulation buffer; the intra output keeps fp16
     main = _macro(code, "main_kernel")
     assert f'{inter_out.name}: T.Tensor((1024, 64), "float32")' in main
     assert f'{intra_out.name}: T.Tensor((1024, 64), "float16")' in main
 
-    # inside the iteration: a fresh fp32 partial (cleared gemm), then the atomic add
+    # inside the iteration: a fresh fp32 partial (cleared gemm), then the atomic add of
+    # each element into the 8x8-blocked buffer (64-wide rows: block row, column in block)
     body = _macro(code, f"{loop.name}_iter")
     assert f'{t}_global: T.Tensor(({tile[0]}, {tile[1]}), "float32")' in body
+    assert tile[1] == 64
     lines = [l.strip() for l in body.splitlines()]
-    (add,) = [i for i, l in enumerate(lines) if l.startswith("T.atomic_add(")]
-    assert lines[add] == f"T.atomic_add({t}_global, {t})"
+    (add,) = [i for i, l in enumerate(lines) if l == f"for ai0, ai1 in T.Parallel(*{t}.shape):"]
+    flat = " ".join(" ".join(lines[add + 1 :]).replace("( ", "(").replace(" )", ")").split())
+    assert flat.startswith(
+        f"T.atomic_add({t}_global[ai0 // 8 * 8 + ai1 // 8, ai0 % 8 * 8 + ai1 % 8], {t}[ai0, ai1])"
+    )
+    assert body.count("T.atomic_add(") == 1
     assert re.match(rf"ukernel_mma_\w*_clear\(.*, {t}\)$", lines[add - 1])
     assert body.count(f"{t} = T.alloc_fragment(") == 1
     assert '"float32"' in body[body.index(f"{t} = T.alloc_fragment(") :].split(")", 2)[1]
@@ -185,3 +192,91 @@ def test_batched_pair_builds_every_candidate():
         assert code.count("T.atomic_add(") == 1
         # the inter block is the CTA's head: sliced on the batch launch index only
         assert re.search(r"OutputNod\w+\[1 \* i0 : 1 \* i0 \+ 1, 0 : 0 \+ 256, 0 : 0 \+ 64\]", code)
+
+
+# ---- 8x8-blocked inter buffers -------------------------------------------------------
+
+
+def _tmap(shape, tile):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(shape=shape, tile_size=tile)
+
+
+@pytest.mark.parametrize(
+    "shape, tile, width",
+    [
+        ((4096, 64), (64, 64), 64),  # dK/dV of the attention backward
+        ((1, 4096, 64), (1, 128, 64), 64),  # a batch entry
+        ((1024, 128), (8, 128), 128),
+        ((1024, 128), (64, 64), None),  # the tile does not span the rows
+        ((1024, 64), (4, 64), None),  # tile rows not a multiple of 8
+        ((1000, 64), (16, 64), None),  # tile rows do not divide the block
+        ((1024, 12), (64, 12), None),  # width not a multiple of 8
+        ((1024, 64), (1, 64), None),  # a single row (squeezed to rank 1)
+        ((64,), (64,), None),
+    ],
+)
+def test_which_inter_buffers_are_blocked(shape, tile, width):
+    from cleave.codegen.kernel import inter_blocked_width
+
+    assert inter_blocked_width(_tmap(shape, tile)) == width
+
+
+def test_symbolic_inter_buffers_are_not_blocked():
+    import sympy
+
+    from cleave.codegen.kernel import inter_blocked_width
+
+    assert inter_blocked_width(_tmap((sympy.Symbol("M"), 64), (64, 64))) is None
+
+
+def test_unblocked_atomic_add_keeps_the_region_form():
+    from cleave.codegen.tensor_codegen import gen_atomic_add
+
+    assert gen_atomic_add("t", "t_global") == "T.atomic_add(t_global, t)\n"
+
+
+def _blocked_index(width):
+    """The (row, col) the emitted blocked atomic add writes element (i, j) to, as a function."""
+    from cleave.codegen.tensor_codegen import gen_atomic_add
+
+    code = gen_atomic_add("t", "g", width, 2)
+    assert code.startswith("for ai0, ai1 in T.Parallel(*t.shape):\n")
+    index = code.split("g[", 1)[1].rsplit("], t[ai0, ai1])", 1)[0]
+    return lambda i, j: eval(f"({index})", {"ai0": i, "ai1": j})
+
+
+@pytest.mark.parametrize("width", [64, 128, 24])
+def test_blocked_index_is_the_buffer_layout_relative_to_any_tile(width):
+    """For a tile of whole rows starting at a multiple of 8 (row r0), the view index the
+    kernel writes element (i, j) to is the blocked position of (r0 + i, j) in the plane."""
+    index = _blocked_index(width)
+    rows, tile_rows = 64, 16
+    for r0 in range(0, rows, tile_rows):
+        seen = set()
+        for i in range(tile_rows):
+            for j in range(width):
+                a, b = index(i, j)
+                assert 0 <= b < width and 0 <= a < tile_rows
+                m, n = r0 + i, j
+                blocked = (m // 8) * 8 * width + (n // 8) * 64 + (m % 8) * 8 + n % 8
+                assert (r0 + a) * width + b == blocked
+                seen.add((a, b))
+        assert len(seen) == tile_rows * width
+
+
+def test_output_layout_follows_its_loop_accumulator():
+    from types import SimpleNamespace
+
+    from cleave.codegen.kernel import inter_output_layout
+    from cleave.ir.graph import AccumEdge
+
+    acc = object()
+    loop = SimpleNamespace(graph=SimpleNamespace(tmap={acc: _tmap((1024, 64), (4, 64))}))
+    edge = AccumEdge.__new__(AccumEdge)
+    edge.src_node, edge.accum_node = loop, acc
+    out = SimpleNamespace(inputs=[edge])
+    assert inter_output_layout(out) is None
+    loop.graph.tmap[acc] = _tmap((1024, 64), (8, 64))
+    assert inter_output_layout(out) == "blocked8x8"
