@@ -234,17 +234,22 @@ def describe_tile(t) -> str:
 
 # Why a graph with a max has no tiling at all. A max is a max, whoever wrote it, and a loop
 # carries it wherever its streaming obstacle is served; a graph with an obstacle that is not
-# served says why after this text (``_schedule_once``).
+# served says why after this text (``_schedule_once``). Only where it is true: not when the
+# softmax filter refused a tiling that held every such row in one block (then the row was not
+# longer, and the filter's reasons are the reason).
 MAX_ROW_LIMIT = "a max needs its whole row in one block, and this row is longer"
+NO_TILING = "no tiling candidates"
 
 
 def _search(ir_graph, topk: int, force: bool, hints: dict | None,
-            refused: Counter | None = None):
+            refused: Counter | None = None, whole: Counter | None = None):
     """The top ``topk`` tilings of one lowered graph.
 
     A graph with a streaming obstacle, served or not, keeps only the tilings the build
     schedules (``schedule.streaming.streaming_accept``), decided before the top-k cut; the
-    reasons of the others are added to ``refused``. For any other graph nothing changes.
+    reasons of the others are added to ``refused``, and those of the refused tilings that
+    reduce every max without a record in one step to ``whole``. For any other graph
+    nothing changes.
     """
     from ..schedule import search_tiling
     from ..schedule.streaming import streaming_accept
@@ -270,6 +275,32 @@ def _search(ir_graph, topk: int, force: bool, hints: dict | None,
     finally:
         if stable is not None and refused is not None:
             refused.update(stable.reasons)
+        if stable is not None and whole is not None:
+            whole.update(stable.whole)
+
+
+def _no_tiling(g, ir, reasons: Counter, whole: Counter) -> str:
+    """Why lowered graph ``ir`` of searched graph ``g`` has no tiling.
+
+    The row limit only where no tiling the policy made held the row of every max without a
+    record in one step (``whole`` is empty): the policy made none, or the softmax filter
+    refused only tilings that step such a max. Then, for a max whose streaming obstacle is
+    not served, why it is not carried across a loop instead. Otherwise the graph has no
+    tiling for the reasons the filter counted (``reasons``), whatever its maxes.
+    """
+    unstreamed = "; ".join(getattr(ir, "streaming_refusals", None) or ())
+    if "max" in g.ops and not whole:
+        why = MAX_ROW_LIMIT
+        if unstreamed:
+            why += f"; it is not carried across a loop: {unstreamed}"
+    else:
+        why = NO_TILING
+        if unstreamed:
+            why += f"; a max is not carried across a loop: {unstreamed}"
+    if reasons:  # every tiling was refused by the softmax filter: say why
+        why += f" ({sum(reasons.values())} refused: " + "; ".join(
+            f"{n}x {reason}" for reason, n in reasons.most_common()) + ")"
+    return why
 
 
 def _schedule_once(graphs: GraphSet, config: ScheduleConfig, force: bool):
@@ -278,23 +309,15 @@ def _schedule_once(graphs: GraphSet, config: ScheduleConfig, force: bool):
     topk, hints = config.topk, config.hints
 
     def add(g, variant, role, ir, factor, inputs=None):
-        reasons = Counter()
+        reasons, whole = Counter(), Counter()
         try:
-            tiles = _search(ir, topk, force, hints, reasons)
+            tiles = _search(ir, topk, force, hints, reasons, whole)
         except ScheduleRejected as e:
             refused.append(Refusal(g.index, variant, role, e))
             return
         if not tiles:
-            why = "no tiling candidates"
-            if "max" in g.ops:
-                why = MAX_ROW_LIMIT
-            unstreamed = getattr(ir, "streaming_refusals", None)
-            if unstreamed:  # why the max is not carried across a loop instead
-                why = f"{MAX_ROW_LIMIT}; it is not carried across a loop: " + "; ".join(unstreamed)
-            if reasons:  # every tiling was refused by the softmax filter: say why
-                why += f" ({sum(reasons.values())} refused: " + "; ".join(
-                    f"{n}x {reason}" for reason, n in reasons.most_common()) + ")"
-            refused.append(Refusal(g.index, variant, role, ScheduleRejected(why)))
+            refused.append(Refusal(g.index, variant, role,
+                                   ScheduleRejected(_no_tiling(g, ir, reasons, whole))))
         for rank, t in enumerate(tiles):
             label = f"g{g.index} {variant} {role} #{rank} {describe_tile(t)}"
             plans.append(Plan(g.index, variant, role, t, label, rank, factor, g, inputs))

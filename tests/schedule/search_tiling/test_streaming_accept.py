@@ -156,25 +156,75 @@ def test_a_bug_inside_the_filter_is_a_refused_graph_that_names_it(flash, monkeyp
     assert "1x ScheduleRejected: RuntimeError: boom" in planset.summary()
 
 
-def test_no_candidate_left_says_why(monkeypatch):
-    """A returned softmax whose row is longer than any block: its obstacle is refused (T4),
-    and the report names that reason after the row limit, then the tilings the filter
-    dropped."""
-    shapes = dict(R=64, C=16384)
-    ir = X.streamed_ir(X.softmax_rows, shapes, "is also read by")
-    (why,) = ir.streaming_refusals
-    planset = _scheduled(monkeypatch, X.softmax_rows, shapes, ir, topk=16, fusion="off")
+UNIT_EXTENT = "a unit extent that is not a batch dim"
+UNIT_DIM = "a unit dim that is not a batch dim has no tile"
+
+
+def _no_tiling(planset, head):
+    """The one refusal of a graph without tilings starts with ``head`` and counts the
+    tilings the filter dropped; returns the count part."""
     assert len(planset) == 0
     (refusal,) = planset.refused
     assert isinstance(refusal.error, ScheduleRejected)
     text = str(refusal.error)
-    head = ("a max needs its whole row in one block, and this row is longer; it is not "
-            f"carried across a loop: {why} (")
     assert text.startswith(head) and text.endswith(")"), text
     counted = text[len(head):-1]
     assert counted.split(" refused: ")[0].isdigit() and "x " in counted, counted
     assert planset.summary().splitlines()[1].startswith(
-        "  refused: 1x ScheduleRejected: a max needs its whole row in one block")
+        f"  refused: 1x ScheduleRejected: {head[:40]}")
+    return counted
+
+
+def test_no_candidate_left_says_why(monkeypatch):
+    """A returned softmax at 16384 columns: its obstacle is refused (T4), so the row has to
+    be in one block, and the only tilings that hold it there have one row, which no kernel
+    has (a unit extent). That is the reason, not the row limit: the report names why the max
+    is not carried, then the tilings the filter dropped."""
+    shapes = dict(R=64, C=16384)
+    ir = X.streamed_ir(X.softmax_rows, shapes, "is also read by")
+    (why,) = ir.streaming_refusals
+    planset = _scheduled(monkeypatch, X.softmax_rows, shapes, ir, topk=16, fusion="off")
+    counted = _no_tiling(planset, f"{plans.NO_TILING}; a max is not carried across a loop: {why} (")
+    assert UNIT_EXTENT in counted and plans.MAX_ROW_LIMIT not in str(planset.refused[0].error)
+
+
+def two_outputs(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
+                v: cl.Tensor["H", "SKV", "D"]):
+    """Attention in traced order next to the plain ``exp(s) @ v`` of its scores."""
+    s = (q @ k.mT) / q.shape[-1] ** 0.5
+    e = X.stable_exp(s)
+    return (e / cl.sum(e, -1, keepdim=True)) @ v, cl.exp(s) @ v
+
+
+def test_the_row_limit_where_every_tiling_the_filter_dropped_steps_the_max(monkeypatch):
+    """The traced order next to ``exp(s) @ v`` at S_KV=256: the policy steps the max with
+    the second matmul in every tiling it makes (32, 64, 128 of 256) and none holds the row
+    in one block, so the row limit is the reason, then why the max is not carried (T3),
+    then what the filter dropped."""
+    ir = X.streamed_ir(two_outputs, dict(H=2, SQ=64, SKV=256, D=64), TWO_PASSES)
+    (why,) = ir.streaming_refusals
+    planset = _scheduled(monkeypatch, two_outputs, dict(H=2, SQ=64, SKV=256, D=64), ir,
+                         topk=16, fusion="off")
+    counted = _no_tiling(planset, f"{plans.MAX_ROW_LIMIT}; it is not carried across a loop: {why} (")
+    assert "is computed per iteration of GraphNode_mma_" in counted, counted
+
+
+@pytest.mark.parametrize("fn, shapes, refused, reason", [
+    # served: the max is carried, it needs no row in one block; every tiling has a unit dim
+    (X.flash_attention, dict(H=2, SQ=1, SKV=256, D=64), (), UNIT_DIM),
+    # not served (T4), and the row of 64 fits; the one tiling that holds it has one row
+    (X.softmax_rows, dict(R=1, C=64), ("is also read by",), UNIT_DIM),
+], ids=["carried_max_one_query", "returned_softmax_one_row"])
+def test_a_row_that_fits_is_not_called_longer(monkeypatch, fn, shapes, refused, reason):
+    """Every tiling was refused for another reason than the row: the report gives those
+    reasons, after why a max is not carried where one is not, and never the row limit."""
+    ir = X.streamed_ir(fn, shapes, *refused)
+    why = "; ".join(ir.streaming_refusals)
+    head = f"{plans.NO_TILING}; a max is not carried across a loop: {why} (" if why else \
+        f"{plans.NO_TILING} ("
+    planset = _scheduled(monkeypatch, fn, shapes, ir, topk=16, fusion="off")
+    counted = _no_tiling(planset, head)
+    assert reason in counted and plans.MAX_ROW_LIMIT not in str(planset.refused[0].error)
 
 
 def test_reason_key_folds_bare_numbers_only():

@@ -536,7 +536,9 @@ def streaming_accept(flat_graph):
     """``search_tiling(accept=...)`` filter for a graph with a recorded full-extent value,
     else ``None``: a candidate is kept iff the default build schedules it (the same
     ``schedule_kernel`` the build calls), decided before the top-k cut. ``accept.reasons``
-    counts the refusals by reason.
+    counts the refusals by reason; ``accept.whole`` counts, by reason, the refused tilings
+    that reduce every max without a record in one step (its row fitted one block, so the
+    tiling was refused for something else).
 
     Also for a graph whose obstacle is NOT served (``streaming_refusals`` lists why): the
     policy still steps such a max on its own while its descendants are pinned, and every
@@ -545,15 +547,21 @@ def streaming_accept(flat_graph):
     """
     if not recorded(flat_graph) and not getattr(flat_graph, "streaming_refusals", None):
         return None
-    from .tiling import schedule_kernel
+    from .tiling import _iterative_reductions, schedule_kernel
+
+    held = [n for tier, _ in graph_tiers(flat_graph) for n in tier.nodes
+            if getattr(n, "running_max", False) and getattr(n, "streaming", None) is None
+            and len(n.raxis) > 0]
 
     def accept(cand) -> bool:
         try:
             schedule_kernel(cand)
         except ScheduleRejected as e:
             accept.reasons[_reason_key(e)] += 1
+            if not _iterative_reductions(held, cand.rstep_map):
+                accept.whole[_reason_key(e)] += 1
             return False
         return True
 
-    accept.reasons = Counter()
+    accept.reasons, accept.whole = Counter(), Counter()
     return accept

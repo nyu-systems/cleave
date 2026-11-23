@@ -24,7 +24,7 @@ import cleave.lang as cl
 from cleave import pipeline as P
 from cleave.frontend import trace
 from cleave.ir.ops import Exp
-from cleave.pipeline.plans import MAX_ROW_LIMIT, lower
+from cleave.pipeline.plans import MAX_ROW_LIMIT, NO_TILING, lower
 from cleave.runtime.inputs import adversarial_cases, softmax_axis, why_not_adversarial
 from cleave.runtime.validate import Tolerance, compare_outputs
 from tests._lowering import run_lowered
@@ -124,13 +124,16 @@ def test_search_where_a_softmax_next_to_an_exp_of_its_logits_has_plans():
     exp is read by the division, which is not summed over the row, so the max is not
     carried across a loop and the reason says so."""
     two_passes = ("which is not summed over that dim: that needs two passes over the row")
-    # softmax + exp: whole rows in every tile; 4096 columns have a plan, 8192 have none
+    # softmax + exp: whole rows in every tile; 4096 columns have a plan, 8192 have none: the
+    # one tiling that holds a row of 8192 in one block holds one row, which no kernel has
     plans = _plans(softmax_plus_exp, 64, 4096)
     assert len(plans) >= 1 and {tile[1] for tile in _output_tiles(plans)} == {4096}
     plans = _plans(softmax_plus_exp, 64, 8192)
     assert len(plans) == 0
     reasons = _reasons(plans)
-    assert all(MAX_ROW_LIMIT in reason and two_passes in reason for reason in reasons), reasons
+    assert all(reason.startswith(f"{NO_TILING}; a max is not carried across a loop: ")
+               and two_passes in reason and "a unit extent that is not a batch dim" in reason
+               for reason in reasons), reasons
     # ... where the softmax alone still has one
     plans = _plans(softmax_alone, 64, 8192)
     assert len(plans) >= 1 and {tile[1] for tile in _output_tiles(plans)} == {8192}
