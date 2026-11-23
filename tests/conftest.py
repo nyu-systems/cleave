@@ -22,6 +22,7 @@ _MARKERS = {
         "tests/pipeline_api/test_e2e.py",
         "tests/runtime/test_run_candidates.py",
         "tests/frontend/test_exact_softmax.py::test_gpu_",
+        "tests/lower/test_attention_bwd_gpu.py",
     ),
     "expected": (
         "tests/graph/handwritten/",
