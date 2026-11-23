@@ -443,7 +443,7 @@ def batch_softmax(x: cl.Tensor["B", "R", "C"]):
 # The same refusals where the softmax has its max: ``cl.softmax`` records ``x - max(x)``, so
 # a softmax over a vector or a batch axis is refused at that subtraction, the first op that
 # broadcasts.
-def _stable_exp(x, dim):
+def _exp_minus_max(x, dim):
     return cl.exp(x - cl.max(x, dim, keepdim=True))
 
 
@@ -456,14 +456,14 @@ def batch_axis_softmax(x: cl.Tensor["B", "R", "C"]):
 
 
 def two_axes_softmax(x: cl.Tensor["R", "C"]):
-    e = _stable_exp(x, -1)
+    e = _exp_minus_max(x, -1)
     return e / cl.sum(cl.sum(e, -1, keepdim=True), -2, keepdim=True)
 
 
 def unit_row_softmax(x: cl.Tensor["B", "F"], v: cl.Tensor["ONE", "F"]):
     # out[i, j] = (v . e_j) / sum(e_i): with B == 4 on both axes the divide used to lower as
     # a product along the columns
-    e = _stable_exp(x, -1)
+    e = _exp_minus_max(x, -1)
     return (v @ e.mT) / cl.sum(e, -1, keepdim=True)
 
 

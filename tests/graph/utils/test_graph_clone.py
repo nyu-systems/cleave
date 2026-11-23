@@ -7,7 +7,7 @@ import pytest
 pytest.importorskip("tilelang")
 
 from cleave.ir.graph import Graph, GraphNode, OutputNode, PlaceHolderNode
-from cleave.ir.ops import Exp, Matmul, Mul, ReduceMax, ReduceSum, wire_input
+from cleave.ir.ops import Exp, Matmul, Mul, ReduceMax, wire_input
 from cleave.ir.graph_utils import clone_graph, find_topo_sort, gather_all_nodes
 from cleave.ir.update_rule import Streaming
 from tests.graph._rolling_tier import build_rolling_tier, schedule_rolling_tier
