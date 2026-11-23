@@ -11,7 +11,9 @@ from cleave.ir.ops import Exp, Matmul
 from cleave.schedule import search_tiling
 from cleave.schedule.policy.default import TCPolicy
 
-from tests._graphs import ACCUM_DTYPE, DTYPE, OUT_DTYPE, _connect, _finalize, mha_bhsd_graph
+from tests._graphs import (
+    ACCUM_DTYPE, DTYPE, OUT_DTYPE, _connect, _finalize, mha_bhsd_graph, mla_decode_bhsd_graph,
+)
 
 
 def _register_a_matmuls(graph):
@@ -48,6 +50,15 @@ def test_a_operand_computed_from_loads_keeps_every_block_m():
     (mma,) = _register_a_matmuls(graph)
     cands = search_tiling(graph, topk=10000)
     assert {int(c.get_tile(mma)[-2]) for c in cands if c.n_threads == 256} - {128}
+
+
+def test_mla_decode_value_gemm_is_not_refused():
+    # mla_decode_pass stages its softmax operand through shared: such candidates compile and
+    # pass the end2end test (10 of them would have been refused), so they stay.
+    graph = mla_decode_bhsd_graph(1, 128, 1024, 512, 64)
+    (pv,) = [n for n in _register_a_matmuls(graph) if not n.transpose_B]
+    cands = search_tiling(graph, topk=10000)
+    assert {int(c.get_tile(pv)[-2]) for c in cands if c.n_threads == 256} - {128}
 
 
 def test_refusal_is_specific_to_sm_90_and_two_warpgroups():

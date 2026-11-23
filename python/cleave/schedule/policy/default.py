@@ -14,6 +14,7 @@ from ...ir.analysis import (
     find_orthogonal_reduction_groups,
     get_output_axis_tokens,
 )
+from ...codegen.passes import is_mla_value_gemm
 from ...ir.ops import Copy, Div, Matmul, Mul, ReduceSum
 from ...ir.ops.elementwise import BinaryElementwise
 
@@ -1516,7 +1517,8 @@ class TCPolicy(DefaultPolicy):
         lowers at every M. Repro (lowering only, no GPU): cleave-attn-bwd-evidence
         scratch/p8-staging/repro_rs_gemm_layout.py, scratch/p8b-rsgemm/repro_variants.py.
         A transposed A, or a gemm whose operands are both computed, is staged through
-        shared memory by codegen, so it is not read from registers.
+        shared memory by codegen, so it is not read from registers; so is MLA decode's
+        value gemm under ``mla_decode_pass``.
         """
         if n_threads != 256 or getattr(self.arch, "sm_version", None) != 90:
             return False
@@ -1527,6 +1529,10 @@ class TCPolicy(DefaultPolicy):
             if not isinstance(a_src, ComputeOpNode) or isinstance(b_src, ComputeOpNode):
                 continue
             if not self._reads_gemm_accumulator(a_src):
+                continue
+            if is_mla_value_gemm(node):
+                # CompilerPassOptions.mla_decode_pass stages this A operand through shared
+                # (codegen/passes.py), and the candidate then compiles.
                 continue
             if int(candidate.get_tile(node)[-2]) != 128:
                 return True
