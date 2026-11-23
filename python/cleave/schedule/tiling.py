@@ -18,6 +18,7 @@ from ..ir.analysis import (
     build_output_axis_provenance,
     build_reduction_axis_provenance,
     infer_output_axis_dependencies,
+    nearest_reductions,
 )
 from ..ir.graph_utils import (
     get_op_ancestors,
@@ -676,14 +677,257 @@ def _pin_absorbed_reduction_axes(ordered_nodes, rstep_map, tile_map, itile_map):
     return itile_map
 
 
+INTRA, INTER = "intra", "inter"
+
+
+def _merge_into_loop(
+    gnode,
+    new_nodes,
+    existing_placeholders,
+    tile_map,
+    itile_map,
+    node_to_graph,
+    graphs,
+    top_bind_node,
+):
+    """Move ``new_nodes`` (gathered ancestors) into the loop graph of ``gnode``.
+
+    Nodes already in the loop are skipped; ``existing_placeholders`` (outer
+    placeholders the loop already binds) are rewired onto the loop's own placeholders.
+    """
+    new_nodes = [n for n in new_nodes if n not in gnode.graph.nodes]
+    new_nodes = [n for n in new_nodes if n not in existing_placeholders]
+
+    # reconnect existing placeholder nodes
+    # TODO merge this code with assign_placeholder_nodes
+    if existing_placeholders:
+        inner_placeholders_map = {}
+        for n in gnode.graph.nodes:
+            if isinstance(n, PlaceHolderNode):
+                inner_placeholders_map[top_bind_node[n.name].name] = n
+        for ph in existing_placeholders:
+            inner_node = inner_placeholders_map[
+                top_bind_node[ph.name].name
+            ]
+            for edge in list(ph.outputs):
+                if edge.dst_node in new_nodes:
+                    edge.src_node = inner_node
+                    inner_node._out_edges.append(edge)
+                    ph._out_edges.remove(edge)
+
+    # add new nodes to the graph
+    prev_nodes = list(gnode.graph.nodes)
+    gnode.graph.nodes.extend(new_nodes)
+    gnode._assign_placeholder_nodes(skip=prev_nodes)
+    gnode._assign_accum_nodes()
+    assign_tensor_map(
+        gnode,
+        tile_map,
+        itile_map,
+        node_to_graph,
+        graphs,
+        top_bind_node,
+        node_to_graph[gnode.name],
+    )
+    _normalize_inner_reduction_axes(gnode, itile_map)
+
+
+def _inter_chains(cand) -> Dict[str, List[str]]:
+    """For each inter output of ``cand``, its node and the nodes down to its reduction.
+
+    Names, top (the node feeding the OutputNode) first, reduction last. The policy only
+    makes an output inter when this chain is single-input and linear.
+    """
+    chains = {}
+    for node, context in getattr(cand, "accumulation", {}).items():
+        if context != INTER:
+            continue
+        chain, n = [node.name], node
+        while not n.raxis:
+            n = n.inputs[0].src_node
+            chain.append(n.name)
+        chains[node.name] = chain
+    return chains
+
+
+def _select_launch_output_node(output_nodes, accumulation):
+    """The canonical output: among the intra outputs when contexts are assigned."""
+    if accumulation:
+        output_nodes = [
+            n
+            for n in output_nodes
+            if accumulation.get(_get_output_binding_node(n).name) == INTRA
+        ]
+    return _select_canonical_output_node(output_nodes)
+
+
+def _inter_output_coord_exprs(canonical_node, output_node, launch_axis_plan):
+    """Launch coordinates of an inter output's block: its batch axes only.
+
+    The block spans every other axis whole (the loop variable selects the iteration's
+    tile inside it), so it has no launch-axis mapping there.
+    """
+    canonical_flags = list(getattr(canonical_node, "is_batch_dim", []) or [])
+    output_flags = list(getattr(output_node, "is_batch_dim", []) or [])
+    canonical_batch = [a for a, is_batch in enumerate(canonical_flags) if is_batch]
+    output_batch = [a for a, is_batch in enumerate(output_flags) if is_batch]
+    if len(canonical_batch) != len(output_batch):
+        raise ScheduleRejected(
+            f"Inter output {output_node.name} does not have the batch axes of the launch."
+        )
+    coord_exprs = [None] * len(output_node.get_shape())
+    for axis, canonical_axis in zip(output_batch, canonical_batch):
+        coord_exprs[axis] = launch_axis_plan.axis_coord_exprs[canonical_axis]
+    return coord_exprs
+
+
+def _join_inter_outputs(
+    accumulation,
+    inter_chains,
+    intra_reductions,
+    graphs,
+    tile_map,
+    itile_map,
+    node_to_graph,
+    top_bind_node,
+    ordered_nodes,
+):
+    """Move every inter output, with its ancestors, into the loop of the intra outputs.
+
+    The inter output's iteration tile then follows the loop counter (``assign_tensor_map``
+    slices its block with it) and the loop graph's ``accumulation`` marks it ``inter``;
+    the main graph's ``accumulation`` gives the context of each ``OutputNode``.
+    """
+    by_name = {n.name: n for n in ordered_nodes}
+    loops = {node_to_graph[name] for name in intra_reductions}
+    gnodes = [
+        n for n in graphs["main"].nodes if isinstance(n, GraphNode) and n.name in loops
+    ]
+    if len(loops) != 1 or len(gnodes) != 1:
+        raise ScheduleRejected(
+            "Inter outputs need the intra outputs to accumulate in exactly one loop; "
+            f"their reductions are in {sorted(loops)}."
+        )
+    (gnode,) = gnodes
+
+    for top_name in inter_chains:
+        lock_graph(gnode.graph)
+        new_nodes = gather_all_nodes(by_name[top_name], descending=False)
+        unlock_graph(gnode.graph)
+        elsewhere = [
+            n.name
+            for n in new_nodes
+            if not isinstance(n, PlaceHolderNode)
+            and n not in gnode.graph.nodes
+            and node_to_graph.get(n.name, "main") != "main"
+        ]
+        if elsewhere:
+            raise ScheduleRejected(
+                f"Inter output {top_name} depends on {elsewhere}, which iterate in "
+                "another loop; nested loops are not supported."
+            )
+        top_bind_inner_nodes = [
+            top_bind_node[n.name]
+            for n in gnode.graph.nodes
+            if isinstance(n, PlaceHolderNode)
+        ]
+        existing_placeholders = [
+            n
+            for n in new_nodes
+            if isinstance(n, PlaceHolderNode)
+            and top_bind_node[n.name] in top_bind_inner_nodes
+        ]
+        _merge_into_loop(
+            gnode,
+            new_nodes,
+            existing_placeholders,
+            tile_map,
+            itile_map,
+            node_to_graph,
+            graphs,
+            top_bind_node,
+        )
+
+    accum_names = [n.name for n in gnode.graph.accum_nodes]
+    missing = [name for name in inter_chains if name not in accum_names]
+    if missing:
+        raise ScheduleRejected(
+            f"Inter outputs {missing} are also consumed inside the loop; their partial "
+            "sums cannot feed another node."
+        )
+    gnode.graph.accumulation = {
+        n: INTER if n.name in inter_chains else INTRA for n in gnode.graph.accum_nodes
+    }
+    graphs["main"].accumulation = {
+        n: accumulation.get(_get_output_binding_node(n).name, INTRA)
+        for n in graphs["main"].nodes
+        if isinstance(n, OutputNode)
+    }
+
+
+def _with_token_axis_deps(output_axis_deps, flat_graph, output_node, inter_chains):
+    """``output_axis_deps`` completed, by axis provenance, for every node it misses.
+
+    A dim of such a node depends on canonical axis ``a`` when its source axes meet the
+    axes of ``a``, or the axes an inter reduction sums over where that reduction meets
+    ``a`` (the launch tiles ``a``, so it also tiles the inter reduction's axis).
+    """
+    ops = [n for n in flat_graph.nodes if not n.is_placeholder() and not n.is_output()]
+    out_tokens = build_output_axis_provenance(ops)
+    red_tokens = build_reduction_axis_provenance(ops, out_tokens)
+    canonical = _get_output_binding_node(output_node)
+    by_name = {n.name: n for n in ops}
+    inter_axes = [
+        set().union(*red_tokens.get(by_name[chain[-1]], [set()]))
+        for chain in inter_chains.values()
+    ]
+    axis_classes = []
+    for tokens in out_tokens.get((canonical, 0), []):
+        tokens = set(tokens)
+        for axes in inter_axes:
+            if axes & tokens:
+                tokens |= axes
+        axis_classes.append(tokens)
+
+    deps = dict(output_axis_deps)
+    for (node, out_id), dim_tokens in out_tokens.items():
+        if out_id != 0 or node.name in deps:
+            continue
+        deps[node.name] = [
+            {a for a, cls in enumerate(axis_classes) if tokens & cls}
+            for tokens in dim_tokens
+        ]
+    return deps
+
+
 def apply_tiling(cand: List) -> List[Graph]:
+    # accumulation context per output-feeding node name (empty: every output intra)
+    accumulation = {
+        k.name: v for k, v in (getattr(cand, "accumulation", None) or {}).items()
+    }
+    inter_chains = _inter_chains(cand)
+    inter_chain_nodes = {name for chain in inter_chains.values() for name in chain}
+    flat_ops = [
+        n for n in cand.flat_graph.nodes if not n.is_placeholder() and not n.is_output()
+    ]
+    intra_reductions = [  # names, read before the graph is restructured
+        r.name
+        for n in flat_ops
+        if accumulation.get(n.name) == INTRA
+        for r in nearest_reductions(n, flat_ops)
+    ]
     output_nodes = [n for n in cand.flat_graph.nodes if n.is_output()]
-    output_node = _select_canonical_output_node(output_nodes)
+    output_node = _select_launch_output_node(output_nodes, accumulation)
 
     # this needs to be called before any graph modifications
     # to correctly infer output axis dependencies for the
     # original output node
     output_axis_deps = infer_output_axis_dependencies(output_node)
+    if inter_chains:
+        # tensors only an inter output reads are not ancestors of the canonical output
+        output_axis_deps = _with_token_axis_deps(
+            output_axis_deps, cand.flat_graph, output_node, inter_chains
+        )
 
     # remove the split ops and extract the split extent if applicable
     split_extent, flat_graph = _extract_split_extent(cand.flat_graph)
@@ -696,7 +940,7 @@ def apply_tiling(cand: List) -> List[Graph]:
     ]
     output_nodes = [n for n in graphs["main"].nodes if n.is_output()]
     main_output_nodes = list(output_nodes)
-    output_node = _select_canonical_output_node(output_nodes)
+    output_node = _select_launch_output_node(output_nodes, accumulation)
     node_to_graph, graph_to_node = {
         node.name: "main" for node in gather_all_nodes(*ordered_nodes)
     }, {}
@@ -742,6 +986,8 @@ def apply_tiling(cand: List) -> List[Graph]:
     graphs["main"].extent = launch_axis_plan.extent
 
     for node in reversed(ordered_nodes):
+        if node.name in inter_chain_nodes:
+            continue  # joins the intra loop below, after that loop is built
         if (
             len(node.raxis) > 0
             and node in cand.rstep_map
@@ -793,41 +1039,16 @@ def apply_tiling(cand: List) -> List[Graph]:
 
                     found_compatible_graph = True
 
-                    new_nodes = [n for n in new_nodes if n not in gnode.graph.nodes]
-                    new_nodes = [n for n in new_nodes if n not in existing_placeholders]
-
-                    # reconnect existing placeholder nodes
-                    # TODO merge this code with assign_placeholder_nodes
-                    if existing_placeholders:
-                        inner_placeholders_map = {}
-                        for n in gnode.graph.nodes:
-                            if isinstance(n, PlaceHolderNode):
-                                inner_placeholders_map[top_bind_node[n.name].name] = n
-                        for ph in existing_placeholders:
-                            inner_node = inner_placeholders_map[
-                                top_bind_node[ph.name].name
-                            ]
-                            for edge in list(ph.outputs):
-                                if edge.dst_node in new_nodes:
-                                    edge.src_node = inner_node
-                                    inner_node._out_edges.append(edge)
-                                    ph._out_edges.remove(edge)
-
-                    # add new nodes to the graph
-                    prev_nodes = list(gnode.graph.nodes)
-                    gnode.graph.nodes.extend(new_nodes)
-                    gnode._assign_placeholder_nodes(skip=prev_nodes)
-                    gnode._assign_accum_nodes()
-                    assign_tensor_map(
+                    _merge_into_loop(
                         gnode,
+                        new_nodes,
+                        existing_placeholders,
                         tile_map,
                         itile_map,
                         node_to_graph,
                         graphs,
                         top_bind_node,
-                        node_to_graph[gnode.name],
                     )
-                    _normalize_inner_reduction_axes(gnode, itile_map)
 
                     break
 
@@ -870,6 +1091,19 @@ def apply_tiling(cand: List) -> List[Graph]:
                 parent_graph_name,
             )
             _normalize_inner_reduction_axes(graph_node, itile_map)
+
+    if inter_chains:
+        _join_inter_outputs(
+            accumulation,
+            inter_chains,
+            intra_reductions,
+            graphs,
+            tile_map,
+            itile_map,
+            node_to_graph,
+            top_bind_node,
+            ordered_nodes,
+        )
     lock_graph(graphs["main"])  # graph structure is fixed after this point
 
     graphs["main"].nodes = find_topo_sort(main_output_nodes)
@@ -892,11 +1126,18 @@ def apply_tiling(cand: List) -> List[Graph]:
             bound_node = _get_output_binding_node(node)
             logical_shape = list(bound_node.get_shape())
             logical_tile_size = list(tile_size)
-            axis_map = _get_same_launch_output_axis_map(canonical_output_binding, bound_node)
-            logical_coord_exprs = [
-                launch_axis_plan.axis_coord_exprs[canonical_axis]
-                for canonical_axis in axis_map
-            ]
+            if bound_node.name in inter_chains:
+                logical_coord_exprs = _inter_output_coord_exprs(
+                    canonical_output_binding, bound_node, launch_axis_plan
+                )
+            else:
+                axis_map = _get_same_launch_output_axis_map(
+                    canonical_output_binding, bound_node
+                )
+                logical_coord_exprs = [
+                    launch_axis_plan.axis_coord_exprs[canonical_axis]
+                    for canonical_axis in axis_map
+                ]
 
             physical_shape = logical_shape
             physical_tile_size = logical_tile_size

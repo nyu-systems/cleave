@@ -1045,8 +1045,13 @@ class DefaultPolicy:
         if any(len(r.raxis) != 1 for r in intra.reductions):
             return None
 
-        canonical = intra.outputs[0]
-        for node in intra.outputs[1:]:
+        # the first highest-rank intra output in graph output order, as apply_tiling picks
+        outputs = list(intra.outputs)
+        if self.flat_graph is not None:
+            order = [n.inputs[0].src_node for n in self.flat_graph.nodes if n.is_output()]
+            outputs.sort(key=lambda n: order.index(n) if n in order else len(order))
+        canonical = outputs[0]
+        for node in outputs[1:]:
             if len(node.get_space_dim()) > len(canonical.get_space_dim()):
                 canonical = node
         canonical_flags = self._get_visible_batch_dim_flags(canonical)

@@ -106,6 +106,14 @@ class Graph:
     accum_nodes: List[Node] = field(
         default_factory=list
     )  # nodes that require accumulation
+    accumulation: dict[Node, str] = field(
+        default_factory=dict
+    )  # accumulation context, set by `apply_tiling` only when outputs reduce over
+    # orthogonal axes (empty otherwise: every accum node is "intra"). On an iterative
+    # graph, keyed by accum node: "intra" sums over the loop in registers and is written
+    # once after it; "inter" is a partial per iteration whose tile (`tmap`) follows the
+    # loop counter, to be summed across CTAs (atomic adds into a zero-initialised fp32
+    # buffer). On the main graph, keyed by OutputNode: the context of that output.
     binding: dict[str, Node] = field(
         default_factory=dict
     )  # map PlaceHolder/Output nodes in the supergraph to nodes in the subgraph

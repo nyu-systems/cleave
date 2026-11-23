@@ -1,3 +1,4 @@
+from ..core.errors import CodegenError
 from ..ir.graph import ComputeOpNode, GraphNode, OutputNode, PlaceHolderNode
 
 
@@ -21,6 +22,15 @@ class GraphValidator:
         where = "main graph" if is_main else "subgraph"
 
         assert graph.nodes, f"{where}: no nodes."
+
+        # A raise, not an assert: emitting an inter output as an intra one would
+        # silently miscompile (it would accumulate the wrong tiles), and `-O` drops asserts.
+        inter = [n.name for n, context in graph.accumulation.items() if context != "intra"]
+        if inter:
+            raise CodegenError(
+                f"{where}: inter accumulation (summed across CTAs) of {inter} is not "
+                "implemented in code generation."
+            )
 
         # --- args: only declared IO, inputs first, each fully described -----------------
         seen_output = False
