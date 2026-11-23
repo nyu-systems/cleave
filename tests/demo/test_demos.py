@@ -96,12 +96,12 @@ def test_every_demo_has_a_case():
 # The demos whose softmax is ``cl.softmax``, the exact one: every attention demo.
 ATTENTION = ["mha_decode", "gqa_decode", "mqa_decode", "mha_prefill", "gqa_prefill",
              "mqa_prefill", "mla_prefill", "mla_decode", "qknorm"]
-# The demos whose kernels can return an output with a boundary role: an exact softmax,
-# split over the keys (by default for the decode demos, with the ``--split SKV`` their
-# docstrings name for the MHA / GQA / MQA prefill demos). Its partials return their float32
-# shift, so the demo declares one bound per role. mla_decode, mla_prefill and qknorm offer
-# no split: no split graph of mla_decode has a partial / combine cut, the split graphs of
-# mla_prefill need about 190 GB of references, and qknorm's split search is no demo run.
+# The demos that declare one bound per boundary role: an exact softmax split over the keys
+# (by default for the decode demos, with ``--split SKV`` for the MHA / GQA / MQA prefill
+# demos), whose partials return their float32 max. That split is built from the loop state
+# and runs unsplit until it is wired in (the demos' docstrings say so). mla_decode,
+# mla_prefill and qknorm offer no split: mla_decode asks for none, the split of mla_prefill
+# would need about 190 GB of references, and qknorm declares a single bound.
 BY_ROLE = set(ATTENTION) - {"mla_decode", "mla_prefill", "qknorm"}
 
 

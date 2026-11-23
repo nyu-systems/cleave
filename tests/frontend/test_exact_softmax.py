@@ -545,20 +545,34 @@ def test_gpu_unstabilized_twin_is_caught_at_x100(cache_root):
 
 def test_gpu_unstabilized_kernel_fails_against_the_exact_reference(cache_root):
     """The teeth at the level of one kernel: the tilings of the plain twin (the same
-    attention without the max), held to the exact program's reference, which is finite at
-    x100. Each such kernel passes on normal inputs and is rejected at x100 for the NaN it
-    returns, against a reference that has none."""
+    attention without the max) that the build schedules, held to the exact program's
+    reference, which is finite at x100. Each such kernel passes on normal inputs and is
+    rejected at x100 for the NaN it returns, against a reference that has none.
+
+    (The twin has no max, so no accept filter: its top tilings loop the row sum while the
+    division outside the loop reads the exp, which ``apply_tiling`` refuses with its typed
+    reason. The filter here keeps what the build schedules, as ``streaming_accept`` does for
+    the exact graph.)"""
     _gpu()
+    from cleave.core.errors import ScheduleRejected
     from cleave.pipeline.plans import lower
     from cleave.pipeline.superopt import GraphSet
     from cleave.runtime.evaluate import run_candidates
     from cleave.runtime.reference import placeholder_order
     from cleave.runtime.validate import publish_reference
+    from cleave.schedule.tiling import schedule_kernel
+
+    def builds(cand) -> bool:
+        try:
+            schedule_kernel(cand)
+        except ScheduleRejected:
+            return False
+        return True
 
     shapes = dict(H=32, SQ=64, SKV=256, D=64)
     (exact,) = lower(next(iter(GraphSet.identity(trace(attention, shapes, cl.f16)))))
     plans = P.schedule(GraphSet.identity(trace(attention_unstabilized, shapes, cl.f16)),
-                       P.ScheduleConfig(topk=4))
+                       P.ScheduleConfig(topk=4, hints={"accept": builds}))
     assert len(plans) >= 1
     # the twin's kernels read the exact graph's inputs, by name
     names = sorted(n.name for n in placeholder_order(exact))
