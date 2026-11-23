@@ -190,7 +190,3 @@ def test_reason_key_folds_bare_numbers_only():
            "tiles (N of N)")
     assert key(ScheduleRejected("reduce_max_2_5: its tile (1,) holds a single row\nmore")) == (
         "reduce_max_2_5: its tile (N,) holds a single row")
-    # the hand-derived pass reads the same function
-    import cleave.schedule.stabilize as stab
-
-    assert stab._reason_key is key and stab._weighted_slices is stream._weighted_slices

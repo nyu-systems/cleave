@@ -203,8 +203,7 @@ def test_the_engine_is_not_even_imported_for_a_graph_without_a_record(tmp_path):
         "            apply_tiling(c)\n"
         "        except Exception as e:\n"
         "            assert type(e).__name__ == 'ScheduleRejected', e\n"
-        "loaded = [m for m in ('cleave.pipeline.update', 'z3', 'cleave.schedule.stabilize')\n"
-        "          if m in sys.modules]\n"
+        "loaded = [m for m in ('cleave.pipeline.update', 'z3') if m in sys.modules]\n"
         "assert not loaded, loaded\n"
     )
     env = dict(os.environ, CUDA_VISIBLE_DEVICES="", CLEAVE_CACHE_ROOT=str(tmp_path))

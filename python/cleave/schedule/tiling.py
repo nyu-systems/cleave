@@ -1294,9 +1294,9 @@ def schedule_kernel(cand) -> Graph:
     """``apply_tiling`` for a candidate the default build emits a kernel for.
 
     The scheduled graph, or ``ScheduleRejected``: from ``apply_tiling`` itself (the
-    stabilization rewrite included), or because the kernel could not compile for a unit
+    assembly of a carried max included), or because the kernel could not compile for a unit
     extent (``refuse_unit_extents``). The default build (``runtime.compile.
-    build_candidate``) and the softmax accept filter (``stabilize.stabilize_accept``)
+    build_candidate``) and the softmax accept filter (``streaming.streaming_accept``)
     both schedule through here, so what the filter keeps is what the build schedules, by
     construction. The paged path calls ``apply_tiling`` itself: it schedules step-1
     tilings only to read them and emits its own kernels for them.
@@ -2057,16 +2057,11 @@ def apply_tiling(cand: List) -> List[Graph]:
         )
     _normalize_main_reduction_axes(graphs["main"])
 
-    if any(getattr(n, "stabilize", None) is not None for n in ordered_nodes):
-        # A softmax exp the scale analysis marked gets its max here, where the tiers are
-        # final. Lazy: the pass is not even imported for a graph without one.
-        from .stabilize import stabilize
-
-        return stabilize(graphs["main"])
     if any(getattr(n, "streaming", None) is not None for n in ordered_nodes):
         # A full-extent value with a proven update rule (``schedule.streaming``): where its
         # dim ended up looped, it becomes carried state and each accumulator under it gets
-        # its repair -- if the rule was derived for this candidate's flat graph.
+        # its repair -- if the rule was derived for this candidate's flat graph. Here, where
+        # the tiers are final; lazy: the assembly is not even imported for a graph without one.
         from .streaming import assemble
 
         return assemble(graphs["main"], cand.flat_graph)

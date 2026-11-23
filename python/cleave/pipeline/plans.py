@@ -242,13 +242,11 @@ def _search(ir_graph, topk: int, force: bool, hints: dict | None,
             refused: Counter | None = None):
     """The top ``topk`` tilings of one lowered graph.
 
-    A graph with a marked softmax exp keeps only the tilings ``apply_tiling`` builds,
-    stabilization included, decided before the top-k cut; the reasons of the others are
-    added to ``refused``. The same holds for a graph with a streaming obstacle, served or
-    not (``schedule.streaming.streaming_accept``). For any other graph nothing changes.
+    A graph with a streaming obstacle, served or not, keeps only the tilings the build
+    schedules (``schedule.streaming.streaming_accept``), decided before the top-k cut; the
+    reasons of the others are added to ``refused``. For any other graph nothing changes.
     """
     from ..schedule import search_tiling
-    from ..schedule.stabilize import stabilize_accept
     from ..schedule.streaming import streaming_accept
 
     kw = dict(hints or {})
@@ -257,9 +255,7 @@ def _search(ir_graph, topk: int, force: bool, hints: dict | None,
         unknown = [k for k in kw if k not in accepted]
         if unknown:
             raise ScheduleRejected(f"search_tiling does not accept hints {unknown}")
-    stable = stabilize_accept(ir_graph)
-    if stable is None:
-        stable = streaming_accept(ir_graph)
+    stable = streaming_accept(ir_graph)
     if stable is not None:
         user = kw.get("accept")
         kw["accept"] = stable if user is None else (lambda cand: user(cand) and stable(cand))

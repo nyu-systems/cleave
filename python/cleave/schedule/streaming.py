@@ -197,9 +197,7 @@ def streamed(ordered_nodes, red_tokens, ancestors, flat_graph=None) -> dict:
 # ------------------------------------------------------------------------------ assembly
 #
 # Everything below edits a finished tiled graph: the max and the shifted scores already
-# exist in the flat graph, so only the carried state and the repair are added. The helpers
-# that read a tier are shared with ``schedule/stabilize.py`` (the hand-derived pass), which
-# imports them from here.
+# exist in the flat graph, so only the carried state and the repair are added.
 
 
 def _stored_tile(tier, edge) -> Iterator:
