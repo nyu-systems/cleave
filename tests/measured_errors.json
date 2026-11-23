@@ -561,7 +561,7 @@
  ],
  "test:exact_split_attention": [
   {
-   "abs": 0.0009765625,
+   "abs": 0.007513642311096191,
    "absolute": false,
    "dtype": "float16",
    "rel": 0.0009765625,
@@ -570,13 +570,13 @@
     "float16",
     "float32"
    ],
-   "validated": 2112
+   "validated": 2553
   },
   {
-   "abs": 0.007513642311096191,
+   "abs": 0.000244140625,
    "absolute": false,
    "dtype": "float16",
-   "rel": 0.0006969851674512029,
+   "rel": 1.7334876929453458e-06,
    "seeds": 3,
    "stored": [
     "float32"
@@ -587,7 +587,7 @@
    "abs": 2.86102294921875e-06,
    "absolute": false,
    "dtype": "float32",
-   "rel": 6.22098411895422e-07,
+   "rel": 6.645491907875112e-07,
    "role": "shift",
    "seeds": 3,
    "validated": 504
@@ -595,7 +595,7 @@
  ],
  "test:exact_split_rows": [
   {
-   "abs": 0.00048828125,
+   "abs": 0.0033283233642578125,
    "absolute": false,
    "dtype": "float16",
    "rel": 0.0009699321235530078,
@@ -607,10 +607,10 @@
    "validated": 348
   },
   {
-   "abs": 0.0033283233642578125,
+   "abs": 7.62939453125e-06,
    "absolute": false,
    "dtype": "float16",
-   "rel": 0.00046231423038989305,
+   "rel": 1.8599310180889006e-07,
    "seeds": 3,
    "stored": [
     "float32"
