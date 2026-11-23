@@ -121,6 +121,32 @@ def test_fingerprint_independent_of_process():
     assert out.stdout.strip() == P.attention.trace(**SMALL_ATTN).fingerprint()
 
 
+
+def _dangling(extra):
+    p = Program("dangling", dtype=cl.f16)
+    p.dims(M=256, N=256, D=64)
+    q, k = p.input("q", ("M", "D")), p.input("k", ("N", "D"))
+    s = cl.exp(q @ k.mT)
+    p.output(s @ k)
+    if extra:
+        (s * 2.0).mT @ q  # traced, but no output reads it
+    return p
+
+
+def test_dangling_ops_are_dropped():
+    """Ops no output depends on (e.g. an undeclared gradient) used to reach the lowered graph
+    and make the tiling policy assert (`_compute_shared_memory_usage`)."""
+    from cleave.pipeline import GraphSet
+    from cleave.pipeline.plans import lower
+    from cleave.schedule import search_tiling
+
+    clean, dangling = _dangling(False), _dangling(True)
+    assert dangling.op_count == clean.op_count and dangling.ops == clean.ops
+    assert dangling.fingerprint() == clean.fingerprint()
+    assert dangling.to_graph_structure() == clean.to_graph_structure()
+    (ir,) = lower(GraphSet.identity(dangling)[0])
+    assert search_tiling(ir, topk=4)
+
 # ------------------------------------------------------------------ splits / dims
 
 

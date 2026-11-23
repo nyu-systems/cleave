@@ -157,7 +157,19 @@ class Program:
     @property
     def ops(self) -> list[Op]:
         """Input and compute records in builder order (outputs are in ``.outputs``)."""
-        return [r for r in self._records if r.kind != "output"]
+        return [r for r in self._live_records() if r.kind != "output"]
+
+    def _live_records(self) -> list[Op]:
+        """``_records`` without dangling compute ops (ops no output depends on).
+
+        Tracing may leave such ops behind (e.g. a gradient built but not declared as an
+        output); they have no effect on any output, so every lowered view drops them.
+        """
+        live = {o.tensor.id for o in self.outputs}
+        for r in reversed(self._records):
+            if r.out in live:
+                live.update(a for a in r.args if isinstance(a, int))
+        return [r for r in self._records if r.kind in ("input", "output") or r.out in live]
 
     @property
     def op_count(self) -> int:
@@ -181,7 +193,7 @@ class Program:
             "dtype": self.dtype.name,
             "inputs": [[[dim(d) for d in s.dims], s.dtype.name] for s in self.inputs],
             "ops": [[r.kind, [a if isinstance(a, int) else repr(float(a)) for a in r.args],
-                     [[k, v] for k, v in r.attrs if k != "name"]] for r in self._records],
+                     [[k, v] for k, v in r.attrs if k != "name"]] for r in self._live_records()],
         }
         blob = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(blob.encode()).hexdigest()
@@ -276,7 +288,7 @@ class Program:
 
     def _lowerable(self, what: str) -> None:
         """Refuse reference-only ops (``log``) before anything is built."""
-        bad = sorted({r.kind for r in self._records if r.kind in _REFERENCE_ONLY})
+        bad = sorted({r.kind for r in self._live_records() if r.kind in _REFERENCE_ONLY})
         if bad:
             raise SpecError(f"{self.name}: {what}: {bad} are reference-only ops (usable inside a "
                             "sample= function); no kernel lowers them")
@@ -316,7 +328,7 @@ class Program:
         flags = iter(flags)
         env = {}
         val = lambda a: env[a] if isinstance(a, int) else a  # noqa: E731
-        for r in self._records:
+        for r in self._live_records():
             if r.kind == "input":
                 t = self._values[r.out]
                 env[r.out] = graph.create_tiled_input(t.shape, next(flags), core.dtype(t.dtype.name))
@@ -348,7 +360,7 @@ class Program:
             return d
 
         out = []
-        for r in self._records:
+        for r in self._live_records():
             kind = f"{r.kind}_{r.attr('dim')}" if r.kind in _REDUCE else r.kind
             info = {"op_type": f"kn_{kind}_op",
                     "input_tensors": [desc(a) for a in r.args if isinstance(a, int)],
