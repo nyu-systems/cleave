@@ -357,7 +357,8 @@ def declared_inputs_hook(program, input_names, graph):
     that recomputes every declared input with ``program.derive_inputs`` from the drawn values
     of the inputs it reads, so a kernel is validated (and timed) on, say, a real
     log-sum-exp rather than noise. ``input_names`` is the placeholder of each Program input
-    (``Plan.inputs``); the inputs are matched by that name, never by position.
+    (``Plan.inputs``; ``None`` for an input the graph does not read); the inputs are matched
+    by that name, never by position.
     """
     from ..core.errors import SpecError
 
