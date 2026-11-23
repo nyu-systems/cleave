@@ -54,5 +54,6 @@ if __name__ == "__main__":
         # The auto rule gives 19 for dQ and dK (~46 min of search at 24 threads); 17 (~5.5 min)
         # already finds the shared graph with D = sum_D(dO * o).
         max_ops=17,
-        tolerance=(cl.Tolerance(rtol=5e-3),) * 3,  # placeholder, measured below
+        # dQ, dK, dV; measured 1.1e-3, 1.1e-3, 9.8e-4 (3 seeds, fast preset)
+        tolerance=(cl.Tolerance(rtol=5e-3),) * 3,
     )
