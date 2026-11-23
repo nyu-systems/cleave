@@ -36,6 +36,50 @@ def emit_staged_copy(
     buf.block(gen_copy(src=src, dst=dst, same_level=False))
 
 
+HOISTED_SUFFIX = "_hoisted"
+
+
+def hoisted_nodes(graph):
+    """``(nodes, kept)``: the ``invariant_nodes`` of loop ``graph`` evaluated once, and
+    those of them (``kept``) whose value later iterations read from a shared buffer
+    allocated before the loop (``<name>_hoisted``).
+
+    A value is kept only where every node outside the hoisted set reads it staged
+    through shared memory in its own dtype (``stage_fragment_operands_in_shared``, no
+    cast): that buffer exists anyway, inside the loop, and is filled every iteration;
+    kept, it is filled once. Nodes failing this, and those reading them, stay in the loop.
+    """
+    nodes = list(getattr(graph, "invariant_nodes", ()) or ())
+    while nodes:
+        inside = set(nodes)
+
+        def ok(node):
+            if any(
+                isinstance(e.src_node, ComputeOpNode) and e.src_node not in inside
+                for e in node.inputs
+            ):
+                return False
+            readers = [e for e in node.outputs if e.dst_node not in inside]
+            if not readers:
+                return True
+            return graph.tinfo_map.get(node, (None, None))[1] == "r" and all(
+                isinstance(e.dst_node, ComputeOpNode)
+                and e.dst_node in graph.nodes
+                and e.dst_id in getattr(e.dst_node, "stage_fragment_operands_in_shared", ())
+                and e.dst_id not in getattr(e.dst_node, "index_inputs", ())
+                and e.dst_node.dtype == node.out_dtype
+                for e in readers
+            )
+
+        kept_nodes = [n for n in nodes if ok(n)]
+        if len(kept_nodes) == len(nodes):
+            break
+        nodes = kept_nodes
+    inside = set(nodes)
+    kept = [n for n in nodes if any(e.dst_node not in inside for e in n.outputs)]
+    return nodes, kept
+
+
 class OperandResolver:
     def _resolve_operand(self, buf: CodeBuffer, graph, node, input_idx, edge, staged):
         """The (buffer name, scope) a compute node reads input ``input_idx`` from.
@@ -43,6 +87,10 @@ class OperandResolver:
         Emits the dtype cast and the fragment-to-shared staging the operand needs first.
         """
         src = edge.src_node
+        hoisted, kept = hoisted_nodes(graph)
+        if src in kept and node not in hoisted:
+            # filled on the first iteration, before the loop's first reader (``hoisted_nodes``)
+            return graph.tinfo_map[src][0] + HOISTED_SUFFIX, graph.tinfo_map[src][1]
         if isinstance(src, GraphNode):
             assert isinstance(
                 edge, AccumEdge

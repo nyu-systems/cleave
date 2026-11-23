@@ -21,7 +21,7 @@ from .tensor_codegen import (
 )
 from .buffer import BASE_INDENT, CodeBuffer
 from .macros import qualify_name
-from .operands import emit_alloc, kept_extents, tc_layout
+from .operands import HOISTED_SUFFIX, emit_alloc, hoisted_nodes, kept_extents, tc_layout
 
 
 def _bind_node(graph, arg, is_main):
@@ -334,6 +334,22 @@ class KernelEmitter:
                 seed = [here for _, here, _ in self._prefetch_scalars(graph, node, "0")]
                 dep.block(self._emit_prefetch_read(graph, node, seed, name_prefix))
             kwargs.append(f"{tname}={tname}")
+        # Loop-invariant values: filled on the first iteration, read by every iteration.
+        _, kept = hoisted_nodes(graph)
+        for node in kept:
+            name = graph.tinfo_map[node][0] + HOISTED_SUFFIX
+            dep.block(
+                gen_tensor_allocation_str(
+                    name,
+                    kept_extents(graph.tmap[node].tile_size),
+                    node.out_dtype,
+                    scope="s",
+                    is_tc_layout=True,
+                )
+            )
+            kwargs.append(f"{name}={name}")
+        if kept:
+            kwargs.append("i0=i0")
 
     def _build_graph_call(
         self,
@@ -414,6 +430,12 @@ class KernelEmitter:
                 kept_extents(graph.tmap[node].tile_size), node.out_dtype
             )
             params.append(f"{graph.tinfo_map[node][0]}: {ty}")
+        _, kept = hoisted_nodes(graph)
+        for node in kept:
+            ty = gen_tensor_type(kept_extents(graph.tmap[node].tile_size), node.out_dtype)
+            params.append(f"{graph.tinfo_map[node][0]}{HOISTED_SUFFIX}: {ty}")
+        if kept:
+            params.append("i0: T.int32")
         if not is_main_iter:
             params += self._accum_params(graph)
         return f"\n@T.macro\ndef {qualified_name}_iter({''.join(p + ', ' for p in params)}):\n"
@@ -488,6 +510,28 @@ class KernelEmitter:
                     for sname, _, ahead in self._prefetch_scalars(graph, node, "i0")
                 ]
                 buf.block(self._emit_prefetch_read(graph, node, scalars, name_prefix))
+
+    def _emit_hoisted_block(self, graph, name_prefix, buf: CodeBuffer) -> set:
+        """Loop-invariant nodes, evaluated on the first iteration only; the values later
+        iterations read are copied into the buffers the loop's caller allocated.
+
+        On the first iteration rather than before the loop: TileLang 0.1.13 mis-handles
+        fragment math in front of a warp-specialized ``T.Pipelined`` loop (wrong results
+        at 128 threads, "no available layout found" at 256).
+        """
+        nodes, kept = hoisted_nodes(graph)
+        if not nodes:
+            return set()
+        buf.line("if i0 == 0:")
+        with buf.indented():
+            for node in nodes:
+                self._emit_compute(graph, node, buf, False, name_prefix)
+            for node in kept:
+                tname = graph.tinfo_map[node][0]
+                buf.block(
+                    gen_copy(src=tname, dst=tname + HOISTED_SUFFIX, same_level=False)
+                )
+        return set(nodes)
 
     def _emit_placeholder(self, graph, node, buf, is_main_iter, name_prefix):
         if is_main_iter:
@@ -653,8 +697,11 @@ class KernelEmitter:
         )
         self._emit_window_block(graph, name_prefix, buf)
         self._emit_prefetch_block(graph, name_prefix, buf)
+        hoisted = self._emit_hoisted_block(graph, name_prefix, buf)
         for node in find_topo_sort(graph.nodes):
             if node in graph.prefetch_nodes or node in graph.window_nodes:
+                continue
+            if node in hoisted:
                 continue
             emitter = next(
                 (attr for kind, attr in self._NODE_EMITTERS if isinstance(node, kind)),

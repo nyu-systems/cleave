@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, Set
 from tilelang.carver.roller.node import Edge
 from ..core.errors import ScheduleRejected
 from ..ir.graph import (
+    ComputeOpNode,
     Graph,
     OutputNode,
     GraphNode,
@@ -952,6 +953,42 @@ def _join_inter_outputs(
     }
 
 
+def loop_invariant_nodes(graph: Graph) -> List:
+    """Compute nodes of iterative ``graph`` whose value is the same on every iteration.
+
+    A placeholder is invariant when its tile spans its whole block (``tmap`` has no dim
+    the loop counter slices: the caller loads it once, before the loop). A compute node is
+    invariant when it neither accumulates across iterations nor reads a runtime scalar,
+    its own tile does not follow the counter, and every input is an invariant node of
+    ``graph`` (transitively, so the loop dims of all its sources are absent). Topological
+    order.
+    """
+    def fixed(node):
+        tmap = graph.tmap.get(node)
+        return tmap is not None and tuple(tmap.shape) == tuple(tmap.tile_size)
+
+    skip = set(graph.accum_nodes) | set(graph.prefetch_nodes) | set(graph.window_nodes)
+    invariant, result = set(), []
+    for node in find_topo_sort(graph.nodes):
+        if isinstance(node, PlaceHolderNode):
+            if node in graph.nodes and fixed(node):
+                invariant.add(node)
+            continue
+        if (
+            isinstance(node, ComputeOpNode)
+            and node in graph.nodes
+            and node not in skip
+            and not getattr(node, "scalar_args", ())
+            and getattr(node, "producer_op", None) is None
+            and fixed(node)
+            and node.inputs
+            and all(e.src_node in invariant for e in node.inputs)
+        ):
+            invariant.add(node)
+            result.append(node)
+    return result
+
+
 def _with_token_axis_deps(output_axis_deps, flat_graph, output_node, inter_chains):
     """``output_axis_deps`` completed, by axis provenance, for every node it misses.
 
@@ -1244,6 +1281,11 @@ def apply_tiling(cand: List) -> List[Graph]:
             top_bind_node,
             ordered_nodes,
         )
+        # Only kernels with accumulation contexts: there, an op of the dQ side (D =
+        # sum_D(dO * o)) is loop-invariant in the dK/dV loop. Other kernels keep their text.
+        for gnode in graphs["main"].nodes:
+            if isinstance(gnode, GraphNode) and gnode.graph.accumulation:
+                gnode.graph.invariant_nodes = loop_invariant_nodes(gnode.graph)
     lock_graph(graphs["main"])  # graph structure is fixed after this point
 
     graphs["main"].nodes = find_topo_sort(main_output_nodes)

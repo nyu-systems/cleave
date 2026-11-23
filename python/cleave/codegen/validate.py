@@ -111,7 +111,7 @@ class GraphValidator:
                 ), f"{where}: `{field_name}` is only emitted for the main graph."
 
         # --- prefetched and windowed nodes stay part of the dataflow --------------------
-        for field_name in ("prefetch_nodes", "window_nodes"):
+        for field_name in ("prefetch_nodes", "window_nodes", "invariant_nodes"):
             nodes = getattr(graph, field_name, ())
             assert not (nodes and is_main), (
                 f"{where}: `{field_name}` only means something inside a loop, and the main "

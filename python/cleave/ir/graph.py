@@ -166,6 +166,12 @@ class Graph:
         # `window_nodes`. Required whenever there are any: without it every iteration would
         # refill, which is what hoisting is meant to avoid.
     )
+    invariant_nodes: List[Node] = field(
+        default_factory=list
+    )  # compute nodes of an iterative graph that read nothing the loop counter selects
+    # (set by `apply_tiling`, see `loop_invariant_nodes`). Code generation evaluates them
+    # once, on the first iteration, into buffers allocated before the loop that the later
+    # iterations read: `sum_D(dO * o)` of an attention backward looping over KV blocks.
     dyn_dims: List[str] = field(
         default_factory=list
     )  # symbolic extent names; each must appear bare in some tensor shape so the
