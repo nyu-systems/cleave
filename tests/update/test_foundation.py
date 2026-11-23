@@ -11,6 +11,7 @@ for each accumulator, the policy lets the loop step, and ``apply_tiling`` assemb
 with the max carried. The traced order keeps its pin, with the reason.
 """
 
+import copy
 import dataclasses
 import functools
 import re
@@ -21,6 +22,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from cleave import pipeline as P
+from cleave.core.errors import ScheduleRejected
 from cleave.ir.graph_utils import graph_tiers
 from cleave.ir.ops import NEG_FLT_MAX, Div, Matmul, ReduceMax, ReduceSum
 from cleave.ir.update_rule import loop_key, show, use_searched_updates
@@ -29,6 +31,8 @@ from cleave.runtime.compile import build_candidate
 from cleave.schedule import streaming
 from cleave.schedule.streaming import FOREIGN_RECORD, StreamingRefused, assemble, sites, streamed
 from cleave.schedule.tiling import (
+    absorbed_axis_conflict,
+    absorbed_reductions,
     apply_tiling,
     carried_reductions,
     reduction_ancestors,
@@ -421,6 +425,120 @@ def test_assemble_refuses_a_factor_without_a_tile_op_before_it_edits(monkeypatch
     assert [n.name for n in loop_tier(tiled).nodes] == before and not loop_tier(tiled).lag_nodes
     assert not [e for e in recorded_node(loop_tier(tiled)).outputs
                 if e.dst_node.name.endswith("_prev")]
+
+
+# ------------------------------------------- a carried max steps with its loop, or not at all
+
+
+def with_steps(cand, **steps):
+    """``cand`` with the reduction steps of the named nodes replaced: a step map the policy
+    does not emit, built by hand."""
+    stepped = copy.copy(cand)
+    stepped.rstep_map = {node: {axis: steps.get(node.name, step) for axis, step in own.items()}
+                         for node, own in cand.rstep_map.items()}
+    return stepped
+
+
+def verdicts(ir, cand):
+    """``(what apply_tiling says, what the policy's twin of it says)`` of a candidate: the
+    refusal text, or None where it is built / has no conflict."""
+    nodes, red = scheduled_reductions(ir)
+    twin = absorbed_axis_conflict(nodes, cand.rstep_map, red, reduction_ancestors(nodes),
+                                  carried_reductions(ir))
+    try:
+        apply_tiling(cand)
+    except ScheduleRejected as refusal:
+        return str(refusal), twin
+    return None, twin
+
+
+def test_a_carried_max_that_is_out_of_step_with_its_loop_is_refused():
+    """C1, C2: the loop of the sums has one counter. A step map in which the carried max
+    is stepped differently from a sum that iterates, or is stepped while a sum that reads
+    its finished value is not, is refused with a typed reason -- by ``apply_tiling`` and,
+    in the same words, by the check the policy rates its step maps with."""
+    ir = lowered(flash_by_hand, SHORT)
+    full, record = record_by_hand(ir)
+    base = looped_candidate(ir)
+    row_sum, value_matmul = node_of(ir, ReduceSum).name, node_of(ir, Matmul, 1).name
+    assert set(record.loops) == {row_sum, value_matmul}
+    in_step = {full.name: 32, row_sum: 32, value_matmul: 32}
+    assert verdicts(ir, with_steps(base, **in_step)) == (None, None)
+
+    def carried_by(loop, step, own):
+        return (f"{full.name} is carried by the loop of {loop}, which steps {step}, but is "
+                f"itself stepped {own}: one loop counter advances both")
+
+    def needed_whole(reader, own):
+        return (f"{full.name} is stepped {own} but {reader}, which reads its finished value, "
+                "is not: the value would be needed whole and per iteration at once")
+
+    first = next(n.name for n in ir.nodes if n.name in record.loops)  # the one named first
+    out_of_step = {
+        "the max whole, the sums stepped": (
+            {**in_step, full.name: 256}, carried_by(first, 32, 256)),
+        "the max stepped 64, the sums 32": (
+            {**in_step, full.name: 64}, carried_by(first, 32, 64)),
+        "only the row sum stepped": (
+            {full.name: 256, row_sum: 32, value_matmul: 256}, carried_by(row_sum, 32, 256)),
+        "only the value matmul stepped": (
+            {full.name: 256, row_sum: 256, value_matmul: 32}, carried_by(value_matmul, 32, 256)),
+        "the max stepped alone": (
+            {full.name: 32, row_sum: 256, value_matmul: 256}, needed_whole(first, 32)),
+    }
+    for label, (steps, text) in out_of_step.items():
+        assert verdicts(ir, with_steps(base, **steps)) == (text, text), label
+    # the flat graph was not touched by any of the refused candidates
+    assert full.streaming is record and not hasattr(ir, "streaming_refusals")
+
+
+def test_without_a_record_the_out_of_step_refusals_do_not_exist():
+    """The same step maps on the same graph without a record: whatever the tiler said
+    before is what it says (nothing is carried, so nothing can be out of step)."""
+    with_record = lowered(flash_by_hand, SHORT)
+    full, _ = record_by_hand(with_record)
+    base = looped_candidate(with_record)
+    ir = lowered(flash_by_hand, SHORT)
+    assert carried_reductions(ir) == {}
+    row_sum, value_matmul = node_of(ir, ReduceSum).name, node_of(ir, Matmul, 1).name
+    absorbed = ("Reduction axis of {} is shared with an absorbed ancestor reduction; one loop "
+                "cannot both advance it and hold it whole.")
+    plain = with_steps(base)
+    plain.flat_graph = ir
+    for steps, want in [
+        # the step map that is served with a record is the absorbed-axis conflict without
+        ({full.name: 32, row_sum: 32, value_matmul: 32}, absorbed),
+        ({full.name: 64, row_sum: 32, value_matmul: 32}, absorbed),
+        # the max whole in every iteration of the sums' loop: built, as it always was
+        ({full.name: 256, row_sum: 32, value_matmul: 32}, None),
+    ]:
+        said, twin = verdicts(ir, with_steps(plain, **steps))
+        if want is None:
+            assert said is None and twin is None
+            continue
+        assert said == twin and said in {want.format(row_sum), want.format(value_matmul)}
+        assert "carried" not in said and "finished value" not in said
+
+
+def test_a_carried_max_is_not_absorbed_by_the_loop_that_carries_it():
+    """``absorbed_reductions(carried=)``: an ancestor that iterates under an iterating
+    descendant is absorbed into its loop and held whole -- except the value that loop
+    carries, with respect to the descendants it is carried for."""
+    ir = lowered(flash_by_hand, SHORT)
+    full, record = record_by_hand(ir)
+    base = looped_candidate(ir)
+    nodes, _ = scheduled_reductions(ir)
+    ancestors, carried = reduction_ancestors(nodes), carried_reductions(ir)
+    scores = node_of(ir, Matmul).name
+    step_map = with_steps(base, **{scores: 32}).rstep_map  # every reduction iterates
+    names = lambda found: sorted(n.name for n in found)  # noqa: E731
+    assert names(absorbed_reductions(nodes, step_map, ancestors)) == sorted([scores, full.name])
+    assert names(absorbed_reductions(nodes, step_map, ancestors, {})) == sorted([scores, full.name])
+    assert names(absorbed_reductions(nodes, step_map, ancestors, carried)) == [scores]
+    # carried for one of its descendants only: still absorbed by the loop of the other
+    (key,) = carried
+    one = {key: carried[key][:1]}
+    assert names(absorbed_reductions(nodes, step_map, ancestors, one)) == sorted([scores, full.name])
 
 
 # --------------------------------------------------------------------------- the validator
