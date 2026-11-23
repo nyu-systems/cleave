@@ -66,9 +66,12 @@ def _kernel_key(program, so: SuperoptConfig, sc: ScheduleConfig, ev: EvalConfig)
 
     # names are not in the fingerprint but are baked into the Kernel's call signature
     names = [[s.name for s in program.inputs], [o.name for o in program.outputs]]
+    # per_output enters only where it is on: every other program keeps its key
+    per_output = ["per_output"] if so.resolve_per_output(program) else []
     return cache.digest("kernel", cache.VALIDATION, program.fingerprint(), names,
-                        so.resolve_max_ops(program), fields(so, "threads", "cache", "max_ops"),
-                        fields(sc), fields(ev, "max_parallel", "timeout_s"))
+                        so.resolve_max_ops(program),
+                        fields(so, "threads", "cache", "max_ops", "per_output"),
+                        fields(sc), fields(ev, "max_parallel", "timeout_s"), *per_output)
 
 
 def compile(fn_or_program, *, shapes: dict | None = None, dtype=None, preset="default",
