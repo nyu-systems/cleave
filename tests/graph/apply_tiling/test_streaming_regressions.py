@@ -10,6 +10,9 @@ rolling kernels that were wrong:
                        prototypes rescaled the shared sum for one of them).
 ``column_weighted``    the max is indexed by the accumulator's TRAILING axis
                        (``O[m, n] *= alpha[m]`` was emitted for a factor indexed by ``n``).
+``self_weighted``      the same with ``v = x^T``: one input dim is the accumulator's rows
+                       and the max's, and the factor still belongs to the trailing axis
+                       (the assembly built ``ACC[i0, i1] *= S[i0]`` for it).
 ``max_normalized``     a max of the shifted exp: its accumulator starts at ``-inf``.
 ``sum_next_to_exp``    the exp is read next to its own finished row sum.
 ``unscaled_attention`` traced order, the max and the exp reading the QK^T matmul itself.
@@ -18,10 +21,10 @@ Every candidate goes through the default build. Anything but a ``ScheduleRejecte
 propagates: a refused tiling is a result, a crash is a bug.
 
 Who refuses is pinned per case as a histogram of reasons. The classification refuses the
-last three (T5, T3, T3): no record is ever written for them, the pins stay. The first two
-are classified as streaming obstacles: there the engine finds no rule (``tests/update``),
-and the assembly refuses even a record put on them by hand -- the refusals below are the
-assembly's, on records that a bug in the engine would have to write.
+last three (T5, T3, T3): no record is ever written for them, the pins stay. The first
+three are classified as streaming obstacles: there the engine finds no rule
+(``tests/update``), and the assembly refuses even a record put on them by hand -- the
+refusals below are the assembly's, on records that a bug in the engine would have to write.
 """
 
 import re
@@ -54,6 +57,15 @@ NOT_LEADING = (stream.StreamingRefused,
 NOT_ITS_DIMS = (stream.StreamingRefused,
                 r"reduce_max_\w+: accumulator mma_\w+ tile \(N, N\) does not lead with the row "
                 r"tile \(N,\): its dim N is not dim N of reduce_max_\w+")
+ALSO_ITS_TRAILING_DIM = (stream.StreamingRefused,
+                         r"reduce_max_\w+: accumulator mma_\w+ tile \(N, N\) does not lead with "
+                         r"the row tile \(N,\): dim N of reduce_max_\w+ is also its dim N")
+# The tiler's own refusals of a matmul whose two output dims are one input dim (x^T @ e).
+ONE_DIM_TWO_AXES = (ScheduleRejected,
+                    r"Expected exactly one launch-axis mapping for iter dim N, got \[N, N\]\.")
+SLICE_AND_WHOLE = (ScheduleRejected,
+                   r"Dim N is held whole but launch axes \[N, N\] index it and the grid walks "
+                   r"\[N\]: one tile cannot be a slice and the whole\.")
 
 # A tile that holds one row in the main tier: the build refuses its unit extent
 # (``refuse_unit_extents``) for every graph, with a max or without.
@@ -68,6 +80,8 @@ CASES = {
                       [(TWO_REPAIRS, 27), (SINGLE_ROW_LOOP, 6), (UNIT_ROW, 1)]),
     "column_weighted": (X.column_weighted, dict(M=128, K=4096, N=256), (None,), 0,
                         [(NOT_LEADING, 34), (NOT_ITS_DIMS, 12)]),
+    "self_weighted": (X.self_weighted, dict(K=4096, N=128), (None,), 0,
+                      [(ONE_DIM_TWO_AXES, 34), (SLICE_AND_WHOLE, 6), (ALSO_ITS_TRAILING_DIM, 4)]),
     "max_normalized": (X.max_normalized, dict(R=256, C=4096, D=64),
                        ("must be sums or matmuls that start at zero",), 0, []),
     "sum_next_to_exp": (X.sum_next_to_exp, dict(R=256, C=4096), ("two passes",), 14,
@@ -221,3 +235,55 @@ def test_factor_on_the_trailing_axis_is_refused_on_a_consistent_loop(monkeypatch
         wanted = NOT_ITS_DIMS if rows == cols else NOT_LEADING
         assert re.fullmatch(wanted[1], stream._reason_key(refusal.value)), refusal.value
     assert by_kind["equal"] >= 4 and by_kind["unequal"] >= 4, by_kind
+
+
+def test_a_dim_that_is_both_the_rows_and_the_trailing_axis_is_refused(monkeypatch):
+    """``(x^T @ e) / sum(e, 0)`` with a record by hand. The accumulator's rows come from the
+    columns of ``x``, and so do the max's rows, so dim 0 of the accumulator IS dim 0 of the
+    max -- but the columns of ``x`` are also the accumulator's trailing axis, the one the
+    factor belongs to (``acc[n1, n2] = sum_k x[k, n1] * exp(x[k, n2] - m[n2])``). A repair
+    of the leading dim would emit ``ACC[i0, i1] *= S[i0]``. Every looped tiling the tiler
+    builds is refused, and nothing is edited."""
+    ir = X.streamed_ir(X.self_weighted, dict(K=4096, N=128))
+    (m,) = X.maxes(ir)
+    (matmul,) = [n for n in ir.nodes if type(n) is Matmul]
+    assert stream._other_lead(ir, m, matmul) == f"dim 0 of {m.name} is also its dim 1"
+    looped = 0
+    for cand in search_tiling(ir, topk=1000):
+        with monkeypatch.context() as patch:
+            patch.setattr(stream, "assemble", lambda tiled, flat_graph=None: tiled)
+            try:
+                tiled = apply_tiling(cand)
+            except ScheduleRejected:
+                continue
+        (loop,) = [tier for tier, owner in graph_tiers(tiled) if owner]
+        assert matmul.name in {n.name for n in loop.accum_nodes}
+        before = [n.name for n in loop.nodes]
+        with pytest.raises(stream.StreamingRefused) as refusal:
+            stream.assemble(tiled, ir)
+        assert [n.name for n in loop.nodes] == before and not loop.accum_scale
+        assert re.fullmatch(ALSO_ITS_TRAILING_DIM[1], stream._reason_key(refusal.value)), \
+            refusal.value
+        looped += 1
+    assert looped == 4
+
+
+SERVED = {  # every family the assembly serves: its accumulators lead with the max's dims
+    "flash_attention": (X.flash_attention, dict(H=32, SQ=64, SKV=256, D=64)),
+    "one_head": (X.flash_attention, dict(H=1, SQ=64, SKV=256, D=64)),
+    "flash_and_its_max": (X.flash_and_its_max, dict(H=32, SQ=64, SKV=256, D=64)),
+    "flash_rows": (X.flash_rows, dict(R=256, C=4096, D=64)),
+    "column_average": (X.column_average, dict(H=4, K=4096, N=256)),
+    "column_average_2d": (X.column_average_2d, dict(K=4096, N=256)),
+}
+
+
+@pytest.mark.parametrize("name", sorted(SERVED))
+def test_the_provenance_check_passes_every_served_family(name):
+    fn, shapes = SERVED[name]
+    ir = X.streamed_ir(fn, shapes)
+    for ob in X.obstacles_of(ir):
+        full = next(n for n in ir.nodes if n.name == ob.full)
+        for acc in ob.loops:
+            node = next(n for n in ir.nodes if n.name == acc)
+            assert stream._other_lead(ir, full, node) is None, (ob.full, acc)

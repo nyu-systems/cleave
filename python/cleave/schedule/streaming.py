@@ -298,7 +298,7 @@ def _refused(node, text) -> StreamingRefused:
 
 
 def _other_lead(flat_graph, full, acc):
-    """The first dim of ``full`` that is not the same dim of ``acc``, or None.
+    """Why the leading dims of ``acc`` are not the dims of ``full``, or None.
 
     The repair multiplies ``acc`` by a factor tiled like ``full`` (``Rescale(lead)``):
     element ``[i, ..., j]`` of the accumulator by element ``[i, ...]`` of the factor. That
@@ -306,8 +306,15 @@ def _other_lead(flat_graph, full, acc):
     their tile extents cannot tell when two of them are equal (``(v @ e) / sum(e, 0)``
     leads with the rows of ``v``; its max is indexed by its columns). It is read off the
     output-axis provenance of the flat graph (which input dims each output dim is), as the
-    policy reads it. A unit dim has no provenance on either side (MLA decode's batch of
-    one), and any unit dim is the same as any other."""
+    policy reads it: dim ``k`` of ``acc`` must come from where dim ``k`` of ``full`` comes
+    from, and no other dim of ``acc`` may. Where one input dim is both (``(x^T @ e) /
+    sum(e, 0)``: the rows of the accumulator and the columns it sums under the max are the
+    columns of ``x``), provenance cannot say which dim the factor belongs to, and it is
+    the trailing one.
+
+    A dim with no provenance on either side is left to the tile check before this one: a
+    unit dim comes from nowhere (one head, MLA decode's batch of one), and so does a dim
+    the analysis does not follow through a view (the heads of a split partial)."""
     if flat_graph is None:
         return None  # nothing is served without its flat graph anyway (R1)
     from .tiling import _scheduled_axes
@@ -315,10 +322,13 @@ def _other_lead(flat_graph, full, acc):
     tokens = {(n.name, out): t for (n, out), t in _scheduled_axes(flat_graph).out_tokens.items()}
     rows, lead = tokens.get((full.name, 0)), tokens.get((acc.name, 0))
     if rows is None or lead is None:
-        return 0
+        return f"its dim 0 is not dim 0 of {full.name}"
     for k, dim in enumerate(rows):
         if k >= len(lead) or bool(dim) != bool(lead[k]) or (dim and not dim & lead[k]):
-            return k
+            return f"its dim {k} is not dim {k} of {full.name}"
+        also = next((j for j, other in enumerate(lead) if j != k and dim & other), None)
+        if also is not None:
+            return f"dim {k} of {full.name} is also its dim {also}"
     return None
 
 
@@ -383,8 +393,7 @@ def _locate(tier, owner, full, record, flat_graph=None):
         other = _other_lead(flat_graph, full, acc)
         if other is not None:
             raise _refused(full, f"accumulator {acc.name} tile {acc_tile} does not lead with "
-                                 f"the row tile {tuple(rows)}: its dim {other} is not dim "
-                                 f"{other} of {full.name}")
+                                 f"the row tile {tuple(rows)}: {other}")
         if len(_squeezed(acc_tile)) != len(acc_tile):
             raise _refused(full, f"accumulator {acc.name} has a unit extent in its tile "
                                  f"{acc_tile}")

@@ -122,6 +122,14 @@ def column_weighted(v: cl.Tensor["M", "K"], x: cl.Tensor["K", "N"]):
     return (v @ e) / cl.sum(e, 0, keepdim=True)
 
 
+def self_weighted(x: cl.Tensor["K", "N"]):
+    """``(x^T @ e) / sum(e, 0)``: :func:`column_weighted` with ``v = x^T``. One input dim,
+    the columns of ``x``, is both the accumulator's rows and the max's: the factor still
+    belongs to the accumulator's TRAILING axis."""
+    e = stable_exp(x, 0)
+    return (x.mT @ e) / cl.sum(e, 0, keepdim=True)
+
+
 def sum_next_to_exp(x: cl.Tensor["R", "C"]):
     """``sum(e + l) / l``: the exp is added to its own finished row sum."""
     e = stable_exp(x)
