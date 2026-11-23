@@ -21,6 +21,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+import cleave.lang as cl
 from cleave import pipeline as P
 from cleave.core.errors import ScheduleRejected
 from cleave.ir.graph_utils import graph_tiers
@@ -284,6 +285,31 @@ def test_a_graph_without_a_record_is_scheduled_as_before(monkeypatch):
                 for x in v.values()} == {256}
 
 
+def test_an_obstacle_that_is_not_served_keeps_only_the_tilings_that_build():
+    """A graph whose obstacle has a reason instead of a record (``streaming_refusals``)
+    still gets the filter: the policy steps such a max on its own while the sums are
+    pinned, and none of those tilings can be built. They are dropped before the top-k cut,
+    counted by reason."""
+    ir = lowered(flash_by_hand, SHORT)
+    unfiltered, _ = tilings(ir)
+    built = []
+    for cand in unfiltered:
+        try:
+            schedule_kernel(cand)
+        except ScheduleRejected:
+            continue
+        built.append(cand)
+    assert (len(unfiltered), len(built)) == (32, 8)
+    ir.streaming_refusals = [f"{node_of(ir, ReduceMax).name}: it has no update rule"]
+    assert streaming.streaming_accept(ir) is not None
+    kept, reasons = tilings(ir)
+    assert len(kept) == 8
+    assert {tuple(steps(c)) for c in kept} == {tuple(steps(c)) for c in built}
+    assert sum(reasons.values()) == 24 and len(reasons) == 1
+    (reason,) = reasons
+    assert "is computed per iteration of" in reason and "outside it" in reason
+
+
 def test_a_record_lets_the_loop_step_under_its_max():
     ir = lowered(flash_by_hand, SHORT)
     full, record = record_by_hand(ir)
@@ -539,6 +565,46 @@ def test_a_carried_max_is_not_absorbed_by_the_loop_that_carries_it():
     (key,) = carried
     one = {key: carried[key][:1]}
     assert names(absorbed_reductions(nodes, step_map, ancestors, one)) == sorted([scores, full.name])
+
+
+def flash_and_its_max(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
+                      v: cl.Tensor["H", "SKV", "D"]):
+    """The flash form that also returns its row max (what a split partial hands on)."""
+    s = (q @ k.mT) / q.shape[-1] ** 0.5
+    m = cl.max(s, -1, keepdim=True)
+    e = cl.exp(s - m)
+    return (e @ v) / cl.sum(e, -1, keepdim=True), m
+
+
+def test_a_returned_max_leaves_its_loop_as_carried_state(monkeypatch):
+    """``carry_early``: a carried value that is read outside its loop is registered as an
+    accumulator of the loop while ``apply_tiling`` is still building. Otherwise the max
+    would be one more per-iteration value that is read outside, which is a refusal."""
+    ir = lowered(flash_and_its_max, SHORT)
+    full, record = record_by_hand(ir)
+    assert sorted(type(e.dst_node).__name__ for e in full.outputs) == ["OutputNode", "Sub"]
+    kept, reasons = tilings(ir)
+    kinds = Counter("looped" if sites(schedule_kernel(cand)) else "one tile" for cand in kept)
+    assert kinds == {"looped": 24, "one tile": 8} and not reasons
+    cand = looped_candidate(ir)
+    tier = loop_tier(schedule_kernel(cand))
+    assert [n.name for n in tier.accum_nodes][-1] == full.name  # after the loop's own
+    assert {n.name for n in tier.accum_nodes} == {full.name, *record.loops}
+    code, _ = build_candidate(cand)
+    assert f"T.fill(t_{full.name}, -3.4028234663852886e38)" in code
+    assert f"ukernel_copy_1dims_rr(t_{full.name}, t_{full.name}_prev)" in re.sub(r"\s+", " ", code)
+    with monkeypatch.context() as patch:
+        patch.setattr(streaming, "carry_early", lambda main, rstep_map: None)
+        with pytest.raises(ScheduleRejected) as refusal:
+            apply_tiling(cand)
+    assert str(refusal.value).startswith(
+        f"{full.name} is computed per iteration of {tier_owner(schedule_kernel(cand))} but "
+        "also read by ")
+
+
+def tier_owner(tiled) -> str:
+    (owner,) = [owner.name for _, owner in graph_tiers(tiled) if owner is not None]
+    return owner
 
 
 # --------------------------------------------------------------------------- the validator
