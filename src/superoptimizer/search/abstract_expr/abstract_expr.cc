@@ -532,6 +532,11 @@ void add_terms(AbstractExpr const &e, std::vector<std::string> &terms) {
 }
 
 Canonical canonical(AbstractExpr const &e) {
+  // A split is its input, to Z3 and in to_string (the key of the pattern
+  // cache): the canonical form must be a function of that string too.
+  if (auto const *n = dynamic_cast<Split const *>(&e)) {
+    return canonical(*n->input);
+  }
   if (auto const *n = dynamic_cast<Sum const *>(&e)) {
     Canonical c = canonical(*n->summand);
     c.sums += n->red_deg_log;
@@ -583,7 +588,7 @@ Canonical canonical(AbstractExpr const &e) {
   if (auto const *n = dynamic_cast<Relu const *>(&e)) {
     return single("relu(" + canonical_text(canonical(*n->a)) + ")");
   }
-  // Var, and the rest (clamp, rms, opaque, split) as they print
+  // Var, and the rest (clamp, rms, opaque) as they print
   return single(e.to_string());
 }
 

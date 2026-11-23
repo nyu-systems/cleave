@@ -7,6 +7,7 @@
 // declaration does not make o equal to P @ v), and an unread declared input
 // is not an output.
 #include "cleave/superoptimizer/kernel/graph.h"
+#include "cleave/superoptimizer/search/abstract_expr/abstract_expr.h"
 #include "cleave/superoptimizer/search/verification/probabilistic_verifier.h"
 #include "cleave/superoptimizer/type.h"
 
@@ -210,9 +211,40 @@ void test_fingerprint_is_the_definitions() {
   check(!matches(true), "o declared as P @ k does not verify against P @ v");
 }
 
+// The canonical form that the scalar gate and the subpattern fallback of
+// programs with declared inputs use.
+void test_canonical_patterns() {
+  namespace se = cleave_superoptimizer::search;
+  auto var = [](char const *n) { return std::make_shared<se::Var>(n); };
+  auto mul = [](auto a, auto b) { return std::make_shared<se::Mul>(a, b); };
+  auto sum = [](int n, auto a) { return std::make_shared<se::Sum>(n, a); };
+  auto sub = [](auto a, auto b) { return std::make_shared<se::Sub>(a, b); };
+  auto P = var("P"), v = var("v"), dO = var("dO");
+  auto dP = sum(64, mul(dO, v));
+  // P * (dP - sum_SKV(P * dP))  vs  (dP - sum_D(dO * sum_SKV(P * v))) * P
+  auto naive = mul(P, sub(dP, sum(256, mul(P, dP))));
+  auto rewritten = mul(sub(dP, sum(64, mul(dO, sum(256, mul(P, v))))), P);
+  check(se::ac_canonical_string(*naive) == se::ac_canonical_string(*rewritten),
+        "dS and its rewritten form have one canonical form");
+  check(naive->to_string() != rewritten->to_string(), "... but two strings");
+  check(se::ac_canonical_string(*mul(P, v)) != se::ac_canonical_string(*sum(4, mul(P, v))),
+        "a reduction is not dropped");
+  // a split prints as its input (the pattern cache's key): so is its canonical form
+  auto split = std::make_shared<se::Split>(0, sum(256, mul(P, v)));
+  check(se::ac_canonical_string(*split) == se::ac_canonical_string(*sum(256, mul(P, v))),
+        "a split is canonically its input");
+  // dO * o, o = sum_SKV(P * v), is a subpattern of the naive dS (Z3 does not see it)
+  se::CanonicalSubterms terms(*naive);
+  check(terms.contains_subpattern(*mul(dO, sum(256, mul(P, v)))), "dO * o in dS");
+  check(terms.contains_subpattern(*sum(64, mul(dO, sum(256, mul(P, v))))), "D in dS");
+  check(!terms.contains_subpattern(*mul(dO, dO)), "dO * dO is not in dS");
+  check(!terms.contains_subpattern(*sum(1 << 20, mul(P, v))), "no reduction deeper than dS's");
+}
+
 } // namespace
 
 int main() {
+  test_canonical_patterns();
   test_clone_and_json_keep_the_declaration();
   test_bad_declarations_are_refused();
   test_an_unread_declared_input_gets_symbols();
