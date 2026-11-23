@@ -144,6 +144,11 @@ def describe_tile(t) -> str:
     text = f"tile={list(t.output_tile)}"
     if rsteps:
         text += f" rstep={rsteps}"
+    accumulation = getattr(t, "accumulation", None)
+    if accumulation:  # per output, in graph order: which one the CTA loop accumulates
+        outputs = [n for n in t.flat_graph.nodes if n.is_output()]
+        contexts = [accumulation.get(o.inputs[0].src_node, "?") for o in outputs]
+        text += f" acc=[{','.join(contexts)}]"
     if getattr(t, "n_threads", None):
         text += f" threads={t.n_threads}"
     return text

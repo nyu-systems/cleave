@@ -10,7 +10,10 @@ from ...ir.graph import ViewOpNode
 from ...ir.analysis import (
     build_output_axis_provenance,
     build_reduction_axis_provenance,
+    find_orthogonal_reduction_groups,
+    get_output_axis_tokens,
 )
+from ...ir.ops import Copy, Div, Mul
 
 import copy
 import numpy as np
@@ -18,6 +21,17 @@ from queue import Queue, PriorityQueue
 
 
 DEFAULT_N_THREADS = 128
+
+# Accumulation contexts (see ``DefaultPolicy._for_assignment``). An ``inter`` output is
+# summed across CTAs with an atomic add into an fp32 buffer: every element of its block is
+# read and written back once per CTA, hence the weight on its 4-byte elements.
+INTRA, INTER = "intra", "inter"
+ATOMIC_ACCUM_BYTES = 4
+ATOMIC_COST_WEIGHT = 2
+# Ops an inter output may apply between its reduction and the output: linear in the
+# reduction's result (one input; a scalar operand is folded into the op), so the sum of
+# the per-CTA partials is the output.
+_LINEAR_POST_OPS = (Mul, Div, Copy)
 
 
 class DefaultPolicy:
@@ -65,6 +79,16 @@ class DefaultPolicy:
         self.force_fusion = force_fusion
         self.flat_graph = flat_graph
         self.canonical_output_node = self._select_canonical_output_node()
+        # Output groups that reduce over orthogonal axes (attention backward: dQ sums over
+        # SKV, dK/dV over SQ). Empty for every other graph, which keeps the policy as is.
+        self.reduction_groups = find_orthogonal_reduction_groups(
+            self.ordered_nodes,
+            self.output_nodes,
+            self.output_axis_provenance,
+            self.reduction_axis_provenance,
+        )
+        # Set only on the per-assignment copies made by ``_for_assignment``.
+        self.accumulation = {}
 
     def _select_canonical_output_node(self):
         if not self.output_nodes:
@@ -236,6 +260,9 @@ class DefaultPolicy:
             self.canonical_output_node, tile
         )
         for node in self.output_nodes:
+            if self.accumulation.get(node) == INTER:
+                tile_map[node] = self._inter_block_tile(node)
+                continue
             tile_map[node] = self._project_canonical_tile_to_output(
                 canonical_tile, node
             )
@@ -573,6 +600,12 @@ class DefaultPolicy:
     def _compute_memory_traffic(self, output_tile, rstep_map):
         op_tile_map = self._get_output_tile_map(output_tile)
         op_itile_map = op_tile_map.copy()
+        if self.accumulation:
+            loop_step = self._intra_loop_step(rstep_map)
+            for node, loop_dim in self._inter_loop_dims.items():
+                itile = list(op_itile_map[node])
+                itile[loop_dim] = loop_step
+                op_itile_map[node] = itile
         traffic = 0
         irregular_fusion = False
         active_desc_reduction_axes = {}
@@ -608,7 +641,14 @@ class DefaultPolicy:
                     active_desc_reduction_axes[node] = node_active_axes
 
             tile, itile = op_tile_map[node], op_itile_map[node]
-            input_shapes = self._propagate_inputs_full_rank(node, tile)
+            if self.accumulation and node in self._inter_rstep_dims:
+                # An inter reduction sums its block's slice of the axis the launch
+                # tiles (one step per CTA), not the whole axis.
+                input_shapes = self._propagate_inputs_full_rank(
+                    node, tile, rstep=rstep_map[node]
+                )
+            else:
+                input_shapes = self._propagate_inputs_full_rank(node, tile)
             input_iter_shapes = self._propagate_inputs_full_rank(
                 node, itile, rstep=rstep_map[node]
             )
@@ -632,7 +672,18 @@ class DefaultPolicy:
                 # TODO (david): add extra traffic whenever we need to load from higher-level memory again?
                 # e.g., nodes out of reduction block? this may happen when force_fusion is set to True.
             for edge in node.outputs:
-                if edge.dst_node.is_output():
+                if edge.dst_node.is_output() and self.accumulation.get(node) == INTER:
+                    # summed across CTAs: an atomic add per element of the block
+                    traffic += (
+                        coalesced_tensor_shape(
+                            output_shapes[edge.src_id],
+                            node.get_shape(edge.src_id),
+                            self.arch.transaction_size[0] // ATOMIC_ACCUM_BYTES,
+                        )
+                        * ATOMIC_ACCUM_BYTES
+                        * ATOMIC_COST_WEIGHT
+                    )
+                elif edge.dst_node.is_output():
                     nbytes = (edge.src_node.get_dtype().bits + 7) // 8
                     write_transaction_elements = self.arch.transaction_size[0] // nbytes
                     traffic += (
@@ -754,8 +805,15 @@ class DefaultPolicy:
         return allocator.limit, cached_tensors_map
 
     def compute_tile_dict(self, output_tile: list[int], rstep_map):
+        if self.accumulation:
+            rstep_map = self._assignment_rstep_map(output_tile, rstep_map)
+            if rstep_map is None:
+                td = TileDict(output_tile, {}, flat_graph=self.flat_graph)
+                td.valid = False
+                return td
         td = TileDict(output_tile, rstep_map, flat_graph=self.flat_graph)
         td.n_threads = DEFAULT_N_THREADS
+        td.accumulation = dict(self.accumulation)
         td.traffic, td.tile_map, td.itile_map, irregular_fusion = (
             self._compute_memory_traffic(output_tile, rstep_map)
         )
@@ -938,15 +996,193 @@ class DefaultPolicy:
         return smem_tile_candidates
 
     def emit_config(self, topk, accept=None):
-        base_tile = self.get_base_tile()
-        if base_tile is None:
-            return []
-        smem_tile_candidates = self.propose_iterative_tiles(base_tile)
+        if self.reduction_groups:
+            smem_tile_candidates = self._propose_assignment_tiles()
+        else:
+            base_tile = self.get_base_tile()
+            if base_tile is None:
+                return []
+            smem_tile_candidates = self.propose_iterative_tiles(base_tile)
         smem_tile_candidates = self.get_num_threads(smem_tile_candidates)
         if accept is not None:
             smem_tile_candidates = [c for c in smem_tile_candidates if accept(c)]
 
         return smem_tile_candidates[:topk]
+
+    # ---- accumulation contexts (orthogonal reduction groups) ------------------------
+    #
+    # With reduction groups over orthogonal axes (``self.reduction_groups``) one CTA can
+    # hold only one group's output tile still: it owns that tile (the launch tile) and
+    # loops over the group's reduction axis, accumulating the group in registers
+    # (``intra``). Every other group (``inter``) is summed over the axis the launch tiles:
+    # each iteration computes a partial of its output for the tile the loop variable
+    # selects, and the CTAs add their partials up (atomic adds). Each assignment (which
+    # group is intra) is searched by a copy of the policy (``_for_assignment``) and all are
+    # ranked together, the atomic adds counted in the traffic.
+
+    def _propose_assignment_tiles(self):
+        candidates = []
+        for intra_id in range(len(self.reduction_groups)):
+            policy = self._for_assignment(intra_id)
+            if policy is None:
+                continue
+            base_tile = policy._pin_full_launch_dims(policy.get_base_tile())
+            candidates += policy.propose_iterative_tiles(base_tile)
+        # each assignment's list is sorted by this key already (expand_iterative_tiles);
+        # the stable sort keeps assignment order on ties
+        return sorted(candidates, key=lambda td: (td.traffic + 1) * td.num_wave)
+
+    def _for_assignment(self, intra_id):
+        """This policy with group ``intra_id`` intra and the others inter, or ``None``.
+
+        ``None`` when the assignment cannot be scheduled: an inter output whose reduction
+        is not a single-axis reduction feeding it through linear ops only, an axis that
+        does not map onto exactly one dim of the launch tile or the inter output, or an
+        intra reduction over more than one axis.
+        """
+        intra = self.reduction_groups[intra_id]
+        inter = [g for i, g in enumerate(self.reduction_groups) if i != intra_id]
+        if any(len(r.raxis) != 1 for r in intra.reductions):
+            return None
+
+        canonical = intra.outputs[0]
+        for node in intra.outputs[1:]:
+            if len(node.get_space_dim()) > len(canonical.get_space_dim()):
+                canonical = node
+        canonical_flags = self._get_visible_batch_dim_flags(canonical)
+        canonical_vis = self._visible_dim_ids(canonical)
+
+        def dim_tokens(node, dim):
+            return get_output_axis_tokens(self.output_axis_provenance, node, 0, dim)
+
+        def red_tokens(node):
+            return set().union(*self.reduction_axis_provenance.get(node, [set()]))
+
+        inter_rstep_dims, inter_loop_dims, launch_dims = {}, {}, set()
+        for group in inter:
+            for out in group.outputs:
+                reds = [r for r in group.reductions if r in self._reduction_chain(out)]
+                if len(reds) != 1 or len(reds[0].raxis) != 1:
+                    return None
+                (red,) = reds
+                if not self._is_linear_chain(out, red):
+                    return None
+                dims = [
+                    d
+                    for d, is_batch in enumerate(canonical_flags)
+                    if not is_batch and dim_tokens(canonical, d) & red_tokens(red)
+                ]
+                if len(dims) != 1:
+                    return None
+                inter_rstep_dims[red] = canonical_vis[dims[0]]
+                launch_dims.add(canonical_vis[dims[0]])
+
+                out_flags = self._get_visible_batch_dim_flags(out)
+                if sum(out_flags) != sum(canonical_flags):
+                    return None
+                loop_dims = [
+                    d
+                    for d, is_batch in enumerate(out_flags)
+                    if not is_batch and dim_tokens(out, d) & intra.axis_tokens
+                ]
+                if len(loop_dims) != 1:
+                    return None
+                inter_loop_dims[out] = loop_dims[0]
+
+        policy = copy.copy(self)
+        policy.canonical_output_node = canonical
+        policy.accumulation = {o: INTRA for o in intra.outputs}
+        policy.accumulation.update({o: INTER for g in inter for o in g.outputs})
+        policy._intra_reductions = tuple(intra.reductions)
+        policy._inter_rstep_dims = inter_rstep_dims
+        policy._inter_loop_dims = inter_loop_dims
+        # launch dims that no inter reduction runs over stay whole: a CTA must cover all
+        # of them, or two CTAs would add the same partial of an inter output
+        policy._full_launch_dims = [
+            v
+            for d, (v, is_batch) in enumerate(zip(canonical_vis, canonical_flags))
+            if not is_batch and v not in launch_dims
+        ]
+        # an inter reduction's step is set by the launch tile, not searched
+        policy.compatible_reduction_groups = [
+            kept
+            for kept in (
+                [n for n in group if n not in inter_rstep_dims]
+                for group in self.compatible_reduction_groups
+            )
+            if kept
+        ]
+        return policy
+
+    def _visible_dim_ids(self, node):
+        """For each dim of ``node``, its dim in the visible (batch-collapsed) shape."""
+        flags = self._get_visible_batch_dim_flags(node)
+        if len(self._get_visible_output_shape(node)) == len(flags):
+            return list(range(len(flags)))
+        ids, next_id = [], 1
+        for is_batch in flags:
+            ids.append(0 if is_batch else next_id)
+            next_id += 0 if is_batch else 1
+        return ids
+
+    def _reduction_chain(self, out):
+        """``out`` and the single-input nodes below it, down to the first reduction."""
+        chain, node = [], out
+        while True:
+            chain.append(node)
+            if node.raxis or len(node.inputs) != 1:
+                return chain
+            node = node.inputs[0].src_node
+
+    def _is_linear_chain(self, out, red):
+        chain = self._reduction_chain(out)
+        return chain[-1] is red and all(
+            type(n) in _LINEAR_POST_OPS for n in chain[:-1]
+        )
+
+    def _inter_block_tile(self, node):
+        """An inter output's block: whole but for a single entry of each batch dim."""
+        flags = self._get_visible_batch_dim_flags(node)
+        return [
+            1 if is_batch else int(extent)
+            for extent, is_batch in zip(node.get_space_dim(), flags)
+        ]
+
+    def _intra_loop_step(self, rstep_map):
+        (step,) = {
+            int(next(iter(rstep_map[r].values()))) for r in self._intra_reductions
+        }
+        return step
+
+    def _pin_full_launch_dims(self, tile):
+        tile = list(tile)
+        shape = self._get_visible_output_shape(self.canonical_output_node)
+        for dim in self._full_launch_dims:
+            tile[dim] = int(shape[dim])
+        return tile
+
+    def _assignment_rstep_map(self, output_tile, rstep_map):
+        """``rstep_map`` with each inter reduction stepped by its launch tile, or ``None``.
+
+        ``None`` for a tiling this assignment cannot run: a launch dim of
+        ``_full_launch_dims`` split, intra reductions stepped differently (they share
+        one loop), or no loop at all (the intra axis in one step).
+        """
+        shape = self._get_visible_output_shape(self.canonical_output_node)
+        if any(int(output_tile[d]) != int(shape[d]) for d in self._full_launch_dims):
+            return None
+        steps = {
+            int(next(iter(rstep_map[r].values()))) for r in self._intra_reductions
+        }
+        if len(steps) != 1:
+            return None
+        (step,) = steps
+        if all(step >= int(r.raxis[0].dom.extent) for r in self._intra_reductions):
+            return None
+        rstep_map = dict(rstep_map)
+        for red, dim in self._inter_rstep_dims.items():
+            rstep_map[red] = {red.raxis[0].var.name: int(output_tile[dim])}
+        return rstep_map
 
     def get_num_threads(self, candidates):
         for candidate in candidates:
