@@ -431,14 +431,24 @@ class Program:
                 env[r.out] = getattr(graph, r.kind)(*map(val, r.args))
         return graph
 
-    def to_graph_structure(self) -> list[dict]:
-        """The un-optimized program as a ``get_graph_structure()`` list (for to_ir)."""
+    def to_graph_structure(self, sizes: dict | None = None) -> list[dict]:
+        """The un-optimized program as a ``get_graph_structure()`` list (for to_ir).
+
+        ``sizes`` (``{dim name: extent}``) gives named dims other extents than the
+        program's: the same records at other shapes (``cleave.pipeline.update`` builds an
+        un-searched graph again on prefixes of a dim). Literal dims stay as written.
+        """
         self._lowerable("to_graph_structure")
         input_ids = {r.out for r in self._records if r.kind == "input"}
+        sizes = dict(sizes or {})
+
+        def shape(t):
+            return [int(sizes.get(d.name, d.extent)) if isinstance(d, Dim) else int(d)
+                    for d in t.dims]
 
         def desc(i):
             t = self._values[i]
-            d = {"num_dims": t.ndim, "dim": list(t.shape), "guid": i + 1}
+            d = {"num_dims": t.ndim, "dim": shape(t) if sizes else list(t.shape), "guid": i + 1}
             if i in input_ids:
                 d["dtype"] = t.dtype.name
             return d

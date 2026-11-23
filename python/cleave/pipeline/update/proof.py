@@ -1,54 +1,69 @@
-"""Proof of an update rule over the reals (Python z3).
+"""Proof of an update rule over the reals (Python z3; DESIGN 7).
 
 Float matching cannot tell a right update from one that is merely close on the sampled
 prefixes, so every survivor of the search is proved, or dropped.
 
-Symbols. ``m`` / ``m1``: the full-extent value before / after an iteration, free reals (no
-``m1 >= m`` is assumed). ``a``, ``b``: accumulator values. ``r``: the tile's finished result.
-One free real per value of the flat graph that one element's contribution is made of and
-that does not depend on the full-extent value (a score, a value-matrix entry).
+Symbols. ``m`` / ``m1``: the full-extent value before / after an iteration, FREE reals (no
+``m1 >= m`` is assumed, so a proof also serves a split's merge). ``a``, ``b``: accumulator
+values; ``r``, ``r2``: tile results. One free real ``x_<name>`` per value of the flat graph
+that one element's contribution is made of and that is not computed from the full-extent
+value (a score, a value-matrix entry).
 
-The contribution of ONE element to an accumulator, ``c(x.., m)``, is read off the flat
-graph (:func:`contribution`): the operand of the looped reduction, as a scalar term in the
-full-extent value. For a softmax row sum that is ``exp(s - m)``; for the value matmul
-``exp(s - m) * v``. It is never written down by hand.
+The contribution of ONE element to an accumulator, ``c(x.., m)``, is read off the program's
+own flat graph (:func:`contribution`). Only a fragment of the IR is read (``E7``-``E9``,
+``T5``): exact ``Add`` / ``Sub`` / ``Mul`` / ``Div`` / ``Exp`` between the full-extent value
+and a plain ``ReduceSum`` / ``Matmul`` that starts at zero; constants exactly, as the
+rational the float is.
 
-``exp`` is an uninterpreted function with the law ``exp(x + y) = exp(x) * exp(y)`` and
-``exp(0) = 1``. z3 does not instantiate a quantified law modulo arithmetic, so the instances
-are generated here: for every two exp arguments ``x``, ``y`` that occur (and 0),
-``exp(x) = exp(x - y) * exp(y)``; and ``exp(t) > 0`` for every argument (a consequence of
-the two axioms: ``exp(t) = exp(t/2)^2`` and ``exp(t) * exp(-t) = 1``).
+``exp`` is an uninterpreted function. Every lemma below is a theorem about the real ``exp``
+(``exp(x + y) = exp(x) exp(y)``, ``exp(0) = 1``), so a proof from them is a proof with the
+law; they are ground instances for the set ``A`` of (simplified) exp arguments in a goal:
 
-Obligations for an update ``U(a, m, m1, r)``, with ``G(a) := U(a, m, m1, r) - r``:
+    L0  exp(0) = 1
+    L1  exp(x) = exp(x - y) * exp(y)                 x in A + {0}, y in A, x != y
+    L3  exp(t) * prod_{k<0} exp(s)^|k| = prod_{k>0} exp(s)^k * exp(c)
+                                                     t in A linear with integer coefficients
+    L2  exp(t) > 0                                   every argument above
 
-    (0) accumulate form     G does not depend on r           U(a,..,r) - r = U(a,..,r2) - r2
-    (i) one element         G(c(x.., m)) = c(x.., m1)
-    (ii) distributes        G(a + b) = G(a) + G(b)
+Obligations for a candidate ``U(a, m, m1, r)``, with ``G(a) := U(a, m, m1, r) - r``; each is
+valid iff ``lemmas and not goal`` is unsat:
 
-(0) says the update is "repair, then accumulate"; (i) and (ii) are the two identities of the
-plan. Together: ``G(sum_j c(x_j, m)) = sum_j c(x_j, m1)`` for any number of elements, hence
-``U(F(H), T) = F(H ++ T)`` for any prefix, and by induction over the loop for any number of
-tiles. ``G(0) = 0`` follows from (ii), which is the first iteration.
+    (D)  defined          for every division p / q in U: q != 0   (z3's division is total)
+    (0)  accumulate form  U(a, .., r) - r == U(a, .., r2) - r2
+    (i)  one element      G(c(x.., m)) == c(x.., m1)
+    (ii) distributes      G(a + b) == G(a) + G(b)
+
+Together: ``G(sum_j c(x_j, m)) = sum_j c(x_j, m1)`` for any number of elements, hence
+``U(F(H), T) = F(H ++ T)`` for any prefix and, by induction, any number of tiles; ``G(0) = 0``
+(from (ii)) is the first iteration, whatever the start value is.
 """
 
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from fractions import Fraction
+
+from .texts import E7, E8, E9, T5, Refused
 
 TIMEOUT_MS = 5000
+OBLIGATIONS = ("(D) defined", "(0) accumulate form", "(i) one element",
+               "(ii) distributes over sum")
 
 
 @dataclass
 class Verdict:
     proved: bool
-    results: dict  # obligation -> "unsat" (proved) | "sat" | "unknown"
-    seconds: float
+    results: dict = field(default_factory=dict)  # obligation -> unsat | sat | unknown | error: ..
+    seconds: float = 0.0
     why: str = ""
 
+    def failed(self) -> list:
+        """The obligations that were not proved."""
+        return [k for k, v in self.results.items() if v != "unsat"]
 
-class NotTranslatable(Exception):
-    pass
+
+_Z3 = {}
 
 
 def _z3():
@@ -58,175 +73,318 @@ def _z3():
 
 
 def _exp():
-    z3 = _z3()
-    return z3.Function("exp", z3.RealSort(), z3.RealSort())
+    """The uninterpreted ``exp`` (one per process)."""
+    if "exp" not in _Z3:
+        z3 = _z3()
+        _Z3["exp"] = z3.Function("exp", z3.RealSort(), z3.RealSort())
+    return _Z3["exp"]
+
+
+def const(c) -> object:
+    """A float constant as the exact rational it is: ``Fraction(float(c))``, never a
+    rounded decimal (``0.1`` is ``3602879701896397 / 2**55``)."""
+    f = Fraction(float(c))
+    return _z3().Q(f.numerator, f.denominator)
+
+
+# ------------------------------------------------------------------- one element's term
+
+
+def _between(by_name, full_node, acc_node) -> set:
+    """Names of the nodes computed from ``full_node`` that ``acc_node`` reads (strictly
+    between the two)."""
+    below = set()
+    stack = [full_node]
+    while stack:
+        n = stack.pop()
+        for e in n.outputs:
+            d = e.dst_node
+            if d.name in by_name and d.name not in below:
+                below.add(d.name)
+                stack.append(d)
+    above, stack = set(), [acc_node]
+    while stack:
+        n = stack.pop()
+        for e in n.inputs:
+            s = e.src_node
+            if s.name not in above:
+                above.add(s.name)
+                stack.append(s)
+    return (below & above) - {full_node.name, acc_node.name}
+
+
+def _unmodelled(node) -> tuple | None:
+    """``(attr, value)`` of the first attribute of ``node`` the proof does not model."""
+    from ...ir.update_rule import EXTENTS, SEMANTIC
+
+    if getattr(node, "denom_floor", None) is not None:
+        return "denom_floor", node.denom_floor
+    for attr in getattr(node, "_macro_attrs", ()):
+        if attr not in SEMANTIC and attr not in EXTENTS:
+            return attr, getattr(node, attr, None)
+    return None
+
+
+def check_contribution(flat_graph, full: str, acc: str) -> None:
+    """The refusal (T5, E7, E8, E9) if the contribution of one element to ``acc`` cannot
+    be read off the flat graph; nothing otherwise."""
+    from ...ir.ops import Add, Div, Exp, Matmul, Mul, ReduceSum, Sub
+
+    by_name = {n.name: n for n in flat_graph.nodes}
+    full_node, acc_node = by_name[full], by_name[acc]
+    if type(acc_node) not in (ReduceSum, Matmul) or getattr(acc_node, "accum_init", None) is not None:
+        raise Refused(T5.format(d=acc, cls=type(acc_node).__name__, full=full))
+    between = _between(by_name, full_node, acc_node)
+    computed = between | {full}
+    for node in [n for n in flat_graph.nodes if n.name in between] + [acc_node]:
+        if node is not acc_node and type(node) not in (Add, Sub, Mul, Div, Exp):
+            raise Refused(E7.format(node=node.name, cls=type(node).__name__, full=full, acc=acc))
+        attr = _unmodelled(node)
+        if attr is not None:
+            raise Refused(E8.format(node=node.name, attr=attr[0], value=attr[1]))
+        operands = [e.src_node.name for e in node.inputs]
+        both = sum(name in computed for name in operands) > 1
+        if both and (node is acc_node or getattr(node, "broadcast", -1) != -1):
+            raise Refused(E9.format(node=node.name, full=full))
 
 
 def contribution(flat_graph, full: str, acc: str):
     """``(build, leaves)``: ``build(m)`` is the z3 term of one element's contribution to
     ``acc`` under the full-extent value ``m``; ``leaves`` the free symbols it is made of.
 
-    Walks the flat graph from the looped reduction back. A node that is not computed from
-    the full-extent node is one free real (one element of it). Elementwise ops become
-    arithmetic; ``Exp`` the uninterpreted ``exp``; a ``ReduceSum`` contributes its operand,
-    a ``Matmul`` the product of its operands (the contraction is the sum that is looped).
-    Anything else is not translatable, and the hole has no proof.
+    Walks the flat graph from the accumulator back. A node not computed from the
+    full-extent node is one free real (one element of it); ``Add`` / ``Sub`` / ``Mul`` /
+    ``Div`` become arithmetic (``const_on_left`` honoured for every class, the constant
+    exact), ``Exp`` the uninterpreted ``exp``; a ``ReduceSum`` contributes its operand, a
+    ``Matmul`` the product of its two operands (the contraction is the looped sum).
+    Raises :class:`Refused` (T5, E7, E8, E9) for anything else.
     """
-    from ...ir.ops import Add, Div, Exp, Matmul, Mul, ReduceSum, Sub
+    from ...ir.ops import Exp, Matmul
 
     z3 = _z3()
+    check_contribution(flat_graph, full, acc)
     by_name = {n.name: n for n in flat_graph.nodes}
-    full_node, node = by_name[full], by_name[acc]
-
-    below = set()  # names computed from the full-extent node
-
-    def mark(n):
-        for e in n.outputs:
-            d = e.dst_node
-            if d.name not in below and d.name in by_name:
-                below.add(d.name)
-                mark(d)
-
-    mark(full_node)
+    full_node, acc_node = by_name[full], by_name[acc]
+    computed = _between(by_name, full_node, acc_node) | {full}
     leaves = {}
 
     def term(n, m):
         if n is full_node:
             return m
-        if n.name not in below:
+        if n.name not in computed:
             return leaves.setdefault(n.name, z3.Real(f"x_{n.name}"))
         args = [term(e.src_node, m) for e in sorted(n.inputs, key=lambda e: e.dst_id)]
-        if type(n) in (Add, Sub, Mul, Div):
-            if n.const is not None:
-                c = z3.RealVal(repr(float(n.const)))
-                if type(n) is Div and n.const_on_left:
-                    return c / args[0]
-                return type(n).py_op(args[0], c)
-            return type(n).py_op(args[0], args[1])
-        if isinstance(n, Exp):
+        if type(n) is Exp:
             return _exp()(args[0])
-        raise NotTranslatable(f"{type(n).__name__} {n.name} has no term")
+        if n.const is not None:
+            c = const(n.const)
+            return type(n).py_op(c, args[0]) if n.const_on_left else type(n).py_op(args[0], c)
+        return type(n).py_op(args[0], args[1])
 
     def build(m):
-        if type(node) is ReduceSum:
-            (e,) = node.inputs
-            return term(e.src_node, m)
-        if type(node) is Matmul:
-            a, b = (e.src_node for e in sorted(node.inputs, key=lambda e: e.dst_id))
-            return term(a, m) * term(b, m)
-        raise NotTranslatable(f"{type(node).__name__} {node.name} is not a sum over the looped dim")
+        operands = [e.src_node for e in sorted(acc_node.inputs, key=lambda e: e.dst_id)]
+        if type(acc_node) is Matmul:
+            return term(operands[0], m) * term(operands[1], m)
+        return term(operands[0], m)
 
-    build(z3.Real("m"))  # fill ``leaves``; raises NotTranslatable early
+    build(z3.Real("m"))  # fill ``leaves``
     return build, leaves
 
 
+# --------------------------------------------------------------------- the update's term
+
+
 def translate(expr, env):
-    """A searched expression as a z3 term; ``env`` maps leaf names to z3 terms."""
+    """A searched expression as a z3 term; ``env`` maps leaf names to z3 terms. The prover
+    also reads ``("const", c)`` (the search never forms one)."""
     if isinstance(expr, str):
         return env[expr]
     op, *args = expr
+    if op == "const":
+        return const(args[0])
     a = [translate(x, env) for x in args]
     if op == "exp":
         return _exp()(a[0])
+    if op not in ("add", "sub", "mul", "div"):
+        raise Refused(f"the update uses {op!r}, for which no law is supplied")
     return {"add": lambda x, y: x + y, "sub": lambda x, y: x - y,
             "mul": lambda x, y: x * y, "div": lambda x, y: x / y}[op](*a)
+
+
+def _divisors(expr, env, out):
+    if isinstance(expr, str) or expr[0] == "const":
+        return
+    if expr[0] == "div":
+        out.append(translate(expr[2], env))
+    for x in expr[1:]:
+        _divisors(x, env, out)
 
 
 def _exp_args(term, found):
     z3 = _z3()
     if z3.is_app(term):
-        if term.decl().name() == "exp":
-            found[z3.simplify(term.arg(0)).sexpr()] = z3.simplify(term.arg(0))
+        if term.decl().name() == "exp" and term.num_args() == 1:
+            arg = z3.simplify(term.arg(0))
+            found[arg.sexpr()] = arg
         for child in term.children():
             _exp_args(child, found)
 
 
-def _axioms(*terms):
-    """Ground instances of the exp law for the arguments that occur in ``terms``."""
+def linear(term):
+    """``({symbol sexpr: (symbol, Fraction)}, constant)`` of a z3 term built of ``+``,
+    ``-``, unary minus, multiplication by numerals, numerals and uninterpreted constants;
+    None for anything else."""
+    z3 = _z3()
+    if z3.is_rational_value(term):
+        return {}, Fraction(term.numerator_as_long(), term.denominator_as_long())
+    if z3.is_const(term) and term.decl().kind() == z3.Z3_OP_UNINTERPRETED:
+        return {term.sexpr(): (term, Fraction(1))}, Fraction(0)
+    if not z3.is_app(term):
+        return None
+    kind, kids = term.decl().kind(), term.children()
+    if kind in (z3.Z3_OP_ADD, z3.Z3_OP_SUB):
+        form, k = {}, Fraction(0)
+        for i, child in enumerate(kids):
+            sub = linear(child)
+            if sub is None:
+                return None
+            sign = -1 if kind == z3.Z3_OP_SUB and i > 0 else 1
+            for key, (sym, coef) in sub[0].items():
+                form[key] = (sym, form.get(key, (sym, Fraction(0)))[1] + sign * coef)
+            k += sign * sub[1]
+        return form, k
+    if kind == z3.Z3_OP_UMINUS:
+        sub = linear(kids[0])
+        return None if sub is None else (
+            {key: (s, -c) for key, (s, c) in sub[0].items()}, -sub[1])
+    if kind == z3.Z3_OP_MUL:
+        nums = [c for c in kids if z3.is_rational_value(c)]
+        rest = [c for c in kids if not z3.is_rational_value(c)]
+        if len(rest) > 1:
+            return None
+        scale = Fraction(1)
+        for n in nums:
+            scale *= Fraction(n.numerator_as_long(), n.denominator_as_long())
+        if not rest:
+            return {}, scale
+        sub = linear(rest[0])
+        return None if sub is None else (
+            {key: (s, c * scale) for key, (s, c) in sub[0].items()}, sub[1] * scale)
+    return None
+
+
+def lemmas(*terms) -> list:
+    """L0-L3 for the exp arguments of ``terms``."""
     z3 = _z3()
     exp = _exp()
     args = {}
     for t in terms:
         _exp_args(t, args)
     zero = z3.RealVal(0)
-    axioms = [exp(zero) == 1]
-    pos = dict(args)
+    out = [exp(zero) == 1]
+    positive = dict(args)
     items = list(args.values())
-    for x in items + [zero]:
+    for x in items + [zero]:  # L1: pairwise differences
         for y in items:
             if x.sexpr() == y.sexpr():
                 continue
             d = z3.simplify(x - y)
-            axioms.append(exp(x) == exp(d) * exp(y))
-            pos[d.sexpr()] = d
-    axioms += [exp(t) > 0 for t in pos.values()]
-    return axioms
+            out.append(exp(x) == exp(d) * exp(y))
+            positive[d.sexpr()] = d
+    for t in items:  # L3: decomposition into the symbols, integer coefficients only
+        form = linear(t)
+        if form is None or not form[0]:
+            continue
+        coefs, k = form
+        if any(c.denominator != 1 for _, c in coefs.values()):
+            continue
+        lhs, rhs = exp(t), z3.RealVal(1)
+        if k != 0:
+            kc = z3.Q(k.numerator, k.denominator)
+            rhs = rhs * exp(kc)
+            positive[kc.sexpr()] = kc
+        for sym, c in coefs.values():
+            if c == 0:
+                continue
+            positive[sym.sexpr()] = sym
+            for _ in range(abs(int(c))):
+                if c > 0:
+                    rhs = rhs * exp(sym)
+                else:
+                    lhs = lhs * exp(sym)
+        out.append(lhs == rhs)
+    out += [exp(t) > 0 for t in positive.values()]  # L2: positivity
+    return out
 
 
-def _check(goal, extra=()):
-    """"unsat" iff ``goal`` (a z3 Bool) follows from the exp-law instances."""
+def valid(goal, *context) -> str:
+    """``"unsat"`` iff ``goal`` follows from the lemmas of ``goal`` and ``context``."""
     z3 = _z3()
     s = z3.Solver()
     s.set("timeout", TIMEOUT_MS)
-    s.add(*_axioms(goal, *extra))
-    s.add(*extra)
+    s.add(*lemmas(goal, *context))
     s.add(z3.Not(goal))
     return str(s.check())
 
 
-def prove(expr, flat_graph, full: str, acc: str, *, old="a", shared=None) -> Verdict:
-    """Prove the update ``expr`` for the accumulator ``acc``.
-
-    Leaves of ``expr``: ``old`` (the accumulator before), ``"m"``, ``"m'"``, ``"r"`` (the
-    tile's result), and the names in ``shared`` (name -> expression over ``m`` / ``m'``).
-    """
+def prove(update, flat_graph, full: str, acc: str) -> Verdict:
+    """Prove the update ``update`` (leaves ``a``, ``m``, ``m'``, ``r``) of the accumulator
+    ``acc`` under the full-extent node ``full`` of ``flat_graph``: (D), (0), (i), (ii)."""
     z3 = _z3()
     t0 = time.perf_counter()
     try:
         build, _ = contribution(flat_graph, full, acc)
-    except NotTranslatable as e:
+        m, m1, a, b, r, r2 = z3.Reals("m m1 a b r r2")
+        base = {"m": m, "m'": m1}
+
+        def U(acc_value, tile):
+            return translate(update, {**base, "a": acc_value, "r": tile})
+
+        def G(acc_value):
+            return U(acc_value, r) - r
+
+        here = U(a, r)
+        divisors = []
+        _divisors(update, {**base, "a": a, "r": r}, divisors)
+        goals = {
+            OBLIGATIONS[0]: [(q != 0, (here,)) for q in divisors],
+            OBLIGATIONS[1]: [(here - r == U(a, r2) - r2, ())],
+            OBLIGATIONS[2]: [(G(build(m)) == build(m1), ())],
+            OBLIGATIONS[3]: [(G(a + b) == G(a) + G(b), ())],
+        }
+    except Refused as e:
         return Verdict(False, {}, time.perf_counter() - t0, str(e))
-    m, m1, a, b, r, r2 = z3.Reals("m m1 a b r r2")
-    base = {"m": m, "m'": m1}
-    for name, sub in (shared or {}).items():
-        base[name] = translate(sub, base)
-
-    def U(acc_value, tile):
-        return translate(expr, {**base, old: acc_value, "r": tile})
-
-    def G(acc_value):
-        return U(acc_value, r) - r
-
-    goals = {
-        "(0) accumulate form": U(a, r) - r == U(a, r2) - r2,
-        "(i) one element": G(build(m)) == build(m1),
-        "(ii) distributes over sum": G(a + b) == G(a) + G(b),
-    }
     results = {}
-    for name, goal in goals.items():
-        try:
-            results[name] = _check(goal)
-        except Exception as e:  # noqa: BLE001 - z3 refuses a term (division by a literal 0)
-            results[name] = f"error: {type(e).__name__}"
+    for name, checks in goals.items():
+        verdict = "unsat"
+        for goal, context in checks:
+            try:
+                got = valid(goal, *context)
+            except Exception as e:  # noqa: BLE001 - z3 refuses a term (division by literal 0)
+                got = f"error: {type(e).__name__}"
+            if got != "unsat":
+                verdict = got
+                break
+        results[name] = verdict
     proved = all(v == "unsat" for v in results.values())
     return Verdict(proved, results, time.perf_counter() - t0)
 
 
-def nonpositive_exp_args(expr, shared=None) -> bool:
-    """Structural stability: every ``exp`` argument of ``expr`` is provably ``<= 0`` given
-    ``m <= m1`` (the full-extent value only grows)."""
+def nonpositive_exp_args(update, combine: str = "max") -> bool:
+    """Structural stability: every ``exp`` argument of ``update`` is provably ``<= 0``
+    under what the full-extent value's reducer gives (``m <= m'`` for a max; nothing for
+    another reducer). One query per argument."""
     z3 = _z3()
     m, m1, a, r = z3.Reals("m m1 a r")
-    base = {"m": m, "m'": m1}
-    for name, sub in (shared or {}).items():
-        base[name] = translate(sub, base)
-    term = translate(expr, {**base, "a": a, "r": r})
+    term = translate(update, {"m": m, "m'": m1, "a": a, "r": r})
     args = {}
     _exp_args(term, args)
     for arg in args.values():
         s = z3.Solver()
         s.set("timeout", TIMEOUT_MS)
-        s.add(m <= m1, z3.Not(arg <= 0))
+        if combine == "max":
+            s.add(m <= m1)
+        s.add(z3.Not(arg <= 0))
         if str(s.check()) != "unsat":
             return False
     return True
