@@ -28,6 +28,23 @@ def annotate_args(graph: Graph, is_main: bool = False) -> Graph:
     return graph
 
 
+def _read_transposed_by_gemm(node) -> bool:
+    """Whether a gemm reads ``node``'s tensor transposed (``A^T @ x``, ``x @ A^T``).
+
+    A multi-consumer placeholder is loaded into registers once; a transposed gemm read of
+    that fragment conflicts with the untransposed operand layout of its other consumers
+    (TileLang "Layout infer conflict ... A_ptr"), so such a placeholder stays in shared
+    memory (it is staged through shared on its way to registers anyway).
+    """
+    for edge in node.outputs:
+        dst = edge.dst_node
+        if isinstance(dst, Matmul):
+            flags = (dst.transpose_A, dst.transpose_B)
+            if any(flag and e is edge for e, flag in zip(dst.inputs, flags)):
+                return True
+    return False
+
+
 def annotate_tinfo(graph: Graph, is_main: bool = False) -> Graph:
     all_names = set([node.name for node in graph.nodes])
     assert len(all_names) == len(graph.nodes), "node names should be unique"
@@ -46,7 +63,9 @@ def annotate_tinfo(graph: Graph, is_main: bool = False) -> Graph:
         if isinstance(node, (PlaceHolderNode, OutputNode)):
             graph.tinfo_map[node] = (
                 node.name,
-                "g" if is_main else ("r" if len(node.outputs) > 1 else "s"),
+                "g" if is_main else (
+                    "r" if len(node.outputs) > 1 and not _read_transposed_by_gemm(node) else "s"
+                ),
             )
         elif isinstance(node, ComputeOpNode):
             graph.tinfo_map[node] = (getname("t_" + node.name), "r")

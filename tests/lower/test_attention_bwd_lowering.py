@@ -62,3 +62,27 @@ def test_in_loop_row_sum_broadcast_into_gemm_is_staged_in_shared():
 def test_given_row_operand_is_not_staged():
     code = build_candidate_code(_plans("dkdv", 1)[0].tile)
     assert "_intermediate = T.alloc_shared((32,)" not in code
+
+
+def _shared_input_pair():
+    """Y1 = a @ u and Y2 = a^T @ x2: the input a has two consumers, one reads it transposed."""
+    import cleave.lang as cl
+    from cleave.frontend import Program
+
+    p = Program("pair_in", dtype=cl.f16)
+    p.dims(M=256, N=256, K=64)
+    a, u, x2 = p.input("a", ("M", "N")), p.input("u", ("N", "K")), p.input("x2", ("M", "K"))
+    p.output(a @ u)
+    p.output(a.mT @ x2)
+    return p
+
+
+def test_multi_consumer_input_read_transposed_stays_in_shared():
+    # a multi-consumer input is otherwise loaded into registers; the transposed gemm read of
+    # that fragment is a TileLang layout conflict ("Get different layout for A_ptr")
+    plans = list(schedule(GraphSet.identity(_shared_input_pair()), ScheduleConfig(topk=4)))
+    assert plans
+    for plan in plans:
+        code = build_candidate_code(plan.tile)
+        assert "ukernel_mma_ssr_transA" in code
+        assert "ukernel_mma_rsr_transA" not in code
