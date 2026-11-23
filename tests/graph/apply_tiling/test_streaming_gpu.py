@@ -126,14 +126,36 @@ def test_gpu_hand_written_max_attention(cache_root):
 
 def test_gpu_logits_that_are_an_input(cache_root):
     """``softmax(x) @ v`` with ``x`` an fp16 input: the max reads storage, every plan
-    carries it over C = 4096. Held to the bound of that program's own output (the role
-    ``""`` of ``exact_split_rows``, which declares it for its split pipeline)."""
+    carries it over C = 4096."""
     _gpu()
-    tolerance = tolerance_for("exact_split_rows")[""]
+    tolerance = tolerance_for("flash_rows")
     program = trace(X.flash_rows, dict(R=64, C=4096, D=64), cl.f16)
     plans = P.schedule(P.superoptimize(program, P.SuperoptConfig()), P.ScheduleConfig(topk=4))
     assert plans and all(_looped(p) for p in plans)
     _held(_build(plans, tolerance))
+
+
+def softmax_first_axis(x: cl.Tensor["H", "K", "N"], y: cl.Tensor["H", "K", "N"]):
+    return cl.sum(cl.softmax(x, 1) * y, 1, keepdim=True)
+
+
+def test_gpu_a_softmax_over_the_first_axis(cache_root):
+    """``sum(softmax(x, 1) * y, 1)`` at 4x4096x64: the softmax runs over the first non-batch
+    axis, and every plan of every graph is held to every case. The flash form
+    (``sum(e * y) / sum(e)``) loops over K with the max carried; in the forms that divide
+    before the second sum the max keeps its pin, and it may run a loop of its own ahead of
+    what reads it (two passes) -- kernels the hand-derived pass never had."""
+    _gpu()
+    tolerance = tolerance_for("softmax_first_axis")
+    program = trace(softmax_first_axis, dict(H=4, K=4096, N=64), cl.f16)
+    graphs = P.superoptimize(program, P.SuperoptConfig())
+    plans = P.schedule(graphs, P.ScheduleConfig(topk=1000))
+    looped = [p for p in plans if _looped(p)]
+    assert looped and len(looped) < len(plans)
+    assert {p.graph_index for p in plans} == {g.index for g in graphs}
+    report = _build(plans, tolerance)
+    _held(report)
+    assert len(report.correct) == len(plans)
 
 
 def softmax(x: cl.Tensor["R", "C"]):
