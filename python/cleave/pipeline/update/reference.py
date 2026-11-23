@@ -214,6 +214,21 @@ class Flat:
             inputs = [x.float() if x.is_floating_point() else x for x in inputs]
         return list(inputs)
 
+    def stored(self, inputs) -> list:
+        """``inputs`` as the program's inputs hold them: rounded to each placeholder's
+        dtype (then float32 again for the float32 instance). A shaped sample is computed in
+        float32; an input the program declares float16 never holds a value that float16
+        cannot, or the graph's own nodes would read it at two precisions."""
+        from ...runtime.reference import _placeholder_torch_dtype, placeholder_order, torch_dtype
+
+        out = []
+        for x, p in zip(inputs, placeholder_order(self.graph(self.tile))):
+            if x.is_floating_point():
+                x = x.to(_placeholder_torch_dtype(p, torch_dtype(self.dtype)))
+                x = x.float() if self.dtype == "float32" else x
+            out.append(x)
+        return out
+
     def cut(self, inputs, start: int, length: int) -> list:
         """``inputs`` restricted to ``[start, start + length)`` of the looped dim. Whether
         the restriction is the right one is not assumed: ``extension`` checks that the
@@ -346,7 +361,7 @@ def shaped(flat: Flat, seed: int, kind: str, gain: float) -> list:
 
     inputs = flat.sample(N, seed)
     if kind == "none":
-        return inputs
+        return inputs  # as sampled: already what the inputs hold
     out = []
     for x, (ax, groups) in zip(inputs, flat.looped_layout()):
         if kind == "ramp":
@@ -366,7 +381,7 @@ def shaped(flat: Flat, seed: int, kind: str, gain: float) -> list:
             part = y.narrow(ax, flat.tile, N - flat.tile)
             part.copy_((part.float() * gain).to(y.dtype))
             out.append(y)
-    return out
+    return flat.stored(out)
 
 
 @dataclass
@@ -379,8 +394,9 @@ class References:
     tried: int  # shaped samples tried
 
 
-def reference_set(flat: Flat) -> References:
-    """The reference set of DESIGN 5.4, with its adequacy checked (E10)."""
+def reference_set(flat: Flat, *, check: bool = True) -> References:
+    """The reference set of DESIGN 5.4, with its adequacy checked (E10; ``check=False``
+    leaves the check to the caller, which then has the cases for its report)."""
     cases = []
     for seed in SEEDS_NORMAL:
         inputs = flat.sample(N, seed)
@@ -404,7 +420,8 @@ def reference_set(flat: Flat) -> References:
         if best_score >= goal:
             break
     cases += best
-    counts = check_adequacy(cases, flat.full, flat.accs, rows)
+    counts = (check_adequacy(cases, flat.full, flat.accs, rows) if check
+              else adequacy(cases, flat.accs))
     return References(cases, rows, counts, best_label, tried)
 
 

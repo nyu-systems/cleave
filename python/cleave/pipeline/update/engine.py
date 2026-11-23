@@ -128,13 +128,14 @@ def _run(d, flat_graph, recipe, budgets, rank_cases, combine):
         proof_module.check_leaves(flat_graph, full, acc)
     d.unary = unary_ops(flat_graph, full, loops)
 
-    # ---- references (E1-E6, E10)
+    # ---- references (E1-E4 instantiation, E6 rows, E5 cases, E10 adequacy)
     looped = _looped(recipe, flat_graph, full)
     flat = d.flat = ref.Flat(recipe, flat_graph, full, loops, looped, dtype="float32")
-    refs = ref.reference_set(flat)
+    ref.row_dependency(flat)
+    refs = ref.reference_set(flat, check=False)
     d.references, d.adequacy, d.shaped = refs.cases, refs.adequacy, refs.shaped
     d.cases = [(c.label, c.moved) for c in refs.cases]
-    ref.row_dependency(flat)
+    ref.check_adequacy(refs.cases, full, loops, refs.rows)
     d.timings["references"] = time.perf_counter() - t0
 
     # ---- one hole per accumulator, narrowest first; independent of each other
@@ -181,7 +182,7 @@ def _run(d, flat_graph, recipe, budgets, rank_cases, combine):
     if not d.ranked:
         first = rejected[0]
         case = first.case
-        if not first.replays[case].finite:  # rejected for its max, not for a value
+        if first.replays[case].finite:  # rejected for its max, not for a value
             case += f", where the carried {full} is not the flat graph's"
         raise Refused(E12.format(loops=", ".join(loops), case=case))
     best = d.ranked[0]
