@@ -59,7 +59,9 @@ def gen_tensor_allocation_str(
         alloc_code += f"{ts}, "
     alloc_code += f"), '{dtype}')\n"
 
-    if scope == "s" and is_tc_layout:
+    # TileLang's swizzled layout needs a rank >= 2 buffer (a 1-D broadcast row of a
+    # tensor-core chain is read element-wise, never by the gemm).
+    if scope == "s" and is_tc_layout and len(tile_shape) >= 2:
         alloc_code += (
             f"T.annotate_layout({{{tname}: tl.layout.make_swizzled_layout({tname})}})\n"
         )
