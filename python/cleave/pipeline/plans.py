@@ -149,8 +149,8 @@ def state_pair(graph: SearchedGraph, ir, split_factor: int) -> list:
     (dim,) = dims
     prefix = f"graph {graph.index}: split over {dim}: "
     f = int(split_factor)
-    extent = int(graph.program.sizes[dim])
-    if f < 1 or extent % f:
+    extent = (getattr(graph.program, "sizes", None) or {}).get(dim)
+    if f < 1 or (extent is not None and int(extent) % f):
         raise LoweringRejected(prefix + NO_SPLIT_FACTOR.format(n=extent, f=f))
     if graph.symbol_map is None:
         raise LoweringRejected(prefix + UNSEARCHED)
