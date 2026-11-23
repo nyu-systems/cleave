@@ -693,8 +693,6 @@ class KernelEmitter:
         op = Rescale(
             rank=len(kept_extents(graph.tmap[node].tile_size)),
             lead=len(kept_extents(graph.tmap[factor].tile_size)),
-            # a factor that is exactly 1 on most iterations (``lazy_rolling_nodes``)
-            guard=bool(getattr(factor, "unit_guard", False)),
         )
         func_name = self.emit_op_node(
             op, mem_scope=fscope + scope, clear=False, name_prefix=name_prefix

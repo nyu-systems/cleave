@@ -236,66 +236,6 @@ def test_rescale_macro_names_and_bodies():
     assert "ACC[i0, i1, i2] *= S[i0, i1]" in cg.generated_macros["ukernel_rescale_lead2_3dims_rr"]
 
 
-def test_guarded_rescale_macro_names_and_bodies():
-    """The rescale of the lazy rolling form: a thread whose own entries of the factor are
-    all exactly 1 skips the multiply. A different macro, so a different name."""
-    cg = TilelangCodeGen()
-    plain = _emit(cg, Rescale(rank=2, lead=1), "rr")
-    full = _emit(cg, Rescale(rank=1, lead=1, guard=True), "rr")
-    lead = _emit(cg, Rescale(rank=2, lead=1, guard=True), "rr")
-    assert plain == "ukernel_rescale_lead1_2dims_rr"
-    assert full == "ukernel_rescale_if_moved_1dims_rr"
-    assert lead == "ukernel_rescale_if_moved_lead1_2dims_rr"
-    assert cg.generated_macros[full] == (
-        "@T.macro\n"
-        "def ukernel_rescale_if_moved_1dims_rr(S, ACC):\n"
-        '    low = T.alloc_var("float32")\n'
-        "    low = 1.0\n"
-        "    for j0 in T.Parallel(*S.shape):\n"
-        "        low = T.min(low, T.if_then_else(S[j0] == 1.0, 1.0, 0.0))\n"
-        "    if low < 1.0:\n"
-        "        for i0 in T.Parallel(*ACC.shape):\n"
-        "            ACC[i0] *= S[i0]\n"
-    )
-    assert cg.generated_macros[lead] == (
-        "@T.macro\n"
-        "def ukernel_rescale_if_moved_lead1_2dims_rr(S, ACC):\n"
-        '    low = T.alloc_var("float32")\n'
-        "    low = 1.0\n"
-        "    for j0 in T.Parallel(*S.shape):\n"
-        "        low = T.min(low, T.if_then_else(S[j0] == 1.0, 1.0, 0.0))\n"
-        "    if low < 1.0:\n"
-        "        for i0, i1 in T.Parallel(*ACC.shape):\n"
-        "            ACC[i0, i1] *= S[i0]\n"
-    )
-    assert len(cg.generated_macros) == 3
-    wide = _emit(cg, Rescale(rank=3, lead=2, guard=True), "rr")
-    assert wide == "ukernel_rescale_if_moved_lead2_3dims_rr"
-    assert "T.if_then_else(S[j0, j1] == 1.0, 1.0, 0.0)" in cg.generated_macros[wide]
-    assert "ACC[i0, i1, i2] *= S[i0, i1]" in cg.generated_macros[wide]
-    assert Rescale(2, 1).guard is False and Rescale(2, 1, guard=1).guard is True
-    with pytest.raises(AssertionError, match="register"):
-        Rescale(rank=1, lead=1, guard=True).gen_macro(mem_scope="sr", clear=False)
-
-
-def test_grid_floor_macro():
-    """``g(x) = 8 * floor(x / 8)``: the shift of the lazy rolling form. The grid is a power
-    of two, so both factors are exact in float32."""
-    from cleave.ir.ops import GridFloor
-
-    assert GridFloor.GRID == 8.0 and math.log2(GridFloor.GRID).is_integer()
-    assert math.exp(GridFloor.GRID) < 65504.0  # exp(s - g(m)) < e^GRID is finite in float16
-    cg = TilelangCodeGen()
-    name = _emit(cg, GridFloor((16,), name="exp_5_max_grid"), "rr")
-    assert name == "ukernel_grid_floor_1dims_rr"
-    assert cg.generated_macros[name] == (
-        "@T.macro\n"
-        "def ukernel_grid_floor_1dims_rr(A, B):\n"
-        "    for i0 in T.Parallel(*B.shape):\n"
-        "        B[i0] = T.floor(A[i0] * 0.125) * 8.0\n"
-    )
-
-
 @pytest.mark.parametrize("rank, lead", [(1, 2), (2, 0), (2, 3)])
 def test_rescale_factor_is_a_leading_slice(rank, lead):
     with pytest.raises(AssertionError, match="Rescale"):

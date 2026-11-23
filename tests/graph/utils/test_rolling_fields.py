@@ -178,64 +178,6 @@ def test_rolling_nodes_names_dtypes_and_wiring(exp_cls, rows, n_batch_dims):
     assert not alpha.outputs  # read through `accum_scale`, not through an edge
 
 
-@pytest.mark.parametrize("exp_cls", [Exp, _OtherExp])
-@pytest.mark.parametrize("rows, n_batch_dims", [((ROWS,), 0), ((4, ROWS), 1)])
-def test_lazy_rolling_nodes_names_dtypes_and_wiring(exp_cls, rows, n_batch_dims):
-    """The lazily rescaled form: the shift is ``g(m)``, the lag node ``g`` of the previous
-    max, and the factor says that it is 1 on most iterations."""
-    from cleave.ir.ops import GridFloor
-    from cleave.ir.rolling import lazy_rolling_nodes
-
-    m = ReduceMax((*rows, 64), axis=-1, name="exp_5_max", accum_init=NEG_FLT_MAX)
-    m_prev, shift, step, alpha = lazy_rolling_nodes(
-        m, stem="exp_5", rows=rows, n_batch_dims=n_batch_dims, exp_cls=exp_cls)
-
-    assert _names([m_prev, shift, step, alpha]) == [
-        "exp_5_max_prev", "exp_5_max_grid", "exp_5_max_step", "exp_5_alpha"]
-    assert type(m_prev) is GridFloor and type(shift) is GridFloor
-    assert type(step) is Sub and type(alpha) is exp_cls
-    for node in (m_prev, shift, step, alpha):
-        assert node.dtype == node.out_dtype == STAT_DTYPE == "float32", node.name
-        assert tuple(node.dims) == tuple(rows) and node.n_batch_dims == n_batch_dims, node.name
-        assert [int(d) for d in node.get_shape(0)] == list(rows), node.name
-    assert step.const is None and step.broadcast == -1
-
-    def sources(node):
-        return [(e.src_node, e.dst_id) for e in node.inputs]
-
-    assert sources(m_prev) == [(m, 0)] and sources(shift) == [(m, 0)]
-    assert sources(step) == [(m_prev, 0), (shift, 1)]  # g(m_prev) - g(m): <= 0, alpha <= 1
-    assert sources(alpha) == [(step, 0)]
-    assert sorted((e.dst_node.name, e.dst_id) for e in m.outputs) == [
-        ("exp_5_max_grid", 0), ("exp_5_max_prev", 0)]
-    assert not alpha.outputs
-    # the codegen guards the rescale by this factor; the eager factor has no such mark
-    assert alpha.unit_guard is True
-    _, _, eager = rolling_nodes(
-        ReduceMax((*rows, 64), axis=-1, name="exp_6_max", accum_init=NEG_FLT_MAX),
-        stem="exp_6", rows=rows, n_batch_dims=n_batch_dims, exp_cls=exp_cls)
-    assert not hasattr(eager, "unit_guard")
-
-
-def test_grid_floor_is_exact_and_bounds_the_shifted_scores():
-    """``g(m) <= m < g(m) + GRID`` and ``g`` of a multiple of the grid is that multiple, bit
-    for bit; the sentinel the carried max starts at is its own ``g``."""
-    import torch
-
-    from cleave.ir.ops import GridFloor
-    from cleave.runtime.reference import REFERENCES
-
-    g = REFERENCES[GridFloor]
-    node = GridFloor((8,), name="g")
-    x = torch.tensor([-17.5, -8.0, -0.25, 0.0, 7.999, 8.0, 123.4, NEG_FLT_MAX],
-                     dtype=torch.float32)
-    got = g(node, [x])
-    want = torch.tensor([-24.0, -8.0, -8.0, 0.0, 0.0, 8.0, 120.0, NEG_FLT_MAX],
-                        dtype=torch.float32)
-    assert torch.equal(got, want)
-    assert ((x - got >= 0) & (x - got < GridFloor.GRID)).all()
-
-
 def test_rolling_nodes_need_a_float32_max():
     m = ReduceMax((ROWS, 64), name="exp_5_max", dtype="float16", out_dtype="float16")
     with pytest.raises(AssertionError, match="float32"):

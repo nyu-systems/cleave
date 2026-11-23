@@ -22,7 +22,6 @@ from . import (
     CausalMaskedScore,
     ConstFill,
     Copy,
-    GridFloor,
     Div,
     Exp,
     Exp2,
@@ -103,7 +102,6 @@ AXIS_MAP_EXEMPT: Dict[str, str] = {
     "Lse2": _SAME_SHAPE,
     "MaskedLse2": _SAME_SHAPE,
     "Copy": _UNARY,
-    "GridFloor": _UNARY,
     "Accumulate": _UNARY,
     "AccumulateMax": _UNARY,
     # Unary in the plain form; the shifted form also reads the row max of its operand, and
@@ -147,7 +145,6 @@ _SPECS = (
     _spec(Exp2),
     _spec(Lse2),
     _spec(Copy),
-    _spec(GridFloor),
     _spec(Accumulate),
     _spec(AccumulateMax),
     _spec(PermuteView),

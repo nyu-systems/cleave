@@ -505,7 +505,6 @@ def test_gpu_exact_softmax_wide_values_are_rescaled_every_iteration_and_validate
     assert not [r for r in built if r.error_type in ("NonFiniteOutput", "OutputMismatch")], built
     for r in built.correct:
         assert "ukernel_rescale_lead1_2dims_rr" in r.source
-        assert "_if_moved" not in r.source and "grid_floor" not in r.source
 
 
 def _kernel_nans(error) -> int:

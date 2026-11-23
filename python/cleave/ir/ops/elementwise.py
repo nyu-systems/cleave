@@ -379,23 +379,6 @@ class Copy(UnaryElementwise):
     _te = lambda x: x  # noqa: E731
 
 
-class GridFloor(UnaryElementwise):
-    """``B = GRID * floor(A / GRID)``: ``A`` rounded down to a multiple of ``GRID``.
-
-    The shift of a lazily rescaled rolling softmax (``cleave.ir.rolling.lazy_rolling_nodes``):
-    ``P = exp(s - g(m))`` in place of ``exp(s - m)``, ``m`` the running max. ``g(m)`` moves
-    only when ``m`` crosses a multiple of the grid, so the rescale factor
-    ``exp(g(m_prev) - g(m))`` is exactly 1 on every other iteration. ``GRID`` is a power of
-    two: the rounding is exact in float32 however it is compiled, the two places that take
-    it of one value get the same bits, and ``P < e^GRID = 2981`` is far inside float16.
-    """
-
-    GRID = 8.0
-    kind = "grid_floor"
-    _tl = f"T.floor({{a}} * {1.0 / GRID!r}) * {GRID!r}"
-    _te = lambda x: te.floor(x * (1.0 / 8.0)) * 8.0  # noqa: E731
-
-
 def _kv_mask(scalar_args) -> str:
     """The columns of a KV tile inside the request's window (macro indices m0, m1)."""
     tile_base, valid_len = scalar_args[:2]

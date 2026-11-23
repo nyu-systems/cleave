@@ -527,44 +527,25 @@ class Rescale(MacroOp):
     accumulator class (``ReduceSum``, ``Matmul``, ``Accumulate``), which is why the scale is
     declared on the graph rather than being a variant of each of them. ``rank`` and ``lead``
     are tile ranks of accumulator and factor (unit extents already squeezed).
-
-    ``guard``: a thread skips the multiply when every entry of ``S`` it holds is exactly 1
-    (``x * 1.0`` is ``x``, so the result is the same bits; any other entry, a NaN included,
-    takes the multiply). For a factor that is 1 on most iterations
-    (``cleave.ir.rolling.lazy_rolling_nodes``).
     """
 
-    _macro_attrs = ("rank", "lead", "guard")
+    _macro_attrs = ("rank", "lead")
 
-    def __init__(self, rank: int, lead: int, guard: bool = False):
+    def __init__(self, rank: int, lead: int):
         assert 1 <= lead <= rank, f"Rescale: factor rank {lead} vs accumulator rank {rank}"
-        self.rank, self.lead, self.guard = int(rank), int(lead), bool(guard)
+        self.rank, self.lead = int(rank), int(lead)
 
     def gen_macro(self, **kwargs) -> str:
         s_scope, acc_scope = kwargs["mem_scope"]
         assert s_scope == "r" and acc_scope == "r", "Rescale works on register fragments."
         idx = [f"i{d}" for d in range(self.rank)]
-        if not self.guard:
-            macro_str = f"""\
+        macro_str = f"""\
         @T.macro
         def {self.get_macro_name(**kwargs)}(S, ACC):
             for {", ".join(idx)} in T.Parallel(*ACC.shape):
                 ACC[{", ".join(idx)}] *= S[{", ".join(idx[: self.lead])}]"""
-            return self._format_code(macro_str)
-        own = [f"j{d}" for d in range(self.lead)]
-        macro_str = f"""\
-        @T.macro
-        def {self.get_macro_name(**kwargs)}(S, ACC):
-            low = T.alloc_var("float32")
-            low = 1.0
-            for {", ".join(own)} in T.Parallel(*S.shape):
-                low = T.min(low, T.if_then_else(S[{", ".join(own)}] == 1.0, 1.0, 0.0))
-            if low < 1.0:
-                for {", ".join(idx)} in T.Parallel(*ACC.shape):
-                    ACC[{", ".join(idx)}] *= S[{", ".join(idx[: self.lead])}]"""
         return self._format_code(macro_str)
 
     def get_macro_name(self, **kwargs) -> str:
         lead = "" if self.lead == self.rank else f"_lead{self.lead}"
-        guard = "_if_moved" if self.guard else ""
-        return f"ukernel_rescale{guard}{lead}_{self.rank}dims_{kwargs['mem_scope']}"
+        return f"ukernel_rescale{lead}_{self.rank}dims_{kwargs['mem_scope']}"
