@@ -13,7 +13,7 @@ pytest.importorskip("z3")
 import cleave
 import cleave.lang as cl
 from cleave.ir.ops import Div, Matmul, ReduceSum, Sub
-from cleave.ir.update_rule import loop_key, use_searched_updates
+from cleave.ir.update_rule import loop_key
 from cleave.pipeline import plans
 from cleave.pipeline import update as update_package
 from cleave.pipeline.update import engine, store, texts
@@ -31,8 +31,7 @@ def refused(fn, shapes=SHAPES, edit=None, **kw):
     if edit is not None:
         edit(ir)
     ob = the_obstacle(ir)
-    with use_searched_updates():
-        d = engine.run(ir, ob, Recipe.of(graph), key=loop_key(ir, ob.full, ob.loops), **kw)
+    d = engine.run(ir, ob, Recipe.of(graph), key=loop_key(ir, ob.full, ob.loops), **kw)
     return ir, ob, d
 
 
@@ -208,7 +207,7 @@ def test_e13_a_bug_in_the_search_keeps_the_pin_and_names_itself(monkeypatch, tmp
     # ... and it never leaves ``plans.lower``: the graph keeps its pin and says why
     monkeypatch.setattr(update_package, "_DERIVED", {})
     graph = identity(flash_rows_explicit, SHAPES)
-    with use_searched_updates(), cleave.Session(cache_root=tmp_path):
+    with cleave.Session(cache_root=tmp_path):
         (ir,) = plans.lower(graph)
         assert ir.streaming_refusals == [f"{ob.full}: RuntimeError: boom (a bug in the update search)"]
         assert not [n for n in ir.nodes if getattr(n, "streaming", None) is not None]
@@ -224,7 +223,7 @@ def test_e1_a_graph_made_without_a_program_keeps_its_pin(tmp_path, monkeypatch):
     graph = identity(flash_rows_explicit, SHAPES)
     bare = SearchedGraph(0, graph.structure, None, False, None)
     monkeypatch.setattr(update_package, "_DERIVED", {})
-    with use_searched_updates(), cleave.Session(cache_root=tmp_path):
+    with cleave.Session(cache_root=tmp_path):
         (ir,) = plans.lower(bare)
         ob = the_obstacle(ir)
         assert ir.streaming_refusals == [f"{ob.full}: " + texts.E1.format(full=ob.full)]
@@ -330,8 +329,7 @@ def test_e14_one_sum_scaled_by_two_softmaxes():
     found = [ob for ob in obstacles(nodes, red, reduction_ancestors(nodes)) if not ob.refused]
     assert len(found) == 2
     for ob in found:
-        with use_searched_updates():
-            d = engine.run(ir, ob, Recipe.of(graph), key=loop_key(ir, ob.full, ob.loops))
+        d = engine.run(ir, ob, Recipe.of(graph), key=loop_key(ir, ob.full, ob.loops))
         other = next(o.full for o in found if o is not ob)
         assert f"is computed from {other}, another reduction over the dim {ob.full}" in d.refused
         assert d.seconds < 0.5
@@ -357,6 +355,5 @@ def test_t5_a_max_under_the_max_is_not_a_sum():
                     "must be sums or matmuls that start at zero")
     assert ob.refused == want
     ob = dataclasses.replace(ob, refused="")
-    with use_searched_updates():
-        d = engine.run(ir, ob, Recipe.of(graph), key=loop_key(ir, ob.full, ob.loops))
+    d = engine.run(ir, ob, Recipe.of(graph), key=loop_key(ir, ob.full, ob.loops))
     assert d.refused == want

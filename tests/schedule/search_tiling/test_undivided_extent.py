@@ -55,12 +55,13 @@ import cleave.lang as cl
 from cleave import pipeline as P
 from cleave.core.errors import ScheduleRejected
 from cleave.frontend import trace
+from cleave.pipeline.plans import lower
 from cleave.pipeline.superopt import GraphSet
 from cleave.runtime.compile import build_candidate_code
 from cleave.schedule import apply_tiling, search_tiling
 from cleave.schedule.policy.default import TCPolicy
 
-from tests import _softmax as S
+from tests import _explicit_softmax as X
 
 NO_MULTIPLE_OF_16 = (
     r"mma_\d+ contracts 1000 float16 elements: a tensor-core matmul of 16-bit operands "
@@ -71,7 +72,7 @@ NOT_PADDED = "the last tile of a reduction is not padded"
 
 def flash_fixed_shift(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
                       v: cl.Tensor["H", "SKV", "D"]):
-    """The flash form with a constant shift written by hand: no request, no record."""
+    """The flash form with a constant shift written by hand: no max, no record."""
     e = cl.exp((q @ k.mT) / q.shape[-1] ** 0.5 + -6.25)
     return (e @ v) / cl.sum(e, -1, keepdim=True)
 
@@ -80,7 +81,15 @@ def _shapes(skv):
     return dict(H=32, SQ=64, SKV=skv, D=64)
 
 
-@pytest.mark.parametrize("fn", [S.flash_attention, flash_fixed_shift],
+def _lowered(fn, shapes, dtype=cl.f16):
+    """The identity (un-searched) graph of ``fn``, lowered as the pipeline lowers it (the
+    update rule of a softmax's max derived)."""
+    (graph,) = list(GraphSet.identity(trace(fn, shapes, dtype)))
+    (ir,) = lower(graph)
+    return ir
+
+
+@pytest.mark.parametrize("fn", [X.flash_attention, flash_fixed_shift],
                          ids=["exact", "fixed_shift"])
 def test_an_extent_the_tensor_core_step_does_not_divide_is_refused_with_its_reason(fn):
     plans = P.schedule(GraphSet.identity(trace(fn, _shapes(1000), cl.f16)),
@@ -96,7 +105,7 @@ def test_an_extent_the_tensor_core_step_does_not_divide_is_refused_with_its_reas
 
 
 def test_the_policy_itself_raises_the_refusal():
-    ir = S.lowered(S.flash_attention, _shapes(1000))
+    ir = _lowered(X.flash_attention, _shapes(1000))
     for force in (False, True):
         with pytest.raises(ScheduleRejected, match=NO_MULTIPLE_OF_16):
             list(search_tiling(ir, topk=16, force_fusion=force))
@@ -104,7 +113,7 @@ def test_the_policy_itself_raises_the_refusal():
 
 @pytest.mark.parametrize("skv", [96, 1024, 1536])
 def test_extents_the_step_divides_schedule_as_before(skv):
-    plans = P.schedule(GraphSet.identity(trace(S.flash_attention, _shapes(skv), cl.f16)),
+    plans = P.schedule(GraphSet.identity(trace(X.flash_attention, _shapes(skv), cl.f16)),
                        P.ScheduleConfig(topk=16))
     assert len(plans) >= 1
     assert not any(NOT_PADDED in str(r.error) or "none divides that extent" in str(r.error)
@@ -198,7 +207,7 @@ def test_a_long_odd_row_is_summed_in_one_step_or_refused_with_the_reason():
 def _stepped_by(columns, step):
     """A tiling of the row sum over ``columns`` whose reduction is stepped by ``step``: one
     the search proposes, with its step replaced."""
-    ir = S.lowered(row_sum, dict(R=64, C=columns))
+    ir = _lowered(row_sum, dict(R=64, C=columns))
     cand = next(c for c in search_tiling(ir, topk=1000) if _reduction_steps(c) == [columns])
     for steps in cand.rstep_map.values():
         for name in steps:
@@ -247,7 +256,7 @@ def _both_stepped_by(shapes, step):
     """A tiling of ``two_row_sums`` the search proposes -- the sum over 256 columns stepped
     by ``step``, the one over 257 by the whole axis -- with the sum over 257 stepped by
     ``step`` as well: its entry of the step map and the inner tile of the input it reads."""
-    ir = S.lowered(two_row_sums, shapes)
+    ir = _lowered(two_row_sums, shapes)
 
     def steps(cand, extent):
         (node,) = [n for n in cand.rstep_map if n.raxis and int(n.raxis[0].dom.extent) == extent]
@@ -291,7 +300,7 @@ def test_a_sum_that_joins_another_sums_loop_is_held_to_a_dividing_step_too():
 def test_two_row_sums_are_stepped_by_what_divides_each():
     """What the search proposes for the same program: every step divides its own axis."""
     for shapes in (dict(R=64, C=257, D=256), dict(R=64, C=256, D=257)):
-        cands = list(search_tiling(S.lowered(two_row_sums, shapes), topk=1000))
+        cands = list(search_tiling(_lowered(two_row_sums, shapes), topk=1000))
         assert cands
         for cand in cands:
             for node, steps in cand.rstep_map.items():
@@ -322,7 +331,7 @@ def test_an_output_axis_the_tensor_core_tile_does_not_divide_is_refused_with_its
         shapes, reason):
     """It ended the search with ``ValueError: 64 is not in list`` (``32`` for the columns):
     the same list lookup as for the reduction axis, on the output axes."""
-    ir = S.lowered(plain_matmul, shapes)
+    ir = _lowered(plain_matmul, shapes)
     for force in (False, True):
         with pytest.raises(ScheduleRejected, match=reason):
             list(search_tiling(ir, topk=16, force_fusion=force))
@@ -337,7 +346,7 @@ def test_an_output_axis_the_tensor_core_tile_does_not_divide_is_refused_with_its
 
 
 def test_attention_over_96_queries_is_refused_with_the_same_reason():
-    ir = S.lowered(S.flash_attention, dict(H=12, SQ=96, SKV=256, D=64))
+    ir = _lowered(X.flash_attention, dict(H=12, SQ=96, SKV=256, D=64))
     with pytest.raises(ScheduleRejected, match=_no_tile(1, 96, 64)):
         list(search_tiling(ir, topk=16))
 
@@ -346,4 +355,4 @@ def test_attention_over_96_queries_is_refused_with_the_same_reason():
                                     dict(M=48, K=256, N=24)],
                          ids=["128x128", "64x32", "48x24"])
 def test_output_axes_the_tile_divides_or_holds_whole_schedule_as_before(shapes):
-    assert len(list(search_tiling(S.lowered(plain_matmul, shapes), topk=16))) >= 1
+    assert len(list(search_tiling(_lowered(plain_matmul, shapes), topk=16))) >= 1

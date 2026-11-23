@@ -70,28 +70,34 @@ All demos share the same flags (`python demo/<name>.py --help`):
 | `rmsnorm_matmul.py` | `RMSNorm(X) @ W`; `--preset split-k` for the split-K shapes |
 | `swiglu.py`, `lora.py`, `matmul_rowsum.py` | SwiGLU, LoRA (`cleave.Program` builder), row-sum |
 | `matmul_matmul.py` | `(Q K^T) V`; `--preset split` for the split-KV decode shapes |
-| `{mha,gqa,mqa}_decode.py` | decode attention, split along `SKV` by default: each partial returns the max of its split, the combine weights by it |
+| `{mha,gqa,mqa}_decode.py` | decode attention; they ask for a split along `SKV`, which runs unsplit for now (below) |
 | `{mha,gqa,mqa,mla}_prefill.py`, `mla_decode.py`, `qknorm.py` | prefill / MLA / QK-norm attention |
 | `mha_backward.py` | attention backward: `dQ, dK, dV` in one fused kernel (declared inputs `L`, `o`) |
 | `staged.py` | the pipeline one stage at a time (research view) |
 
 `--split` is parsed by every demo, but not every demo has a split run: `mla_prefill.py` and
-`qknorm.py` declare a single tolerance and end on that with `--split SKV` (a split partial of
-an exact softmax also returns its shift, which needs a bound of its own; their docstrings say
-why none is declared), and `mla_decode.py` has no split plan at its search budget, so the
-flag leaves its run as it is.
+`qknorm.py` declare a single tolerance and offer none (their docstrings say why), and
+`mla_decode.py` asks for none. For now no attention demo has a split run at all: the search
+does not split a graph whose max reduces the split dim (`--split SKV`), and the split pair
+built from the loop state (each partial returns the max of its split, the combine repairs
+the partials by it) is not wired in yet. Such a run is the unsplit one, and its report
+refuses every split factor with that reason.
 
 `demo/dynamic/` holds the paged-KV dynamic-shape demos.
 
-`cl.softmax` is the exact softmax, `exp(s - max(s)) / sum`: the search sees `exp / sum / div`
-and no max, and every schedule gets the shift it needs (the row max where a tile holds the
-row, a running max over a looped row as in FlashAttention, the max of each split under
-split-KV as in FlashDecoding; the paged kernels carry a running max too). Where the softmax
-is contracted over its row (a sum or a matmul, as in attention's `softmax(...) @ V`) that
-holds at any row length. A program that returns the softmax itself (a standalone softmax,
-attention weights) is exact too, but is served only while its row fits one tile: nothing
-recomputes the exp for the output once the row sum is looped. Shapes that have no kernel yet
-(each is refused with its reason, or fails in TileLang, never served wrongly):
+`cl.softmax` is the exact softmax, `exp(s - max(s)) / sum`, and records its max: the max is an
+ordinary reduction of the searched graph (`cl.exp(s - cl.max(s, -1, keepdim=True))` written
+by hand is the same program). Where a tile holds the row, the row max is computed in place.
+Where a tiling loops over the row (FlashAttention), the loop carries the max across its
+iterations and repairs every sum and matmul it accumulates with an update rule that is
+searched for on the program's own graph, proven with z3 and ranked (`cleave.pipeline.update`);
+the paged kernels carry a hand-placed running max. Where the softmax is contracted over its
+row (a sum or a matmul, as in attention's `softmax(...) @ V`) that holds at any row length. A
+program that returns the softmax itself (a standalone softmax, attention weights) is exact
+too, but is served only while its row fits one tile: its exp is read by the division, which
+is not summed over the row, so the max is not carried across a loop (the refusal says so).
+Shapes that have no kernel yet (each is refused with its reason, or fails in TileLang, never
+served wrongly):
 
 - attention with a single query row (`S_Q = 1`): a unit dim that is not a batch dim has no tile;
 - for 16-bit dtypes, a matmul that contracts a length no multiple of 16 divides (float16
@@ -102,14 +108,15 @@ recomputes the exp for the output once the row sum is looped. Shapes that have n
   that 32 does not divide (`M = 96`, `N = 48`).
 
 `cl.softmax(x)` next to another `exp` of the same tensor is served under the limit of a
-softmax that is returned: the search computes `exp(x)` once, the lowering computes it again
-for the softmax, and the row still has to fit one tile. `cl.softmax(x) + cl.exp(x)` has
-plans for float16 rows of 4096 and none at 8192 (where a softmax alone still has one). Two
-softmaxes of `x` over different axes need a row and a column in one tile, which is the
+softmax that is returned: the softmax's exp reads `x - max(x)`, a value of its own that the
+search keeps apart from `exp(x)`, and the row has to fit one tile. `cl.softmax(x) + cl.exp(x)`
+has plans for float16 rows of 4096 and none at 8192 (where a softmax alone still has one).
+Two softmaxes of `x` over different axes need a row and a column in one tile, which is the
 whole tensor: 16x32 and 64x128 have plans, 64x256 has none.
 
-Kernels of a program whose softmax is exact are validated on adversarial logits as well as
-on normal ones, wherever the logits can be shaped through an input: every attention demo but
+Kernels of a graph whose softmax is exact (an `exp` that reads `x - max(x)`, whoever wrote it)
+are validated on adversarial logits as well as on normal ones, wherever the logits can be
+shaped through an input: every attention demo but
 `qknorm.py`, whose logits are computed from the normalized `q` and `k` (its report says so,
 as it does for any softmax of a program that no case shapes). A paged program gets its
 adversarial workloads when it is one of the registry operators (`cleave.dynamic.registry`)
@@ -168,9 +175,10 @@ the reference has, and shapes and dtypes must agree.
 
 There is no default tolerance. Each operator declares its own `cl.Tolerance(rtol=..., atol=...)`
 (one, or one per output when every plan has that many: a program with split plans declares
-one, because a split partial has more outputs than its combine; where its softmax is exact
-the partials also return their float32 shift, and the program declares one bound per boundary
-role, `{"": cl.Tolerance(...), "shift": cl.Tolerance(...)}`), set from its measured error
+one, because a split partial has more outputs than its combine; a split partial that also
+returns a float32 max gets a bound of its own by boundary role,
+`{"": cl.Tolerance(...), "shift": cl.Tolerance(...)}`, which the decode demos declare for the
+split of their softmax that is not built yet), set from its measured error
 (the next 1-2-5 step at or above 4x the largest error of its valid kernels, 2x for a bf16
 output, whose single ulp is already 0.8% of the row max; valid kernels sit within a few ulp of
 the reference, wrong kernels above 10% of the row max): `cleave.compile(..., tolerance=...)`,

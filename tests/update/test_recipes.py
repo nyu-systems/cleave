@@ -14,7 +14,7 @@ pytest.importorskip("torch")
 pytest.importorskip("z3")
 
 import cleave.lang as cl
-from cleave.ir.update_rule import loop_key, signature, use_searched_updates
+from cleave.ir.update_rule import loop_key, signature
 from cleave.lower.state_split import combine_graph, lower_partial, op_indices
 from cleave.pipeline.update import engine, texts
 from cleave.pipeline.update.instantiate import Recipe
@@ -53,8 +53,7 @@ def items(**shapes):
 
 
 def derived(ir, ob, recipe):
-    with use_searched_updates():
-        return engine.run(ir, ob, recipe, key=loop_key(ir, ob.full, ob.loops))
+    return engine.run(ir, ob, recipe, key=loop_key(ir, ob.full, ob.loops))
 
 
 def assert_derives(d, ir):
@@ -290,7 +289,7 @@ def sum_next_to_exp(x: cl.Tensor["R", "C"]):
 
 _ATT = dict(H=4, SQ=8, SKV=64, D=16)
 _ROWS = dict(R=16, C=64, D=8)
-CENSUS = [  # program, shapes, what lowering under the switch says for each obstacle
+CENSUS = [  # program, shapes, what lowering says for each obstacle
     (flash_attention, _ATT, ["record"]),
     (traced_attention, _ATT, ["T3"]),
     (unscaled_attention, _ATT, ["T3"]),
@@ -312,7 +311,7 @@ WHY = {"T3": " reads ", "T4": ", computed from ", "T5": " is a ReduceMax: ", "E1
 
 @pytest.mark.parametrize("fn, shapes, want", CENSUS, ids=[c[0].__name__ for c in CENSUS])
 def test_every_softmax_program_is_served_or_says_why(fn, shapes, want, tmp_path, monkeypatch):
-    """Lowering under the switch: a record where the engine derives one, the reason
+    """Lowering: a record where the engine derives one, the reason
     otherwise -- the structural ones of the scheduler (T3: two passes, T4: a value of the
     max read outside the loop, T5: a reduction under the max that is no sum) without asking
     the engine, the engine's own after."""
@@ -323,7 +322,7 @@ def test_every_softmax_program_is_served_or_says_why(fn, shapes, want, tmp_path,
     from cleave.pipeline.superopt import GraphSet
 
     monkeypatch.setattr(update_package, "_DERIVED", {})
-    with use_searched_updates(), cleave.Session(cache_root=tmp_path):
+    with cleave.Session(cache_root=tmp_path):
         (graph,) = list(GraphSet.identity(trace(fn, shapes, cl.f16)))
         (ir,) = plans.lower(graph)
     records = [n.streaming for n in ir.nodes if getattr(n, "streaming", None) is not None]

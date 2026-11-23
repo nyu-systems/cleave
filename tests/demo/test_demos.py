@@ -169,15 +169,17 @@ def test_staged_demo_declares_its_own_tolerance(monkeypatch):
 
 
 def test_mha_decode_config(monkeypatch):
-    """The decode demo: no max in the program (the request stands for it), the split over
-    the keys, and the search budget the auto rule gives."""
+    """The decode demo: the max of ``cl.softmax`` in the program, the split over the keys,
+    and the search budget the auto rule gives (15 with the split; the search itself runs
+    unsplit, at 13: ``tests/pipeline_api/test_softmax_split_unsplit.py``)."""
     seen = run_demo(monkeypatch, "mha_decode", [])
     program, so, sc = seen["program"], seen["so"], seen["sc"]
     assert [r.kind for r in program.ops if r.kind != "input"] == [
-        "matmul", "div", "exp", "reduce_sum", "div", "matmul"]
-    assert len(program.stabilize_requests) == 1
+        "matmul", "div", "reduce_max", "sub", "exp", "reduce_sum", "div", "matmul"]
+    (m,) = [r for r in program.ops if r.kind == "reduce_max"]
+    assert m.attr("dim") == 2  # the keys
     assert so.split == ("SKV",) and sc.split_k == (16, 32)
-    assert so.max_ops == "auto" and so.resolve_max_ops(program) == 13
+    assert so.max_ops == "auto" and so.resolve_max_ops(program) == 15
     assert program.sizes == {"H": 32, "SQ": 64, "D": 64, "SKV": 4096}
     # --split none: the solo kernels only, on the same budget
     solo = run_demo(monkeypatch, "mha_decode", ["--split", "none"])
@@ -187,17 +189,18 @@ def test_mha_decode_config(monkeypatch):
 
 @pytest.mark.parametrize("name", ATTENTION)
 def test_attention_demo_softmax_is_exact(monkeypatch, name):
-    """No attention demo shifts its scores by a constant: each records the one request of
-    ``cl.softmax`` on an exp that reads the scaled scores themselves, and no max."""
+    """No attention demo shifts its scores by a constant: each records the one max of
+    ``cl.softmax``, over the keys, and its exp reads the scaled scores minus that max."""
     program = run_demo(monkeypatch, name, [])["program"]
-    assert len(program.stabilize_requests) == 1
     ops = {r.out: r for r in program.ops}
+    (m,) = [r for r in program.ops if r.kind == "reduce_max"]
+    assert m.attr("dim") == 2  # the keys: the last of three axes
     (exp,) = [r for r in program.ops if r.kind == "exp"]
-    assert exp.attr("stabilize") == 2  # the keys: the last of three axes
-    scores = ops[exp.args[0]]
-    # the exp's operand is the division by sqrt(d), not an add of a constant behind it
+    (sub,) = [r for r in program.ops if r.kind == "sub"]
+    assert exp.args == (sub.out,) and sub.args == (m.args[0], m.out)  # exp(s - max(s))
+    scores = ops[m.args[0]]
+    # the softmax's logits are the division by sqrt(d), not an add of a constant behind it
     assert scores.kind == "div" and isinstance(scores.args[1], float)
-    assert not [r for r in program.ops if r.kind in ("reduce_max", "sub")]
     # an add in the program adds two tensors (MLA's two score terms) or qknorm's eps to
     # a mean of squares; none of them feeds the exp
     for add in (r for r in program.ops if r.kind == "add"):
@@ -275,31 +278,6 @@ def test_a_declaration_that_does_not_fit_ends_a_demo_in_one_line(monkeypatch):
     monkeypatch.setattr(sys, "argv", [str(DEMO / "mla_prefill.py")])
     with pytest.raises(examples.CleaveError, match="something else"):
         runpy.run_path(str(DEMO / "mla_prefill.py"), run_name="__main__")
-
-
-def test_search_split_of_a_demo_that_declares_one_tolerance_stops_before_it_builds(
-        monkeypatch, tmp_path):
-    """demo/mla_prefill.py declares one ``Tolerance`` and offers no split (its docstring
-    says why). Asked for one anyway, with the budget the split graphs need, the run
-    searches and schedules them and then ends on one line that names the plan the
-    declaration does not cover -- before a kernel or a reference is built: the pipeline
-    refuses the declaration first, so ``run_candidates`` is never reached. (Small shapes;
-    the real search and scheduler, no GPU.)"""
-    import cleave.runtime.evaluate as evaluate_mod
-
-    monkeypatch.setenv("CLEAVE_CACHE_ROOT", str(tmp_path))
-    reached = []
-    monkeypatch.setattr(evaluate_mod, "run_candidates",
-                        lambda *a, **kw: reached.append(1) or [])
-    message = _run_to_exit(monkeypatch, "mla_prefill", [
-        "--H", "4", "--SQ", "64", "--SKV", "1024", "--D", "32", "--DV", "16",
-        "--split", "SKV:4", "--max-ops", "13", "--preset", "fast", "--topk", "4",
-        "--no-cache"])
-    assert message.startswith("mla_prefill: build(): plan 'g") and "\n" not in message
-    assert "split-k=4 partial #0" in message and "(partial): one Tolerance covers" in message
-    assert message.endswith("declare the tolerance by role, "
-                            "tolerance={'': Tolerance(...), 'shift': Tolerance(...)}")
-    assert not reached
 
 
 def test_qknorm_says_which_inputs_its_kernels_are_validated_on():

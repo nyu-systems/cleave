@@ -2,14 +2,16 @@
 
 A kernel-cache hit returns the saved kernel without building or validating anything, and the
 key holds the program's fingerprint, the configs and ``pipeline.cache.SCHEMA``. A change to
-the tiler, the stabilization rewrite or codegen changes what the same program builds without
-changing any of the first two, so it has to come with a bump of the third; nothing else
-tells a saved kernel that it is stale.
+the tiler, the update search, the assembly of a carried max or codegen changes what the same
+program builds without changing any of the first two, so it has to come with a bump of the
+third; nothing else tells a saved kernel that it is stale.
 
-This pins the text (by digest) of a few kernels of programs that record the exact softmax,
-next to the ``SCHEMA`` they were generated under. They are identity graphs (lowered as
-traced, no search), one tiling each: an in-tile max, a running max, both of one graph, and
-a running max over accumulators wide enough for the lazily rescaled form.
+This pins the text (by digest) of a few kernels of ``cl.softmax`` programs (the max in the
+flat graph), next to the ``SCHEMA`` they were generated under. They are identity graphs
+(lowered as traced, with the update rules ``plans.lower`` derives; no search), one tiling
+each: a tile that holds the row whole (the flat graph's own max), a loop that carries the
+max, both of one graph, and a carried max over accumulators wide enough that the lazy form of
+the hand-derived pass rescaled them only when the max moved (here: every iteration).
 When a digest moves, the test fails until ``SCHEMA`` is above the pinned value and the new
 digests are pinned with it.
 
@@ -27,10 +29,13 @@ pytest.importorskip("tilelang")
 import cleave.lang as cl
 from cleave.pipeline import cache
 from cleave.runtime.compile import build_candidate_code
+from cleave.pipeline.plans import lower
+from cleave.pipeline.superopt import GraphSet
+from cleave.frontend import trace
 from cleave.schedule import apply_tiling, search_tiling
-from cleave.schedule.stabilize import sites, stabilize_accept
+from cleave.schedule.streaming import sites, streaming_accept
 
-from tests import _softmax as S
+from tests import _explicit_softmax as X
 
 
 def softmax_rows(x: cl.Tensor["R", "C"]):
@@ -54,7 +59,7 @@ def attention_over_queries(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV"
 def flash_wide_values(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
                       v: cl.Tensor["H", "SKV", "DV"]):
     """Flash form with values wider than the keys: a 64 x 512 accumulator of ``P @ V``."""
-    e = S.stable_exp((q @ k.mT) / q.shape[-1] ** 0.5)
+    e = X.stable_exp((q @ k.mT) / q.shape[-1] ** 0.5)
     return (e @ v) / cl.sum(e, -1, keepdim=True)
 
 
@@ -62,49 +67,68 @@ SHORT, LONG = dict(H=32, SQ=64, SKV=256, D=64), dict(H=32, SQ=4096, SKV=4096, D=
 WIDE = dict(H=8, SQ=64, SKV=1024, D=64, DV=512)
 # name -> (program, shapes, how the pinned tiling serves the softmax). The flash form is the
 # one the search finds for attention (the row sum next to the value matmul); written out
-# here, it makes the request the way ``cl.softmax`` does.
+# here with the max ``cl.softmax`` records.
 KERNELS = {
-    "softmax_64x1024/in-tile": (softmax_rows, dict(R=64, C=1024), "in-tile"),
+    "softmax_64x1024/one-tile": (softmax_rows, dict(R=64, C=1024), "one-tile"),
     # a softmax axis that is not the last: behind a squeezed batch dim, and inside the loop
     # of the value matmul
-    "softmax_mid_4x256x64/in-tile": (softmax_mid, dict(H=4, C=256, R=64), "in-tile"),
-    "attention_over_queries_skv1024/in-tile": (
-        attention_over_queries, dict(H=32, SQ=64, SKV=1024, D=64), "in-tile"),
-    "attention_skv256/in-tile": (attention, SHORT, "in-tile"),
-    "flash_skv256/in-tile": (S.flash_attention, SHORT, "in-tile"),
-    "flash_skv256/rolling": (S.flash_attention, SHORT, "rolling"),
-    "flash_skv4096/rolling": (S.flash_attention, LONG, "rolling"),
-    "flash_wide_values/rolling-lazy": (flash_wide_values, WIDE, "rolling-lazy"),
+    "softmax_mid_4x256x64/one-tile": (softmax_mid, dict(H=4, C=256, R=64), "one-tile"),
+    "attention_over_queries_skv1024/one-tile": (
+        attention_over_queries, dict(H=32, SQ=64, SKV=1024, D=64), "one-tile"),
+    "attention_skv256/one-tile": (attention, SHORT, "one-tile"),
+    "flash_skv256/one-tile": (X.flash_attention, SHORT, "one-tile"),
+    "flash_skv256/looped": (X.flash_attention, SHORT, "looped"),
+    "flash_skv4096/looped": (X.flash_attention, LONG, "looped"),
+    "flash_wide_values/looped": (flash_wide_values, WIDE, "looped"),
 }
+# name -> the output tile of the pinned tiling, where it is not the first one of its kind:
+# the whole 64 x 512 value accumulator in one block (256 elements a thread), which 1119's
+# lazy form rescaled only when the max moved; here it is rescaled every iteration.
+OUTPUT_TILE = {"flash_wide_values/looped": [1, 64, 512]}
 
 # The SCHEMA these digests were generated under, and the digests. Re-pin both together.
-# (A bump that changes none of these eight texts leaves both as they are.)
-PINNED_SCHEMA = 39
+# (A bump that changes none of these eight texts leaves both as they are.) Pinned again at
+# the switch-over to the searched update rules, where every softmax program gained its max.
+PINNED_SCHEMA = 42
 PINNED = {
-    'softmax_64x1024/in-tile': ('tile=[2, 1024] rstep=[1024]', '8211bb6438573d68'),
-    'softmax_mid_4x256x64/in-tile': ('tile=[1, 256, 2] rstep=[256]', '77c506ba7b618bee'),
-    'attention_over_queries_skv1024/in-tile': ('tile=[1, 64, 32] rstep=[32, 1, 32]', '2e88cd515f035f38'),
-    'attention_skv256/in-tile': ('tile=[1, 64, 32] rstep=[32, 256, 256]', 'd5982c362d1466dd'),
-    'flash_skv256/in-tile': ('tile=[1, 64, 32] rstep=[32, 256, 256]', '9464e85013b3084e'),
-    'flash_skv256/rolling': ('tile=[1, 64, 32] rstep=[32, 32, 32]', '963ffee491434feb'),
-    'flash_skv4096/rolling': ('tile=[1, 128, 64] rstep=[32, 32, 32]', '6f82f9c294167554'),
-    'flash_wide_values/rolling-lazy': ('tile=[1, 64, 512] rstep=[32, 32, 32]', 'cf186bc349c18508'),
+    'softmax_64x1024/one-tile': ('tile=[2, 1024] rstep=[64, 1024]', 'f9936a0218828a65'),
+    'softmax_mid_4x256x64/one-tile': ('tile=[1, 256, 2] rstep=[2, 256]', '86aa9f6b4d2251bd'),
+    'attention_over_queries_skv1024/one-tile': ('tile=[1, 64, 32] rstep=[32, 1, 64, 32]', 'e4e3ed988e304efb'),
+    'attention_skv256/one-tile': ('tile=[1, 64, 32] rstep=[32, 256, 256, 256]', '291a70e8f38e0e54'),
+    'flash_skv256/one-tile': ('tile=[1, 64, 32] rstep=[32, 256, 256, 256]', '19a0f522e478e99b'),
+    'flash_skv256/looped': ('tile=[1, 64, 32] rstep=[32, 32, 32, 32]', 'eb265502f8782244'),
+    'flash_skv4096/looped': ('tile=[1, 128, 64] rstep=[32, 32, 32, 32]', '9836667cbf4ffe18'),
+    'flash_wide_values/looped': ('tile=[1, 64, 512] rstep=[32, 32, 32, 32]', '0925f36a22c0a31f'),
 }
 
 
-def _kind(site) -> str:
-    return site.case + ("-lazy" if site.lazy else "")
+def _kind(tiled) -> str:
+    """``looped`` where a loop carries the max (one site), ``one-tile`` where the tile holds
+    the row whole and the flat graph's own max stands (no site)."""
+    found = sites(tiled)
+    assert len(found) <= 1, found
+    return "looped" if found else "one-tile"
+
+
+def _lowered(fn, shapes, dtype=cl.f16):
+    (graph,) = list(GraphSet.identity(trace(fn, shapes, dtype)))
+    (ir,) = lower(graph)
+    return ir
 
 
 def digests() -> dict:
     """``name -> (tiling label, digest of the generated text)``: for each kernel the first
-    128-thread tiling the accept filter keeps that serves the softmax the named way."""
+    128-thread tiling the accept filter keeps that serves the softmax the named way (with
+    the output tile of ``OUTPUT_TILE``, where one is named)."""
     out = {}
     for name, (fn, shapes, case) in KERNELS.items():
-        ir = S.lowered(fn, shapes)
-        assert ir.nodes and stabilize_accept(ir) is not None, f"{name}: no softmax request"
-        for cand in search_tiling(ir, topk=1000, accept=stabilize_accept(ir)):
-            if cand.n_threads == 128 and [_kind(s) for s in sites(apply_tiling(cand))] == [case]:
+        ir = _lowered(fn, shapes)
+        accept = streaming_accept(ir)
+        assert ir.nodes and accept is not None, f"{name}: no streaming obstacle"
+        for cand in search_tiling(ir, topk=1000, accept=accept):
+            tile = OUTPUT_TILE.get(name, list(cand.output_tile))
+            if (cand.n_threads == 128 and list(cand.output_tile) == tile
+                    and _kind(apply_tiling(cand)) == case):
                 break
         else:
             raise AssertionError(f"{name}: no {case} tiling among the accepted candidates")
@@ -145,7 +169,7 @@ def test_a_text_change_fails_until_the_schema_is_bumped_and_pinned():
     assert stale(dict(PINNED), PINNED_SCHEMA) is None
     assert stale(dict(PINNED), PINNED_SCHEMA + 3) is None  # bumped for another reason
     assert "went back" in stale(dict(PINNED), PINNED_SCHEMA - 1)
-    name = "flash_skv256/rolling"
+    name = "flash_skv256/looped"
     label, digest = PINNED[name]
     changed = {**PINNED, name: (label, digest[::-1])}
     no_bump = stale(changed, PINNED_SCHEMA)
@@ -157,10 +181,10 @@ def test_a_text_change_fails_until_the_schema_is_bumped_and_pinned():
     assert "'new'" in stale({**PINNED, "new": ("tile=[1]", "0" * 16)}, PINNED_SCHEMA)
 
 
-def test_the_guard_pins_both_rewrites():
-    """Each pinned kernel is the kind its name says: an in-tile max, a running max, and a
-    running max that is rescaled lazily."""
-    assert {name.rpartition("/")[2] for name in PINNED} == {"in-tile", "rolling", "rolling-lazy"}
+def test_the_guard_pins_both_kinds():
+    """Each pinned kernel is the kind its name says: the row whole in one tile (the flat
+    graph's own max), or the max carried by a loop."""
+    assert {name.rpartition("/")[2] for name in PINNED} == {"one-tile", "looped"}
     assert set(PINNED) == set(KERNELS)
     for name, (label, digest) in PINNED.items():
         assert label.startswith("tile=[") and len(digest) == 16, name

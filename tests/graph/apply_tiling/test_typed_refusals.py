@@ -228,17 +228,48 @@ def test_grid_dim_without_one_launch_axis_is_a_typed_refusal():
     }
 
 
+def _raw_statistics_graph(BH, S_Q, S_KV, D):
+    """Three outputs of one launch: the unnormalized statistics of a softmax and a max.
+
+        scores = Q K^T / sqrt(D)
+        exp    = Exp(scores)
+        l      = ReduceSum(exp)       ->  OutputNode_0  (BH, S_Q)      float16
+        o      = exp @ V              ->  OutputNode_1  (BH, S_Q, D)   float16
+        m      = ReduceMax(scores)    ->  OutputNode_2  (BH, S_Q)      float32
+    """
+    from cleave.ir.ops import Mul, ReduceMax
+    from tests._graphs import ACCUM_DTYPE, DTYPE, OUT_DTYPE, _connect, _finalize
+
+    f32 = dict(dtype=ACCUM_DTYPE, out_dtype=ACCUM_DTYPE)
+    scores = (BH, S_Q, S_KV)
+    mma_0 = Matmul((BH, S_Q, S_KV, D), dtype=DTYPE, out_dtype=ACCUM_DTYPE, name="mma_0",
+                   transpose_B=True, warp_policy="rows")
+    mul_0 = Mul(scores, const=1.0 / (D**0.5), name="mul_0", **f32)
+    exp_0 = Exp(scores, name="exp_0", **f32)
+    rowsum_0 = ReduceSum(scores, name="rowsum_0", **f32)
+    mma_1 = Matmul((BH, S_Q, D, S_KV), dtype=DTYPE, out_dtype=ACCUM_DTYPE, name="mma_1",
+                   warp_policy="rows")
+    row_max = ReduceMax(scores, axis=-1, name="reduce_max_2_exp_0", **f32)
+    _connect(mma_0, mul_0, 0, 0)
+    _connect(mul_0, exp_0, 0, 0)
+    _connect(exp_0, rowsum_0, 0, 0)
+    _connect(exp_0, mma_1, 0, 0)
+    _connect(mul_0, row_max, 0, 0)
+    for i, (node, dtype) in enumerate(
+        ((rowsum_0, OUT_DTYPE), (mma_1, OUT_DTYPE), (row_max, "float32"))
+    ):
+        OutputNode(node, dtype=dtype).name = f"OutputNode_{i}"
+    return _finalize(mma_0, mul_0, exp_0, rowsum_0, mma_1, row_max)
+
+
 def test_outputs_next_to_the_canonical_one_have_launch_axes():
     """A multi-output graph with every reduction un-looped. The outputs next to the
     canonical one are not its ancestors, so no launch axis used to be derived for their
     dims and such a tiling was refused ("... for iter dim 0, got []"). They are launched
     on the canonical output's axes, as the outputs of a loop always were."""
-    from tests._softmax import exps, raw_statistics_graph
     from tests.graph.apply_tiling._test_utils import build_tiled_candidate
 
-    ir = raw_statistics_graph(32, 64, 256, 64)
-    for exp in exps(ir):
-        exp.stabilize = None  # the tiler's own business, softmax or not
+    ir = _raw_statistics_graph(32, 64, 256, 64)  # the tiler's own business, softmax or not
     rstep = {"mma_0": {"v3": 64}, "mul_0": {}, "exp_0": {}, "rowsum_0": {"v2": 256},
              "mma_1": {"v3": 256}, "reduce_max_2_exp_0": {"v2": 256}}
     tiled = apply_tiling(build_tiled_candidate(ir, [1, 32, 32], rstep))

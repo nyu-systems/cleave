@@ -23,7 +23,7 @@ from cleave.dynamic import reference as dyn
 from cleave.dynamic.workloads import ADVERSARIAL_WORKLOADS, MLA_SM_SCALE, WORKLOADS
 from cleave.ir.graph import OutputNode, PlaceHolderNode
 from cleave.ir.graph_utils import find_topo_sort
-from cleave.ir.ops import Exp, PermuteView, ReduceSum, SplitView, Stabilize
+from cleave.ir.ops import Exp, PermuteView, ReduceMax, ReduceSum, SplitView, Sub
 from cleave.pipeline import EvalConfig
 from cleave.runtime import inputs as rt_inputs
 from cleave.runtime import reference as rt
@@ -34,10 +34,27 @@ from cleave.runtime.inputs import (
 )
 
 from tests import _graphs as g
-from tests._softmax import lowered
 from tests.frontend import _programs as programs
 
 DTYPE = "float16"
+
+
+def lowered(fn, shapes, dtype=cl.f16):
+    """The identity (un-searched) graph of ``fn`` as ``pipeline.plans.lower`` lowers it:
+    the flat graph the pipeline validates against."""
+    from cleave.frontend import trace
+    from cleave.pipeline.plans import lower
+    from cleave.pipeline.superopt import GraphSet
+
+    (graph,) = list(GraphSet.identity(trace(fn, shapes, dtype)))
+    (ir,) = lower(graph)
+    return ir
+
+
+def _records_a_max(program) -> bool:
+    """Whether ``program`` records a max (``cl.softmax`` does, and so does a softmax with
+    its max written out): what makes its softmax exact."""
+    return any(r.kind == "reduce_max" for r in program.ops)
 
 # name -> (graph, number of score matmuls). The softmax axis is the last axis of the scores.
 ATTENTION = {
@@ -52,7 +69,8 @@ ATTENTION = {
 
 
 def _scores(graph, inputs):
-    """What every ``Exp`` of ``graph`` is fed (its logits), by the reference executor."""
+    """The logits of every ``Exp`` of ``graph``, by the reference executor: what it is fed,
+    or, for the exp of an exact softmax, ``x`` of the ``x - max(x)`` it reads."""
     order = find_topo_sort(graph.nodes)
     placeholders = [n for n in order if isinstance(n, PlaceHolderNode)]
     env = {(p, 0): t for p, t in zip(placeholders, inputs)}
@@ -62,7 +80,12 @@ def _scores(graph, inputs):
             continue
         args = [env[(e.src_node, e.src_id)] for e in sorted(node.inputs, key=lambda e: e.dst_id)]
         if isinstance(node, Exp):
-            found.append(args[0].float())
+            fed = node.inputs[0].src_node
+            if rt_inputs.softmax_axis(node) is not None and fed is not rt_inputs._logits_of(node):
+                (edge,) = [e for e in fed.inputs if e.dst_id == 0]
+                found.append(env[(edge.src_node, edge.src_id)].float())
+            else:
+                found.append(args[0].float())
         env[(node, 0)] = rt._eval_node(node, args)
     assert found
     return found
@@ -351,7 +374,7 @@ def test_a_plain_exp_next_to_an_exact_softmax_is_not_shaped():
     shapes = dict(H=2, SQ=8, SKV=96, D=16, E=16)
     graph = lowered(attention_plus_gate, shapes)
     exps = [n for n in graph.nodes if type(n) is Exp]
-    assert sorted(n.stabilize is not None for n in exps) == [False, True]
+    assert sorted(rt_inputs.softmax_axis(n) is not None for n in exps) == [False, True]
     (scores,) = rt_inputs.score_matmuls(graph)  # the softmax's own matmul only
     assert scores.K == 16 and scores.N == 96
     assert adversarial_cases(graph) == DENSE_ADVERSARIAL and why_not_adversarial(graph) == ""
@@ -365,14 +388,22 @@ def test_a_plain_exp_next_to_an_exact_softmax_is_not_shaped():
             graph, DTYPE, seed=7, device="cpu", distribution=distribution)
         assert all(torch.isfinite(r).all() for r in reference), distribution
     # the inputs of the plain exp's matmul are the ones left alone, in every case
-    gate = next(n for n in graph.nodes if type(n) is Exp and n.stabilize is None)
+    gate = next(n for n in graph.nodes if type(n) is Exp and rt_inputs.softmax_axis(n) is None)
     assert rt_inputs._plain_exp_fed_by(graph, rt.placeholder_order(graph))[0] is gate
 
-    # the same graph without the record: every exp counts again, as for any graph that
-    # makes no claim (an explicit request shapes what it can)
-    for n in exps:
-        n.stabilize = None
-    assert len(rt_inputs.score_matmuls(graph)) == 2
+    # the same program with its softmax written as a plain exp / sum: every exp counts
+    # again, as for any graph that makes no claim (an explicit request shapes what it can)
+    plain = lowered(plain_attention_plus_gate, shapes)
+    assert all(rt_inputs.softmax_axis(n) is None for n in plain.nodes)
+    assert len(rt_inputs.score_matmuls(plain)) == 2
+
+
+def plain_attention_plus_gate(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
+                              v: cl.Tensor["H", "SKV", "D"], a: cl.Tensor["H", "SQ", "E"],
+                              b: cl.Tensor["H", "D", "E"]):
+    """:func:`attention_plus_gate` with its softmax written without the max."""
+    e = cl.exp((q @ k.mT) / q.shape[-1] ** 0.5)
+    return (e / cl.sum(e, -1, keepdim=True)) @ v + cl.exp((a @ b.mT) / 8.0)
 
 
 def test_an_input_shared_with_a_plain_exp_gets_no_adversarial_case():
@@ -398,6 +429,12 @@ def softmax_columns(x: cl.Tensor["C", "R"]):
 
 def softmax_of_negated_rows(x: cl.Tensor["R", "C"]):
     return cl.softmax(x * -0.5, -1)
+
+
+def plain_softmax_rows(x: cl.Tensor["R", "C"]):
+    """:func:`softmax_rows` written without the max: a plain exp makes no claim."""
+    e = cl.exp(x)
+    return e / cl.sum(e, -1, keepdim=True)
 
 
 # name -> (program, shapes, softmax axis of the input, the constant between input and exp)
@@ -454,16 +491,25 @@ def test_logits_that_are_an_input_are_shaped_along_their_softmax_axis(name):
 
 
 def _viewed_logits_graph(view):
-    """``sum(exp(view(x)), -1)`` with the record of a softmax over the last axis: what the
-    partial of ``cl.softmax(x)`` looks like once the program is split over that axis."""
+    """``sum(exp(v - max(v)), -1)`` with ``v = view(x)``, a softmax over the last axis of
+    the view: what the partial of ``cl.softmax(x)`` looks like once the program is split
+    over that axis."""
     dims = tuple(int(s) for s in view.output_shape)
-    exp = Exp(dims, name="exp_0", dtype=DTYPE, out_dtype="float32", n_batch_dims=len(dims) - 2)
+    batch = len(dims) - 2
+    full = ReduceMax(dims, axis=-1, name="reduce_max_0", dtype=DTYPE, out_dtype="float32")
+    sub = Sub(dims, broadcast=0, name="sub_0", dtype="float32", out_dtype="float32",
+              n_batch_dims=batch)
+    exp = Exp(dims, name="exp_0", dtype="float32", out_dtype="float32", n_batch_dims=batch)
     rowsum = ReduceSum(dims, name="rowsum_0", dtype="float32", out_dtype="float32")
-    g._connect(view, exp, 0, 0)
+    g._connect(view, full, 0, 0)
+    g._connect(view, sub, 0, 0)
+    g._connect(full, sub, 0, 1)
+    g._connect(sub, exp, 0, 0)
     g._connect(exp, rowsum, 0, 0)
     OutputNode(rowsum, dtype=DTYPE)
-    exp.stabilize = Stabilize(axes=(-1,), scaled=(("rowsum_0", 1),))
-    return g._finalize(rowsum)
+    graph = g._finalize(rowsum)
+    assert rt_inputs.softmax_axis(exp) == -1
+    return graph
 
 
 # name -> (input shape, split factor, the input's softmax axis, where the split dim sits)
@@ -538,16 +584,14 @@ def test_logits_read_through_a_permute_are_shaped_along_the_axis_it_moved():
 
 
 def test_a_plain_exp_of_an_input_names_no_softmax_axis():
-    """Without the record nothing says what the exp is summed over: no logit input, and the
+    """Without the max nothing says what the exp is summed over: no logit input, and the
     adversarial cases are an error, as for any graph without logits to shape."""
     from cleave.lower import to_ir
 
     prog = programs.matmul.trace(M=8, N=8, K=16)
     assert logit_inputs(to_ir(prog.to_graph_structure(), dtype=DTYPE, out_dtype=DTYPE)) == []
-    graph = lowered(softmax_rows, dict(R=8, C=96))
-    for node in graph.nodes:
-        if type(node) is Exp:
-            node.stabilize = None
+    graph = lowered(plain_softmax_rows, dict(R=8, C=96))
+    assert [type(n).__name__ for n in graph.nodes if type(n) is Exp] == ["Exp"]
     assert logit_inputs(graph) == [] and adversarial_cases(graph) == ()
     with pytest.raises(SpecError, match="no score matmul"):
         _inputs(graph, "increasing")
@@ -589,11 +633,11 @@ def test_adversarial_inputs_are_switched_on_per_path():
     of every dynamic operator is exact, so every validation of a registry operator on the
     registry's workloads includes its adversarial ones (``compile_dynamic``), with no
     per-operator flag. Timing asks for the captured workloads only, which is why the
-    factories still default to them. A dense program says so by what it records: the
-    request for the exact softmax (``Program._stable_exp``, what ``cl.softmax`` records),
-    and the kernels of such a program are held to every adversarial case its inputs can be
-    shaped into, whatever was asked for. An ``exp / sum`` written by hand makes no such
-    request and is validated on what was asked.
+    factories still default to them. A dense program says so by what it records: the max
+    of the exact softmax, ``exp(x - max(x))`` (what ``cl.softmax`` records, and a softmax
+    with its max written out), and the kernels of such a program are held to every
+    adversarial case its inputs can be shaped into, whatever was asked for. An ``exp / sum``
+    written by hand without the max makes no such claim and is validated on what was asked.
     """
     assert all(len(op.adversarial) == 12 for op in OPERATORS.values())
     assert not any(hasattr(op, "exact_softmax") for op in OPERATORS.values())
@@ -634,15 +678,15 @@ def test_adversarial_inputs_are_switched_on_per_path():
 
     shapes = dict(H=2, SQ=8, SKV=96, D=16)
     plain = trace(by_hand, shapes, cl.f16)
-    assert trace(exact, shapes, cl.f16).stabilize_requests and not plain.stabilize_requests
+    assert _records_a_max(trace(exact, shapes, cl.f16)) and not _records_a_max(plain)
     assert held_to(trace(exact, shapes, cl.f16), ("normal",)) == ("normal",) + DENSE_ADVERSARIAL
     assert held_to(trace(exact, shapes, cl.f16), ("increasing", "normal")) == (
         "increasing", "normal", "large_logits", "decreasing", "last_spike", "constant", "offset")
     assert held_to(plain, ("normal",)) == ("normal",)
     assert held_to(plain, ("normal", "large_logits")) == ("normal", "large_logits")
-    # the demos' attention is ``cl.softmax``: it makes the request, and is held to them all
+    # the demos' attention is ``cl.softmax``: it records the max, and is held to them all
     demos = programs.attention.trace(HQ=2, HKV=2, SQ=8, SKV=96, D=16)
-    assert demos.stabilize_requests
+    assert _records_a_max(demos)
     assert held_to(demos, ("normal",)) == ("normal",) + DENSE_ADVERSARIAL
 
     # a softmax of an input: the logits are the input, and the lowered graph says along
@@ -719,7 +763,7 @@ def test_build_holds_an_exact_program_to_its_adversarial_cases(monkeypatch):
         return (e / cl.sum(e, -1, keepdim=True)) @ v
 
     plain = trace(by_hand, dict(H=32, SQ=64, SKV=256, D=64), cl.f16)
-    assert not plain.stabilize_requests
+    assert not _records_a_max(plain)
     built, published = _stubbed_build(monkeypatch, plain)
     assert set(published) == {("normal",)} and all(r.cases == ("normal",) for r in built)
     report = P.evaluate(built)
@@ -771,8 +815,8 @@ def test_a_softmax_no_case_shapes_is_named_next_to_the_cases(monkeypatch):
     small = dict(H=2, SQ=8, SKV=96, D=16)
     graph = lowered(attention_plus_softmax_of_a_sum, small)
     attention_exp, summed_exp = [n for n in graph.nodes if type(n) is Exp]
-    assert attention_exp.stabilize is not None and summed_exp.stabilize is not None
-    assert type(summed_exp.inputs[0].src_node).__name__ == "Add"
+    assert rt_inputs.softmax_axis(attention_exp) == rt_inputs.softmax_axis(summed_exp) == -1
+    assert type(rt_inputs._logits_of(summed_exp)).__name__ == "Add"
     assert adversarial_cases(graph) == DENSE_ADVERSARIAL
     note = why_not_adversarial(graph)
     assert note == (f"the logits of {summed_exp.name!r} are neither the result of a score "

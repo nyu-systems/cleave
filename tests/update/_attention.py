@@ -1,8 +1,6 @@
 """The attention program of the searched-update tests, and how they pick its plans.
 
-``cl.softmax`` records the explicit max only where update rules are searched
-(``cleave.ir.update_rule.use_searched_updates``); the helpers take the switch as an
-argument so that one test can hold the two paths against each other.
+``cl.softmax`` records the explicit max, ``exp(x - max(x)) / sum``.
 """
 
 from __future__ import annotations
@@ -10,7 +8,6 @@ from __future__ import annotations
 import cleave.lang as cl
 from cleave import pipeline as P
 from cleave.frontend import trace
-from cleave.ir.update_rule import use_searched_updates
 
 MAX_OPS = 11  # demo/mha_prefill.py
 FACTOR = ("exp", ("sub", "m", "m'"))  # acc *= exp(m - m'), then the accumulator's own macro
@@ -21,12 +18,11 @@ def attention(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
     return cl.softmax((q @ k.mT) / q.shape[-1] ** 0.5, dim=-1) @ v
 
 
-def mha(sq: int, skv: int, *, searched: bool = True):
+def mha(sq: int, skv: int):
     """``(program, searched graphs)`` of MHA attention, H=32, D=64, float16, at
-    ``max_ops=11``; ``searched``: with the update rules switched on, or off."""
-    with use_searched_updates(searched):
-        program = trace(attention, dict(H=32, SQ=sq, SKV=skv, D=64), cl.f16)
-        return program, P.superoptimize(program, P.SuperoptConfig(max_ops=MAX_OPS, cache=False))
+    ``max_ops=11``."""
+    program = trace(attention, dict(H=32, SQ=sq, SKV=skv, D=64), cl.f16)
+    return program, P.superoptimize(program, P.SuperoptConfig(max_ops=MAX_OPS, cache=False))
 
 
 def flash(graphs):
@@ -64,13 +60,14 @@ def flash_by_hand(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
 
 
 def lowered(fn, shapes, dtype=cl.f16):
-    """The identity (un-searched) graph of ``fn``, lowered to IR. The max is written out in
-    the program, so the graph is the same whatever the switch says."""
-    from cleave.pipeline.plans import lower
+    """The identity (un-searched) graph of ``fn``, lowered to IR without the derivation
+    ``plans.lower`` adds (no record, no refusal list): the tests put a record by hand
+    (``record_by_hand``) where they want one."""
+    from cleave.pipeline.plans import _lower_structure
     from cleave.pipeline.superopt import GraphSet
 
     (graph,) = list(GraphSet.identity(trace(fn, shapes, dtype)))
-    (ir,) = lower(graph)
+    (ir,) = _lower_structure(graph, graph.structure)
     return ir
 
 

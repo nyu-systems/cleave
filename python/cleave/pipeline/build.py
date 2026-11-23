@@ -193,9 +193,8 @@ def _reference_fn(distributions, program, publish):
     held = {}
 
     def explicit(graph) -> bool:
-        # Where update rules are searched, a graph whose exp reads ``x - max(x)`` is exact
-        # by structure, whoever wrote it (``runtime.inputs.softmax_axis``; never true for
-        # an exp without a record while the switch is off).
+        # A graph whose exp reads ``x - max(x)`` is exact by structure, whoever wrote it
+        # (``runtime.inputs.softmax_axis``).
         from ..runtime.inputs import softmax_axis
 
         return any(getattr(n, "stabilize", None) is None and softmax_axis(n) is not None

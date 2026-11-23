@@ -2,11 +2,12 @@
 the partial -> combine Kernel against the Program's own reference.
 
 The attention here writes its softmax out by hand, on a constant shift (``exp(s + c) / sum``
-with ``c = -50 / sqrt(D)``), so it makes no request and its split pair is the cut as it is:
-a partial with two outputs, the row sum and the value product, and nothing else across the
+with ``c = -50 / sqrt(D)``), so it has no max and its split pair is the cut as it is: a
+partial with two outputs, the row sum and the value product, and nothing else across the
 boundary. It is the program these tests have always held: ``cl.softmax(s, shift=c)``
 recorded exactly these ops while it took a shift. (``cl.softmax`` is the exact softmax,
-whose partial also returns its shift: ``test_exact_split_attention.py``.)
+with its max in the flat graph: the search does not split it,
+``test_softmax_split_unsplit.py``.)
 
 Until the records existed no static split-attention kernel could be used: a partial never
 validated (its reference was laid out by matching extents, which raises when ``S_Q == D``

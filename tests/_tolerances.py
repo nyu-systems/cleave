@@ -75,8 +75,8 @@ TOLERANCES = {
     "softmax": Tolerance(rtol=1e-3),
     "softmax_mid": Tolerance(rtol=2e-3),  # over the middle axis of a batched input
     "exact_attention": Tolerance(rtol=5e-3),
-    # cl.softmax(x) next to another exp of x (tests/frontend/test_merged_exps.py): the
-    # search computes exp(x) once and the lowering computes it again for the softmax
+    # cl.softmax(x) next to another exp of x (tests/frontend/test_softmax_next_to_exp.py):
+    # the softmax's exp reads x - max(x), the other one x
     "softmax_plus_exp": Tolerance(rtol=2e-3),
     "dual_softmax": Tolerance(rtol=5e-3),
     # the attention with its softmax written out by hand on a constant shift (a plain exp, no

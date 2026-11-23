@@ -1,13 +1,12 @@
-"""``pipeline.plans.lower`` marks the softmax exps of a program that requested them (CPU).
+"""``pipeline.plans.lower`` of a ``cl.softmax`` program: the max is in the flat graph (CPU).
 
-The mark is plain data on the freshly lowered flat graph. The search space and the tiling
-candidates are those of the shift-free graph; a graph that cannot honour the request is
-refused with the analysis' reason. A split graph lowers to an exact pair: the partial
-exports its shift, the combine weights the partials by it
-(``tests/lower/test_split_softmax.py``).
+``cl.softmax`` records ``exp(x - max(x)) / sum``, and the flat graph keeps it as written: a
+``ReduceMax`` and the subtraction ahead of the exp, which ``runtime.inputs.softmax_axis``
+recognizes as the exp of an exact softmax. Where a reduction wants to loop under the max (a
+streaming obstacle), lowering writes the proven update rule on the max (a ``Streaming``
+record) or the reason it has none (``ir.streaming_refusals``); a graph that has no tiling
+says that reason in the plan summary.
 """
-
-import json
 
 import pytest
 
@@ -16,14 +15,16 @@ pytest.importorskip("tilelang")
 
 import cleave.lang as cl
 from cleave import pipeline as P
-from cleave.core.errors import LoweringRejected
 from cleave.frontend import trace
-from cleave.ir.ops import Exp, Stabilize
-from cleave.pipeline.plans import describe_tile, lower
-from cleave.pipeline.superopt import GraphSet, SearchedGraph
-from cleave.runtime.reference import fingerprint_seed, output_order, placeholder_order
-from tests._softmax import stable_exp
-from tests.pipeline import _pipeline as PL
+from cleave.ir.ops import Exp, ReduceMax, Sub
+from cleave.ir.update_rule import loop_key
+from cleave.pipeline.plans import MAX_ROW_LIMIT, _lower_structure, describe_tile, lower
+from cleave.pipeline.superopt import GraphSet
+from cleave.runtime.inputs import softmax_axis
+from cleave.runtime.reference import fingerprint_seed
+from tests._explicit_softmax import stable_exp
+
+FACTOR = ("exp", ("sub", "m", "m'"))
 
 
 def flash(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"], v: cl.Tensor["H", "SKV", "D"]):
@@ -32,7 +33,7 @@ def flash(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"], v: cl.Ten
 
 
 def flash_twin(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"], v: cl.Tensor["H", "SKV", "D"]):
-    e = cl.exp((q @ k.mT) / q.shape[-1] ** 0.5)  # the same records without the request
+    e = cl.exp((q @ k.mT) / q.shape[-1] ** 0.5)  # the same records without the max
     return (e @ v) / cl.sum(e, -1, keepdim=True)
 
 
@@ -50,6 +51,7 @@ def cube(x: cl.Tensor["R", "C"]):
 
 
 SHAPES = dict(H=32, SQ=64, SKV=4096, D=64)
+SHORT = dict(H=32, SQ=64, SKV=256, D=64)
 
 
 def _exps(ir):
@@ -63,158 +65,118 @@ def _lowered(fn, sizes, dtype=cl.f16):
     return prog, ir
 
 
-def test_identity_graph_is_annotated():
+def _without_derivation(fn, sizes, dtype=cl.f16):
+    (graph,) = GraphSet.identity(trace(fn, sizes, dtype))
+    (ir,) = _lower_structure(graph, graph.structure)
+    return ir
+
+
+def test_identity_graph_carries_the_proven_rule_on_its_max():
     _, ir = _lowered(flash, SHAPES)
-    (exp,) = _exps(ir)
-    assert isinstance(exp.stabilize, Stabilize)
-    assert exp.stabilize.axes == (-1,) and exp.stabilize.rolling == "" and exp.stabilize.export is None
+    (full,) = [n for n in ir.nodes if type(n) is ReduceMax]
+    record = full.streaming
     assert [type(next(n for n in ir.nodes if n.name == name)).__name__
-            for name, _ in exp.stabilize.scaled] == ["Matmul", "ReduceSum"]
+            for name in record.loops] == ["Matmul", "ReduceSum"]
+    assert record.rules == tuple((acc, FACTOR) for acc in record.loops)
+    assert record.key == loop_key(ir, full.name, record.loops)
+    assert ir.streaming_refusals == [] and len(ir.derivations) == 1
 
 
-def test_flat_graph_stays_shift_free():
-    """Same nodes, names, shapes and dtypes as the plain twin: no max ahead of the sums, and
-    the validation inputs (seeded by the flat graph) are the twin's."""
+def test_flat_graph_has_the_max_ahead_of_the_exp():
+    """The plain twin's nodes plus the max and the subtraction, which the exp reads: the
+    exp is the exp of an exact softmax over the last axis by structure. The validation
+    inputs are seeded by the flat graph, so they are not the twin's."""
     _, ir = _lowered(flash, SHAPES)
     _, twin = _lowered(flash_twin, SHAPES)
+    (exp,) = _exps(ir)
+    sub = exp.inputs[0].src_node
+    (full,) = [n for n in ir.nodes if type(n) is ReduceMax]
+    assert type(sub) is Sub and {e.src_node.name for e in sub.inputs} == {
+        full.name, full.inputs[0].src_node.name}
+    assert softmax_axis(exp) == -1 and [softmax_axis(e) for e in _exps(twin)] == [None]
+    kinds = sorted(type(n).__name__ for n in ir.nodes)
+    assert kinds == sorted([type(n).__name__ for n in twin.nodes] + ["ReduceMax", "Sub"])
+    assert full.get_dtype(0) == "float32"  # the statistic is float32 over float16 scores
+    assert fingerprint_seed(ir) != fingerprint_seed(twin)
 
-    def nodes(graph):
-        return [(type(n).__name__, n.name, [tuple(int(s) for s in n.get_shape(i))
-                                           for i in range(max(1, n.num_outputs()))])
-                for n in graph.nodes]
 
-    assert nodes(ir) == nodes(twin)
-    assert not any("Max" in kind for kind, *_ in nodes(ir))
-    assert [e.stabilize for e in _exps(twin)] == [None]
-    assert fingerprint_seed(ir) == fingerprint_seed(twin)
-
-
-@pytest.mark.parametrize("fn, sizes", [(flash, SHAPES), (flash, dict(H=32, SQ=64, SKV=256, D=64)),
-                                       (traced, dict(H=32, SQ=64, SKV=256, D=64)),
-                                       (softmax, dict(R=64, C=256))],
-                         ids=["flash_4096", "flash_256", "traced_256", "softmax_256"])
-def test_tiling_candidates_are_those_of_the_unmarked_graph(fn, sizes):
-    """The record is invisible to ``search_tiling``: same candidates, in the same order."""
+@pytest.mark.parametrize("fn, sizes, why", [
+    (traced, SHORT, "a finished reduction over the dim"),
+    (softmax, dict(R=64, C=256), "which is not summed over that dim"),
+], ids=["traced_256", "softmax_256"])
+def test_a_refused_obstacle_leaves_the_tiling_candidates_as_they_are(fn, sizes, why):
+    """A graph whose obstacle is not served gets its reason, and ``search_tiling`` lists the
+    candidates of the same graph lowered without any derivation, in the same order."""
     from cleave.schedule import search_tiling
 
     _, ir = _lowered(fn, sizes)
-    marked = [e for e in _exps(ir) if e.stabilize is not None]
-    assert marked
-    with_record = [describe_tile(t) for t in search_tiling(ir, topk=16)]
-    assert with_record
-    for exp in marked:
-        exp.stabilize = None
-    without = [describe_tile(t) for t in search_tiling(ir, topk=16)]
-    assert with_record == without
+    (reason,) = ir.streaming_refusals
+    assert why in reason and not [n for n in ir.nodes if getattr(n, "streaming", None)]
+    plain = _without_derivation(fn, sizes)
+    with_reason = [describe_tile(t) for t in search_tiling(ir, topk=16)]
+    assert with_reason
+    assert with_reason == [describe_tile(t) for t in search_tiling(plain, topk=16)]
 
 
-def test_schedule_keeps_the_plans_and_reports_no_refusal():
+def test_schedule_keeps_looped_plans_and_reports_no_refusal():
+    """The flash form at S_KV = 4096: every plan loops over the keys with the max carried;
+    the plain twin, without a max, has the same number of tilings."""
+    from cleave.schedule import apply_tiling
+    from cleave.schedule.streaming import sites
+
     prog = trace(flash, SHAPES, cl.f16)
     plans = P.schedule(GraphSet.identity(prog), P.ScheduleConfig(topk=4))
     twin = P.schedule(GraphSet.identity(trace(flash_twin, SHAPES, cl.f16)), P.ScheduleConfig(topk=4))
-    assert len(plans) == len(twin) > 0 and not plans.refused
-    assert [describe_tile(p.tile) for p in plans] == [describe_tile(p.tile) for p in twin]
-    (exp,) = _exps(plans[0].tile.flat_graph)
-    assert exp.stabilize is not None  # the candidate carries the marked flat graph
+    assert len(plans) == len(twin) == 4 and not plans.refused
+    for plan in plans:
+        (site,) = sites(apply_tiling(plan.tile))
+        assert site.extent == site.block == 4096 and 1 < site.step < 4096
+        (full,) = [n for n in plan.tile.flat_graph.nodes if type(n) is ReduceMax]
+        assert full.streaming is not None  # the candidate carries the recorded flat graph
 
 
 def test_refusal_reason_reaches_the_plan_summary():
-    prog = trace(cube, dict(R=64, C=256), cl.f16)
+    """A row longer than a block whose exp is also read where it is not summed (the square
+    of the softmax's numerator): no tiling, and the summary says why the max is not carried."""
+    prog = trace(cube, dict(R=64, C=16384), cl.f16)
     plans = P.schedule(GraphSet.identity(prog), P.ScheduleConfig(topk=4))
-    assert not plans and plans.refused
-    reason = ("LoweringRejected: graph 0: softmax cannot be stabilized: exp_1: output of div_4 "
-              "keeps degree 1 in its scale")
-    assert {r.reason for r in plans.refused} == {reason}
-    assert reason in plans.summary()
+    assert not plans and plans.refused  # (fusion="auto": once unforced, once forced)
+    for refusal in plans.refused:
+        text = str(refusal.error)
+        assert text.startswith(f"{MAX_ROW_LIMIT}; it is not carried across a loop: reduce_max_")
+        assert "is also read by mul_" in text and "which is not summed over that dim" in text
+        assert refusal.reason in plans.summary()
 
 
-def _split_graph(program):
-    structure = json.loads((PL.STRUCTURES_DIR / "gqa" / "before_split_gqa_graph_structure_valid_1.graph")
-                           .read_text())
-    return SearchedGraph(0, structure, dict(PL.SYMBOL_MAPS["gqa"]), True, program, ("SKV",))
-
-
-def test_split_graph_of_a_requesting_program_lowers_to_an_exact_pair():
-    """The partial exports its shift as a float32 output and names it in the record of its
-    exp; the combine reads it and is a softmax over the split axis."""
-    requesting, plain = trace(flash, SHAPES, cl.f16), trace(flash_twin, SHAPES, cl.f16)
-    partial, combine = lower(_split_graph(requesting), 4)
-    (exp,), (weights,) = _exps(partial), _exps(combine)
-    assert [(o.boundary.role, str(o.get_dtype(0))) for o in output_order(partial)] == [
-        ("shift", "float32"), ("", "float32"), ("", "float32")]
-    assert exp.stabilize.axes == (-1,) and exp.stabilize.export == output_order(
-        partial)[0].inputs[0].src_node.name
-    assert sorted(p.boundary.role for p in placeholder_order(combine)) == ["", "", "shift"]
-    assert weights.stabilize.axes == (-2,) and weights.stabilize.export is None
-    # the same structure of a program without the request lowers as it always did
-    partial, combine = lower(_split_graph(plain), 4)
-    assert [e.stabilize for g in (partial, combine) for e in _exps(g)] == [None]
-    assert len(output_order(partial)) == len(placeholder_order(combine)) == 2
-
-
-def test_a_requesting_program_schedules_its_split_graphs():
-    """Solo plans, and partial and combine plans for the split graph: nothing is refused."""
-    prog = trace(flash, SHAPES, cl.f16)
-    (solo,) = GraphSet.identity(prog)
-    graphs = GraphSet([solo, _split_graph(prog)], prog)
-    graphs[1].index = 1
-    plans = P.schedule(graphs, P.ScheduleConfig(topk=2, split_k=(PL.SPLIT_FACTOR,)))
-    assert not plans.refused, plans.summary()
-    assert sorted((p.variant, p.role) for p in plans) == [
-        ("solo", "main")] * 2 + [("split-k=4", "combine")] * 2 + [("split-k=4", "partial")] * 2
-    for plan in plans:
-        marked = [e for e in _exps(plan.tile.flat_graph) if e.stabilize is not None]
-        assert len(marked) == 1  # every plan carries a marked flat graph
-
-
-def test_split_refusal_is_per_graph_in_a_schedule():
-    """A split graph that cannot be made exact is refused with the reason; the program
-    keeps its solo plans."""
-    prog = trace(flash, SHAPES, cl.f16)
-    (solo,) = GraphSet.identity(prog)
-    # the split graph of a program that asked for two softmaxes: a split carries one
-    broken = SearchedGraph(1, _split_graph(prog).structure, dict(PL.SYMBOL_MAPS["gqa"]), True,
-                           _two_requests(prog), ("SKV",))
-    plans = P.schedule(GraphSet([solo, broken], prog),
-                       P.ScheduleConfig(topk=2, split_k=(PL.SPLIT_FACTOR,)))
-    assert plans and {p.variant for p in plans} == {"solo"}
-    reason = ("graph 1: softmax cannot be stabilized: 2 softmax requests; a split carries one "
-              "softmax")
-    assert [(r.variant, r.role, str(r.error)) for r in plans.refused] == [
-        ("split-k=4", "partial", reason)]
-    assert f"1x LoweringRejected: {reason}" in plans.summary()
-
-
-def _two_requests(prog):
-    """``prog`` as a program that asked for two softmaxes."""
-    import copy
-
-    twice = copy.copy(prog)
-    twice.__class__ = type("TwoRequests", (type(prog),), {
-        "stabilize_requests": property(lambda self: prog.stabilize_requests * 2)})
-    return twice
-
-
-def test_search_graphs_are_annotated():
-    """The request survives the search as a program-level fact; each graph gets its own mark."""
+def test_search_graphs_keep_the_max():
+    """The max is an opaque reduction of the searched graph: every graph the search returns
+    for ``cl.softmax`` has it, and its exp is an exact softmax by structure."""
     prog = trace(softmax, dict(R=16, C=256), cl.f16)
     graphs = P.superoptimize(prog, P.SuperoptConfig(cache=False))
-    assert len(graphs) >= 1 and all("max" not in g.ops for g in graphs)
+    assert len(graphs) >= 1 and all({"max", "sub"} <= set(g.ops) for g in graphs)
     for graph in graphs:
         (ir,) = lower(graph)
         (exp,) = _exps(ir)
-        assert exp.stabilize is not None and exp.stabilize.axes == (-1,)
+        assert softmax_axis(exp) == -1
+        (reason,) = ir.streaming_refusals  # a returned softmax: T4
+        assert "which is not summed over that dim" in reason
 
 
-def test_search_of_attention_marks_both_orders():
-    """The flash-form graph carries the rolling form, the traced-order graph does not."""
+def test_search_of_attention_records_the_flash_form_only():
+    """The flash form (row sum and value matmul siblings) gets the proven rule; the traced
+    order, whose value matmul reads the finished row sum, keeps its pin with the reason."""
     prog = trace(traced, dict(H=4, SQ=64, SKV=1024, D=64), cl.f16)
     graphs = P.superoptimize(prog, P.SuperoptConfig(max_ops=13, cache=False))
-    rolling = {}
+    found = {}
     for graph in graphs:
         assert not graph.is_split
         (ir,) = lower(graph)
-        (exp,) = _exps(ir)
-        assert exp.stabilize is not None and exp.stabilize.axes == (-1,)
-        rolling[graph.summary()] = exp.stabilize.rolling
-    assert sorted(bool(r) for r in rolling.values()) == [False, True], rolling
+        (full,) = [n for n in ir.nodes if type(n) is ReduceMax]
+        assert softmax_axis(_exps(ir)[0]) == -1
+        found[graph.summary()] = (getattr(full, "streaming", None) is not None,
+                                  ir.streaming_refusals)
+    assert sorted(found) == ["solo matmul>div>max>sub>exp>sum>div>matmul",
+                             "solo matmul>div>max>sub>exp>sum>matmul>div"]
+    assert found["solo matmul>div>max>sub>exp>sum>matmul>div"] == (True, [])
+    recorded, (why,) = found["solo matmul>div>max>sub>exp>sum>div>matmul"]
+    assert not recorded and "a finished reduction over the dim" in why

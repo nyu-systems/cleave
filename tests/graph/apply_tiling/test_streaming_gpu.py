@@ -1,6 +1,6 @@
 """The searched path end to end on a GPU: every family the assembly serves, validated.
 
-Under the switch (``searched_updates``) ``cl.softmax`` records the explicit max; the flat
+``cl.softmax`` records the explicit max; the flat
 search keeps it, lowering derives the update rule of every streaming obstacle, the tiler
 carries the max where a loop steps its row, and each kernel is validated against the
 reference of its own flat graph -- which a graph whose exp reads ``x - max(x)`` is, by
@@ -30,7 +30,6 @@ EVERY_CASE = ("normal",) + ADVERSARIAL
 FAST = dict(preset="fast", schedule=P.ScheduleConfig(topk=16),
             eval=P.EvalConfig(warmup=2, iters=20, max_parallel=4))
 
-pytestmark = pytest.mark.usefixtures("searched_updates")
 
 
 @pytest.fixture

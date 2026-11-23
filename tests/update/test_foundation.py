@@ -1,10 +1,10 @@
-"""The searched update rules, end to end, on MHA attention, behind their switch.
+"""The searched update rules, end to end, on MHA attention.
 
 ``test_search_*`` run the superoptimizer, the update search and the tiling search on the
 CPU; ``test_gpu_*`` validate a kernel (root conftest marks). The other tests need neither:
 they put a record on an identity graph by hand and test the hooks that read it.
 
-Under the switch ``cl.softmax`` records ``exp(x - max(x)) / sum``. The flat search returns
+``cl.softmax`` records ``exp(x - max(x)) / sum``. The flat search returns
 the flash form (the row sum and the value matmul are siblings) and the traced order. The
 flash form's loop over the keys is a streaming obstacle: lowering derives an update rule
 for each accumulator, the policy lets the loop step, and ``apply_tiling`` assembles it
@@ -26,7 +26,7 @@ from cleave import pipeline as P
 from cleave.core.errors import ScheduleRejected
 from cleave.ir.graph_utils import graph_tiers
 from cleave.ir.ops import NEG_FLT_MAX, Div, Matmul, ReduceMax, ReduceSum
-from cleave.ir.update_rule import loop_key, show, use_searched_updates
+from cleave.ir.update_rule import loop_key, show
 from cleave.pipeline import plans as plans_module
 from cleave.runtime.compile import build_candidate
 from cleave.schedule import streaming
@@ -51,11 +51,10 @@ KERNEL = dict(tile=[1, 128, 64], threads=128, d_step=64, kv_step=32)
 
 
 @functools.lru_cache(maxsize=None)
-def scheduled(sq: int, skv: int, searched: bool = True):
+def scheduled(sq: int, skv: int):
     """``(graphs, plans)`` of MHA attention at ``max_ops=11``, every tiling."""
-    with use_searched_updates(searched):
-        _, graphs = mha(sq, skv, searched=searched)
-        return graphs, P.schedule(graphs, P.ScheduleConfig(topk=TOPK))
+    _, graphs = mha(sq, skv)
+    return graphs, P.schedule(graphs, P.ScheduleConfig(topk=TOPK))
 
 
 def recorded_node(flat_graph):
@@ -68,7 +67,7 @@ def loop_tier(tiled):
     return tier
 
 
-# ------------------------------------------------------------- the pipeline under the switch
+# ------------------------------------------------------------------------------ the pipeline
 
 
 def test_search_mha_prefill_is_streamed_in_the_flash_form():
@@ -112,8 +111,7 @@ def test_search_mha_prefill_is_streamed_in_the_flash_form():
     # ---- the traced order: the value matmul reads the finished row sum; the pin stays
     (refusal,) = plans.refused
     assert (refusal.graph_index, refusal.variant, refusal.role) == (traced_graph.index, "solo", "main")
-    with use_searched_updates():
-        (ir,) = plans_module.lower(traced_graph)
+    (ir,) = plans_module.lower(traced_graph)
     names = dict(full=node_of(ir, ReduceMax).name, total=node_of(ir, ReduceSum).name,
                  reader=node_of(ir, Matmul, 1).name)
     why = ("{full}: {reader} reads {total}, a finished reduction over the dim {full} reduces: "
@@ -153,49 +151,14 @@ def test_search_a_short_row_has_one_tile_plans_as_well():
         assert "_prev" not in code
 
 
-# What differs by design between the kernel of the searched path and the kernel of the
-# hand-derived pass for one tiling: buffer names (``kdiff.py::RULES`` of the design's
-# integration probe) and the name of the loop, which is the row sum's node name.
-RENAMED = [
-    (r"t_exp_5_max_prev|t_reduce_max_2_5_prev", "M_PREV"),
-    (r"t_exp_5_max_step|t_reduce_max_2_5_upd0", "STEP"),
-    (r"t_exp_5_alpha|t_reduce_max_2_5_upd1", "ALPHA"),
-    (r"t_exp_5_max|t_reduce_max_2_5", "MAX"),
-    (r"t_exp_5_shifted|t_sub_6", "SHIFTED"),
-    (r"t_exp_5\b|t_exp_7\b", "EXP"),
-    (r"t_exp_5_cast|t_exp_7_cast", "EXP_CAST"),
-    (r"t_reduction_2_6|t_reduction_2_8", "L"),
-    (r"t_mma_7|t_mma_9", "ACC"),
-    (r"t_div_8|t_div_10", "OUT"),
-    (r"GraphNode_reduction_2_6|GraphNode_reduction_2_8", "LOOP"),
-]
-
-
-def normalized(text: str) -> list:
-    for pattern, name in RENAMED:
-        text = re.sub(pattern, name, text)
-    # join wrapped call lines, so that a line wrapped elsewhere does not count
-    text = re.sub(r"\(\s*\n\s*", "(", text)
-    text = re.sub(r",\s*\n\s*", ", ", text)
-    text = re.sub(r",?\s*\n\s*\)", ")", text)
-    return [line.rstrip() for line in text.splitlines()]
-
-
-def test_search_the_searched_kernel_is_the_kernel_of_the_hand_derived_pass():
-    """Differential test (it goes with the old path): for one tiling of MHA prefill the
-    kernel assembled from the searched rule is, statement for statement, the rolling
-    kernel the hand-derived pass writes -- other buffer names, nothing else."""
+def test_search_the_searched_kernel_carries_the_max_in_the_rolling_order():
+    """For one tiling of MHA prefill the kernel assembled from the searched rule has the
+    loop body of a rolling kernel: the lag copy before the max, the factor of the rule, the
+    repair in front of each accumulator's own macro, and the max started at -FLT_MAX."""
     _, new_plans = scheduled(4096, 4096)
-    old_graphs, old_plans = scheduled(4096, 4096, searched=False)
-    assert "solo matmul>div>exp>sum>matmul>div" in {g.summary() for g in old_graphs}
-    new, old = pick(new_plans, **KERNEL), pick(old_plans, **KERNEL)
-    assert steps(new.tile) == [64, 32, 32, 32] and steps(old.tile) == [64, 32, 32]
+    new = pick(new_plans, **KERNEL)
+    assert steps(new.tile) == [64, 32, 32, 32]
     new_code, _ = build_candidate(new.tile)
-    old_code, _ = build_candidate(old.tile)
-    assert new_code != old_code
-    assert normalized(new_code) == normalized(old_code)
-    # ... which is this loop body: the lag copy before the max, the factor of the rule, the
-    # repair in front of each accumulator's own macro, and the max started at -FLT_MAX
     body = new_code[new_code.index("def GraphNode_reduction_2_8_iter"):]
     order = ["ukernel_copy_1dims_rr(t_reduce_max_2_5, t_reduce_max_2_5_prev)",
              "ukernel_reduce_max_axis2_rr(t_div_4, t_reduce_max_2_5)",
@@ -234,9 +197,8 @@ def test_gpu_the_searched_kernel_validates_on_every_adversarial_case(tmp_path, m
     assert tolerance.rtol == 5e-3 and tolerance.atol == 0
     _, plans = scheduled(4096, 4096)
     plan = pick(plans, **KERNEL)
-    with use_searched_updates():
-        built = P.build(plans.filter(lambda p: p is plan),
-                        config=P.EvalConfig(warmup=2, iters=20, max_parallel=1, tolerance=tolerance))
+    built = P.build(plans.filter(lambda p: p is plan),
+                    config=P.EvalConfig(warmup=2, iters=20, max_parallel=1, tolerance=tolerance))
     (result,) = built.results
     assert result.ok, (result.stage, str(result.error)[:2000])
     assert result.cases == ("normal",) + ADVERSARIAL and len(result.cases) == 7

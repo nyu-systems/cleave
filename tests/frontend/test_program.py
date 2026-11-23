@@ -164,7 +164,7 @@ def test_program_metadata():
     assert [i.name for i in prog.inputs] == ["q", "k", "v"]
     assert prog.inputs[1].dims[1] == cl.Dim("SKV", 32)
     assert prog.sizes == dict(HQ=4, SQ=8, D=16, HKV=4, SKV=32)
-    assert prog.op_count == 9 and len(prog.outputs) == 1  # 3 inputs + 6 compute ops
+    assert prog.op_count == 11 and len(prog.outputs) == 1  # 3 inputs + 8 compute ops
     assert "matmul" in repr(prog)
 
 

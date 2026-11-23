@@ -22,7 +22,6 @@ import cleave.schedule.streaming as stream
 from cleave import pipeline as P
 from cleave.core.errors import ScheduleRejected
 from cleave.frontend import trace
-from cleave.ir.update_rule import use_searched_updates
 from cleave.pipeline import plans
 from cleave.pipeline.superopt import GraphSet
 from cleave.runtime.compile import build_candidate_code
@@ -157,16 +156,14 @@ def test_a_bug_inside_the_filter_is_a_refused_graph_that_names_it(flash, monkeyp
     assert "1x ScheduleRejected: RuntimeError: boom" in planset.summary()
 
 
-@pytest.mark.parametrize("searched", [True, False], ids=["searched", "switch off"])
-def test_no_candidate_left_says_why(monkeypatch, searched):
+def test_no_candidate_left_says_why(monkeypatch):
     """A returned softmax whose row is longer than any block: its obstacle is refused (T4),
     and the report names that reason after the row limit, then the tilings the filter
-    dropped. The text does not depend on the switch: the list of reasons is the graph's."""
+    dropped."""
     shapes = dict(R=64, C=16384)
     ir = X.streamed_ir(X.softmax_rows, shapes, "is also read by")
     (why,) = ir.streaming_refusals
-    with use_searched_updates(searched):
-        planset = _scheduled(monkeypatch, X.softmax_rows, shapes, ir, topk=16, fusion="off")
+    planset = _scheduled(monkeypatch, X.softmax_rows, shapes, ir, topk=16, fusion="off")
     assert len(planset) == 0
     (refusal,) = planset.refused
     assert isinstance(refusal.error, ScheduleRejected)

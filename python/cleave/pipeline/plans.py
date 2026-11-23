@@ -9,7 +9,6 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Sequence
 
 from ..core.errors import LoweringRejected, ScheduleRejected
-from ..ir.update_rule import searched_updates
 from .config import ScheduleConfig
 from .superopt import GraphSet, SearchedGraph
 
@@ -99,7 +98,7 @@ def lower(graph: SearchedGraph, split_factor: int | None = None) -> list:
     bundle = _lower_structure(graph, graph.structure, split_factor)
     if getattr(graph.program, "stabilize_requests", ()):
         bundle = _annotate_softmax(graph, bundle)
-    elif searched_updates() and not graph.is_split:
+    elif not graph.is_split:
         _derive_updates(graph, bundle[0])
     return bundle
 
@@ -279,15 +278,10 @@ def describe_tile(t) -> str:
     return text
 
 
-# (Short enough for a refusal's one-line reason. A softmax that is returned itself -- a
-# standalone softmax, attention weights -- needs its row in one block with cl.softmax too:
-# the advice is for a softmax that is summed or multiplied over its row.)
-MAX_ROW_LIMIT = ("a max written by hand needs its whole row in one block, and this row is longer; "
-                 "cl.softmax carries a running max over any row it feeds to a sum or a matmul")
-# Where update rules are searched (``ir.update_rule.searched_updates``) a max is a max,
-# whoever wrote it, and a loop carries it wherever its obstacle is served: the advice above
-# does not hold. A graph with an obstacle says why it is not carried (``_schedule_once``).
-ROW_LIMIT = "a max needs its whole row in one block, and this row is longer"
+# Why a graph with a max has no tiling at all. A max is a max, whoever wrote it, and a loop
+# carries it wherever its streaming obstacle is served; a graph with an obstacle that is not
+# served says why after this text (``_schedule_once``).
+MAX_ROW_LIMIT = "a max needs its whole row in one block, and this row is longer"
 
 
 def _search(ir_graph, topk: int, force: bool, hints: dict | None,
@@ -343,10 +337,10 @@ def _schedule_once(graphs: GraphSet, config: ScheduleConfig, force: bool):
         if not tiles:
             why = "no tiling candidates"
             if "max" in g.ops:
-                why = ROW_LIMIT if searched_updates() else MAX_ROW_LIMIT
+                why = MAX_ROW_LIMIT
             unstreamed = getattr(ir, "streaming_refusals", None)
             if unstreamed:  # why the max is not carried across a loop instead
-                why = f"{ROW_LIMIT}; it is not carried across a loop: " + "; ".join(unstreamed)
+                why = f"{MAX_ROW_LIMIT}; it is not carried across a loop: " + "; ".join(unstreamed)
             if reasons:  # every tiling was refused by the softmax filter: say why
                 why += f" ({sum(reasons.values())} refused: " + "; ".join(
                     f"{n}x {reason}" for reason, n in reasons.most_common()) + ")"

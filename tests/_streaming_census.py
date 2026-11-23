@@ -21,10 +21,10 @@ job's options, no top-k cut) it checks what unit tests cannot afford to:
   (e) staging              with ``mla_decode_pass`` the value matmul still stages the exp
                            through shared memory, as in the plain twin;
   (f) counts               a ``demo:`` or ``program:`` job: the plans ``pipeline.schedule``
-                           keeps for the searched program equal the plans the hand-derived
-                           pass kept for the same program (``CLEAVE_SEARCHED_UPDATES`` off,
-                           ``cl.softmax`` requesting the exact softmax), and the plans of the
-                           searched program are the candidates the census accepted.
+                           keeps for the program equal the plans the hand-derived pass of
+                           1119 kept for the same program (``HAND_DERIVED_PLANS``, recorded
+                           while that pass was in the tree; ``COUNTS_DIFFER`` where they
+                           differ by design), and are the candidates the census accepted.
 
 Jobs come from three sources.
 
@@ -32,10 +32,9 @@ Jobs come from three sources.
 lowered as identity graphs; a classified obstacle gets a record by hand (the rule the
 engine proves for each of them), a refused one its reason.
 
-``demo:`` jobs: a demo's own program and configs, traced with the switch ON (``cl.softmax``
-records the explicit max), through ``superoptimize`` and ``plans.lower``: the searched
-graphs, with the records the engine derives. ``mla_decode`` is searched at ``max_ops=14``
-(the budget its graphs need with the max in them; the demo pins 13 for the old path).
+``demo:`` jobs: a demo's own program and configs (``cl.softmax`` records the explicit max),
+through ``superoptimize`` and ``plans.lower``: the searched graphs, with the records the
+engine derives.
 
 ``program:`` jobs: the same for a program that is no demo (``softmax(x) @ v`` with an fp16
 logits input, the first-axis program ``sum(softmax(x, 1) * y, 1)``).
@@ -75,7 +74,6 @@ from cleave.codegen import passes  # noqa: E402
 from cleave.core.errors import ScheduleRejected  # noqa: E402
 from cleave.ir.graph_utils import graph_tiers  # noqa: E402
 from cleave.ir.ops import Exp, Matmul  # noqa: E402
-from cleave.ir.update_rule import use_searched_updates  # noqa: E402
 from cleave.runtime.compile import CompilerPassOptions, build_candidate_code  # noqa: E402
 from cleave.schedule import apply_tiling, search_tiling  # noqa: E402
 from cleave.schedule import streaming  # noqa: E402
@@ -140,8 +138,6 @@ DEMOS = {
 }
 # job -> (demo file, its command line), where they differ from (the job's name, none)
 DEMO_ARGV = {"mha_decode@256": ("mha_decode", ["--SKV", "256"])}
-# demo -> max_ops of the searched program, where the demo's own pin is for the old path
-SEARCHED_MAX_OPS = {"mla_decode": 14}
 
 
 def rows_v(x: cl.Tensor["R", "C"], v: cl.Tensor["C", "D"]):
@@ -154,6 +150,15 @@ def first_axis(x: cl.Tensor["H", "K", "N"], y: cl.Tensor["H", "K", "N"]):
     return cl.sum(cl.softmax(x, 1) * y, 1, keepdim=True)
 
 
+# job -> the plans ``pipeline.schedule`` kept for the program with the hand-derived pass of
+# 1119 (no top-k cut), recorded by this census at the integration of the searched path
+# (a60f5ed, where both paths were in the tree), before that pass was deleted.
+HAND_DERIVED_PLANS = {
+    "demo:mha_prefill": 68, "demo:gqa_prefill": 68, "demo:mqa_prefill": 68,
+    "demo:mla_prefill": 138, "demo:mla_decode": 600, "demo:mha_decode": 32,
+    "demo:gqa_decode": 68, "demo:mqa_decode": 68, "demo:mha_decode@256": 40,
+    "program:rows_v": 16, "program:first_axis": 62,
+}
 # job -> (plans of the searched program, plans of the hand-derived pass, why they differ):
 # where the two paths do not keep the same number of tilings, by design. Anything else
 # must be equal.
@@ -177,9 +182,9 @@ PROGRAM_JOBS = {
 }
 
 
-def _traced_demo(name, flags=(), searched=True):
+def _traced_demo(name, flags=()):
     """``(program, superopt config, schedule config)`` of a demo, as the demo itself traces
-    and configures it, with the searched update rules switched on or off."""
+    and configures it."""
     import runpy
 
     import cleave.examples as examples
@@ -198,8 +203,7 @@ def _traced_demo(name, flags=(), searched=True):
     sys.argv = [str(ROOT / "demo" / f"{name}.py"), *flags]
     sys.path.insert(0, str(ROOT / "demo"))  # the demos import each other by bare name
     try:
-        with use_searched_updates(searched):
-            runpy.run_path(sys.argv[0], run_name="__main__")
+        runpy.run_path(sys.argv[0], run_name="__main__")
     except Stop:
         pass
     finally:
@@ -209,62 +213,56 @@ def _traced_demo(name, flags=(), searched=True):
     return seen["program"], seen["so"], seen["sc"]
 
 
-def _configured(job, searched):
+def _configured(job):
     """``(program, superopt config, schedule config)`` of a demo or program job."""
     from cleave.frontend import trace
     from cleave.pipeline import ScheduleConfig, resolve_configs
 
     if job.startswith("program:"):
         fn, shapes, max_ops = PROGRAM_JOBS[job[8:]]
-        with use_searched_updates(searched):
-            program = trace(fn, shapes, cl.f16)
+        program = trace(fn, shapes, cl.f16)
         so, sc, _ = resolve_configs(program, split=False)
         if max_ops:
             so = so.replace(max_ops=max_ops)
         return program, so, sc if sc is not None else ScheduleConfig()
     name = job[5:]
-    program, so, sc = _traced_demo(*DEMO_ARGV.get(name, (name, [])), searched=searched)
-    demo = DEMO_ARGV.get(name, (name,))[0]
-    if searched and demo in SEARCHED_MAX_OPS:
-        so = so.replace(max_ops=SEARCHED_MAX_OPS[demo])
+    program, so, sc = _traced_demo(*DEMO_ARGV.get(name, (name, [])))
     return program, so.replace(split=()), sc
 
 
 def _searched_graphs(job):
     """``(graphs, search options, notes, counts)`` for a demo or program job.
 
-    ``graphs`` are the solo graphs the program lowers to under the switch, each as
-    ``(label, ir, where its records come from)``; ``notes`` say why a graph of the search
-    is not among them; ``counts`` is ``(plans of the searched program, plans the
-    hand-derived pass keeps for it)``, both of ``pipeline.schedule`` with no top-k cut.
+    ``graphs`` are the solo graphs the program lowers to, each as ``(label, ir, where its
+    records come from)``; ``notes`` say why a graph of the search is not among them;
+    ``counts`` is ``(plans of the program, plans the hand-derived pass kept for it)``, both
+    of ``pipeline.schedule`` with no top-k cut (the second as recorded,
+    ``HAND_DERIVED_PLANS``).
     """
     from cleave.pipeline import schedule, superoptimize
     from cleave.pipeline.plans import lower
 
-    program, so, sc = _configured(job, searched=True)
+    program, so, sc = _configured(job)
     graphs, notes = [], []
-    with use_searched_updates():
-        found = superoptimize(program, so)
-        for g in found:
-            if g.is_split or g.invalid_split:
-                continue
-            try:
-                irs = lower(g)
-            except Exception as e:  # noqa: BLE001 - a refused graph is reported, not hidden
-                notes.append(f"graph g{g.index}: refused at lowering: {_first(e)}")
-                continue
-            for k, ir in enumerate(irs):
-                label = f"g{g.index}" if len(irs) == 1 else f"g{g.index}.{k}"
-                if recorded(ir) or getattr(ir, "streaming_refusals", None):
-                    where = "engine" if recorded(ir) else "refused: " + "; ".join(
-                        ir.streaming_refusals)[:200]
-                    graphs.append((label, ir, where))
-                else:
-                    notes.append(f"graph {label}: no streaming obstacle")
-        new = len(schedule(found, sc.replace(topk=100000)))
-    old_program, old_so, old_sc = _configured(job, searched=False)
-    with use_searched_updates(False):
-        old = len(schedule(superoptimize(old_program, old_so), old_sc.replace(topk=100000)))
+    found = superoptimize(program, so)
+    for g in found:
+        if g.is_split or g.invalid_split:
+            continue
+        try:
+            irs = lower(g)
+        except Exception as e:  # noqa: BLE001 - a refused graph is reported, not hidden
+            notes.append(f"graph g{g.index}: refused at lowering: {_first(e)}")
+            continue
+        for k, ir in enumerate(irs):
+            label = f"g{g.index}" if len(irs) == 1 else f"g{g.index}.{k}"
+            if recorded(ir) or getattr(ir, "streaming_refusals", None):
+                where = "engine" if recorded(ir) else "refused: " + "; ".join(
+                    ir.streaming_refusals)[:200]
+                graphs.append((label, ir, where))
+            else:
+                notes.append(f"graph {label}: no streaming obstacle")
+    new = len(schedule(found, sc.replace(topk=100000)))
+    old = HAND_DERIVED_PLANS[job]
     options = {"force_fusion": True} if sc.fusion == "force" else {}
     return graphs, options, notes, (new, old)
 

@@ -1,9 +1,11 @@
-"""The lowered, annotated flat graph computes what the program says, at x1 and at x100 (CPU).
+"""The lowered flat graph computes what the program says, at x1 and at x100 (CPU).
 
 Validation compares a kernel with the reference of its lowered flat graph, never with the
 program, so this is the link that makes "the kernel validated" mean "the program is right":
 ``execute(plans.lower(identity graph))`` against ``Program.reference``, which never sees the IR.
-At x100 logits both must stay finite; the plain twin of the same graph does not.
+The max of every softmax is a node of the lowered graph (``exp(x - max(x))``, which
+``runtime.inputs.softmax_axis`` recognizes). At x100 logits both must stay finite; the same
+graph with its maxes taken as zero (the plain ``exp``) does not.
 """
 
 import pytest
@@ -13,13 +15,13 @@ pytest.importorskip("tilelang")
 
 import cleave.lang as cl
 from cleave.frontend import trace
-from cleave.ir.ops import Exp
-from cleave.pipeline.plans import lower
+from cleave.ir.ops import Exp, ReduceMax
+from cleave.pipeline.plans import bind_inputs, lower
 from cleave.pipeline.superopt import GraphSet
-from cleave.runtime.inputs import DISTRIBUTIONS
-from cleave.runtime.reference import build_inputs_and_reference
+from cleave.runtime.inputs import DISTRIBUTIONS, softmax_axis
+from cleave.runtime.reference import build_inputs_and_reference, placeholder_order, values
+from tests._explicit_softmax import stable_exp
 from tests._lowering import run_lowered
-from tests._softmax import stable_exp
 
 
 def _softmax(dims, dim):
@@ -96,7 +98,8 @@ def _inputs(prog, logits, scale):
 def test_lowered_graph_equals_program_reference(name, scale):
     fn, sizes, logits, n_softmax = CASES[name]
     prog, ir = _lowered(fn, sizes)
-    assert sum(n.stabilize is not None for n in ir.nodes if type(n) is Exp) == n_softmax
+    exact = [n for n in ir.nodes if type(n) is Exp and softmax_axis(n) is not None]
+    assert len(exact) == n_softmax == len([n for n in ir.nodes if type(n) is ReduceMax])
     inputs = _inputs(prog, logits, scale)
     (got,) = run_lowered(ir, prog, inputs)
     (want,) = prog.reference(*inputs)
@@ -105,15 +108,20 @@ def test_lowered_graph_equals_program_reference(name, scale):
 
 
 @pytest.mark.parametrize("name", CASES)
-def test_unmarked_graph_is_not_finite_at_x100(name):
-    """What the annotation is for: drop the records and the same graph overflows."""
+def test_the_graph_without_its_maxes_is_not_finite_at_x100(name):
+    """What the max is for: the same graph with every max given as zero -- the plain
+    ``exp`` of the logits -- overflows."""
     fn, sizes, logits, _ = CASES[name]
     prog, ir = _lowered(fn, sizes)
-    for node in ir.nodes:
-        if type(node) is Exp:
-            node.stabilize = None
-    (got,) = run_lowered(ir, prog, _inputs(prog, logits, 100.0))
+    maxes = [n for n in ir.nodes if type(n) is ReduceMax]
+    assert maxes
+    by_name = dict(zip(bind_inputs(ir, prog), _inputs(prog, logits, 100.0)))
+    inputs = [by_name[n.name] for n in placeholder_order(ir)]
+    zero = {m.name: torch.zeros(tuple(int(s) for s in m.get_shape(0))) for m in maxes}
+    _, (got,) = values(ir, inputs, given=zero)
     assert not torch.isfinite(got).all()
+    _, (exact,) = values(ir, inputs)
+    assert torch.isfinite(exact).all()
 
 
 @pytest.mark.parametrize("sizes", [dict(HQ=32, HKV=32, SQ=64, SKV=256, D=64),

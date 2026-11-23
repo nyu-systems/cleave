@@ -17,6 +17,6 @@ if __name__ == "__main__":
         mla_decode,
         shapes=dict(B=1, H=128, SKV=1024, D=512, PE=64),
         dtype=cl.f16,
-        max_ops=13,  # the engine default; the auto rule gives 14
+        max_ops=14,  # the budget its graphs need with the max in them; the auto rule gives 16
         tolerance=cl.Tolerance(rtol=5e-3),
     )

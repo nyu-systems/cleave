@@ -25,7 +25,7 @@ from cleave import pipeline as P
 from cleave.core.errors import ScheduleRejected
 from cleave.frontend import trace
 from cleave.ir.ops import Div, Matmul, ReduceMax, ReduceSum
-from cleave.ir.update_rule import Obstacle, use_searched_updates
+from cleave.ir.update_rule import Obstacle
 from cleave.pipeline import plans as plans_module
 from cleave.pipeline.superopt import GraphSet
 from cleave.schedule import search_tiling
@@ -300,22 +300,15 @@ def test_a_graph_without_tilings_says_why_its_max_is_not_carried(monkeypatch):
     assert why.startswith(f"{X.maxes(ir)[0].name}: mma_") and "a finished reduction" in why
 
 
-@pytest.mark.parametrize("searched", [True, False], ids=["searched", "switch off"])
-def test_a_max_without_an_obstacle_entry_and_without_tilings(monkeypatch, searched):
-    """No list of reasons on the graph (no obstacle was looked at): the row limit alone.
-    With the switch off it is the text of the hand-derived path, whose advice is about
-    ``cl.softmax``; where update rules are searched a max is a max, whoever wrote it, and
-    the advice goes. (Which graph has no tiling is the policy's business; here it has
-    none.)"""
+def test_a_max_without_an_obstacle_entry_and_without_tilings(monkeypatch):
+    """No list of reasons on the graph (no obstacle was looked at): the row limit alone. A
+    max is a max, whoever wrote it: the text gives no advice about ``cl.softmax``. (Which
+    graph has no tiling is the policy's business; here it has none.)"""
     ir = X.lowered(X.flash_attention, SMALL)
     assert not hasattr(ir, "streaming_refusals")
     monkeypatch.setattr(plans_module, "_search", lambda *args, **kwargs: [])
-    with use_searched_updates(searched):
-        plans = _schedule_ir(monkeypatch, X.flash_attention, SMALL, ir, topk=8)
+    plans = _schedule_ir(monkeypatch, X.flash_attention, SMALL, ir, topk=8)
     assert not plans and plans.refused
     texts = {str(r.error) for r in plans.refused}
-    if searched:
-        assert texts == {"a max needs its whole row in one block, and this row is longer"}
-        assert plans_module.ROW_LIMIT in texts
-    else:
-        assert texts == {plans_module.MAX_ROW_LIMIT}
+    assert texts == {"a max needs its whole row in one block, and this row is longer"}
+    assert texts == {plans_module.MAX_ROW_LIMIT}

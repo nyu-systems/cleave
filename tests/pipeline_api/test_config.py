@@ -50,18 +50,20 @@ def test_config_normalization_and_replace():
     assert EvalConfig().max_parallel == 8
 
 
-# The budgets of demo/*.py (13 = engine default where the rule gives less). The attention
-# programs are one op shorter than they were under the fixed shift (its add is gone), and
-# the budget follows: the search finds the same graphs.
+# The auto rule on the programs of demo/*.py (13 = engine default where the rule gives
+# less). ``cl.softmax`` records its max and the subtraction (two ops more than the request of
+# the hand-derived pass), and the rule follows. A program split over a dim its max reduces
+# is searched unsplit (``pipeline.superopt``), at the budget of ``split=()``: the first row
+# of attention is the budget the decode demos search at.
 DEMO_MAX_OPS = [
     (P.matmul, dict(M=128, N=128, K=4096), (), 13),
     (P.matmul, dict(M=128, N=128, K=4096), ("K",), 13),
     (P.rmsnorm_matmul, dict(M=128, N=6144, K=4096), ("K",), 13),
     (P.attention, dict(HQ=32, SQ=64, HKV=32, SKV=4096, D=64), (), 13),  # decode, --split none
-    (P.attention, dict(HQ=32, SQ=64, HKV=32, SKV=4096, D=64), ("SKV",), 13),  # mha/gqa/mqa decode
-    (P.attention, dict(HQ=32, SQ=4096, HKV=32, SKV=4096, D=64), ("SKV",), 13),  # prefill split
-    (P.qknorm, dict(HQ=64, SQ=4096, HKV=8, SKV=4096, D=128), (), 25),
-    (P.qknorm, dict(HQ=64, SQ=4096, HKV=8, SKV=4096, D=128), ("SKV",), 27),
+    (P.attention, dict(HQ=32, SQ=64, HKV=32, SKV=4096, D=64), ("SKV",), 15),  # mha/gqa/mqa decode
+    (P.attention, dict(HQ=32, SQ=4096, HKV=32, SKV=4096, D=64), ("SKV",), 15),  # prefill split
+    (P.qknorm, dict(HQ=64, SQ=4096, HKV=8, SKV=4096, D=128), (), 27),
+    (P.qknorm, dict(HQ=64, SQ=4096, HKV=8, SKV=4096, D=128), ("SKV",), 29),
 ]
 
 
@@ -103,7 +105,7 @@ def test_cache_schema_retires_kernels_built_before_a_scheduler_fix(monkeypatch):
 
     prog = trace(P.matmul, dict(M=128, N=128, K=4096), cl.f16)
     cfgs = resolve_configs(prog)
-    assert cache.SCHEMA >= 41
+    assert cache.SCHEMA >= 42
     key = _kernel_key(prog, *cfgs)
     monkeypatch.setattr(cache, "SCHEMA", 1)
     assert _kernel_key(prog, *cfgs) != key
@@ -180,7 +182,7 @@ def test_kernel_cache_key_covers_validation():
     assert key(declared) == key(declared.replace(max_parallel=2, timeout_s=5.0))
     # 1: elementwise assert_close with a 0.5/0.5 default. 3: the partial of a program
     # split over the softmax axis of an input was held to no adversarial case.
-    assert cache.VALIDATION >= 6
+    assert cache.VALIDATION >= 7
     before = key(declared)
     cache.VALIDATION += 1
     try:

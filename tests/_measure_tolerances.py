@@ -145,8 +145,6 @@ GPU_TESTS = [
     "tests/schedule/end2end", "tests/graph/apply_tiling", "tests/graph/handwritten",
     "tests/reference", "tests/runtime/test_run_candidates.py", "tests/pipeline_api/test_e2e.py",
     "tests/pipeline_api/test_split_attention.py",
-    "tests/pipeline_api/test_exact_split_attention.py",
-    "tests/pipeline_api/test_exact_split_rows.py",
     "tests/frontend/test_exact_softmax.py", "tests/frontend_dynamic/test_paged_pipeline.py",
     "tests/pipeline_api/test_declared_validation.py", "tests/runtime/test_inter_outputs.py",
     "tests/pipeline_api/test_per_output_gpu.py",

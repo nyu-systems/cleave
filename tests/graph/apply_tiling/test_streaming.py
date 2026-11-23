@@ -208,7 +208,6 @@ def test_the_engine_is_not_even_imported_for_a_graph_without_a_record(tmp_path):
         "assert not loaded, loaded\n"
     )
     env = dict(os.environ, CUDA_VISIBLE_DEVICES="", CLEAVE_CACHE_ROOT=str(tmp_path))
-    env.pop("CLEAVE_SEARCHED_UPDATES", None)
     env["PYTHONPATH"] = os.pathsep.join(
         [str(ROOT), str(ROOT / "python"), env.get("PYTHONPATH", "")]
     )

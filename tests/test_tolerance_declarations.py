@@ -376,9 +376,9 @@ def test_the_measurement_counts_hand_made_requests_and_not_a_kernel_broken_on_pu
 
 
 def test_the_measurement_leaves_out_the_kernels_built_without_the_exact_softmax(tmp_path):
-    """``tests/frontend/test_exact_softmax.py`` builds an attention without the stabilize
-    request, and the exact program's tilings without the rewrite, to show that validation
-    rejects them at x100. Those are no kernels of the operator: neither their passes on
+    """``tests/frontend/test_exact_softmax.py`` builds an attention without the max, and
+    holds the tilings of that plain twin to the exact program's reference, to show that
+    validation rejects them at x100. Those are no kernels of the operator: neither their passes on
     normal inputs nor their deliberate non-finite failures are part of its measurement, so
     a non-finite failure in its table is always a finding."""
     from tests._measure_tolerances import load, measured_errors, rows

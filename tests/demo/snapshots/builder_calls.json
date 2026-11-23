@@ -77,46 +77,62 @@
      "t4"
     ],
     [
-     "exp",
+     "reduce_max",
      [
-      "t4"
+      "t4",
+      2.0
      ],
      "t5"
     ],
     [
-     "reduce_sum",
+     "sub",
      [
-      "t5",
-      2.0
+      "t4",
+      "t5"
      ],
      "t6"
     ],
     [
-     "div",
+     "exp",
      [
-      "t5",
       "t6"
      ],
      "t7"
     ],
     [
-     "matmul",
+     "reduce_sum",
      [
       "t7",
-      "t2",
-      false,
-      false
+      2.0
      ],
      "t8"
     ],
     [
+     "div",
+     [
+      "t7",
+      "t8"
+     ],
+     "t9"
+    ],
+    [
+     "matmul",
+     [
+      "t9",
+      "t2",
+      false,
+      false
+     ],
+     "t10"
+    ],
+    [
      "create_tiled_output",
      [
-      "t8"
+      "t10"
      ]
     ]
    ],
-   "max_ops": 13,
+   "max_ops": 15,
    "split_k": [
     4,
     8,
@@ -200,42 +216,58 @@
      "t4"
     ],
     [
-     "exp",
+     "reduce_max",
      [
-      "t4"
+      "t4",
+      2.0
      ],
      "t5"
     ],
     [
-     "reduce_sum",
+     "sub",
      [
-      "t5",
-      2.0
+      "t4",
+      "t5"
      ],
      "t6"
     ],
     [
-     "div",
+     "exp",
      [
-      "t5",
       "t6"
      ],
      "t7"
     ],
     [
-     "matmul",
+     "reduce_sum",
      [
       "t7",
-      "t2",
-      false,
-      false
+      2.0
      ],
      "t8"
     ],
     [
+     "div",
+     [
+      "t7",
+      "t8"
+     ],
+     "t9"
+    ],
+    [
+     "matmul",
+     [
+      "t9",
+      "t2",
+      false,
+      false
+     ],
+     "t10"
+    ],
+    [
      "create_tiled_output",
      [
-      "t8"
+      "t10"
      ]
     ]
    ],
@@ -319,42 +351,58 @@
      "t4"
     ],
     [
-     "exp",
+     "reduce_max",
      [
-      "t4"
+      "t4",
+      2.0
      ],
      "t5"
     ],
     [
-     "reduce_sum",
+     "sub",
      [
-      "t5",
-      2.0
+      "t4",
+      "t5"
      ],
      "t6"
     ],
     [
-     "div",
+     "exp",
      [
-      "t5",
       "t6"
      ],
      "t7"
     ],
     [
-     "matmul",
+     "reduce_sum",
      [
       "t7",
-      "t2",
-      false,
-      false
+      2.0
      ],
      "t8"
     ],
     [
+     "div",
+     [
+      "t7",
+      "t8"
+     ],
+     "t9"
+    ],
+    [
+     "matmul",
+     [
+      "t9",
+      "t2",
+      false,
+      false
+     ],
+     "t10"
+    ],
+    [
      "create_tiled_output",
      [
-      "t8"
+      "t10"
      ]
     ]
    ],
@@ -1440,46 +1488,62 @@
      "t4"
     ],
     [
-     "exp",
+     "reduce_max",
      [
-      "t4"
+      "t4",
+      2.0
      ],
      "t5"
     ],
     [
-     "reduce_sum",
+     "sub",
      [
-      "t5",
-      2.0
+      "t4",
+      "t5"
      ],
      "t6"
     ],
     [
-     "div",
+     "exp",
      [
-      "t5",
       "t6"
      ],
      "t7"
     ],
     [
-     "matmul",
+     "reduce_sum",
      [
       "t7",
-      "t2",
-      false,
-      false
+      2.0
      ],
      "t8"
     ],
     [
+     "div",
+     [
+      "t7",
+      "t8"
+     ],
+     "t9"
+    ],
+    [
+     "matmul",
+     [
+      "t9",
+      "t2",
+      false,
+      false
+     ],
+     "t10"
+    ],
+    [
      "create_tiled_output",
      [
-      "t8"
+      "t10"
      ]
     ]
    ],
-   "max_ops": 13,
+   "max_ops": 15,
    "split_k": [
     16,
     32
@@ -1562,42 +1626,58 @@
      "t4"
     ],
     [
-     "exp",
+     "reduce_max",
      [
-      "t4"
+      "t4",
+      2.0
      ],
      "t5"
     ],
     [
-     "reduce_sum",
+     "sub",
      [
-      "t5",
-      2.0
+      "t4",
+      "t5"
      ],
      "t6"
     ],
     [
-     "div",
+     "exp",
      [
-      "t5",
       "t6"
      ],
      "t7"
     ],
     [
-     "matmul",
+     "reduce_sum",
      [
       "t7",
-      "t2",
-      false,
-      false
+      2.0
      ],
      "t8"
     ],
     [
+     "div",
+     [
+      "t7",
+      "t8"
+     ],
+     "t9"
+    ],
+    [
+     "matmul",
+     [
+      "t9",
+      "t2",
+      false,
+      false
+     ],
+     "t10"
+    ],
+    [
      "create_tiled_output",
      [
-      "t8"
+      "t10"
      ]
     ]
    ],
@@ -1681,42 +1761,58 @@
      "t4"
     ],
     [
-     "exp",
+     "reduce_max",
      [
-      "t4"
+      "t4",
+      2.0
      ],
      "t5"
     ],
     [
-     "reduce_sum",
+     "sub",
      [
-      "t5",
-      2.0
+      "t4",
+      "t5"
      ],
      "t6"
     ],
     [
-     "div",
+     "exp",
      [
-      "t5",
       "t6"
      ],
      "t7"
     ],
     [
-     "matmul",
+     "reduce_sum",
      [
       "t7",
-      "t2",
-      false,
-      false
+      2.0
      ],
      "t8"
     ],
     [
+     "div",
+     [
+      "t7",
+      "t8"
+     ],
+     "t9"
+    ],
+    [
+     "matmul",
+     [
+      "t9",
+      "t2",
+      false,
+      false
+     ],
+     "t10"
+    ],
+    [
      "create_tiled_output",
      [
-      "t8"
+      "t10"
      ]
     ]
    ],
@@ -1835,46 +1931,62 @@
      "t7"
     ],
     [
-     "exp",
+     "reduce_max",
      [
-      "t7"
+      "t7",
+      2.0
      ],
      "t8"
     ],
     [
-     "reduce_sum",
+     "sub",
      [
-      "t8",
-      2.0
+      "t7",
+      "t8"
      ],
      "t9"
     ],
     [
-     "div",
+     "exp",
      [
-      "t8",
       "t9"
      ],
      "t10"
     ],
     [
-     "matmul",
+     "reduce_sum",
      [
       "t10",
-      "t1",
-      false,
-      false
+      2.0
      ],
      "t11"
     ],
     [
+     "div",
+     [
+      "t10",
+      "t11"
+     ],
+     "t12"
+    ],
+    [
+     "matmul",
+     [
+      "t12",
+      "t1",
+      false,
+      false
+     ],
+     "t13"
+    ],
+    [
      "create_tiled_output",
      [
-      "t11"
+      "t13"
      ]
     ]
    ],
-   "max_ops": 13,
+   "max_ops": 14,
    "split_k": []
   },
   "mla_prefill": {
@@ -1954,42 +2066,58 @@
      "t4"
     ],
     [
-     "exp",
+     "reduce_max",
      [
-      "t4"
+      "t4",
+      2.0
      ],
      "t5"
     ],
     [
-     "reduce_sum",
+     "sub",
      [
-      "t5",
-      2.0
+      "t4",
+      "t5"
      ],
      "t6"
     ],
     [
-     "div",
+     "exp",
      [
-      "t5",
       "t6"
      ],
      "t7"
     ],
     [
-     "matmul",
+     "reduce_sum",
      [
       "t7",
-      "t2",
-      false,
-      false
+      2.0
      ],
      "t8"
     ],
     [
+     "div",
+     [
+      "t7",
+      "t8"
+     ],
+     "t9"
+    ],
+    [
+     "matmul",
+     [
+      "t9",
+      "t2",
+      false,
+      false
+     ],
+     "t10"
+    ],
+    [
      "create_tiled_output",
      [
-      "t8"
+      "t10"
      ]
     ]
    ],
@@ -2073,46 +2201,62 @@
      "t4"
     ],
     [
-     "exp",
+     "reduce_max",
      [
-      "t4"
+      "t4",
+      2.0
      ],
      "t5"
     ],
     [
-     "reduce_sum",
+     "sub",
      [
-      "t5",
-      2.0
+      "t4",
+      "t5"
      ],
      "t6"
     ],
     [
-     "div",
+     "exp",
      [
-      "t5",
       "t6"
      ],
      "t7"
     ],
     [
-     "matmul",
+     "reduce_sum",
      [
       "t7",
-      "t2",
-      false,
-      false
+      2.0
      ],
      "t8"
     ],
     [
+     "div",
+     [
+      "t7",
+      "t8"
+     ],
+     "t9"
+    ],
+    [
+     "matmul",
+     [
+      "t9",
+      "t2",
+      false,
+      false
+     ],
+     "t10"
+    ],
+    [
      "create_tiled_output",
      [
-      "t8"
+      "t10"
      ]
     ]
    ],
-   "max_ops": 13,
+   "max_ops": 15,
    "split_k": [
     4,
     8,
@@ -2196,42 +2340,58 @@
      "t4"
     ],
     [
-     "exp",
+     "reduce_max",
      [
-      "t4"
+      "t4",
+      2.0
      ],
      "t5"
     ],
     [
-     "reduce_sum",
+     "sub",
      [
-      "t5",
-      2.0
+      "t4",
+      "t5"
      ],
      "t6"
     ],
     [
-     "div",
+     "exp",
      [
-      "t5",
       "t6"
      ],
      "t7"
     ],
     [
-     "matmul",
+     "reduce_sum",
      [
       "t7",
-      "t2",
-      false,
-      false
+      2.0
      ],
      "t8"
     ],
     [
+     "div",
+     [
+      "t7",
+      "t8"
+     ],
+     "t9"
+    ],
+    [
+     "matmul",
+     [
+      "t9",
+      "t2",
+      false,
+      false
+     ],
+     "t10"
+    ],
+    [
      "create_tiled_output",
      [
-      "t8"
+      "t10"
      ]
     ]
    ],
@@ -2315,42 +2475,58 @@
      "t4"
     ],
     [
-     "exp",
+     "reduce_max",
      [
-      "t4"
+      "t4",
+      2.0
      ],
      "t5"
     ],
     [
-     "reduce_sum",
+     "sub",
      [
-      "t5",
-      2.0
+      "t4",
+      "t5"
      ],
      "t6"
     ],
     [
-     "div",
+     "exp",
      [
-      "t5",
       "t6"
      ],
      "t7"
     ],
     [
-     "matmul",
+     "reduce_sum",
      [
       "t7",
-      "t2",
-      false,
-      false
+      2.0
      ],
      "t8"
     ],
     [
+     "div",
+     [
+      "t7",
+      "t8"
+     ],
+     "t9"
+    ],
+    [
+     "matmul",
+     [
+      "t9",
+      "t2",
+      false,
+      false
+     ],
+     "t10"
+    ],
+    [
      "create_tiled_output",
      [
-      "t8"
+      "t10"
      ]
     ]
    ],
@@ -2544,46 +2720,62 @@
      "t18"
     ],
     [
-     "exp",
+     "reduce_max",
      [
-      "t18"
+      "t18",
+      2.0
      ],
      "t19"
     ],
     [
-     "reduce_sum",
+     "sub",
      [
-      "t19",
-      2.0
+      "t18",
+      "t19"
      ],
      "t20"
     ],
     [
-     "div",
+     "exp",
      [
-      "t19",
       "t20"
      ],
      "t21"
     ],
     [
-     "matmul",
+     "reduce_sum",
      [
       "t21",
-      "t2",
-      false,
-      false
+      2.0
      ],
      "t22"
     ],
     [
+     "div",
+     [
+      "t21",
+      "t22"
+     ],
+     "t23"
+    ],
+    [
+     "matmul",
+     [
+      "t23",
+      "t2",
+      false,
+      false
+     ],
+     "t24"
+    ],
+    [
      "create_tiled_output",
      [
-      "t22"
+      "t24"
      ]
     ]
    ],
-   "max_ops": 25,
+   "max_ops": 27,
    "split_k": []
   },
   "rmsnorm_matmul": {
@@ -2974,42 +3166,58 @@
     "t4"
    ],
    [
-    "exp",
+    "reduce_max",
     [
-     "t4"
+     "t4",
+     2.0
     ],
     "t5"
    ],
    [
-    "reduce_sum",
+    "sub",
     [
-     "t5",
-     2.0
+     "t4",
+     "t5"
     ],
     "t6"
    ],
    [
-    "div",
+    "exp",
     [
-     "t5",
      "t6"
     ],
     "t7"
    ],
    [
-    "matmul",
+    "reduce_sum",
     [
      "t7",
-     "t2",
-     false,
-     false
+     2.0
     ],
     "t8"
    ],
    [
+    "div",
+    [
+     "t7",
+     "t8"
+    ],
+    "t9"
+   ],
+   [
+    "matmul",
+    [
+     "t9",
+     "t2",
+     false,
+     false
+    ],
+    "t10"
+   ],
+   [
     "create_tiled_output",
     [
-     "t8"
+     "t10"
     ]
    ]
   ],
@@ -3089,42 +3297,58 @@
     "t4"
    ],
    [
-    "exp",
+    "reduce_max",
     [
-     "t4"
+     "t4",
+     2.0
     ],
     "t5"
    ],
    [
-    "reduce_sum",
+    "sub",
     [
-     "t5",
-     2.0
+     "t4",
+     "t5"
     ],
     "t6"
    ],
    [
-    "div",
+    "exp",
     [
-     "t5",
      "t6"
     ],
     "t7"
    ],
    [
-    "matmul",
+    "reduce_sum",
     [
      "t7",
-     "t2",
-     false,
-     false
+     2.0
     ],
     "t8"
    ],
    [
+    "div",
+    [
+     "t7",
+     "t8"
+    ],
+    "t9"
+   ],
+   [
+    "matmul",
+    [
+     "t9",
+     "t2",
+     false,
+     false
+    ],
+    "t10"
+   ],
+   [
     "create_tiled_output",
     [
-     "t8"
+     "t10"
     ]
    ]
   ],
@@ -3566,42 +3790,58 @@
     "t4"
    ],
    [
-    "exp",
+    "reduce_max",
     [
-     "t4"
+     "t4",
+     2.0
     ],
     "t5"
    ],
    [
-    "reduce_sum",
+    "sub",
     [
-     "t5",
-     2.0
+     "t4",
+     "t5"
     ],
     "t6"
    ],
    [
-    "div",
+    "exp",
     [
-     "t5",
      "t6"
     ],
     "t7"
    ],
    [
-    "matmul",
+    "reduce_sum",
     [
      "t7",
-     "t2",
-     false,
-     false
+     2.0
     ],
     "t8"
    ],
    [
+    "div",
+    [
+     "t7",
+     "t8"
+    ],
+    "t9"
+   ],
+   [
+    "matmul",
+    [
+     "t9",
+     "t2",
+     false,
+     false
+    ],
+    "t10"
+   ],
+   [
     "create_tiled_output",
     [
-     "t8"
+     "t10"
     ]
    ]
   ],
@@ -3681,42 +3921,58 @@
     "t4"
    ],
    [
-    "exp",
+    "reduce_max",
     [
-     "t4"
+     "t4",
+     2.0
     ],
     "t5"
    ],
    [
-    "reduce_sum",
+    "sub",
     [
-     "t5",
-     2.0
+     "t4",
+     "t5"
     ],
     "t6"
    ],
    [
-    "div",
+    "exp",
     [
-     "t5",
      "t6"
     ],
     "t7"
    ],
    [
-    "matmul",
+    "reduce_sum",
     [
      "t7",
-     "t2",
-     false,
-     false
+     2.0
     ],
     "t8"
    ],
    [
+    "div",
+    [
+     "t7",
+     "t8"
+    ],
+    "t9"
+   ],
+   [
+    "matmul",
+    [
+     "t9",
+     "t2",
+     false,
+     false
+    ],
+    "t10"
+   ],
+   [
     "create_tiled_output",
     [
-     "t8"
+     "t10"
     ]
    ]
   ],
@@ -3906,42 +4162,58 @@
     "t18"
    ],
    [
-    "exp",
+    "reduce_max",
     [
-     "t18"
+     "t18",
+     2.0
     ],
     "t19"
    ],
    [
-    "reduce_sum",
+    "sub",
     [
-     "t19",
-     2.0
+     "t18",
+     "t19"
     ],
     "t20"
    ],
    [
-    "div",
+    "exp",
     [
-     "t19",
      "t20"
     ],
     "t21"
    ],
    [
-    "matmul",
+    "reduce_sum",
     [
      "t21",
-     "t2",
-     false,
-     false
+     2.0
     ],
     "t22"
    ],
    [
+    "div",
+    [
+     "t21",
+     "t22"
+    ],
+    "t23"
+   ],
+   [
+    "matmul",
+    [
+     "t23",
+     "t2",
+     false,
+     false
+    ],
+    "t24"
+   ],
+   [
     "create_tiled_output",
     [
-     "t22"
+     "t24"
     ]
    ]
   ],

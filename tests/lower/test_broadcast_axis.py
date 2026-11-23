@@ -49,8 +49,8 @@ SHAPES = [
 ]
 UNIT_SHAPES = [
     # One element along the softmax axis, the row axis or both: either index reads the same
-    # values, but the index still names the axis (the scale analysis maps the divisor's
-    # factor through it). The search drops a sum over a unit axis, so these are identity only.
+    # values, but the index still names the axis the divisor is broadcast along. The search
+    # drops a sum over a unit axis, so these are identity only.
     (("R", "C"), dict(R=1, C=1), -1, 0),
     (("R", "C"), dict(R=1, C=1), 0, 1),  # said 0 before: the two shapes cannot tell
     (("B", "R", "C"), dict(B=4, R=1, C=1), -1, 0),
@@ -344,34 +344,6 @@ def test_split_combine_with_one_head_divides_by_the_row_sums(sq, d):
     torch.testing.assert_close(got.reshape(want.shape), want, rtol=1e-5, atol=1e-6)
 
 
-def test_search_one_head_attention_lowers_its_split_graphs():
-    """The same, from the search: attention with one head and S_Q == D, split over the keys.
-    Every split graph the search finds lowers (each was refused at the combine's division),
-    and the partial followed by the combine computes the program."""
-    from tests._softmax import chained_reference
-
-    def fn(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
-           v: cl.Tensor["H", "SKV", "D"]):
-        return cl.softmax((q @ k.mT) / q.shape[-1] ** 0.5, dim=-1) @ v
-
-    prog = trace(fn, dict(H=1, SQ=16, SKV=64, D=16), cl.f16)
-    split = [g for g in P.superoptimize(prog, P.SuperoptConfig(split=("SKV",), max_ops=14,
-                                                               cache=False))
-             if g.is_split and not g.invalid_split]
-    assert split
-    torch.manual_seed(0)
-    inputs = [torch.randn(tuple(t.shape)).to(torch.float16) for t in prog.inputs]
-    (want,) = prog.reference(*inputs)
-    for graph in split:
-        partial, combine = lower(graph, 4)
-        (div,) = [n for n in combine.nodes if type(n) is Div]
-        assert div.broadcast == 0
-        _, (got,) = chained_reference(partial, combine, prog, inputs)
-        assert got.numel() == want.numel()
-        error = (got.float().reshape(want.shape) - want.float()).abs()
-        assert float((error / want.float().abs().amax(-1, keepdim=True)).max()) <= 2e-3
-
-
 def test_a_reduced_batch_axis_is_refused():
     # (B, M, N) / sum over B: the divisor is (M, N), which no broadcast index describes;
     # with B == M == N it used to pass for a row sum.
@@ -468,6 +440,33 @@ def batch_softmax(x: cl.Tensor["B", "R", "C"]):
     return e / cl.sum(e, 0, keepdim=True)
 
 
+# The same refusals where the softmax has its max: ``cl.softmax`` records ``x - max(x)``, so
+# a softmax over a vector or a batch axis is refused at that subtraction, the first op that
+# broadcasts.
+def _stable_exp(x, dim):
+    return cl.exp(x - cl.max(x, dim, keepdim=True))
+
+
+def vector_softmax(x: cl.Tensor["C"]):
+    return cl.softmax(x, 0)
+
+
+def batch_axis_softmax(x: cl.Tensor["B", "R", "C"]):
+    return cl.softmax(x, 0)
+
+
+def two_axes_softmax(x: cl.Tensor["R", "C"]):
+    e = _stable_exp(x, -1)
+    return e / cl.sum(cl.sum(e, -1, keepdim=True), -2, keepdim=True)
+
+
+def unit_row_softmax(x: cl.Tensor["B", "F"], v: cl.Tensor["ONE", "F"]):
+    # out[i, j] = (v . e_j) / sum(e_i): with B == 4 on both axes the divide used to lower as
+    # a product along the columns
+    e = _stable_exp(x, -1)
+    return (v @ e.mT) / cl.sum(e, -1, keepdim=True)
+
+
 def column_input(x: cl.Tensor["R", "C"], y: cl.Tensor["R", "ONE"]):
     return x * y
 
@@ -540,6 +539,20 @@ REFUSED = {
     "input_two_layouts": (input_two_layouts, dict(R=4, ONE=1),
                           r"input 1 is read as \(4, 1\) by reduction_1_1 and as \(4,\) by sub_2; an "
                           r"input has one layout"),
+    # softmaxes written with their max
+    "vector_softmax": (vector_softmax, dict(C=24),
+                       r"kn_sub_op at index 2: the operand \(\) is broadcast along axis 0 of the first "
+                       r"operand \(24,\) \(dims \(24,\) and \(1,\)\)" + RULE),
+    "batch_axis_softmax": (batch_axis_softmax, dict(B=3, R=16, C=24),
+                           r"kn_sub_op at index 2: the operand \(16, 24\) is broadcast along axis 0 of "
+                           r"the first operand \(3, 16, 24\) \(dims \(3, 16, 24\) and \(1, 16, 24\)\)"
+                           + RULE),
+    "two_axes_softmax": (two_axes_softmax, dict(R=16, C=24),
+                         r"kn_div_op at index 6: the operand \(\) is broadcast along axes 0, 1 of the "
+                         r"first operand \(16, 24\) \(dims \(16, 24\) and \(1, 1\)\)" + RULE),
+    "unit_row_softmax": (unit_row_softmax, dict(B=4, F=2, ONE=1),
+                         r"kn_div_op at index 7: the operand \(4,\) has extent 4 where the first "
+                         r"operand \(1, 4\) has 1 \(dims \(1, 4\) and \(4, 1\)\)" + RULE),
 }
 
 

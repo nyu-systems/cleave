@@ -16,7 +16,7 @@ import pytest
 pytest.importorskip("torch")
 pytest.importorskip("z3")
 
-from cleave.ir.update_rule import repair_of, show, use_searched_updates
+from cleave.ir.update_rule import repair_of, show
 from cleave.pipeline import plans
 from cleave.pipeline.update import engine
 
@@ -100,8 +100,7 @@ def test_search_mha_prefill_lists_at_budget_5_and_the_ranking_rejects_three():
 
 def test_search_two_derivations_in_one_process_are_equal():
     _, graphs = searched(attention, MHA, 11)
-    with use_searched_updates():
-        one, two = mha(), derivation(flash(graphs))
+    one, two = mha(), derivation(flash(graphs))
     assert one is not two
     assert one.rules == two.rules and one.chosen == two.chosen
     assert engine.report(one) == engine.report(two)
@@ -110,7 +109,7 @@ def test_search_two_derivations_in_one_process_are_equal():
 
 _CHILD = r"""
 import json, sys
-from cleave.ir.update_rule import loop_key, use_searched_updates
+from cleave.ir.update_rule import loop_key
 from cleave.pipeline.update import engine
 from cleave.pipeline.update.instantiate import Recipe
 from tests.update._programs import attention, lowered, searched, the_obstacle
@@ -120,8 +119,7 @@ _, graphs = searched(attention, MHA, 11)
 graph = flash(graphs)
 ir = lowered(graph)
 ob = the_obstacle(ir)
-with use_searched_updates():
-    d = engine.run(ir, ob, Recipe.of(graph), key=loop_key(ir, ob.full, ob.loops))
+d = engine.run(ir, ob, Recipe.of(graph), key=loop_key(ir, ob.full, ob.loops))
 print("RESULT " + json.dumps({"rules": d.rules, "report": engine.report(d)}))
 """
 
@@ -153,9 +151,8 @@ def test_search_qknorm_flash_form_gets_a_record_and_the_traced_form_its_reason()
     """RMS-normalized keys move the max little: the reference set's shaped sample is chosen
     for the rows it discriminates, and the flash form gets the same rule as MHA."""
     _, graphs = searched(qknorm, QKNORM, None)
-    with use_searched_updates():
-        (ir,) = plans.lower(flash(graphs))
-        (other,) = plans.lower(traced(graphs))
+    (ir,) = plans.lower(flash(graphs))
+    (other,) = plans.lower(traced(graphs))
     (full,) = [n for n in ir.nodes if getattr(n, "streaming", None) is not None]
     record = full.streaming
     assert record.rules == tuple((acc, FACTOR) for acc in record.loops) and len(record.loops) == 2
@@ -172,8 +169,7 @@ def test_search_qknorm_flash_form_gets_a_record_and_the_traced_form_its_reason()
 
 def test_search_qknorm_reference_set_is_adequate():
     _, graphs = searched(qknorm, QKNORM, None)
-    with use_searched_updates():
-        d = derivation(flash(graphs))
+    d = derivation(flash(graphs))
     assert not d.refused, d.refused
     assert d.shaped == "shaped seed=9 none x1"
     assert d.adequacy == {"mma_23": 8, "reduction_2_22": 9}

@@ -7,7 +7,6 @@ import time
 from typing import Callable
 
 from ..core.errors import CleaveError, SpecError
-from ..ir.update_rule import searched_updates
 from . import cache
 from .build import build, evaluate
 from ..frontend.tensor import as_dtype, split_names
@@ -69,16 +68,10 @@ def _kernel_key(program, so: SuperoptConfig, sc: ScheduleConfig, ev: EvalConfig)
     names = [[s.name for s in program.inputs], [o.name for o in program.outputs]]
     # per_output enters only where it is on: every other program keeps its key
     per_output = ["per_output"] if so.resolve_per_output(program) else []
-    # While the searched update rules sit behind their switch, one program (an
-    # ``exp(x - max(x))`` written by hand) builds different kernels under the two settings,
-    # and is held to different input cases: a kernel saved under one setting is never
-    # returned under the other. The default setting keeps its keys.
-    searched = ("searched-updates",) if searched_updates() else ()
     return cache.digest("kernel", cache.VALIDATION, program.fingerprint(), names,
                         so.resolve_max_ops(program),
                         fields(so, "threads", "cache", "max_ops", "per_output"),
-                        fields(sc), fields(ev, "max_parallel", "timeout_s"), *per_output,
-                        *searched)
+                        fields(sc), fields(ev, "max_parallel", "timeout_s"), *per_output)
 
 
 def compile(fn_or_program, *, shapes: dict | None = None, dtype=None, preset="default",

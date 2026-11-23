@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from ..ir.update_rule import searched_updates
 from .program import grouped_matmul
 from .tensor import Tensor
 
@@ -62,28 +61,20 @@ def rms_norm(x, dim: int = -1, eps: float = 0.0):
 def softmax(x, dim: int = -1):
     """The exact softmax, ``exp(x - max(x)) / sum(...)`` over ``dim``.
 
-    Traced, it records ``exp, sum, div`` and asks for the exp to be stabilized
-    (``Program._stable_exp``): the search sees no max, and each schedule gets the shift it
-    needs -- the row max where a tile holds the whole row, a running max where the row is
-    looped over, the max of each split where the row is split. Eagerly it is the max written
-    out. (``cl.exp(x) / cl.sum(cl.exp(x), dim, keepdim=True)`` written by hand makes no such
-    request: it is the plain exp, and overflows where its logits do.)
+    Traced and eager alike it is the max written out: it records ``reduce_max, sub, exp,
+    reduce_sum, div``, exactly what ``cl.exp(x - cl.max(x, dim, keepdim=True))`` divided by
+    its sum records by hand (one program, one fingerprint). The max is an ordinary reduction
+    of the searched flat graph. Where a tiling loops over the softmax dim under it, the loop
+    carries the max across its iterations and repairs every sum and matmul it accumulates
+    with an update rule that is searched for and proven on the program's own flat graph
+    (``cleave.pipeline.update``, ``cleave.schedule.streaming``). (``cl.exp(x) /
+    cl.sum(cl.exp(x), dim, keepdim=True)`` without the max is the plain exp, and overflows
+    where its logits do.)
 
     A row of any length is served where the softmax feeds a sum or a matmul over that row
     (attention's ``softmax(...) @ v``). A softmax that is returned itself -- a standalone
-    softmax, attention weights -- is served while its row fits one block. Next to another
-    ``exp`` of the same tensor the search computes that ``exp`` once and the lowering
-    computes it again for the softmax (``cleave.lower.unmerge``); the softmax is a returned
-    one there too. ``cl.softmax(x) + cl.exp(x)`` has plans for float16 rows of 4096 and none
-    at 8192 (where a softmax alone still has one). A second softmax of ``x`` over another
-    axis needs a row and a column in one block, which is the whole tensor: 16x32 and 64x128
-    have plans, 64x256 has none."""
-    if _traced(x) and not searched_updates():
-        e = x.program._stable_exp(x, dim)
-    else:
-        # Dormant until the switch-over (``CLEAVE_SEARCHED_UPDATES``): the max is recorded,
-        # an ordinary reduction of the searched flat graph, and a loop over the softmax
-        # dim carries it with an update rule that is searched and proven
-        # (``cleave.pipeline.update``, ``cleave.schedule.streaming``).
-        e = exp(x - max(x, dim, keepdim=True))
+    softmax, attention weights, a softmax next to another ``exp`` of its logits -- is served
+    while its row fits one block, and so is a second softmax of ``x`` over another axis, which
+    needs a row and a column in one block."""
+    e = exp(x - max(x, dim, keepdim=True))
     return e / sum(e, dim, keepdim=True)

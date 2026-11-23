@@ -21,8 +21,6 @@ _MARKERS = {
         "tests/frontend_dynamic/test_paged_pipeline.py::test_compile_end_to_end",
         "tests/pipeline_api/test_e2e.py",
         "tests/pipeline_api/test_split_attention.py::test_gpu_",
-        "tests/pipeline_api/test_exact_split_attention.py::test_gpu_",
-        "tests/pipeline_api/test_exact_split_rows.py::test_gpu_",
         "tests/runtime/test_run_candidates.py",
         "tests/runtime/test_inter_outputs.py",
         "tests/runtime/test_stored_layout.py::test_gpu_",
@@ -46,18 +44,16 @@ _MARKERS = {
         "tests/demo/test_demos.py::test_search_",
         "tests/frontend/test_exact_softmax.py::test_search_",
         "tests/frontend/test_exact_softmax.py::test_gpu_",
+        "tests/frontend/test_softmax_next_to_exp.py::test_search_",
         "tests/graph/apply_tiling/test_streaming_gpu.py::test_gpu_",
         "tests/graph/apply_tiling/test_streaming_regressions.py::test_search_",
         "tests/runtime/test_explicit_softmax_inputs.py::test_search_",
         "tests/lower/test_broadcast_axis.py::test_search_",
         "tests/pipeline_api/test_bind_inputs.py::test_search_",
         "tests/pipeline_api/test_softmax_lowering.py::test_search_",
+        "tests/pipeline_api/test_softmax_split_unsplit.py::test_search_",
         "tests/pipeline_api/test_split_attention.py::test_search_",
         "tests/pipeline_api/test_split_attention.py::test_gpu_",
-        "tests/pipeline_api/test_exact_split_attention.py::test_search_",
-        "tests/pipeline_api/test_exact_split_attention.py::test_gpu_",
-        "tests/pipeline_api/test_exact_split_rows.py::test_search_",
-        "tests/pipeline_api/test_exact_split_rows.py::test_gpu_",
         "tests/update/test_foundation.py::test_search_",
         "tests/update/test_foundation.py::test_gpu_",
         "tests/update/test_state_split.py::test_search_",
@@ -147,17 +143,6 @@ def pytest_collection_modifyitems(config, items):
                 continue
             if key.startswith(prefixes):
                 item.add_marker(getattr(pytest.mark, name))
-
-
-@pytest.fixture
-def searched_updates():
-    """The searched update rules switched on for one test (``CLEAVE_SEARCHED_UPDATES``;
-    dormant by default until the switch-over): ``cl.softmax`` records the explicit max and
-    lowering derives an update rule for every streaming obstacle."""
-    from cleave.ir.update_rule import use_searched_updates
-
-    with use_searched_updates():
-        yield
 
 
 @pytest.fixture(autouse=True)

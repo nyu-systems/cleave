@@ -15,7 +15,7 @@ import pytest
 torch = pytest.importorskip("torch")
 pytest.importorskip("z3")
 
-from cleave.ir.update_rule import update_of, use_searched_updates
+from cleave.ir.update_rule import update_of
 from cleave.pipeline.update import rank, search, store, texts
 from cleave.pipeline.update.proof import prove
 from cleave.pipeline.update.rank import Ranked, Replay, order, replay
@@ -113,8 +113,7 @@ def test_search_a_carried_max_one_ulp_off_rejects():
     assert rejected[0].replays["normal@4"].finite
 
     _, graphs = searched(attention, MHA, 11)
-    with use_searched_updates():
-        refused = derivation(flash(graphs), combine=one_ulp_up)
+    refused = derivation(flash(graphs), combine=one_ulp_up)
     assert refused.refused == texts.E12.format(
         loops=", ".join(d.loops),
         case=f"normal@32, where the carried {d.full} is not the flat graph's")

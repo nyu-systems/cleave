@@ -1,4 +1,4 @@
-"""Which exp is an exact softmax, by structure, where update rules are searched (CPU).
+"""Which exp is an exact softmax, by structure (CPU).
 
 With the max in the flat graph there is no record on the exp: an exp is the exp of an exact
 softmax when it reads ``x - max(x, axis)`` -- a ``Sub`` whose second operand is a
@@ -25,7 +25,6 @@ import cleave.lang as cl
 from cleave import pipeline as P
 from cleave.frontend import trace
 from cleave.ir.ops import Exp, Matmul, ReduceMax, Sub
-from cleave.ir.update_rule import use_searched_updates
 from cleave.pipeline.plans import lower
 from cleave.pipeline.superopt import GraphSet
 from cleave.runtime.inputs import (
@@ -45,18 +44,12 @@ from tests._lowering import run_lowered
 
 SMALL = dict(H=32, SQ=64, SKV=256, D=64)
 
-# The structural claim is the searched path's: every test runs with the switch on, and the
-# ones about the switch turn it off where they say so.
-pytestmark = pytest.mark.usefixtures("searched_updates")
-
 
 def _lowered(fn, sizes, dtype=cl.f16):
-    """``(program, lowered identity graph)``, traced and lowered with the switch on:
-    ``cl.softmax`` records the explicit max."""
-    with use_searched_updates():
-        prog = trace(fn, sizes, dtype)
-        (graph,) = GraphSet.identity(prog)
-        (ir,) = lower(graph)
+    """``(program, lowered identity graph)``: ``cl.softmax`` records the explicit max."""
+    prog = trace(fn, sizes, dtype)
+    (graph,) = GraphSet.identity(prog)
+    (ir,) = lower(graph)
     return prog, ir
 
 
@@ -107,17 +100,6 @@ def test_softmax_axis_is_read_off_the_explicit_max(fn, sizes, axis):
     assert [n.name for n in ir.nodes if softmax_axis(n) is not None] == [exp.name]
 
 
-def test_softmax_axis_is_a_claim_only_where_update_rules_are_searched():
-    """The structure is the same graph with the switch off (the max is written out); the
-    claim it makes is the searched path's, so the hand-derived path's graphs keep theirs."""
-    ir = X.lowered(X.flash_attention, SMALL)
-    (exp,) = _exps(ir)
-    with use_searched_updates():
-        assert softmax_axis(exp) == -1
-    with use_searched_updates(False):
-        assert softmax_axis(exp) is None
-
-
 def shifted_by_another_max(x: cl.Tensor["R", "C"], y: cl.Tensor["R", "C"]):
     return cl.exp(x - cl.max(y, -1, keepdim=True))
 
@@ -141,8 +123,8 @@ def test_an_exp_of_anything_else_is_no_softmax(fn):
 
 
 def test_a_hand_written_max_is_the_softmax_cl_softmax_records():
-    """``exp(x - max(x))`` written by hand traces to the graph ``cl.softmax`` records under
-    the switch, and is held to the same claim."""
+    """``exp(x - max(x))`` written by hand traces to the graph ``cl.softmax`` records, and
+    is held to the same claim."""
     _, by_hand = _lowered(X.softmax_rows, dict(R=16, C=24))
     _, recorded = _lowered(softmax_last, dict(R=16, C=24))
     shape = [(type(n).__name__, tuple(int(s) for s in n.get_shape(0))) for n in by_hand.nodes
@@ -198,13 +180,24 @@ def test_the_key_operand_of_a_softmax_that_also_returns_its_max():
         assert adversarial_cases(ir) == ADVERSARIAL and not why_not_adversarial(ir)
 
 
+def plain_query_softmax(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
+                        v: cl.Tensor["H", "SKV", "D"]):
+    """Normalized over the queries without the max: a plain ``exp`` makes no claim."""
+    e = cl.exp((q @ k.mT) / q.shape[-1] ** 0.5)
+    return (e / cl.sum(e, -2, keepdim=True)) @ v
+
+
 def test_the_key_operand_without_the_claim_is_the_last_axis():
-    """With the switch off the same explicit graph makes no claim: the last axis, as for any
-    graph that makes none."""
-    _, ir = _lowered(query_softmax, SMALL)
+    """A graph whose exp does not read ``x - max(x)`` makes no claim: the key operand is
+    the one of the last axis, whatever axis it is normalized over."""
+    _, ir = _lowered(plain_query_softmax, SMALL)
+    (exp,) = _exps(ir)
+    assert softmax_axis(exp) is None
     (scores,) = score_matmuls(ir)
-    with use_searched_updates(False):
-        assert key_operand(ir, scores) == 1
+    assert key_operand(ir, scores) == 1
+    _, claimed = _lowered(query_softmax, SMALL)
+    (scores,) = score_matmuls(claimed)
+    assert key_operand(claimed, scores) == 0
 
 
 def test_logits_that_are_an_input():
@@ -271,21 +264,27 @@ def test_a_plain_exp_of_another_input_leaves_the_cases_alone():
 
 def test_the_reference_publishing_holds_an_explicit_softmax_to_every_case():
     """``pipeline.build``: a graph whose exp reads ``x - max(x)`` is held to the adversarial
-    cases whoever wrote it; with the switch off a graph without a request makes no claim."""
+    cases whoever wrote it; a graph whose exp does not makes no claim."""
     from cleave.pipeline.build import _reference_fn
 
     prog, ir = _lowered(X.flash_attention, SMALL)
+    plain_prog, plain = _lowered(plain_flash, SMALL)
     published = []
 
     def publish(reference_cache_dir, graph, dtype, distributions, **kw):
         published.append(tuple(distributions))
         return "ok"
 
-    reference = _reference_fn(("normal",), prog, publish)
-    reference("dir", ir, "float16")
-    with use_searched_updates(False):
-        reference("dir", ir, "float16")
+    _reference_fn(("normal",), prog, publish)("dir", ir, "float16")
+    _reference_fn(("normal",), plain_prog, publish)("dir", plain, "float16")
     assert published == [("normal",) + ADVERSARIAL, ("normal",)]
+
+
+def plain_flash(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
+                v: cl.Tensor["H", "SKV", "D"]):
+    """The flash form without the max: a plain ``exp``."""
+    e = cl.exp((q @ k.mT) / q.shape[-1] ** 0.5)
+    return (e @ v) / cl.sum(e, -1, keepdim=True)
 
 
 # ------------------------------------------------------- the lowered graph is the program

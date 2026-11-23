@@ -52,7 +52,6 @@ from __future__ import annotations
 from ..core.errors import SpecError
 from ..ir.graph import PlaceHolderNode
 from ..ir.ops import Div, Exp, Matmul, Mul, PermuteView, ReduceMax, SplitView, Sub
-from ..ir.update_rule import searched_updates
 from .reference import placeholder_order
 
 # What a dynamic operator can be validated on as well (``cleave.dynamic.reference`` adds two
@@ -158,16 +157,15 @@ def softmax_axis(node):
     """The axis, counted from the end, that ``node`` is the exp of an exact softmax over,
     or None.
 
-    Either the record of the hand-derived pass (``Exp.stabilize``, with one axis), or --
-    where update rules are searched (``ir.update_rule.searched_updates``) -- a structural
-    fact: the exp reads ``x - max(x, axis)``, a ``Sub`` whose second operand is a
+    Either the record of the hand-derived pass (``Exp.stabilize``, with one axis), or a
+    structural fact: the exp reads ``x - max(x, axis)``, a ``Sub`` whose second operand is a
     ``ReduceMax`` of its first. Its argument is then never positive, whatever the logits
     are, which is the claim the adversarial cases test.
     """
     record = getattr(node, "stabilize", None)
     if record is not None:
         return record.axes[0] if len(record.axes) == 1 else None
-    if type(node) is not Exp or not searched_updates():
+    if type(node) is not Exp:
         return None
     shift = _explicit_max(node.inputs[0].src_node)
     return None if shift is None else shift.flat_axis - len(node.get_shape(0))

@@ -1,10 +1,9 @@
 """Softmax programs written with their max, and the streaming records the assembly tests use (CPU).
 
-The searched path keeps the stable softmax in the flat graph as it is written,
-``exp(x - max(x)) / sum(...)``: the max is an ordinary reduction. The programs here write
-it out (``cl.max``, ``cl.exp``, ``cl.sum``), so they trace and lower to the same graph
-whatever ``CLEAVE_SEARCHED_UPDATES`` says, and they are lowered as identity graphs with the
-switch OFF: nothing is derived for them.
+The flat graph keeps the stable softmax as it is written, ``exp(x - max(x)) / sum(...)``:
+the max is an ordinary reduction. The programs here write it out (``cl.max``, ``cl.exp``,
+``cl.sum``; ``cl.softmax`` records the same), and they are lowered as identity graphs
+without the derivation of ``pipeline.plans.lower``: nothing is derived for them.
 
 :func:`streamed_ir` then classifies every streaming obstacle of the graph
 (``schedule.streaming.obstacles``, what ``pipeline.plans`` asks), CHECKS it against what
@@ -20,15 +19,15 @@ from __future__ import annotations
 import cleave.lang as cl
 from cleave.frontend import trace
 from cleave.ir.ops import Exp, ReduceMax
-from cleave.ir.update_rule import Streaming, loop_key, use_searched_updates
-from cleave.pipeline.plans import lower
+from cleave.ir.update_rule import Streaming, loop_key
+from cleave.pipeline.plans import _lower_structure
 from cleave.pipeline.superopt import GraphSet
 
 FACTOR = ("exp", ("sub", "m", "m'"))  # acc *= exp(m - m'), then the accumulator's own macro
 
 
 def stable_exp(x, dim: int = -1):
-    """``exp(x - max(x, dim))``: what ``cl.softmax`` records where update rules are searched."""
+    """``exp(x - max(x, dim))``: what ``cl.softmax`` records."""
     return cl.exp(x - cl.max(x, dim, keepdim=True))
 
 
@@ -141,10 +140,10 @@ def sum_next_to_exp(x: cl.Tensor["R", "C"]):
 
 
 def lowered(fn, shapes, dtype=cl.f16):
-    """The identity (un-searched) graph of ``fn``, lowered to IR with the switch off."""
-    with use_searched_updates(False):
-        (graph,) = list(GraphSet.identity(trace(fn, shapes, dtype)))
-        (ir,) = lower(graph)
+    """The identity (un-searched) graph of ``fn``, lowered to IR without the derivation
+    ``plans.lower`` adds (no record, no refusal list)."""
+    (graph,) = list(GraphSet.identity(trace(fn, shapes, dtype)))
+    (ir,) = _lower_structure(graph, graph.structure)
     return ir
 
 

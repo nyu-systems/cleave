@@ -1,8 +1,7 @@
 """Programs with the max written out, and how the engine tests reach their obstacles.
 
-Every program here records its own ``exp(x - max(x))``, so its graph is the same whatever
-the switch says; the engine is called directly (``engine.run``) or through
-``pipeline.plans.lower`` under the switch.
+Every program here records its own ``exp(x - max(x))`` (``cl.softmax`` records the same);
+the engine is called directly (``engine.run``) or through ``pipeline.plans.lower``.
 """
 
 from __future__ import annotations
@@ -12,7 +11,7 @@ import functools
 import cleave.lang as cl
 from cleave import pipeline as P
 from cleave.frontend import trace
-from cleave.ir.update_rule import loop_key, use_searched_updates
+from cleave.ir.update_rule import loop_key
 from cleave.pipeline.superopt import GraphSet
 from cleave.pipeline.update import engine
 from cleave.pipeline.update.instantiate import Recipe
@@ -127,11 +126,10 @@ def attention(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
 
 @functools.lru_cache(maxsize=None)
 def searched(fn, shapes: tuple, max_ops=None, dtype=cl.f16):
-    """``(program, graphs)`` of ``fn`` under the switch (``shapes`` as sorted items)."""
-    with use_searched_updates():
-        program = trace(fn, dict(shapes), dtype)
-        config = P.SuperoptConfig(max_ops=max_ops) if max_ops else P.SuperoptConfig()
-        return program, P.superoptimize(program, config)
+    """``(program, graphs)`` of ``fn`` (``shapes`` as sorted items)."""
+    program = trace(fn, dict(shapes), dtype)
+    config = P.SuperoptConfig(max_ops=max_ops) if max_ops else P.SuperoptConfig()
+    return program, P.superoptimize(program, config)
 
 
 def identity(fn, shapes: dict, dtype=cl.f16):
@@ -176,5 +174,4 @@ def flash(graphs):
 def mha_derivation(budgets=(4,)):
     """The derivation of MHA prefill's flash form (``max_ops=11``) at ``budgets``."""
     _, graphs = searched(attention, MHA, 11)
-    with use_searched_updates():
-        return derivation(flash(graphs), budgets=budgets)
+    return derivation(flash(graphs), budgets=budgets)

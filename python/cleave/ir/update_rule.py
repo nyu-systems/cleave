@@ -20,44 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
-from contextlib import contextmanager
 from dataclasses import dataclass
-
-# ------------------------------------------------------------------------------ the switch
-#
-# The searched path is dormant until the switch-over: ``cl.softmax`` records the request of
-# the hand-derived pass unless this is on. Read at four places only (``frontend.composites.
-# softmax``, ``pipeline.plans.lower``, ``runtime.inputs.softmax_axis`` and, through that,
-# ``pipeline.build._reference_fn``) and, so that a kernel saved under one setting is never
-# returned under the other, in the kernel-cache key (``pipeline.compile._kernel_key``).
-
-SWITCH_ENV = "CLEAVE_SEARCHED_UPDATES"
-_SEARCHED = os.environ.get(SWITCH_ENV, "") not in ("", "0")
-
-
-def searched_updates() -> bool:
-    """Whether ``cl.softmax`` records the explicit max and update rules are searched."""
-    return _SEARCHED
-
-
-@contextmanager
-def use_searched_updates(on: bool = True):
-    """The switch set to ``on`` inside the block (also in the environment, so a process
-    started inside it starts with the same setting), restored on exit."""
-    global _SEARCHED
-    before, env_before = _SEARCHED, os.environ.get(SWITCH_ENV)
-    _SEARCHED = bool(on)
-    os.environ[SWITCH_ENV] = "1" if on else "0"
-    try:
-        yield
-    finally:
-        _SEARCHED = before
-        if env_before is None:
-            os.environ.pop(SWITCH_ENV, None)
-        else:
-            os.environ[SWITCH_ENV] = env_before
-
 
 # ----------------------------------------------------------------------------------- data
 

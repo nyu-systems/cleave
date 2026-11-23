@@ -17,7 +17,7 @@ pytest.importorskip("z3")
 
 import cleave
 import cleave.lang as cl
-from cleave.ir.update_rule import loop_key, use_searched_updates
+from cleave.ir.update_rule import loop_key
 from cleave.pipeline import cache, plans
 from cleave.pipeline import update as update_package
 from cleave.pipeline.update import engine, proof, store, texts
@@ -33,9 +33,9 @@ SHAPES = dict(R=16, C=64, D=8)
 
 @pytest.fixture
 def fresh(tmp_path, monkeypatch):
-    """An empty store and an empty in-process memo; the switch on."""
+    """An empty store and an empty in-process memo."""
     monkeypatch.setattr(update_package, "_DERIVED", {})
-    with use_searched_updates(), cleave.Session(cache_root=tmp_path):
+    with cleave.Session(cache_root=tmp_path):
         yield tmp_path
 
 
@@ -94,7 +94,6 @@ def test_a_derivation_is_stored_and_read_back_with_every_rule_proved_again(fresh
 _CHILD = r"""
 import json
 import cleave
-from cleave.ir.update_rule import use_searched_updates
 from cleave.pipeline import update
 from cleave.pipeline.update import engine, proof
 from cleave.pipeline.update.instantiate import Recipe
@@ -114,8 +113,7 @@ proof.prove = counted
 graph = identity(flash_rows, SHAPES)
 ir = lowered(graph)
 ob = the_obstacle(ir)
-with use_searched_updates():
-    d = update.derive(ir, ob, Recipe.of(graph))
+d = update.derive(ir, ob, Recipe.of(graph))
 print("RESULT " + json.dumps({"from_store": d.from_store, "rules": d.rules, "refused": d.refused,
                               "proofs": len(calls)}))
 """
@@ -295,13 +293,12 @@ def test_the_process_keeps_a_light_derivation(fresh):
     assert d.flat is None and d.kernel is None and d.references == []
     assert d.holes and all(h.leaves == {} and h.target is None for h in d.holes)
     assert all(h.search is not None and h.verdicts for h in d.holes)
-    with use_searched_updates():
-        full = engine.run(ir, ob, recipe, key=d.key)
+    full = engine.run(ir, ob, recipe, key=d.key)
     assert full.flat is not None and engine.report(full) == engine.report(d)
 
 
 def test_lowering_reads_the_store(fresh, monkeypatch):
-    """``plans.lower`` under the switch: the first lowering derives, a later one in a
+    """``plans.lower``: the first lowering derives, a later one in a
     fresh process (here: memo) reads the record back."""
     graph = identity(flash_rows, SHAPES)
     (ir,) = plans.lower(graph)

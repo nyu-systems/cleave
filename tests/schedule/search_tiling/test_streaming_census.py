@@ -209,7 +209,7 @@ def test_a_count_that_differs_by_design_says_why(monkeypatch, tmp_path, capsys):
 
 
 def test_search_a_demo_job_censuses_the_searched_graphs(monkeypatch, tmp_path, capsys):
-    """The real thing, on the smallest demo: its own program traced with the switch on (the
+    """The real thing, on the smallest demo: its own program (``cl.softmax`` records the
     explicit max), searched, lowered with the engine's records, and every tiling of both
     searched graphs censused. Flash form: every tiling is served, 24 of them looped; traced
     order: only the ones that hold the row whole. The plans are 1119's 40."""
@@ -248,18 +248,14 @@ def test_search_the_demo_at_its_own_shape_is_all_looped(monkeypatch, tmp_path, c
 
 def test_importing_the_tool_leaves_the_process_alone():
     """The tool is importable (this module does it): the environment and ``sys.path`` are
-    only touched when it runs as a script, a demo job puts back what it borrowed, and the
-    switch is as it was."""
-    import os
+    only touched when it runs as a script, and a demo job puts back what it borrowed."""
     import sys
 
     import cleave.examples as examples
-    from cleave.ir.update_rule import searched_updates
     from cleave.pipeline import compile as real_compile
 
     assert str(tool.ROOT / "demo") not in sys.path
     assert examples._compile is real_compile
-    assert searched_updates() is (os.environ.get("CLEAVE_SEARCHED_UPDATES", "") not in ("", "0"))
     source = (tool.ROOT / "tests" / "_streaming_census.py").read_text()
     head, guard, rest = source.partition('if __name__ == "__main__":  # run as a script')
     assert guard and "os.environ" not in head
@@ -273,4 +269,8 @@ def test_every_job_of_the_design_is_listed():
     assert {"demo:mha_prefill", "demo:gqa_prefill", "demo:mqa_prefill", "demo:mha_decode",
             "demo:gqa_decode", "demo:mqa_decode", "demo:mla_decode", "demo:mla_prefill",
             "program:rows_v", "program:first_axis"} <= jobs
-    assert tool.SEARCHED_MAX_OPS == {"mla_decode": 14}
+    assert set(tool.HAND_DERIVED_PLANS) == {j for j in jobs if j.startswith(("demo:", "program:"))}
+    # MLA decode is censused at the budget its demo pins, the one its graphs need with the
+    # max in them
+    program, so, _ = tool._configured("demo:mla_decode")
+    assert so.resolve_max_ops(program) == 14

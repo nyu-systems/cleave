@@ -153,7 +153,7 @@ def test_no_looped_kernel(name, force):
     assert accept.reasons == Counter({text: n for (_, text), n in reasons.items()})
 
 
-def test_search_the_engine_gives_the_trailing_axis_no_rule(searched_updates):
+def test_search_the_engine_gives_the_trailing_axis_no_rule():
     """What keeps a wrong record off ``column_weighted``, which the classification lets
     through: the engine, run by lowering on the searched graphs, proves no update for the
     value matmul (its rows are not the max's), so the max keeps its pin with that reason.

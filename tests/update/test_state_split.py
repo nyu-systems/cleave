@@ -16,7 +16,7 @@ from cleave import pipeline as P
 from cleave.frontend import trace
 from cleave.ir.graph_utils import boundary_signature
 from cleave.ir.ops import Matmul, ReduceMax, ReduceSum, SplitView
-from cleave.ir.update_rule import signature, use_searched_updates
+from cleave.ir.update_rule import signature
 from cleave.lower.state_split import (
     SplitRefused,
     combine_graph,
@@ -37,10 +37,9 @@ SHAPES = dict(H=4, SQ=8, SKV=256, D=16)
 @functools.lru_cache(maxsize=None)
 def solo():
     """``(searched flash graph, its lowered IR, full-extent node name, record)``."""
-    with use_searched_updates():
-        program = trace(attention, SHAPES, cl.f16)
-        graph = flash(P.superoptimize(program, P.SuperoptConfig(max_ops=11, cache=False)))
-        (ir,) = lower(graph)
+    program = trace(attention, SHAPES, cl.f16)
+    graph = flash(P.superoptimize(program, P.SuperoptConfig(max_ops=11, cache=False)))
+    (ir,) = lower(graph)
     (full,) = [n for n in ir.nodes if getattr(n, "streaming", None) is not None]
     return graph, ir, full.name, full.streaming
 
