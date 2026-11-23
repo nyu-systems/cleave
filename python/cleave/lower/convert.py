@@ -269,7 +269,7 @@ class _Ctx:
         return None
 
     def placeholder(self, t: KGTensor) -> PlaceHolderNode:
-        node = PlaceHolderNode(name=f"input_{t.guid}")
+        node = PlaceHolderNode(name=input_name(t.guid))
         shape = self.shape(t)
         dtype = self.dtype if t.dtype is None else str(t.dtype)
         node.set_shape(shape)
@@ -292,6 +292,11 @@ class _Ctx:
         for i, t in enumerate(outputs):
             self.nodes[t.guid] = (node, i)
             self.shapes[t.guid] = tuple(node.get_shape(i))
+
+
+def input_name(guid: int) -> str:
+    """The placeholder name of the kernel-graph input tensor ``guid``."""
+    return f"input_{guid}"
 
 
 Built = Tuple[Optional[object], Sequence[KGTensor]]  # (node or None, the inputs to wire)

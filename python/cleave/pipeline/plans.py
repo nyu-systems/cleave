@@ -113,27 +113,29 @@ def lower(graph: SearchedGraph, split_factor: int | None = None) -> list:
     return bundle
 
 
-def bind_inputs(ir_graph, program) -> tuple[str, ...] | None:
-    """Placeholder name for each Program input, matched in order, else by unique shape."""
-    from ..ir.graph import PlaceHolderNode
+def bind_inputs(ir_graph, graph: SearchedGraph) -> tuple[str | None, ...] | None:
+    """Placeholder name for each Program input, by input identity; None for an unread input.
 
+    The k-th ``kn_input_op`` of the structure is Program input k, and its tensor's guid names
+    the lowered placeholder (``input_<guid>``). Shapes cannot decide: same-shaped inputs would
+    bind in placeholder (first-use) order. None (unbindable) if a placeholder is not a
+    structure input or the input counts differ.
+    """
+    from ..ir.graph import PlaceHolderNode
+    from ..lower.convert import input_name
+
+    program = graph.program
     if program is None or not hasattr(program, "inputs"):
         return None
-    phs = [n for n in ir_graph.nodes if isinstance(n, PlaceHolderNode)]
-    ph_shapes = [tuple(int(s) for s in n.get_shape(0)) for n in phs]
-    want = [tuple(int(s) for s in spec.shape) for spec in program.inputs]
-    if len(phs) != len(want):
+    guids = [op["output_tensors"][0]["guid"] for op in graph.structure
+             if op["op_type"] == "kn_input_op"]
+    if len(guids) != len(program.inputs):
         return None
-    if ph_shapes == want:
-        return tuple(n.name for n in phs)
-    taken, names = set(), []
-    for shape in want:
-        hits = [i for i, s in enumerate(ph_shapes) if s == shape and i not in taken]
-        if len(hits) != 1:
-            return None
-        taken.add(hits[0])
-        names.append(phs[hits[0]].name)
-    return tuple(names)
+    names = {n.name: n for n in ir_graph.nodes if isinstance(n, PlaceHolderNode)}
+    bound = tuple(PlaceHolderNode.full_name(input_name(g)) for g in guids)
+    if not set(names) <= set(bound):
+        return None
+    return tuple(b if b in names else None for b in bound)
 
 
 def describe_tile(t) -> str:
@@ -203,7 +205,7 @@ def _schedule_once(graphs: GraphSet, config: ScheduleConfig, force: bool):
             except LoweringRejected as e:
                 refused.append(Refusal(g.index, "solo", "main", e))
                 continue
-            add(g, "solo", "main", ir, None, bind_inputs(ir, program))
+            add(g, "solo", "main", ir, None, bind_inputs(ir, g))
             continue
         if not config.split_k:
             refused.append(Refusal(g.index, "split", "partial",
@@ -216,7 +218,7 @@ def _schedule_once(graphs: GraphSet, config: ScheduleConfig, force: bool):
             except LoweringRejected as e:
                 refused.append(Refusal(g.index, variant, "partial", e))
                 continue
-            add(g, variant, "partial", partial, f, bind_inputs(partial, program))
+            add(g, variant, "partial", partial, f, bind_inputs(partial, g))
             if f not in combined:  # the combine is searched once per factor
                 combined.add(f)
                 add(g, variant, "combine", combine, f)

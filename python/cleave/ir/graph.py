@@ -308,7 +308,11 @@ class PlaceHolderNode(Node):
     producer_op = None  # op that fills this inner placeholder's tile (see codegen)
 
     def __init__(self, name=""):
-        super().__init__(name="PlaceHolder_" + name)
+        super().__init__(name=self.full_name(name))
+
+    @staticmethod
+    def full_name(name: str) -> str:
+        return "PlaceHolder_" + name
 
     def is_placeholder(self):
         return True
