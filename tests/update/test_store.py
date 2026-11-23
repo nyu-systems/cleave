@@ -16,14 +16,15 @@ pytest.importorskip("torch")
 pytest.importorskip("z3")
 
 import cleave
+import cleave.lang as cl
 from cleave.ir.update_rule import loop_key, use_searched_updates
 from cleave.pipeline import cache, plans
 from cleave.pipeline import update as update_package
-from cleave.pipeline.update import engine, proof, store
+from cleave.pipeline.update import engine, proof, store, texts
 from cleave.pipeline.update.instantiate import Recipe
 
 from ._attention import FACTOR
-from ._programs import flash_rows, identity, lowered, the_obstacle
+from ._programs import _max, flash_rows, identity, lowered, the_obstacle
 from .test_refusals import column_weighted
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -75,8 +76,9 @@ def test_a_derivation_is_stored_and_read_back_with_every_rule_proved_again(fresh
     path = store.path_of(first.key)
     assert path.is_relative_to(cache.root() / "update") and path.parent.name == path.stem[:2]
     entry = json.loads(path.read_text())
-    assert set(entry) == {"key", "full", "loops", "rules", "refused", "report"}
+    assert set(entry) == {"key", "recipe", "full", "loops", "rules", "refused", "report"}
     assert entry["key"] == first.key == loop_key(ir, ob.full, ob.loops)
+    assert entry["recipe"] == "" == first.recipe_key  # a rule holds for the loop structure
     assert entry["rules"] == [[acc, json.loads(json.dumps(FACTOR))] for acc in ob.loops]
     assert entry["report"] == engine.report(first)
     assert update_package.derive(ir, ob, recipe) is first  # the in-process memo
@@ -166,12 +168,92 @@ def test_a_stored_refusal_is_returned_without_a_search(fresh, monkeypatch):
     ir, ob, recipe = setting(column_weighted, dict(M=8, K=64, N=16))
     first = update_package.derive(ir, ob, recipe)
     assert first.refused.endswith("do not lead its accumulators")
-    assert json.loads(store.path_of(first.key).read_text())["refused"] == first.refused
+    # E6 is read off the references: it is kept for this recipe, not for the loop structure
+    assert first.recipe_key == recipe.key and not store.path_of(first.key).exists()
+    entry = json.loads(store.path_of(first.key, recipe.key).read_text())
+    assert entry["refused"] == first.refused and entry["recipe"] == recipe.key
     no_search(monkeypatch)
     calls = proofs(monkeypatch)
     again = derive_again(ir, ob, recipe, monkeypatch)
     assert again.from_store and again.refused == first.refused and not again.rules
     assert calls == []
+
+
+def literal_rows(x: cl.Tensor["R", 64], v: cl.Tensor[64, "D"]):
+    """``flash_rows`` with its looped dim written as a literal: the loop structure of
+    ``flash_rows`` at C=64 (the loop key has no extents), but nothing to resize."""
+    e = cl.exp(x - _max(x))
+    return (e @ v) / cl.sum(e, -1, keepdim=True)
+
+
+def rsqrt_literal(x: cl.Tensor["R", 64], v: cl.Tensor[64, "D"]):
+    p = cl.rsqrt(cl.exp(x - _max(x)))
+    return (p @ v) / cl.sum(p, -1, keepdim=True)
+
+
+def test_a_refusal_of_one_recipe_is_not_another_programs(fresh, monkeypatch):
+    """E1 is a fact about ``literal_rows``' recipe, not about the loop structure it shares
+    with ``flash_rows``: neither the memo nor the store hands it to ``flash_rows``, which
+    derives its own rule. A rule is the loop structure's: ``literal_rows`` then gets it,
+    proved again on its own graph."""
+    lit_ir, lit_ob, lit = setting(literal_rows, dict(R=16, D=8))
+    ir, ob, recipe = setting()
+    key = loop_key(ir, ob.full, ob.loops)
+    assert loop_key(lit_ir, lit_ob.full, lit_ob.loops) == key and lit.key != recipe.key
+    e1 = texts.E1.format(full=ob.full)
+    refusal = update_package.derive(lit_ir, lit_ob, lit)
+    assert refusal.refused == e1 and refusal.recipe_key == lit.key
+    assert store.path_of(key, lit.key).exists() and not store.path_of(key).exists()
+
+    d = update_package.derive(ir, ob, recipe)  # one process
+    assert not d.refused and not d.from_store and d.rules == tuple((a, FACTOR) for a in ob.loops)
+
+    store.path_of(key).unlink()  # a second process, whose store holds the refusal alone
+    monkeypatch.setattr(update_package, "_DERIVED", {})
+    again = update_package.derive(lit_ir, lit_ob, lit)
+    assert again.from_store and again.refused == e1
+    mine = update_package.derive(ir, ob, recipe)
+    assert not mine.from_store and mine.rules == d.rules
+
+    monkeypatch.setattr(update_package, "_DERIVED", {})  # a third: the rule is looked up first
+    no_search(monkeypatch)
+    calls = proofs(monkeypatch)
+    shared = update_package.derive(lit_ir, lit_ob, lit)
+    assert shared.from_store and not shared.refused and shared.rules == d.rules
+    assert len(calls) == len(ob.loops)  # proved on literal_rows' graph
+
+
+def test_a_refusal_of_the_flat_graph_alone_holds_for_the_loop_structure(fresh, monkeypatch):
+    """E7 is read off the flat graph before the recipe is used: it is the loop structure's,
+    and another program of that structure gets it without a search."""
+    from .test_refusals import rsqrt_on_the_path
+
+    ir, ob, recipe = setting(rsqrt_on_the_path)
+    first = update_package.derive(ir, ob, recipe)
+    assert first.refused.endswith("only elementwise add, sub, mul, div and exp are read there")
+    assert first.recipe_key == ""
+    assert json.loads(store.path_of(first.key).read_text())["recipe"] == ""
+    lit_ir, lit_ob, lit = setting(rsqrt_literal, dict(R=16, D=8))
+    assert loop_key(lit_ir, lit_ob.full, lit_ob.loops) == first.key and lit.key != recipe.key
+    no_search(monkeypatch)
+    assert update_package.derive(lit_ir, lit_ob, lit) is first  # the memo
+    again = derive_again(lit_ir, lit_ob, lit, monkeypatch)
+    assert again.from_store and again.refused == first.refused
+
+
+def test_each_loop_structure_has_an_entry_of_its_own(fresh, monkeypatch):
+    from ._programs import column_average
+
+    settings = [setting(), setting(column_average, dict(H=2, K=64, N=8))]
+    firsts = [update_package.derive(*s) for s in settings]
+    assert all(not d.refused for d in firsts) and firsts[0].key != firsts[1].key
+    paths = [store.path_of(d.key) for d in firsts]
+    assert paths[0] != paths[1] and all(p.exists() for p in paths)
+    monkeypatch.setattr(update_package, "_DERIVED", {})
+    no_search(monkeypatch)
+    for s, d in zip(settings, firsts):
+        again = update_package.derive(*s)
+        assert again.from_store and again.rules == d.rules
 
 
 def test_the_key_moves_with_the_engine_sources_the_settings_and_the_build(tmp_path, monkeypatch):

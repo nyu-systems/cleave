@@ -56,6 +56,10 @@ class Derivation:
     seconds: float = 0.0
     from_store: bool = False  # read back from ``store`` (re-proved), not derived here
     bug: bool = False  # refused with E13: an unexpected exception (never stored)
+    # ``Recipe.key`` of a refusal that depends on the recipe (E1-E6, E10-E12, E15): it is
+    # kept for that recipe only. "" for a rule and for a refusal read off the flat graph
+    # alone (T5, E7, E8, E9, E14): those hold for the loop structure.
+    recipe_key: str = ""
     report_text: str = ""  # the report of a derivation read from the store
     references: list = field(default_factory=list, repr=False)  # reference.Case
     flat: object = field(default=None, repr=False)  # the float32 reference instance
@@ -116,29 +120,34 @@ def run(flat_graph, obstacle, recipe, *, key: str = "", budgets=BUDGETS, rank_ca
     again at other extents (``instantiate.Recipe``)."""
     d = Derivation(key, obstacle.full, tuple(obstacle.loops))
     t0 = time.perf_counter()
+    graph_alone = True  # until the recipe is first used
     try:
-        _run(d, flat_graph, recipe, budgets, rank_cases, combine)
+        # ---- what the proof can read, before anything is built (T5, E7, E8, E9, E14):
+        # read off the flat graph alone, so it holds for every graph of the loop structure
+        for acc in d.loops:
+            proof_module.check_contribution(flat_graph, d.full, acc)
+        for acc in d.loops:
+            proof_module.check_leaves(flat_graph, d.full, acc)
+        d.unary = unary_ops(flat_graph, d.full, d.loops)
+        graph_alone = False
+        _run(d, flat_graph, recipe, budgets, rank_cases, combine, t0)
     except Refused as e:
         d.refused = str(e)
+        if not graph_alone:
+            d.recipe_key = recipe.key
     except Exception as e:  # noqa: BLE001 - a bug in the engine keeps the pin and says so
         d.refused, d.bug = bug(e), True
     d.seconds = time.perf_counter() - t0
     return d
 
 
-def _run(d, flat_graph, recipe, budgets, rank_cases, combine):
+def _run(d, flat_graph, recipe, budgets, rank_cases, combine, t0):
     full, loops = d.full, d.loops
-    t0 = time.perf_counter()
-    # ---- what the proof can read, before anything is built (T5, E7, E8, E9, E14)
-    for acc in loops:
-        proof_module.check_contribution(flat_graph, full, acc)
-    for acc in loops:
-        proof_module.check_leaves(flat_graph, full, acc)
-    d.unary = unary_ops(flat_graph, full, loops)
-
-    # ---- references (E1-E4 instantiation, E6 rows, E5 cases, E10 adequacy)
+    # ---- references (E1-E4 instantiation, E15 the loop's own dim, E6 rows, E5 cases,
+    # E10 adequacy)
     looped = _looped(recipe, flat_graph, full)
     flat = d.flat = ref.Flat(recipe, flat_graph, full, loops, looped, dtype="float32")
+    flat.check_loop()
     ref.row_dependency(flat)
     refs = ref.reference_set(flat, check=False)
     d.references, d.adequacy, d.shaped = refs.cases, refs.adequacy, refs.shaped

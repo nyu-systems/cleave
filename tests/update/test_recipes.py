@@ -31,6 +31,7 @@ from ._programs import (
     flash_rows,
     gqa,
     identity,
+    left_constant,
     lowered,
     mla_decode,
     searched,
@@ -39,7 +40,7 @@ from ._programs import (
     traced_attention,
     two_softmaxes,
 )
-from .test_refusals import column_weighted, max_normalized
+from .test_refusals import column_weighted, max_normalized, self_attention
 
 
 def flash(graphs):
@@ -302,9 +303,11 @@ CENSUS = [  # program, shapes, what lowering under the switch says for each obst
     (max_normalized, _ROWS, ["T5"]),
     (column_weighted, dict(M=8, K=64, N=16), ["E6"]),
     (sum_next_to_exp, dict(R=16, C=64), ["T3"]),
+    (left_constant, _ROWS, ["record"]),
+    (self_attention, dict(H=4, S=256, D=16), ["E15"]),
 ]
 WHY = {"T3": " reads ", "T4": ", computed from ", "T5": " is a ReduceMax: ", "E14": ", which ",
-       "E6": " of one row changes with "}
+       "E6": " of one row changes with ", "E15": " also sizes a dim the loop does not step"}
 
 
 @pytest.mark.parametrize("fn, shapes, want", CENSUS, ids=[c[0].__name__ for c in CENSUS])

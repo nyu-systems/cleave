@@ -12,13 +12,13 @@ import pytest
 z3 = pytest.importorskip("z3")
 pytest.importorskip("torch")
 
-from cleave.ir.ops import Matmul, ReduceSum
+from cleave.ir.ops import Div, Matmul, ReduceSum
 from cleave.lower.state_split import combine_graph
 from cleave.pipeline.update import proof
 from cleave.pipeline.update.proof import OBLIGATIONS, contribution, prove
 
 from ._attention import FACTOR, record_by_hand
-from ._programs import flash_attention, identity, lowered, scaled_rows, tenth_rows
+from ._programs import flash_attention, identity, left_constant, lowered, scaled_rows, tenth_rows
 
 D, ZERO, ONE, TWO = OBLIGATIONS  # (D) defined, (0) accumulate form, (i) one element, (ii)
 
@@ -84,6 +84,8 @@ WRONG = {
     "0/0 at rest    r + a*exp(m-m')*((m'-m)/(m'-m))": (
         ("add", "r", ("mul", ("mul", "a", e), ("div", ("sub", "m'", "m"), ("sub", "m'", "m")))), D),
     "0/0 at r=0     r + a*exp(m-m')*(r/r)": (("add", "r", ("mul", ("mul", "a", e), ("div", "r", "r"))), D),
+    "0/0 at a=0     r + a*exp(m-m') + (a-a)/a": (
+        ("add", "r", ("add", ("mul", "a", e), ("div", ("sub", "a", "a"), "a"))), D),
     "non-additive   r + a*a*exp(m-m')": (("add", "r", ("mul", ("mul", "a", "a"), e)), TWO),
     "square         r + a*exp(m-m')*exp(m-m')": (("add", "r", ("mul", ("mul", "a", e), e)), ONE),
     "affine         r + a*exp(m-m') + (m'-m)": (("add", ("add", "r", ("mul", "a", e)), ("sub", "m'", "m")), ONE),
@@ -170,6 +172,20 @@ def test_a_constant_of_the_flat_graph_is_the_exact_rational_it_is():
         assert "3602879701896397.0 36028797018963968.0" in build(z3.Real("m")).sexpr()
         tenth = ("exp", ("mul", ("sub", "m", "m'"), ("const", 0.1)))
         assert prove(("add", "r", ("mul", "a", tenth)), ir, full.name, acc).proved
+
+
+def test_a_constant_on_the_left_is_read_on_the_left():
+    """``1 / exp(max(x) - x)``: the division's constant is its dividend. Read the other way
+    round the contribution would be ``exp(max(x) - x)``, and the wrong sign would be the
+    rule."""
+    ir = lowered(identity(left_constant, dict(R=3, C=8, D=2)))
+    full, record = record_by_hand(ir)
+    (div,) = [n for n in ir.nodes if type(n) is Div and n.const is not None]
+    assert div.const == 1.0 and div.const_on_left
+    for acc in record.loops:
+        assert prove(("add", "r", ("mul", "a", e)), ir, full.name, acc).proved
+        wrong = prove(("add", "r", ("mul", "a", einv)), ir, full.name, acc)
+        assert not wrong.proved and wrong.results[ONE] == "sat"
 
 
 def test_a_factor_written_by_hand_for_the_record_is_proved_too():

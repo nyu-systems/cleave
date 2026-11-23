@@ -36,6 +36,11 @@ E13 = "{type}: {message} (a bug in the update search)"
 # same on every prefix of the loop.
 E14 = ("{node}, which {acc} reads, is computed from {other}, another reduction over the dim "
        "{full} reduces: it changes from one prefix of the loop to the next")
+# Not in DESIGN 4.3's list: the looped dim's symbol must size nothing else of the state (a
+# self-attention whose queries and keys are both written ``S``: a prefix of the keys would
+# cut the queries too).
+E15 = ("{node} is {a} at {n} elements of the looped dim of {full} and {b} at {m}: its symbol "
+       "{symbol} also sizes a dim the loop does not step")
 # The structural rule S5 of ``schedule.streaming.obstacles`` (its text T5), checked again
 # here: the contribution of one element is only read off a plain sum or matmul.
 T5 = ("{d} is a {cls}: the reductions that loop under {full} must be sums or matmuls that "

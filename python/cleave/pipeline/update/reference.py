@@ -14,10 +14,11 @@ Float32 throughout (or the program's own dtype, for ranking); no FP64.
     first iter  old state = the start values (``carry_init``, zeros); new state F(T)
 
 Every guard is a typed refusal (``texts``): the graph must lower at small shapes (E2) and be
-the same graph there (E3), the inputs must carry the looped dim on one axis (E4), the cut
-must be right (E5: the full-extent value is its reducer's own fold, bit for bit), the rows
-of the full-extent value must lead its accumulators (E6), and the references must show
-what an update has to repair (E10).
+the same graph there (E3), the looped symbol must size the looped dim (E1) and nothing else
+of the state (E15), the inputs must carry the looped dim on one axis (E4), the cut must be
+right (E5: the full-extent value is its reducer's own fold, bit for bit), the rows of the
+full-extent value must lead its accumulators (E6), and the references must show what an
+update has to repair (E10).
 """
 
 from __future__ import annotations
@@ -29,7 +30,7 @@ import numpy as np
 from ...ir.update_rule import signature
 from ...runtime.reference import values
 from .search import LOOSE_RTOL
-from .texts import E2, E3, E4, E5, E6, E10, Refused
+from .texts import E1, E2, E3, E4, E5, E6, E10, E15, Refused
 
 TILE = 4  # elements of the looped dim per iteration of the references
 N = 16  # looped extent of a reference sample: tile 4, prefixes 4 / 8 / 12
@@ -74,20 +75,28 @@ def first_difference(a: list, b: list) -> str:
 
 
 def probe_looped(recipe, full: str):
-    """The symbol ``full`` reduces, found by one lowering with a distinct extent per symbol
-    (unit symbols stay 1): None when no symbol has the extent its axis has."""
+    """The symbol ``full`` reduces, found by lowering with a distinct extent per symbol
+    (unit symbols stay 1): None when no symbol has the extent its axis has. A hit is
+    confirmed by one more lowering with another extent for that symbol: a literal dim whose
+    extent happens to be the probe's is no symbol of it."""
     free = [s for s in sorted(recipe.symbols, key=symbol_order) if recipe.symbols[s] != 1]
-    if not free or len(free) > len(_PROBE):
+    if not free or len(free) >= len(_PROBE):
         return None
     probe = {s: _PROBE[i] for i, s in enumerate(free)}
     sizes = {**{s: 1 for s in recipe.symbols if recipe.symbols[s] == 1}, **probe}
-    try:
-        graph = recipe.at(sizes, "float32")
-    except Exception as e:  # noqa: BLE001 - lowering refuses these extents
-        raise Refused(E2.format(error=f"{type(e).__name__}: {e}"[:200])) from e
-    extent = int(_node(graph, full).raxis[0].dom.extent)
-    hits = [s for s in free if probe[s] == extent]
-    return hits[0] if len(hits) == 1 else None
+
+    def extent(sizes):
+        try:
+            graph = recipe.at(sizes, "float32")
+        except Exception as e:  # noqa: BLE001 - lowering refuses these extents
+            raise Refused(E2.format(error=f"{type(e).__name__}: {e}"[:200])) from e
+        return int(_node(graph, full).raxis[0].dom.extent)
+
+    hits = [s for s in free if probe[s] == extent(sizes)]
+    if len(hits) != 1:
+        return None
+    other = _PROBE[len(free)]  # an extent no symbol had
+    return hits[0] if extent({**sizes, hits[0]: other}) == other else None
 
 
 @dataclass(eq=False)
@@ -182,6 +191,26 @@ class Flat:
 
     def node(self, n: int, name: str):
         return _node(self.graph(n), name)
+
+    def check_loop(self) -> None:
+        """The looped symbol sizes the looped dim and nothing else of the state: at ``n``
+        elements ``full`` reduces ``n`` of them (else E1: the symbol is not its dim's), every
+        input carries it on one axis at most (E4, ``looped_layout``), and ``full`` and every
+        accumulator have the same shape at ``tile`` and ``2 * tile`` elements (else E15:
+        the symbol also names a dim the loop does not step, such as the queries' axis of a
+        self-attention written ``q, k: [.., S, ..]``)."""
+        t = self.tile
+        for n in (t, 2 * t):
+            if int(self.node(n, self.full).raxis[0].dom.extent) != n:
+                raise Refused(E1.format(full=self.full))
+        self.looped_layout()
+        symbol = ", ".join(sorted(map(str, self._looped)))
+        for name in (self.full, *self.accs):
+            a = [int(x) for x in self.node(t, name).get_shape(0)]
+            b = [int(x) for x in self.node(2 * t, name).get_shape(0)]
+            if a != b:
+                raise Refused(E15.format(node=name, a=a, n=t, full=self.full, b=b, m=2 * t,
+                                         symbol=symbol))
 
     def looped_layout(self) -> list:
         """Per placeholder (``placeholder_order``), ``(axis, groups)``: the axis that carries

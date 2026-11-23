@@ -226,14 +226,84 @@ def test_e1_a_graph_made_without_a_program_keeps_its_pin(tmp_path, monkeypatch):
     monkeypatch.setattr(update_package, "_DERIVED", {})
     with use_searched_updates(), cleave.Session(cache_root=tmp_path):
         (ir,) = plans.lower(bare)
-    ob = the_obstacle(ir)
-    assert ir.streaming_refusals == [f"{ob.full}: " + texts.E1.format(full=ob.full)]
-    assert not [n for n in ir.nodes if getattr(n, "streaming", None) is not None]
+        ob = the_obstacle(ir)
+        assert ir.streaming_refusals == [f"{ob.full}: " + texts.E1.format(full=ob.full)]
+        assert not [n for n in ir.nodes if getattr(n, "streaming", None) is not None]
+        # kept for this recipe only: the graph with a program (same loop structure) derives
+        key, recipe = loop_key(ir, ob.full, ob.loops), Recipe.of(bare)
+        assert store.path_of(key, recipe.key).exists() and not store.path_of(key).exists()
+        (served,) = plans.lower(graph)
+    assert served.streaming_refusals == [] and loop_key(served, ob.full, ob.loops) == key
 
 
 def flash_rows_explicit(x: cl.Tensor["R", "C"], v: cl.Tensor["C", "D"]):
     e = cl.exp(x - _max(x))
     return (e @ v) / cl.sum(e, -1, keepdim=True)
+
+
+def literal_five(x: cl.Tensor["R", 5], v: cl.Tensor[5, "D"]):
+    """A literal looped dim whose extent is the probe's for the first symbol (D: 5)."""
+    e = cl.exp(x - _max(x))
+    return (e @ v) / cl.sum(e, -1, keepdim=True)
+
+
+def self_attention(q: cl.Tensor["H", "S", "D"], k: cl.Tensor["H", "S", "D"],
+                   v: cl.Tensor["H", "S", "D"]):
+    """Queries and keys written with one dim name: the looped symbol also sizes the rows."""
+    s = (q @ k.mT) / q.shape[-1] ** 0.5
+    e = cl.exp(s - _max(s))
+    return (e @ v) / cl.sum(e, -1, keepdim=True)
+
+
+def test_e1_a_literal_dim_whose_extent_is_a_probes_is_no_symbol():
+    """The probe gives D the extent 5, and the literal looped dim is 5 too: one more
+    lowering with another extent for D shows that the dim does not follow it."""
+    from cleave.pipeline.update.reference import probe_looped
+
+    graph = identity(literal_five, dict(R=16, D=8))
+    ir, ob, d = refused(literal_five, dict(R=16, D=8))
+    recipe = Recipe.of(graph)
+    assert recipe.looped(ir, ob.full) is None and probe_looped(recipe, ob.full) is None
+    assert d.refused == texts.E1.format(full=ob.full) and not d.bug
+    assert d.recipe_key == recipe.key  # a refusal of this recipe, not of the loop structure
+
+
+def test_e15_a_looped_symbol_that_also_sizes_the_rows():
+    """``q, k, v: [H, S, D]``: a prefix of S cuts the queries too, so the rows of the max
+    change from one prefix to the next. Not E5: the max IS a running max of the keys."""
+    ir, ob, d = refused(self_attention, dict(H=4, S=256, D=16))
+    assert d.refused == texts.E15.format(node=ob.full, a=[3, 4], n=4, full=ob.full, b=[3, 8],
+                                         m=8, symbol="S")
+    assert d.refused == (f"{ob.full} is [3, 4] at 4 elements of the looped dim of {ob.full} and "
+                         "[3, 8] at 8: its symbol S also sizes a dim the loop does not step")
+    assert not d.references and not d.bug
+
+
+def test_e5_the_fold_of_the_max_is_compared_bit_for_bit(monkeypatch):
+    """A fold that is one ulp off is no fold: the cut is not trusted to within rounding."""
+    import torch
+
+    from cleave.pipeline.update import reference
+
+    graph = identity(flash_rows_explicit, SHAPES)
+    ir = lowered(graph)
+    ob = the_obstacle(ir)
+    recipe = Recipe.of(graph)
+    flat = reference.Flat(recipe, ir, ob.full, ob.loops, recipe.looped(ir, ob.full))
+    inputs = flat.sample(reference.N, 1)
+    for prefix in (0, 4):
+        assert reference.extension(flat, inputs, prefix, "here").prefix == prefix
+    real = reference.combine_of
+
+    def one_ulp_up(node):
+        fold = real(node)
+        return lambda a, b: torch.nextafter(fold(a, b), torch.full_like(a, float("inf")))
+
+    monkeypatch.setattr(reference, "combine_of", one_ulp_up)
+    for prefix in (0, 4):
+        with pytest.raises(texts.Refused) as refusal:
+            reference.extension(flat, inputs, prefix, f"here {prefix}")
+        assert str(refusal.value) == texts.E5.format(full=ob.full, label=f"here {prefix}")
 
 
 def test_e14_a_value_of_another_max_over_the_same_dim():

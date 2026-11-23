@@ -14,13 +14,20 @@ again: it is re-instantiated, never re-implemented.
 extent (None where the program has none: the split factor and the extent of one split).
 ``looped`` names the symbol(s) the full-extent value reduces; several symbols tied by a
 contraction are resized together (a ``frozenset``).
+
+``key`` is a digest of everything ``at`` and ``looped`` read (the kind, the dtype, the
+symbols with their extents, and the structure or the program the graph is built from).
+Two graphs of one loop structure (``update_rule.loop_key``, which has no extents) can have
+different recipes; a refusal that depends on the recipe is kept under both keys
+(``pipeline.update.derive``), a rule under the loop structure's alone.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass, field
 from typing import Any, Callable
-
 
 
 @dataclass(eq=False)
@@ -31,6 +38,16 @@ class Recipe:
     build: Callable = field(repr=False)  # (sizes, dtype) -> Graph
     find_looped: Callable = field(repr=False)  # (flat_graph, full) -> symbol | frozenset | None
     origin: Any = field(default=None, repr=False)
+    made_of: Any = field(default=None, repr=False)  # what ``build`` reads besides ``symbols``
+
+    @property
+    def key(self) -> str:
+        """sha256 over the kind, the dtype, the symbols with their extents and what the
+        graph is built from: equal keys build equal graphs."""
+        symbols = sorted([repr(s), e] for s, e in self.symbols.items())
+        blob = json.dumps(["recipe", self.kind, self.dtype, symbols, self.made_of],
+                          sort_keys=True, default=repr, separators=(",", ":"))
+        return hashlib.sha256(blob.encode()).hexdigest()
 
     def at(self, sizes: dict, dtype: str):
         """The flat graph with ``sizes`` (symbol -> extent) in ``dtype``."""
@@ -66,7 +83,7 @@ class Recipe:
                                        ranks=[len(_tensor_dims(op["output_tensors"][0]))
                                               for op in inputs])
 
-        return cls("searched", dict(g.symbol_map), g.dtype, build, find, g)
+        return cls("searched", dict(g.symbol_map), g.dtype, build, find, g, g.structure)
 
     @classmethod
     def identity(cls, g) -> "Recipe":
@@ -89,7 +106,8 @@ class Recipe:
             return _looped_from_tokens(flat_graph, full, symbol, set(symbols),
                                        ranks=[len(s.dims) for s in getattr(program, "inputs", ())])
 
-        return cls("identity", symbols, g.dtype, build, find, g)
+        made_of = program.fingerprint() if program is not None else g.structure
+        return cls("identity", symbols, g.dtype, build, find, g, made_of)
 
     @classmethod
     def partial(cls, g, full: str, accs: tuple, *, solo=None, split_factor=None) -> "Recipe":
@@ -112,7 +130,8 @@ class Recipe:
             sizes[looped] = f * int(sizes.pop(inner))
             return lower_partial(g, full_op, acc_ops, f, symbol_map=sizes, dtype=dtype)
 
-        return cls("partial", symbols, g.dtype, build, lambda flat_graph, name: inner, g)
+        return cls("partial", symbols, g.dtype, build, lambda flat_graph, name: inner, g,
+                   [g.structure, full, list(accs)])
 
     @classmethod
     def combine(cls, g, full: str, rules: tuple, split_pos: int, out_dtype: str, *, solo=None,
@@ -134,7 +153,8 @@ class Recipe:
             base = _one_graph(g.structure, {**sizes, looped: 4}, dtype)
             return combine_graph(base, full, rules, f, split_pos, dtype)
 
-        return cls("combine", symbols, out_dtype, build, lambda flat_graph, name: factor, g)
+        return cls("combine", symbols, out_dtype, build, lambda flat_graph, name: factor, g,
+                   [g.structure, full, [[a, f] for a, f in rules], int(split_pos)])
 
 
 # ---------------------------------------------------------------------------------- helpers

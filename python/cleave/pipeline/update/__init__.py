@@ -19,7 +19,12 @@ references are all read off the flat graph. Every reason an obstacle keeps its p
 typed refusal (``texts``); ``derive`` never raises.
 
 A derivation is made once per loop structure (``update_rule.loop_key``): in a process
-(``_DERIVED``) and on disk (``store``, every stored rule proved again on load).
+(``_DERIVED``) and on disk (``store``, every stored rule proved again on load). The loop
+key has no extents, so two programs can share it; a rule holds for both (it is proved on
+the flat graph, which the key pins), and so does a refusal read off the flat graph alone.
+A refusal that depends on the recipe (E1-E6, E10-E12, E15: the symbols, the extents, the
+references) is kept under the loop key AND the recipe's key: another program of the same
+loop structure derives its own. A rule of the loop structure is looked up first.
 """
 
 from __future__ import annotations
@@ -28,12 +33,15 @@ import time
 
 from ...ir.update_rule import loop_key
 
-_DERIVED: dict = {}  # loop_key -> Derivation (one per loop structure per process)
+# loop_key -> Derivation (a rule, or a refusal of the flat graph alone), and
+# (loop_key, Recipe.key) -> Derivation (a refusal of that recipe)
+_DERIVED: dict = {}
 
 
 def derive(flat_graph, obstacle, recipe):
     """The ``Derivation`` for one obstacle of ``flat_graph``, made at most once per loop
-    structure; ``recipe`` builds the graph again at other extents."""
+    structure (a refusal that depends on the recipe: once per loop structure and recipe);
+    ``recipe`` builds the graph again at other extents."""
     from . import store
     from .engine import run
     from .texts import bug
@@ -43,7 +51,12 @@ def derive(flat_graph, obstacle, recipe):
         key = loop_key(flat_graph, obstacle.full, tuple(obstacle.loops))
         if key in _DERIVED:
             return _DERIVED[key]
+        mine = (key, recipe.key)
+        if mine in _DERIVED:
+            return _DERIVED[mine]
         found = store.load(key, flat_graph, obstacle)
+        if found is None:
+            found = store.load(key, flat_graph, obstacle, recipe_key=recipe.key)
         if found is None:
             found = run(flat_graph, obstacle, recipe, key=key)
             store.save(found)
@@ -56,5 +69,5 @@ def derive(flat_graph, obstacle, recipe):
         return Derivation("", obstacle.full, tuple(obstacle.loops), refused=bug(e), bug=True,
                           seconds=time.perf_counter() - t0)
     if not found.bug:
-        _DERIVED[key] = found
+        _DERIVED[(key, found.recipe_key) if found.recipe_key else key] = found
     return found

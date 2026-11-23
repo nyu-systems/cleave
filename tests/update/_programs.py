@@ -87,6 +87,13 @@ def tenth_rows(x: cl.Tensor["R", "C"], v: cl.Tensor["C", "D"]):
     return (e @ v) / cl.sum(e, -1, keepdim=True)
 
 
+def left_constant(x: cl.Tensor["R", "C"], v: cl.Tensor["C", "D"]):
+    """``1 / exp(max(x) - x)``: a constant on the LEFT of a division between the max and
+    the sums (the same softmax weights as ``flash_rows``)."""
+    e = 1.0 / cl.exp(x * -1.0 + _max(x))
+    return (e @ v) / cl.sum(e, -1, keepdim=True)
+
+
 def gqa(q: cl.Tensor["HQ", "SQ", "D"], k: cl.Tensor["HKV", "SKV", "D"],
         v: cl.Tensor["HKV", "SKV", "D"]):
     s = (q @ k.mT) / q.shape[-1] ** 0.5
