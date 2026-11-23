@@ -52,7 +52,17 @@ def dq_o(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"], v: cl.Tens
     return (_p(q, k, L) * (dO @ v.mT - d) * C) @ k
 
 
-PROGRAMS = {"dv": dv, "dq": dq, "dk": dk, "dkdv": dkdv, "dkdv_o": dkdv_o, "dq_o": dq_o}
+def fused_o(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"], v: cl.Tensor["H", "SKV", "D"],
+            dO: cl.Tensor["H", "SQ", "D"], L: cl.Tensor["H", "SQ", 1, cl.f32],
+            o: cl.Tensor["H", "SQ", "D"]):
+    """dQ, dK, dV in one program (two reduction groups) with D = sum_D(dO * o) in the graph."""
+    p = _p(q, k, L)
+    ds = p * (dO @ v.mT - (dO * o).sum(dim=-1, keepdim=True))
+    return (ds @ k) * C, (ds.mT @ q) * C, p.mT @ dO
+
+
+PROGRAMS = {"dv": dv, "dq": dq, "dk": dk, "dkdv": dkdv, "dkdv_o": dkdv_o, "dq_o": dq_o,
+            "fused_o": fused_o}
 
 
 def program(name, shapes=SMALL):
