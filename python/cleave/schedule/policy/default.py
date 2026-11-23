@@ -6,17 +6,19 @@ from .common import (
 )
 from .bestfit import BestFit
 from .hint import INTER, INTRA, TileDict, Stride
-from ...ir.graph import ViewOpNode
+from ...ir.graph import ComputeOpNode, ViewOpNode
 from ...ir.analysis import (
     build_output_axis_provenance,
     build_reduction_axis_provenance,
     find_orthogonal_reduction_groups,
     get_output_axis_tokens,
 )
-from ...ir.ops import Copy, Div, Mul
+from ...ir.ops import Copy, Div, Matmul, Mul, ReduceSum
+from ...ir.ops.elementwise import BinaryElementwise
 
 import copy
 import numpy as np
+import tvm
 from queue import Queue, PriorityQueue
 
 
@@ -716,13 +718,84 @@ class DefaultPolicy:
             tensor_strides_map,
         )
 
-    def infer_node_smem_usage(self, td, node):
+    def infer_node_smem_usage(self, td, node, own_loops):
         # view ops are alias-only and should not contribute internal shared-memory footprint.
         if isinstance(node, ViewOpNode):
             return 0, []
-        return node.footprint(
+        internal, cached = node.footprint(
             td.get_itile(node), td.get_rstep(node), td.tensor_strides_map[node]
         )
+        return internal + self._staged_operand_bytes(td, node, own_loops), cached
+
+    def _staged_operand_indices(self, node, own_loops):
+        """Inputs of ``node`` that codegen copies from registers into shared memory.
+
+        Mirrors two stagings of ``codegen/passes.py`` on the graph ``apply_tiling`` builds:
+        a computed gemm operand read transposed (``annotate_tinfo``: ``P^T @ dO``), and a
+        row sum of plain loads broadcast into a gemm-derived fragment of the same loop body
+        (``annotate_fragment_layout_conflicts``: ``dP - sum_D(dO * o)``). ``own_loops``: the
+        reductions that get a loop of their own; their consumers read them through the loop
+        node, which that pass does not look through. The older two-fragment gemm staging is
+        not counted.
+        """
+        if isinstance(node, Matmul):
+            return tuple(
+                i
+                for i, (edge, flag) in enumerate(
+                    zip(node.inputs, (node.transpose_A, node.transpose_B))
+                )
+                if flag and isinstance(edge.src_node, ComputeOpNode)
+            )
+        if not (
+            isinstance(node, BinaryElementwise)
+            and node.const is None
+            and node.broadcast != -1
+            and len(node.inputs) == 2
+        ):
+            return ()
+
+        def has_matmul_ancestor(start):
+            stack, seen = [start], set()
+            while stack:
+                n = stack.pop()
+                if id(n) in seen or n in own_loops:
+                    continue
+                seen.add(id(n))
+                if isinstance(n, Matmul):
+                    return True
+                stack.extend(e.src_node for e in getattr(n, "inputs", []))
+            return False
+
+        lhs, rhs = (e.src_node for e in node.inputs)
+        if (
+            isinstance(rhs, ReduceSum)
+            and rhs not in own_loops
+            and has_matmul_ancestor(lhs)
+            and not has_matmul_ancestor(rhs)
+        ):
+            return (1,)
+        return ()
+
+    def _staged_operand_bytes(self, td, node, own_loops):
+        """Shared bytes of the staging buffers codegen allocates for ``node``'s inputs:
+        the producer's tile in the consumer's input dtype (``_resolve_operand``).
+        """
+        total = 0
+        for i in self._staged_operand_indices(node, own_loops):
+            src = node.inputs[i].src_node
+            nbytes = (tvm.DataType(node.dtype).bits + 7) // 8
+            total += int(np.prod(td.get_itile(src))) * nbytes
+        return total
+
+    def _own_loop_reductions(self, td):
+        """The reductions ``apply_tiling`` gives a loop node of their own."""
+        from ..tiling import _iterative_reductions, absorbed_reductions
+
+        absorbed = absorbed_reductions(self.ordered_nodes, td.rstep_map)
+        return {
+            n for n in _iterative_reductions(self.ordered_nodes, td.rstep_map)
+            if n not in absorbed
+        }
 
     def _compute_shared_memory_usage(self, td):
         self._compute_stride_map(td)
@@ -730,6 +803,7 @@ class DefaultPolicy:
         block_map = {}
         processed = set()
         cached_tensors_map = {}
+        own_loops = self._own_loop_reductions(td)
 
         def resolve_materialized_source(node, out_id):
             visited = set()
@@ -769,7 +843,7 @@ class DefaultPolicy:
 
         for node in self.ordered_nodes:
             node_internal_bytes, cached_tensors_map[node] = self.infer_node_smem_usage(
-                td, node
+                td, node, own_loops
             )
             block = allocator.malloc(node_internal_bytes)
             allocator.free(block)

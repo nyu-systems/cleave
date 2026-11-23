@@ -86,3 +86,13 @@ def test_multi_consumer_input_read_transposed_stays_in_shared():
         code = build_candidate_code(plan.tile)
         assert "ukernel_mma_ssr_transA" in code
         assert "ukernel_mma_rsr_transA" not in code
+
+
+def test_shared_memory_estimate_counts_staging_buffers():
+    # dK+dV with in-graph D at the reference size: a [1, 512, 64] tile stages P and dS
+    # ([32, 512] fp16 each) through shared memory for the transposed gemms; with them the
+    # kernel needs 234496 B of shared memory and cannot launch (H100: 232448 B).
+    program = A.program("dkdv_o", dict(H=32, SQ=4096, SKV=4096, D=64))
+    plans = list(schedule(GraphSet.identity(program), ScheduleConfig(topk=40)))
+    assert plans
+    assert all(p.output_tile[1] < 512 for p in plans)
