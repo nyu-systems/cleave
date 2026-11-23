@@ -13,18 +13,22 @@ from ..ir.ops.elementwise import BinaryElementwise
 
 # TODO: have all levels of the graph with OutputNode (this should make this function smoother)
 def annotate_args(graph: Graph, is_main: bool = False) -> Graph:
+    # The kernel's outputs are its trailing parameters (``graph_out_indices``): an output
+    # stored straight from the main graph (no reduction loop around it) can come before
+    # a placeholder in topological order, so outputs go after every placeholder.
+    outputs = []
     for node in find_topo_sort(graph.nodes):
         if is_main:
             if isinstance(node, PlaceHolderNode):
                 graph.args.append(node)
             elif isinstance(node, OutputNode):
-                graph.args.append(node)
+                outputs.append(node)
         if isinstance(node, GraphNode):
             in_args = [i.src_node for i in node.inputs]
             # TODO: output nodes
             node.graph.args.extend(in_args)
             annotate_args(node.graph, is_main=False)
-
+    graph.args.extend(outputs)
     return graph
 
 
