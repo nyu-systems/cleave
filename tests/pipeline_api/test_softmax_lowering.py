@@ -5,7 +5,10 @@
 recognizes as the exp of an exact softmax. Where a reduction wants to loop under the max (a
 streaming obstacle), lowering writes the proven update rule on the max (a ``Streaming``
 record) or the reason it has none (``ir.streaming_refusals``); a graph that has no tiling
-says that reason in the plan summary.
+says that reason in the plan summary. At a split factor, a solo graph of a program split
+over its softmax dim lowers to a partial and a combine built from its loop state, each a
+flat graph with its own max and rule (the pair, its refusals and its plans:
+``tests/pipeline_api/test_softmax_split.py``).
 """
 
 import pytest
@@ -180,3 +183,31 @@ def test_search_of_attention_records_the_flash_form_only():
     assert found["solo matmul>div>max>sub>exp>sum>matmul>div"] == (True, [])
     recorded, (why,) = found["solo matmul>div>max>sub>exp>sum>div>matmul"]
     assert not recorded and "a finished reduction over the dim" in why
+
+
+def test_search_the_flash_form_split_lowers_to_two_flat_graphs_with_their_own_rules():
+    """``lower(solo graph, f)`` of a program split over its softmax dim: the partial and the
+    combine built from the flash form's loop state are each a flat graph with the max ahead
+    of its exp, and each carries the rule derived for that graph (keyed by it, not by the
+    solo graph). The keys have no extents, so every split factor shares one derivation per
+    stage. Without a factor the flash form lowers alone, as for an unsplit program."""
+    prog = trace(traced, dict(H=4, SQ=64, SKV=1024, D=64), cl.f16)
+    graphs = P.superoptimize(prog, P.SuperoptConfig(split=("SKV",), max_ops=13, cache=False))
+    assert graphs.state_split == ("SKV",) and not [g for g in graphs if g.is_split]
+    (graph,) = [g for g in graphs if g.summary().endswith("sum>matmul>div")]
+    (solo,) = lower(graph)
+    (full,) = [n for n in solo.nodes if type(n) is ReduceMax]
+    keys = {"solo": {full.streaming.key}}
+    for factor in (4, 8):
+        for role, stage in zip(("partial", "combine"), lower(graph, factor)):
+            (full,) = [n for n in stage.nodes if type(n) is ReduceMax]
+            record = full.streaming
+            assert record.key == loop_key(stage, full.name, record.loops)
+            assert record.rules == tuple((acc, FACTOR) for acc in record.loops)
+            assert stage.streaming_refusals == [] and len(stage.derivations) == 1
+            (exp,) = _exps(stage)
+            sub = exp.inputs[0].src_node
+            assert type(sub) is Sub and full in [e.src_node for e in sub.inputs]
+            keys.setdefault(role, set()).add(record.key)
+    assert {role: len(k) for role, k in keys.items()} == {"solo": 1, "partial": 1, "combine": 1}
+    assert len(set.union(*keys.values())) == 3
