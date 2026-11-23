@@ -3,6 +3,9 @@ from typing import Any, Dict, Optional
 
 from tilelang.carver.roller.hint import Stride  # noqa: F401  (re-exported)
 
+# accumulation contexts of an output (``TileDict.accumulation``, ``Graph.accumulation``)
+INTRA, INTER = "intra", "inter"
+
 
 @dataclass(eq=False, repr=False)
 class TileDict:

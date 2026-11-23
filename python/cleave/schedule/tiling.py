@@ -13,6 +13,7 @@ from ..ir.graph import (
     ViewOpNode,
 )
 from ..ir.ops import ReduceSum
+from .policy.hint import INTER, INTRA
 from ..ir.offsets import OffsetTerm, TileOffset, get_offset_lambda
 from ..ir.analysis import (
     build_output_axis_provenance,
@@ -675,9 +676,6 @@ def _pin_absorbed_reduction_axes(ordered_nodes, rstep_map, tile_map, itile_map):
                 itile[dim] = tile[dim]
         itile_map[node.name] = itile
     return itile_map
-
-
-INTRA, INTER = "intra", "inter"
 
 
 def _merge_into_loop(

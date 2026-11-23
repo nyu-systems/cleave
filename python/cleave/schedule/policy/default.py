@@ -5,7 +5,7 @@ from .common import (
     coalesced_tensor_shape,
 )
 from .bestfit import BestFit
-from .hint import TileDict, Stride
+from .hint import INTER, INTRA, TileDict, Stride
 from ...ir.graph import ViewOpNode
 from ...ir.analysis import (
     build_output_axis_provenance,
@@ -25,7 +25,6 @@ DEFAULT_N_THREADS = 128
 # Accumulation contexts (see ``DefaultPolicy._for_assignment``). An ``inter`` output is
 # summed across CTAs with an atomic add into an fp32 buffer: every element of its block is
 # read and written back once per CTA, hence the weight on its 4-byte elements.
-INTRA, INTER = "intra", "inter"
 ATOMIC_ACCUM_BYTES = 4
 ATOMIC_COST_WEIGHT = 2
 # Ops an inter output may apply between its reduction and the output: linear in the
