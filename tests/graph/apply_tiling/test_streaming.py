@@ -492,6 +492,24 @@ def test_added_nodes_say_which_dims_their_tiles_carry(small, monkeypatch):
     assert owner is None and tmap_by_name(tier)[small.max.name].axes is None
 
 
+def test_a_unit_batch_dim_leads_like_any_other():
+    """The accumulators must lead with the max's own dims (``Rescale(lead)`` multiplies
+    element ``[i, ..]`` by factor element ``[i]``), which is read off where each output dim
+    comes from. A unit dim comes from nowhere -- one head, a batch of one (MLA decode) --
+    on both sides, and is the same dim: every looped tiling is assembled."""
+    ir = X.streamed_ir(X.flash_attention, dict(H=1, SQ=64, SKV=256, D=64))
+    (m,) = X.maxes(ir)
+    assert int(m.get_shape()[0]) == 1
+    built = Counter()
+    for cand in search_tiling(ir, topk=1000):
+        try:
+            tiled = apply_tiling(cand)
+        except ScheduleRejected as e:
+            raise AssertionError(f"refused: {e}") from e
+        built["looped" if stream.sites(tiled) else "one tile"] += 1
+    assert built["looped"] > 0, built
+
+
 def test_a_max_of_logits_in_storage_reads_them_as_stored():
     """``softmax(x) @ v`` with ``x`` an fp16 input: the max reads storage and is float32;
     the subtraction and the exp are float32 compute nodes of the flat graph, so nothing has

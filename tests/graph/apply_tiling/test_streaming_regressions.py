@@ -1,7 +1,8 @@
 """Softmax graphs that are legal but must not get a looped kernel (CPU).
 
 Each program below keeps its max in the flat graph, so a tiling that holds the whole row in
-one tile is served by the flat graph's own max. None of them has a carried form, each for a
+one tile is served by the flat graph's own max (which may also run a loop of its own ahead
+of what reads it: two passes). None of them has a carried form, each for a
 different reason, and for each of them a design prototype of the hand-derived pass built
 rolling kernels that were wrong:
 
@@ -34,14 +35,14 @@ pytest.importorskip("tvm")
 import cleave.schedule.streaming as stream
 from cleave.core.errors import ScheduleRejected
 from cleave.ir.graph_utils import graph_tiers
-from cleave.ir.ops import Matmul, ReduceMax, ReduceSum
+from cleave.ir.ops import Matmul, ReduceMax
 from cleave.runtime.compile import build_candidate_code
 from cleave.schedule import apply_tiling, search_tiling
 from cleave.schedule.tiling import schedule_kernel
 
 from tests import _explicit_softmax as X
 
-N = r"N"
+
 OUTSIDE = (ScheduleRejected,
            r"\w+ is computed per iteration of GraphNode_\w+ but also read by \w+ outside it")
 SINGLE_ROW_LOOP = (stream.StreamingRefused, r"reduce_max_\w+: its tile \(N,\) holds a single row")

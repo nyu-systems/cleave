@@ -306,7 +306,8 @@ def _other_lead(flat_graph, full, acc):
     their tile extents cannot tell when two of them are equal (``(v @ e) / sum(e, 0)``
     leads with the rows of ``v``; its max is indexed by its columns). It is read off the
     output-axis provenance of the flat graph (which input dims each output dim is), as the
-    policy reads it."""
+    policy reads it. A unit dim has no provenance on either side (MLA decode's batch of
+    one), and any unit dim is the same as any other."""
     if flat_graph is None:
         return None  # nothing is served without its flat graph anyway (R1)
     from .tiling import _scheduled_axes
@@ -316,7 +317,7 @@ def _other_lead(flat_graph, full, acc):
     if rows is None or lead is None:
         return 0
     for k, dim in enumerate(rows):
-        if k >= len(lead) or not (dim & lead[k]):
+        if k >= len(lead) or bool(dim) != bool(lead[k]) or (dim and not dim & lead[k]):
             return k
     return None
 
