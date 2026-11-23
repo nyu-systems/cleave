@@ -42,8 +42,10 @@ class TilelangCodeGen(KernelEmitter, SplitEmitter, OperandResolver, MacroEmitter
         self._declare_dyn_dims(graph)
         self._declare_pass_configs(graph)
         if len(graphs) > 1:
+            self._refuse_split_inter(graphs)
             self._gen_split_kernel(graphs)
         else:
+            self._declare_inter_outputs(graphs[0])
             self.gen_graph(graphs[0], name="main_kernel", is_main=True)
         return self.format_code()
 

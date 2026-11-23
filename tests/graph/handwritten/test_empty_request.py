@@ -12,7 +12,7 @@ contribute zero tiles for it and still map every later request correctly.
 
 import pytest
 
-from cleave.dynamic import GATHER_TOLERANCE
+from cleave.dynamic import OPERATORS
 from cleave.dynamic import reference as ref
 from cleave.runtime.compile import _load_main_kernel_from_code
 from tests.graph.handwritten.handwritten_schedules import (
@@ -104,5 +104,5 @@ def test_empty_request(operator):
         dtype="bfloat16",
         workloads_fn=workloads_fn,
         out_idx=out_idx,
-        tolerance=GATHER_TOLERANCE,
+        tolerance=OPERATORS[operator].tolerance,
     )

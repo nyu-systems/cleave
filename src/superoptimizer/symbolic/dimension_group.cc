@@ -1,5 +1,7 @@
 #include "cleave/superoptimizer/symbolic/dimension_group.h"
 
+#include "cleave/superoptimizer/kernel/device_tensor.h"
+
 #include <cassert>
 #include <numeric>
 
@@ -10,7 +12,27 @@ namespace symbolic {
 // DimensionGrouper Implementation
 // ============================================================================
 
-DimensionGrouper::DimensionGrouper() {}
+namespace {
+
+DimensionID::Hash hash_by_position(
+    std::vector<type::GuidType> const &tensor_guids) {
+  auto positions =
+      std::make_shared<std::unordered_map<type::GuidType, type::GuidType>>();
+  for (type::GuidType guid : tensor_guids) {
+    positions->emplace(
+        guid,
+        kernel::DTensor::FIRST_GUID +
+            static_cast<type::GuidType>(positions->size()));
+  }
+  return DimensionID::Hash{positions};
+}
+
+} // namespace
+
+DimensionGrouper::DimensionGrouper(
+    std::vector<type::GuidType> const &tensor_guids)
+    : position_hash(hash_by_position(tensor_guids)),
+      parent(0, position_hash) {}
 
 void DimensionGrouper::touch(DimensionID d) {
   (void)find(d);
@@ -75,7 +97,7 @@ bool DimensionGrouper::is_broadcast(DimensionID d) const {
 std::vector<std::set<DimensionID>> DimensionGrouper::get_groups() const {
   // Map from representative to all members in that group
   std::unordered_map<DimensionID, std::set<DimensionID>, DimensionID::Hash>
-      rep_to_group;
+      rep_to_group(0, position_hash);
 
   // Collect all dimensions that have been touched
   for (auto const &[dim, parent_dim] : parent) {

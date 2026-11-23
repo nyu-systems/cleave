@@ -1,3 +1,4 @@
+#include <algorithm>
 #include "cleave/superoptimizer/search/abstract_expr/abstract_expr.h"
 #include <atomic>
 #include <cassert>
@@ -487,6 +488,148 @@ z3::expr Split::to_z3(z3::context &c,
 
 std::string Split::to_string() const {
   return input->to_string();
+}
+
+namespace {
+
+// sum(sums, mul(factors...)): a product (one factor for anything else) under
+// `sums` (log2 degrees, added up) of reductions.
+struct Canonical {
+  int sums = 0;
+  std::vector<std::string> factors;
+};
+
+std::string canonical_text(Canonical c) {
+  std::sort(c.factors.begin(), c.factors.end());
+  std::string body;
+  if (c.factors.size() == 1) {
+    body = c.factors[0];
+  } else {
+    body = "mul(";
+    for (size_t i = 0; i < c.factors.size(); i++) {
+      body += (i ? "," : "") + c.factors[i];
+    }
+    body += ")";
+  }
+  return c.sums ? "sum" + std::to_string(c.sums) + "(" + body + ")" : body;
+}
+
+Canonical canonical(AbstractExpr const &e);
+
+Canonical single(std::string text) {
+  Canonical c;
+  c.factors.push_back(std::move(text));
+  return c;
+}
+
+void add_terms(AbstractExpr const &e, std::vector<std::string> &terms) {
+  if (auto const *n = dynamic_cast<Add const *>(&e)) {
+    add_terms(*n->lhs, terms);
+    add_terms(*n->rhs, terms);
+  } else {
+    terms.push_back(canonical_text(canonical(e)));
+  }
+}
+
+Canonical canonical(AbstractExpr const &e) {
+  // A split is its input, to Z3 and in to_string (the key of the pattern
+  // cache): the canonical form must be a function of that string too.
+  if (auto const *n = dynamic_cast<Split const *>(&e)) {
+    return canonical(*n->input);
+  }
+  if (auto const *n = dynamic_cast<Sum const *>(&e)) {
+    Canonical c = canonical(*n->summand);
+    c.sums += n->red_deg_log;
+    return c;
+  }
+  if (auto const *n = dynamic_cast<Mul const *>(&e)) {
+    Canonical a = canonical(*n->lhs), b = canonical(*n->rhs);
+    a.sums += b.sums;
+    a.factors.insert(a.factors.end(), b.factors.begin(), b.factors.end());
+    return a;
+  }
+  if (auto const *n = dynamic_cast<Div const *>(&e)) {
+    // sum(i, x / y) == sum(i, x) / y: the numerator's reductions move out
+    Canonical a = canonical(*n->lhs);
+    int sums = a.sums;
+    a.sums = 0;
+    Canonical c =
+        single("div(" + canonical_text(a) + "," +
+               canonical_text(canonical(*n->rhs)) + ")");
+    c.sums = sums;
+    return c;
+  }
+  if (dynamic_cast<Add const *>(&e)) {
+    std::vector<std::string> terms;
+    add_terms(e, terms);
+    std::sort(terms.begin(), terms.end());
+    std::string text = "add(";
+    for (size_t i = 0; i < terms.size(); i++) {
+      text += (i ? "," : "") + terms[i];
+    }
+    return single(text + ")");
+  }
+  if (auto const *n = dynamic_cast<Sub const *>(&e)) {
+    return single("sub(" + canonical_text(canonical(*n->lhs)) + "," +
+                  canonical_text(canonical(*n->rhs)) + ")");
+  }
+  if (auto const *n = dynamic_cast<Exp const *>(&e)) {
+    return single("exp(" + canonical_text(canonical(*n->exponent)) + ")");
+  }
+  if (auto const *n = dynamic_cast<Sqrt const *>(&e)) {
+    return single("sqrt(" + canonical_text(canonical(*n->a)) + ")");
+  }
+  if (auto const *n = dynamic_cast<Silu const *>(&e)) {
+    return single("silu(" + canonical_text(canonical(*n->a)) + ")");
+  }
+  if (auto const *n = dynamic_cast<Gelu const *>(&e)) {
+    return single("gelu(" + canonical_text(canonical(*n->a)) + ")");
+  }
+  if (auto const *n = dynamic_cast<Relu const *>(&e)) {
+    return single("relu(" + canonical_text(canonical(*n->a)) + ")");
+  }
+  // Var, and the rest (clamp, rms, opaque) as they print
+  return single(e.to_string());
+}
+
+} // namespace
+
+std::string ac_canonical_string(AbstractExpr const &e) {
+  return canonical_text(canonical(e));
+}
+
+namespace {
+
+void collect_canonical(
+    AbstractExpr const &e,
+    std::vector<std::pair<int, std::vector<std::string>>> &terms) {
+  Canonical c = canonical(e);
+  std::sort(c.factors.begin(), c.factors.end());
+  terms.emplace_back(c.sums, std::move(c.factors));
+  for (auto const &child : children(e)) {
+    if (child) {
+      collect_canonical(*child, terms);
+    }
+  }
+}
+
+} // namespace
+
+CanonicalSubterms::CanonicalSubterms(AbstractExpr const &pattern) {
+  collect_canonical(pattern, terms);
+}
+
+bool CanonicalSubterms::contains_subpattern(AbstractExpr const &e) const {
+  Canonical c = canonical(e);
+  std::sort(c.factors.begin(), c.factors.end());
+  for (auto const &[sums, factors] : terms) {
+    if (c.sums <= sums &&
+        std::includes(factors.begin(), factors.end(), c.factors.begin(),
+                      c.factors.end())) {
+      return true;
+    }
+  }
+  return false;
 }
 
 } // namespace search

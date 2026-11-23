@@ -2,6 +2,7 @@ import tilelang.language as T
 
 from tests._graphs import mha_bhsd_graph
 from cleave.runtime.compile import compile_and_run_prim_func
+from tests._tolerances import tolerance_for
 
 DTYPE = "float16"
 
@@ -170,4 +171,5 @@ def test_mha_bhsd():
         func,
         graph=mha_bhsd_graph(batch, heads, seq_len, seq_len, dim),
         dtype=DTYPE,
+        tolerance=tolerance_for(mha_bhsd_graph),
     )

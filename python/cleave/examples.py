@@ -3,6 +3,10 @@
 Flags: one per shape dim (traced functions) or per factory keyword (Program factories), plus
 ``--preset --topk --split DIM:f1,f2 --max-ops --fusion --warmup --iters --max-parallel
 --no-cache --save DIR -v --json``.
+
+Keyword defaults reach the stage configs by field name; ``tolerance=cl.Tolerance(rtol=...)`` is
+the one every demo must give: candidates are validated at the operator's declared bound and
+there is no default.
 """
 
 from __future__ import annotations

@@ -2,6 +2,7 @@
 
 #include "cleave/superoptimizer/search/abstract_expr/abstract_expr.h"
 #include "cleave/superoptimizer/search/config.h"
+#include "cleave/superoptimizer/kernel/operator.h"
 
 namespace cleave_superoptimizer {
 namespace search {
@@ -18,6 +19,12 @@ int get_num_consumers(GraphType const &g,
     }
   }
   return num_consumers;
+}
+
+// A declared input is never an output of a graph, read or not.
+inline bool is_declared_input(kernel::KNOperator const *op) {
+  return op->op_type == type::KN_INPUT_OP &&
+         static_cast<kernel::KNInputOp const *>(op)->declaration != nullptr;
 }
 
 bool is_binary(type::KNOperatorType op);

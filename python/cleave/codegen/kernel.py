@@ -11,10 +11,17 @@ from ..ir.graph import (
 )
 from ..ir.ops.base import const_literal
 from ..ir.graph_utils import find_topo_sort
-from .tensor_codegen import gen_copy, gen_tensor_allocation_str, gen_tensor_type
+from ..schedule.policy.hint import INTER
+from .tensor_codegen import (
+    INTER_BLOCK,
+    gen_atomic_add,
+    gen_copy,
+    gen_tensor_allocation_str,
+    gen_tensor_type,
+)
 from .buffer import BASE_INDENT, CodeBuffer
 from .macros import qualify_name
-from .operands import emit_alloc, kept_extents, tc_layout
+from .operands import HOISTED_SUFFIX, emit_alloc, hoisted_nodes, kept_extents, tc_layout
 
 
 def _bind_node(graph, arg, is_main):
@@ -38,6 +45,66 @@ def _call(func: str, args: Sequence[str]) -> str:
 
 def _iter_sargs(graph):
     return graph.sargs if graph.iter_sargs is None else graph.iter_sargs
+
+
+# An inter output is summed across CTAs in a global buffer of this dtype; the runtime
+# zeroes it before every launch and casts it to the output's dtype afterwards.
+INTER_DTYPE = "float32"
+# ``INTER_LAYOUTS`` value of a buffer stored in 8x8 blocks (``inter_blocked_width``).
+BLOCKED_LAYOUT = "blocked8x8"
+
+
+def inter_nodes(graph) -> set:
+    """The nodes ``graph.accumulation`` sums across CTAs: OutputNodes of the main graph,
+    accum nodes of a loop graph. Empty for every graph without accumulation contexts."""
+    return {n for n, context in graph.accumulation.items() if context == INTER}
+
+
+def inter_blocked_width(tmap):
+    """The last extent N when an inter accum node's buffer is stored 8x8-blocked, else None.
+
+    Blocked (see ``tensor_codegen.gen_atomic_add``) when every iteration adds whole rows
+    (the tile spans the block's last dim), 8-row aligned (tile rows a multiple of 8 that
+    divides the block's rows), N a multiple of 8, all static. The CTA block of an inter
+    output spans its whole ``[M, N]`` planes, so the layout is the buffer's own and the
+    runtime undoes it while casting (``INTER_LAYOUTS``).
+    """
+    try:
+        shape = [int(d) for d in tmap.shape]
+        tile = [int(d) for d in tmap.tile_size]
+    except TypeError:
+        return None
+    if len(shape) < 2 or len(kept_extents(tile)) < 2 or kept_extents(tile)[-2:] != tile[-2:]:
+        return None
+    (rows, width), (tile_rows, tile_width) = shape[-2:], tile[-2:]
+    if (
+        tile_width != width
+        or width % INTER_BLOCK
+        or tile_rows % INTER_BLOCK
+        or rows % tile_rows
+    ):
+        return None
+    return width
+
+
+def inter_output_layout(out) -> str | None:
+    """``INTER_LAYOUTS`` entry of an inter OutputNode: its loop accumulator's layout."""
+    edge = out.inputs[0]
+    if not isinstance(edge, AccumEdge):
+        return None
+    tmap = edge.src_node.graph.tmap[edge.accum_node]
+    return BLOCKED_LAYOUT if inter_blocked_width(tmap) is not None else None
+
+
+def _inter_dst(graph, node) -> str:
+    """The global view an inter accum node's per-iteration tile is atomically added to."""
+    return f"{graph.tinfo_map[node][0]}_global"
+
+
+def _arg_dtype(graph, arg, is_main) -> str:
+    if is_main and arg in inter_nodes(graph):
+        return INTER_DTYPE
+    return arg.get_dtype(0)
 
 
 class KernelEmitter:
@@ -267,6 +334,22 @@ class KernelEmitter:
                 seed = [here for _, here, _ in self._prefetch_scalars(graph, node, "0")]
                 dep.block(self._emit_prefetch_read(graph, node, seed, name_prefix))
             kwargs.append(f"{tname}={tname}")
+        # Loop-invariant values: filled on the first iteration, read by every iteration.
+        _, kept = hoisted_nodes(graph)
+        for node in kept:
+            name = graph.tinfo_map[node][0] + HOISTED_SUFFIX
+            dep.block(
+                gen_tensor_allocation_str(
+                    name,
+                    kept_extents(graph.tmap[node].tile_size),
+                    node.out_dtype,
+                    scope="s",
+                    is_tc_layout=True,
+                )
+            )
+            kwargs.append(f"{name}={name}")
+        if kept:
+            kwargs.append("i0=i0")
 
     def _build_graph_call(
         self,
@@ -285,10 +368,15 @@ class KernelEmitter:
         self._bind_call_scalars(graph, it, kwargs)
         self._bind_hoisted_buffers(graph, name_prefix, dep, kwargs)
         if not is_main:
-            kwargs += [
-                f"{graph.tinfo_map[n][0]}={graph.tinfo_map[n][0]}"
-                for n in graph.accum_nodes
-            ]
+            inter = inter_nodes(graph)
+            for n in graph.accum_nodes:
+                if n not in inter:
+                    kwargs.append(f"{graph.tinfo_map[n][0]}={graph.tinfo_map[n][0]}")
+                    continue
+                # This iteration's tile of the CTA's block: the loop counter's offset.
+                tmap, dst = graph.tmap[n], _inter_dst(graph, n)
+                s, squeeze_dims = _tile_slices(tmap.offset(*it), tmap.tile_size)
+                kwargs.append(f"{dst}=_S({dst}[{', '.join(s)}], squeeze_dim={squeeze_dims})")
         call = f"{qualify_name(name, name_prefix)}_iter({''.join(k + ', ' for k in kwargs)})\n"
 
         with body.indented():
@@ -323,7 +411,9 @@ class KernelEmitter:
             tile_size = kept_extents(tmap.tile_size) or [1]
             # A full-shape tile was copied in by the caller under the bound node's name.
             arg_name = bind_node.name if tmap.shape == tmap.tile_size else arg.name
-            params.append(f"{arg_name}: {gen_tensor_type(tile_size, arg.get_dtype(0))}")
+            params.append(
+                f"{arg_name}: {gen_tensor_type(tile_size, _arg_dtype(graph, arg, is_main_iter))}"
+            )
         shifted, shared_shifted = self._prefetch_plan(graph)
         for sname, sdtype in _iter_sargs(graph):
             if sname not in shifted or sname in shared_shifted:
@@ -340,16 +430,34 @@ class KernelEmitter:
                 kept_extents(graph.tmap[node].tile_size), node.out_dtype
             )
             params.append(f"{graph.tinfo_map[node][0]}: {ty}")
+        _, kept = hoisted_nodes(graph)
+        for node in kept:
+            ty = gen_tensor_type(kept_extents(graph.tmap[node].tile_size), node.out_dtype)
+            params.append(f"{graph.tinfo_map[node][0]}{HOISTED_SUFFIX}: {ty}")
+        if kept:
+            params.append("i0: T.int32")
         if not is_main_iter:
             params += self._accum_params(graph)
         return f"\n@T.macro\ndef {qualified_name}_iter({''.join(p + ', ' for p in params)}):\n"
 
     @staticmethod
-    def _accum_params(graph) -> list[str]:
-        return [
-            f"{graph.tinfo_map[n][0]}: {gen_tensor_type(graph.tmap[n].tile_size, n.out_dtype)}"
-            for n in graph.accum_nodes
-        ]
+    def _accum_params(graph, whole: bool = False) -> list[str]:
+        """One parameter per accum node: its register accumulator, or for an inter node
+        the global view it is added into (the CTA's block of the output when ``whole``,
+        in the loop's wrapper; this iteration's tile otherwise, in the ``*_iter`` macro).
+        """
+        inter = inter_nodes(graph)
+        params = []
+        for n in graph.accum_nodes:
+            tmap = graph.tmap[n]
+            if n in inter:
+                extents = kept_extents(tmap.shape if whole else tmap.tile_size) or [1]
+                ty = gen_tensor_type(extents, INTER_DTYPE)
+                params.append(f"{_inter_dst(graph, n)}: {ty}")
+            else:
+                ty = gen_tensor_type(tmap.tile_size, n.out_dtype)
+                params.append(f"{graph.tinfo_map[n][0]}: {ty}")
+        return params
 
     def _emit_window_block(self, graph, name_prefix, buf: CodeBuffer):
         """Window fills lead the body; a prefetch off a window is re-seeded from it."""
@@ -403,6 +511,28 @@ class KernelEmitter:
                 ]
                 buf.block(self._emit_prefetch_read(graph, node, scalars, name_prefix))
 
+    def _emit_hoisted_block(self, graph, name_prefix, buf: CodeBuffer) -> set:
+        """Loop-invariant nodes, evaluated on the first iteration only; the values later
+        iterations read are copied into the buffers the loop's caller allocated.
+
+        On the first iteration rather than before the loop: TileLang 0.1.13 mis-handles
+        fragment math in front of a warp-specialized ``T.Pipelined`` loop (wrong results
+        at 128 threads, "no available layout found" at 256).
+        """
+        nodes, kept = hoisted_nodes(graph)
+        if not nodes:
+            return set()
+        buf.line("if i0 == 0:")
+        with buf.indented():
+            for node in nodes:
+                self._emit_compute(graph, node, buf, False, name_prefix)
+            for node in kept:
+                tname = graph.tinfo_map[node][0]
+                buf.block(
+                    gen_copy(src=tname, dst=tname + HOISTED_SUFFIX, same_level=False)
+                )
+        return set(nodes)
+
     def _emit_placeholder(self, graph, node, buf, is_main_iter, name_prefix):
         if is_main_iter:
             return
@@ -434,14 +564,18 @@ class KernelEmitter:
         writes_to_arg = tname in {
             graph.tinfo_map[a][0] for a in graph.args if a in graph.tinfo_map
         }
+        # An inter accum node is a fresh partial every iteration, added to global memory
+        # below: it is allocated and cleared here, in the accumulation dtype.
+        inter = node in inter_nodes(graph)
+        accumulates = node in graph.accum_nodes and not inter
         # Only non-accumulating nodes are allocated inside the loop.
-        if node not in graph.accum_nodes and not writes_to_arg:
+        if not accumulates and not writes_to_arg:
             emit_alloc(
                 buf,
                 graph,
                 node,
                 kept_extents(graph.tmap[node].tile_size),
-                node.out_dtype,
+                INTER_DTYPE if inter else node.out_dtype,
             )
         staged = set(getattr(node, "stage_fragment_operands_in_shared", ()))
         call_args, mem_scope = [], ""
@@ -455,15 +589,22 @@ class KernelEmitter:
         func_name = self.emit_op_node(
             node,
             mem_scope=mem_scope + scope,
-            clear=node not in graph.accum_nodes,
+            clear=not accumulates,
             name_prefix=name_prefix,
         )
         buf.block(_call(func_name, call_args))
+        if inter:
+            tile = kept_extents(graph.tmap[node].tile_size)
+            width = inter_blocked_width(graph.tmap[node])
+            buf.block(gen_atomic_add(tname, _inter_dst(graph, node), width, len(tile)))
 
     def _emit_subgraph(self, graph, node, buf, is_main_iter, name_prefix):
         sub = node.graph
         self.gen_graph(sub, node.name, is_main=False, name_prefix=name_prefix)
+        inter = inter_nodes(sub)
         for accum_node in sub.accum_nodes:
+            if accum_node in inter:
+                continue  # added straight into the output's global buffer
             assert (
                 accum_node in sub.tmap
             ), f"Accumulation node {accum_node} not in tensor map."
@@ -486,14 +627,32 @@ class KernelEmitter:
             else:
                 call_args.append(graph.tinfo_map[edge.src_node][0])
         call_args += [sname for sname, _ in sub.sargs]
-        call_args += [sub.tinfo_map[n][0] for n in sub.accum_nodes]
+        call_args += [
+            self._inter_output_name(graph, node, n) if n in inter else sub.tinfo_map[n][0]
+            for n in sub.accum_nodes
+        ]
         buf.block(_call(qualify_name(node.name, name_prefix), call_args))
+
+    @staticmethod
+    def _inter_output_name(graph, gnode, accum_node) -> str:
+        """The (global) output buffer of ``graph`` that ``accum_node`` of loop ``gnode``
+        accumulates into."""
+        (name,) = [
+            graph.tinfo_map[out][0]
+            for out in inter_nodes(graph)
+            if isinstance(out.inputs[0], AccumEdge)
+            and out.inputs[0].src_node is gnode
+            and out.inputs[0].accum_node is accum_node
+        ]
+        return name
 
     def _emit_output(self, graph, node, buf, is_main_iter, name_prefix):
         assert (
             len(node.inputs) == 1
         ), f"output node should have only one input, but got {node.inputs=}"
         edge = node.inputs[0]
+        if node in inter_nodes(graph):
+            return  # the loop already added every partial into this buffer
         if isinstance(edge.src_node, GraphNode):
             src_node, _, _ = edge.src_node._resolve_output_binding(edge.src_id)
             src_name, src_scope = edge.src_node.graph.tinfo_map[src_node]
@@ -538,8 +697,11 @@ class KernelEmitter:
         )
         self._emit_window_block(graph, name_prefix, buf)
         self._emit_prefetch_block(graph, name_prefix, buf)
+        hoisted = self._emit_hoisted_block(graph, name_prefix, buf)
         for node in find_topo_sort(graph.nodes):
             if node in graph.prefetch_nodes or node in graph.window_nodes:
+                continue
+            if node in hoisted:
                 continue
             emitter = next(
                 (attr for kind, attr in self._NODE_EMITTERS if isinstance(node, kind)),
@@ -603,10 +765,11 @@ class KernelEmitter:
             # size only an entry keyed on the argument itself records.
             shape_node = arg if arg in graph.tmap else _bind_node(graph, arg, is_main)
             params.append(
-                f"{arg.name}: {gen_tensor_type(graph.tmap[shape_node].shape, arg.get_dtype(0))}"
+                f"{arg.name}: "
+                f"{gen_tensor_type(graph.tmap[shape_node].shape, _arg_dtype(graph, arg, is_main))}"
             )
         params += scalar_params  # no outputs to sit in front of
         if not is_main:
             params += [f"{n}: T.{t}" for n, t in graph.sargs]
-            params += self._accum_params(graph)
+            params += self._accum_params(graph, whole=True)
         return params

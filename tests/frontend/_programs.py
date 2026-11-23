@@ -75,3 +75,28 @@ def rmsnorm_matmul_builder(M, N, K) -> Program:
     x, w = p.input("x", ("M", "K")), p.input("w", ("K", "N"))
     p.output(cl.rms_norm(x) @ w)
     return p
+
+
+
+def _row_lse(x, w):
+    """``t`` for ``lse_attention``: the row log-sum-exp of ``x @ w``, along every row."""
+    scores = x @ w
+    top = cl.max(scores, -1, keepdim=True)
+    return cl.log(cl.sum(cl.exp(scores - top), -1, keepdim=True)) + top + scores * 0.0
+
+
+def lse_attention_builder(M=64, K=64, N=128, D=32, declared=True) -> Program:
+    """``exp(x @ w - t) @ v`` with an fp32 ``t`` that must be the row log-sum-exp of ``x @ w``.
+
+    With ``t`` declared (``sample=``) every probability is at most 1; drawn as noise instead,
+    ``exp(x @ w - t)`` overflows fp16 and the second matmul turns that into NaN. ``t`` is
+    full-shape ``[M, N]`` (an ``[M, 1]`` input does not lower yet); every input has its own
+    shape (``bind_inputs`` matches same-shaped inputs by position).
+    """
+    p = Program("lse_attention")
+    M, K, N, D = p.dims(M=M, K=K, N=N, D=D)
+    x, w = p.input("x", (M, K)), p.input("w", (K, N))
+    t = p.input("t", (M, N), cl.f32, **({"sample": _row_lse} if declared else {}))
+    v = p.input("v", (N, D))
+    p.output(cl.exp(x @ w - t) @ v, name="y")
+    return p

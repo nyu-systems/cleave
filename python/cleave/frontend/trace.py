@@ -54,7 +54,8 @@ def trace(fn, shapes: dict | None = None, dtype=None, *, split=None, name=None):
                         raise SpecError(f"{fn.__name__}: dim {d.name!r} of {p.name!r} unbound; "
                                         f"pass shapes={{{d.name!r}: ...}}")
                 ds.append(d)
-            args.append(prog.input(p.name, ds, spec.dtype))
+            args.append(prog.input(p.name, ds, spec.dtype,
+                                   equals=spec.equals, sample=spec.sample))
         elif isinstance(spec, ScalarSpec):
             raise NotImplementedError(f"{p.name}: runtime cl.Scalar arguments are not in the tile IR yet")
         elif p.default is not inspect.Parameter.empty:

@@ -2,6 +2,7 @@ import tilelang.language as T
 
 from tests._graphs import lora_graph
 from cleave.runtime.compile import compile_and_run_prim_func
+from tests._tolerances import tolerance_for
 
 DTYPE = "float16"
 
@@ -111,4 +112,7 @@ def test_lora():
         num_stages=2,
         threads=32,
     )
-    compile_and_run_prim_func(func, graph=lora_graph(M, N, K, R), dtype=DTYPE)
+    compile_and_run_prim_func(
+        func, graph=lora_graph(M, N, K, R), dtype=DTYPE,
+        tolerance=tolerance_for(lora_graph),
+    )

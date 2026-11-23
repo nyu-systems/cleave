@@ -27,4 +27,5 @@ if __name__ == "__main__":
         shapes=dict(HQ=64, HKV=8, SQ=4096, SKV=4096, D=128),
         dtype=cl.f16,
         fusion="force",
+        tolerance=cl.Tolerance(rtol=1e-2),
     )

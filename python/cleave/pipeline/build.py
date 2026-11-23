@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import ast
+import functools
 import time
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
+from ..core.errors import SpecError
 from .config import EvalConfig
 from .plans import Plan, PlanSet
 from .report import Report, Result, _Results
@@ -123,8 +125,10 @@ def built_kernels(plans: Sequence[Plan], runs) -> list[BuiltKernel | None]:
 
 
 class BuildSet(_Results):
-    def __init__(self, results: list[Result], plans: PlanSet | None = None, seconds: float = 0.0):
+    def __init__(self, results: list[Result], plans: PlanSet | None = None, seconds: float = 0.0,
+                 tolerance=None):
         self.results, self.plans, self.seconds = list(results), plans, seconds
+        self.tolerance = tolerance  # what the kernels were validated at
 
     @property
     def built(self) -> list[Result]:
@@ -145,14 +149,72 @@ def _program_dtype(plans) -> str:
     return str(getattr(program, "dtype", None) or "float16")
 
 
+def _check_tolerance_fits(plan_list, tolerance) -> None:
+    """Refuse a per-output ``tolerance`` that does not fit every plan, before any runs.
+
+    One ``Tolerance`` covers every output of every plan. A sequence is one per output, and
+    the plans of one program need not have the same outputs: a split partial has more than
+    its combine and than the solo plans. All candidates share the declaration, so a sequence
+    is only valid when every plan has exactly that many outputs.
+    """
+    from ..runtime import reference
+    from ..runtime.validate import Tolerance, tolerances_for
+
+    if not plan_list or isinstance(tolerance, Tolerance):
+        return  # nothing to validate, or one bound for every output
+    try:
+        declared = len(tuple(tolerance))
+    except TypeError:
+        declared = 1
+    tolerances_for(tolerance, declared)  # a SpecError unless these are Tolerances
+    counted = {}  # id(flat graph) -> number of outputs
+    for plan in plan_list:
+        graph = plan.tile.flat_graph
+        if id(graph) not in counted:
+            counted[id(graph)] = len(reference.output_order(graph))
+        if counted[id(graph)] != declared:
+            raise SpecError(
+                f"build(): {declared} tolerances were declared, but plan {plan.label!r} "
+                f"({plan.role}) has {counted[id(graph)]} output(s). A per-output tolerance "
+                "must fit every plan, and a split partial has more outputs than its combine "
+                "and the solo plans; declare one Tolerance for all outputs")
+
+
+def _plans_by_graph(plan_list) -> dict:
+    """id(flat graph) -> the plan it was lowered for (plans of one graph share it)."""
+    return {id(p.tile.flat_graph): p for p in plan_list}
+
+
+def derive_for(plan, graph):
+    """The ``derive`` of ``make_inputs`` for ``plan``'s ``graph``: every input its Program
+    declares (``equals=`` / ``sample=``) recomputed from the drawn ones, else None.
+
+    A combine stage reads the partial's outputs, no Program input, so it draws them all.
+    """
+    from ..runtime.reference import declared_inputs_hook
+
+    if plan is None or plan.role == "combine":
+        return None
+    return declared_inputs_hook(plan.program, plan.inputs, graph)
+
+
+def _publish_reference(publish, distributions, plans_by_graph, cache_dir, graph, dtype):
+    """``publish_reference`` with the declared inputs of the plan the graph belongs to."""
+    derive = derive_for(plans_by_graph.get(id(graph)), graph)
+    return publish(cache_dir, graph, dtype, distributions=distributions, derive=derive)
+
+
 def build(plans: PlanSet | Sequence[Plan], workers: int | None = None, *,
           config: EvalConfig | None = None, compiler_pass_options=None) -> BuildSet:
     """Compile, validate and time every plan in its own worker (a crash fails one candidate).
 
     Parallelism: ``workers``, else the active ``Session.max_parallel``, else ``config``.
+    ``config.tolerance`` is required as soon as there is a plan to validate: one
+    ``Tolerance`` for every output, or one per output when every plan has that many.
     """
     from ..core.session import current_session
-    from ..runtime.validate import BenchOptions
+    from ..runtime.inputs import check_distributions
+    from ..runtime.validate import BenchOptions, publish_reference
     from ..runtime.evaluate import run_candidates
 
     config = config or EvalConfig()
@@ -161,20 +223,28 @@ def build(plans: PlanSet | Sequence[Plan], workers: int | None = None, *,
     if timeout is None:
         timeout = session.settings.compile_timeout_secs or 0  # None in Settings: disabled
     plan_list = list(plans)
+    if plan_list and config.tolerance is None:
+        raise SpecError("build(): no validation tolerance declared; there is no default bound. "
+                        "Pass config=EvalConfig(tolerance=cl.Tolerance(rtol=...))")
+    reference_fn = functools.partial(_publish_reference, publish_reference,
+                                     check_distributions(config.distributions),
+                                     _plans_by_graph(plan_list))
+    _check_tolerance_fits(plan_list, config.tolerance)
     t0 = time.perf_counter()
     runs = run_candidates([p.tile for p in plan_list], _program_dtype(plans),
                           max_parallel=workers or session.max_parallel or config.max_parallel,
                           tolerance=config.tolerance, timeout_s=timeout,
                           compiler_pass_options=compiler_pass_options,
-                          benchmark=BenchOptions(config.warmup, config.iters))
+                          benchmark=BenchOptions(config.warmup, config.iters),
+                          reference_fn=reference_fn)
     kernels = built_kernels(plan_list, runs)
     results = [Result(p, r, k) for p, r, k in zip(plan_list, runs, kernels)]
     return BuildSet(results, plans if isinstance(plans, PlanSet) else None,
-                    time.perf_counter() - t0)
+                    time.perf_counter() - t0, config.tolerance)
 
 
 def evaluate(built: BuildSet | PlanSet | Sequence[Plan], config: EvalConfig | None = None) -> Report:
     """The ``Report`` of a ``BuildSet`` (``config`` is only used to build plans first)."""
     if not isinstance(built, BuildSet):
         built = build(built, config=config)
-    return Report(built.results, built.plans, {"build": built.seconds})
+    return Report(built.results, built.plans, {"build": built.seconds}, built.tolerance)

@@ -13,4 +13,9 @@ def gqa_prefill(q: cl.Tensor["HQ", "SQ", "D"], k: cl.Tensor["HKV", "SKV", "D"], 
 
 
 if __name__ == "__main__":
-    cleave.examples.main(gqa_prefill, shapes=dict(HQ=32, HKV=8, SQ=4096, SKV=4096, D=64), dtype=cl.f16)
+    cleave.examples.main(
+        gqa_prefill,
+        shapes=dict(HQ=32, HKV=8, SQ=4096, SKV=4096, D=64),
+        dtype=cl.f16,
+        tolerance=cl.Tolerance(rtol=5e-3),
+    )

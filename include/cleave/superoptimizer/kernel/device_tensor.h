@@ -92,6 +92,8 @@ public:
   int owner_ts_idx;
   // Metadata only: not part of operator==/!= or std::hash.
   type::DataType dtype;
+  // The first guid of a process.
+  static constexpr type::GuidType FIRST_GUID = 10000000;
   static std::atomic<int64_t> next_guid;
 };
 

@@ -1,4 +1,5 @@
-"""Per-candidate results, failure histograms, the split-K pairing rule and ``best()``."""
+"""Per-candidate results, failure histograms, measured errors, the split-K pairing rule and
+``best()``."""
 
 from __future__ import annotations
 
@@ -6,7 +7,66 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
-from ..core.errors import CleaveError
+from ..core.errors import CleaveError, LaunchCrash, NonFiniteOutput, OutputMismatch
+
+# How a kernel can fail the validate stage; "other" is a reference or layout problem.
+VALIDATION_KINDS = {OutputMismatch: "mismatch", NonFiniteOutput: "non_finite",
+                    LaunchCrash: "launch_crash"}
+
+
+def validation_kind(error) -> str:
+    return next((kind for cls, kind in VALIDATION_KINDS.items() if isinstance(error, cls)),
+                "other")
+
+
+def tolerance_dicts(tolerance) -> list | None:
+    """``[{"rtol", "atol"}, ...]`` for a Tolerance or a sequence of them (None stays None)."""
+    if tolerance is None:
+        return None
+    items = tolerance if isinstance(tolerance, (tuple, list)) else (tolerance,)
+    return [{"rtol": t.rtol, "atol": t.atol} for t in items]
+
+
+def worst_measured(measurements) -> list | None:
+    """Per output index, ``{"rel", "abs"}``: the largest of each over ``measurements``.
+
+    As long as the longest measurement: a split partial has more outputs than a solo plan.
+    """
+    out = None
+    for measured in measurements:
+        if measured is None:
+            continue
+        out = out or []
+        out += [{"rel": 0.0, "abs": 0.0} for _ in range(len(measured) - len(out))]
+        for worst, m in zip(out, measured):
+            worst["rel"], worst["abs"] = max(worst["rel"], m.rel), max(worst["abs"], m.abs)
+    return out
+
+
+def format_measured(worst, tolerance=None) -> str:
+    """``rel 6.1e-04 of rtol 0.005`` per output, for the stage report: the measured error
+    beside the bound that governs it. Both errors when the tolerance is not known, and when
+    it has both terms: neither error alone is then a fraction of its term."""
+    if not worst:
+        return ""
+    bounds = tolerance_dicts(tolerance) or [None] * len(worst)
+    if len(bounds) == 1:
+        bounds = bounds * len(worst)
+    parts = []
+    for i, (w, bound) in enumerate(zip(worst, bounds)):
+        both = f"rel {w['rel']:.1e} abs {w['abs']:.1e}"
+        if bound is None:
+            text = both
+        elif bound["rtol"] and bound["atol"]:
+            text = f"{both} of rtol {bound['rtol']:g} * rowmax + atol {bound['atol']:g}"
+        elif bound["rtol"]:
+            text = f"rel {w['rel']:.1e} of rtol {bound['rtol']:g}"
+        elif bound["atol"]:
+            text = f"abs {w['abs']:.1e} of atol {bound['atol']:g}"
+        else:
+            text = f"{both} of an exact bound"
+        parts.append((f"out{i} " if len(worst) > 1 else "") + text)
+    return "; ".join(parts)
 
 
 @dataclass(eq=False)
@@ -30,6 +90,11 @@ class Result:
     @property
     def error(self):
         return self.run.error
+
+    @property
+    def measured(self):
+        """``validate.MeasuredError`` per output, when the comparison ran to the end."""
+        return getattr(self.run, "measured", None)
 
     @property
     def stage(self) -> str | None:
@@ -74,6 +139,11 @@ class Failures(list):
     def by_stage(self) -> dict[str, int]:
         return dict(Counter(r.stage for r in self).most_common())
 
+    def by_validation_kind(self) -> dict[str, int]:
+        """The validate-stage failures as mismatch / non_finite / launch_crash / other."""
+        return dict(Counter(validation_kind(r.error) for r in self
+                            if r.stage == "validate").most_common())
+
     def __str__(self):
         return ", ".join(f"{n}x {k}" for k, n in self.histogram().items()) or "none"
 
@@ -107,9 +177,11 @@ class _Results(Sequence):
 
 
 class Report(_Results):
-    def __init__(self, results: list[Result], plans=None, timings: dict | None = None):
+    def __init__(self, results: list[Result], plans=None, timings: dict | None = None,
+                 tolerance=None):
         self.results, self.plans = list(results), plans
         self.timings: dict[str, float] = dict(timings or {})
+        self.tolerance = tolerance  # what the candidates were validated at
         self._best = None
 
     @property
@@ -161,11 +233,25 @@ class Report(_Results):
         return _fmt([(i, r.variant, r.role, f"{r.latency_us:.2f}", r.label) for i, r in enumerate(rows)],
                     ("#", "variant", "role", "us", "plan"))
 
+    def measured_error(self) -> list | None:
+        """Per output, the largest error measured over the candidates that passed."""
+        return worst_measured(r.measured for r in self.correct)
+
     def to_dict(self) -> dict:
         variants = self.variants()
         return {
             "candidates": len(self), "correct": len(self.correct),
             "failures": self.histogram(), "failures_by_stage": self.failures.by_stage(),
+            "validation": {
+                "tolerance": tolerance_dicts(self.tolerance),
+                "failures": self.failures.by_validation_kind(),
+                "max_error": self.measured_error(),
+                # every candidate whose outputs were compared, passing or not
+                "measured": [{"plan": r.label, "ok": r.ok, "error": r.error_type,
+                              "rel": [m.rel for m in r.measured],
+                              "abs": [m.abs for m in r.measured]}
+                             for r in self.results if r.measured is not None],
+            },
             "timings_s": self.timings,
             "variants": {k: {"latency_us": v.latency_us, "kernels": [m.label for m in v.members]}
                          for k, v in variants.items()},
@@ -190,8 +276,10 @@ class Report(_Results):
         rows.append(("build", text + (f"  [{build_fail}]" if build_fail else ""), self.timings.get("build")))
         val_fail = Failures(r for r in self.results if not r.ok and r.stage == "validate")
         n_val = len(self) - len(build_fail)
+        worst = format_measured(self.measured_error(), self.tolerance)
         rows.append(("validate", f"{n_val - len(val_fail)} ok / {len(val_fail)} failed"
-                     + (f"  [{val_fail}]" if val_fail else ""), None))
+                     + (f"  [{val_fail}]" if val_fail else "")
+                     + (f"  max error {worst}" if worst else ""), None))
         bench_fail = Failures(r for r in self.results if not r.ok and r.stage == "bench")
         variants = self.variants()
         if variants:

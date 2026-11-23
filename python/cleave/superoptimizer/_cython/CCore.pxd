@@ -80,7 +80,13 @@ cdef extern from "cleave/superoptimizer/kernel/graph.h" namespace "cleave_supero
         CppDTensor* div(const CppDTensor* op1, const CppDTensor* op2) except +
         CppDTensor* sub(const CppDTensor* op1, const CppDTensor* op2) except +
         CppDTensor* reduce_max(const CppDTensor* input, int dim) except +
+        void declare_input(const CppDTensor& input,
+                           const CppKNGraph& definition,
+                           const vector[CppDTensor]& sources) except +
+        bint has_declared_inputs()
         vector[CppKNOperator*] operators
+
+    string declaration_key(const CppKNOperator* op) except +
 
 cdef extern from "cleave/superoptimizer/kernel/element_binary.h" namespace "cleave_superoptimizer::kernel":
     cdef cppclass CppKNElementBinaryOp "cleave_superoptimizer::kernel::KNElementBinaryOp"(CppKNOperator):

@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from ...core.errors import PagingRefusal
-from ...ir.graph import Graph
+from ...ir.graph import ComputeOpNode, Graph
+from ...ir.ops import Matmul
 from .errors import UnsupportedTiling
 from .kinds import (
     MLA_PAGED_DECODE,
@@ -12,6 +13,7 @@ from .kinds import (
     PAGED_DECODE_SLAB,
     PAGED_PREFILL_CAUSAL,
     RAGGED_PREFILL_CAUSAL,
+    REGISTER_P_KINDS,
 )
 from .recognize import read_dense_attention, read_dense_mla
 from .specs import MLASpec
@@ -129,14 +131,45 @@ def paging_accept(spec):
     """A ``search_tiling(accept=...)`` filter: tile the candidate, then ``can_page`` it.
 
     Anything ``apply_tiling`` raises counts as a refusal too, as it would downstream.
+
+    A candidate that steps an absorbed reduction below its extent (a score matmul over
+    part of the head dim, inside the KV loop) is refused as well. ``apply_tiling``
+    schedules that reduction whole, so the candidate is the kernel of the one that steps
+    it whole, which the search proposes too; accepted, it would only take a second
+    top-k slot for the same kernel.
     """
     from ...schedule import apply_tiling
+    from ...schedule.tiling import absorbed_reductions
 
     def accept(cand) -> bool:
+        ops = [n for n in cand.flat_graph.nodes if not n.is_placeholder() and not n.is_output()]
         try:
+            if absorbed_reductions(ops, cand.rstep_map):
+                return False
             tiled = apply_tiling(cand)
         except Exception:  # noqa: BLE001 - a filter answers, it does not stop the search
             return False
         return can_page(tiled, spec)
 
     return accept
+
+
+def stage_as_layer(graph: Graph, spec) -> Graph:
+    """Mark ``graph``'s value matmul the way ``spec``'s layer builds it, before the search.
+
+    The layer rebuilds the kernel around a dense tiling, and outside ``REGISTER_P_KINDS``
+    it stages P through shared for the value matmul (``stage_fragment_operands_in_shared``),
+    which then never reads its A operand from registers. Marked here, the search judges
+    that gemm as the layer emits it: ``TCPolicy._register_operand_layout_conflict`` refuses
+    only a register A operand. Returns ``graph``, marked in place.
+    """
+    if spec.kind in REGISTER_P_KINDS:
+        return graph
+    for node in graph.nodes:
+        if (
+            isinstance(node, Matmul)
+            and not node.transpose_A
+            and isinstance(node.inputs[0].src_node, ComputeOpNode)
+        ):
+            node.stage_fragment_operands_in_shared = (0,)
+    return graph

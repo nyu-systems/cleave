@@ -8,16 +8,16 @@ from cleave.codegen import TilelangCodeGen
 from cleave.ir.graph import GraphNode
 from cleave.schedule import apply_tiling
 from cleave.runtime.compile import CompilerPassOptions, check_code
-from cleave.runtime.validate import Tolerance
 
 from tests._graphs import mla_decode_bhsd_graph
+from tests._tolerances import tolerance_for
 from tests.graph.apply_tiling._test_utils import (
     DTYPE,
     assert_candidate_compiles_and_runs,
     build_tiled_candidate,
 )
 
-STRICT_TOLERANCE = Tolerance(rtol=1e-2, atol=1e-2, equal_nan=False)
+TOLERANCE = tolerance_for(mla_decode_bhsd_graph)
 
 _BASE_RSTEP = {
     "mma_0": {"v3": 128},
@@ -102,7 +102,7 @@ def test_apply_tiling_mla_decode_bhsd(
 
     compiler_pass_options = CompilerPassOptions(mla_decode_pass=True)
     assert_candidate_compiles_and_runs(
-        cand, compiler_pass_options=compiler_pass_options
+        cand, TOLERANCE, compiler_pass_options=compiler_pass_options
     )
 
     graph = apply_tiling(cand)
@@ -114,5 +114,5 @@ def test_apply_tiling_mla_decode_bhsd(
         TilelangCodeGen().gen(graph),
         graph=mla_decode_bhsd_graph(2, 128, 4096, 128, 64),
         dtype=DTYPE,
-        tolerance=STRICT_TOLERANCE,
+        tolerance=TOLERANCE,
     )

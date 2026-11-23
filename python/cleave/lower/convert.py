@@ -31,9 +31,11 @@ def _infer_broadcast_index(dims: Tuple[int, ...], other_shape: Tuple[int, ...]) 
         return -1
     batch_dims = dims[:-2]
     m_dim, n_dim = dims[-2], dims[-1]
-    if tuple(other_shape) == tuple(batch_dims + (m_dim,)):
+    # B is a row vector ``[..., M]`` / ``[..., M, 1]`` or a column vector ``[..., N]`` /
+    # ``[..., 1, N]`` (a keepdim input such as a log-sum-exp keeps its unit axis).
+    if tuple(other_shape) in (batch_dims + (m_dim,), batch_dims + (m_dim, 1)):
         return 0
-    if tuple(other_shape) == tuple(batch_dims + (n_dim,)):
+    if tuple(other_shape) in (batch_dims + (n_dim,), batch_dims + (1, n_dim)):
         return 1
     return -1
 
@@ -269,7 +271,7 @@ class _Ctx:
         return None
 
     def placeholder(self, t: KGTensor) -> PlaceHolderNode:
-        node = PlaceHolderNode(name=f"input_{t.guid}")
+        node = PlaceHolderNode(name=input_name(t.guid))
         shape = self.shape(t)
         dtype = self.dtype if t.dtype is None else str(t.dtype)
         node.set_shape(shape)
@@ -292,6 +294,11 @@ class _Ctx:
         for i, t in enumerate(outputs):
             self.nodes[t.guid] = (node, i)
             self.shapes[t.guid] = tuple(node.get_shape(i))
+
+
+def input_name(guid: int) -> str:
+    """The placeholder name of the kernel-graph input tensor ``guid``."""
+    return f"input_{guid}"
 
 
 Built = Tuple[Optional[object], Sequence[KGTensor]]  # (node or None, the inputs to wire)
@@ -515,4 +522,9 @@ def to_ir(
     if not ctx.outputs:
         raise ValueError("No output nodes found in graph structure.")
     nodes = gather_all_nodes(*ctx.outputs)
-    return Graph(nodes=find_topo_sort([n for n in nodes if n.is_output()]))
+    # The outputs in the structure's order (the Program's): the kernel returns them in this
+    # order. The traversal above finds them in another one when a later output is reached
+    # through a shared input before an earlier one.
+    rank = {id(n): i for i, n in enumerate(ctx.outputs)}
+    outputs = sorted((n for n in nodes if n.is_output()), key=lambda n: rank.get(id(n), len(rank)))
+    return Graph(nodes=find_topo_sort(outputs))

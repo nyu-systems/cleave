@@ -73,6 +73,7 @@ All demos share the same flags (`python demo/<name>.py --help`):
 | `{mha,gqa,mqa}_decode.py` | decode attention, split along `SKV` by default |
 | `mha_decode_exact.py` | decode attention with the exact `exp(s - max(s)) / sum` softmax |
 | `{mha,gqa,mqa,mla}_prefill.py`, `mla_decode.py`, `qknorm.py` | prefill / MLA / QK-norm attention |
+| `mha_backward.py` | attention backward: `dQ, dK, dV` in one fused kernel (declared inputs `L`, `o`) |
 | `staged.py` | the pipeline one stage at a time (research view) |
 
 `demo/dynamic/` holds the paged-KV dynamic-shape demos.
@@ -96,14 +97,19 @@ def matmul(x: cl.Tensor["M", "K"], w: cl.Tensor["K", "N"]):
 
 
 def main():
-    kernel = cleave.compile(matmul, shapes=dict(M=128, N=128, K=4096), dtype=cl.f16, preset="fast")
+    # Every candidate is validated against a torch reference at the tolerance the operator
+    # declares (row-relative; there is no default).
+    tolerance = cl.Tolerance(rtol=5e-3)
+    kernel = cleave.compile(matmul, shapes=dict(M=128, N=128, K=4096), dtype=cl.f16, preset="fast",
+                            tolerance=tolerance)
     print(kernel.report.summary())
 
     # The same compile, stage by stage.
     prog = cleave.trace(matmul, dict(M=128, N=128, K=4096), cl.f16)
     graphs = cleave.superoptimize(prog, cleave.SuperoptConfig(split=("K",)))
     plans = schedule(graphs, cleave.ScheduleConfig(topk=100, split_k=(4, 8, 16)))
-    report = cleave.evaluate(cleave.build(plans, workers=8))
+    report = cleave.evaluate(cleave.build(plans, workers=8,
+                                          config=cleave.EvalConfig(tolerance=tolerance)))
     print(report.table(top=5, by="variant"))
     print(report.best())
 

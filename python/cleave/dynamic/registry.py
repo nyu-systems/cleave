@@ -23,10 +23,36 @@ from .paging import (
 from ..runtime.validate import Tolerance
 from . import workloads as _wl
 
-# The paged/ragged gather kernels reproduce the SOL-ExecBench references far more tightly
-# than the default loose bound (output cosine >= 0.99999, lse error <= 1e-5). ``equal_nan``
-# stays off: an empty causal row is defined as 0 / -inf, so a NaN is a real defect.
-GATHER_TOLERANCE = Tolerance(rtol=0.01, atol=0.01, equal_nan=False)
+
+# The absolute part of every lse bound. It is not measured (no captured row has a zero scale)
+# and it is not an operator's slack: it is what an lse of exactly 0 can be off by, 4 fp32
+# ulps of a sum of 1 in log2 units (4 * 2**-23 / ln 2 = 6.9e-7), rounded up to a 1-2-5 step.
+LSE_ATOL = 1e-6
+
+
+def _tolerance(out_rtol, lse_rtol):
+    """``(out, lse)`` bounds of one operator, each set from its measured error.
+
+    Both are relative to the row. For the bf16 output the row is the head_dim vector of one
+    query row and head, and there is no absolute part: an empty causal row is exactly 0.
+    For the fp32 lse the row is the heads of one query row. Its error grows with its
+    magnitude (measured per operator over |lse| of 2 .. 25: the largest absolute error rises
+    with the row max, the largest relative one stays level, between 2e-7 and 1.6e-6), so an
+    absolute bound sized on one logit scale is wrong on every other: at |lse| = 450 (logits
+    x100) one fp32 ulp is already 3e-5. ``LSE_ATOL`` only keeps a row whose lse is 0 from
+    demanding a bit-exact answer; an empty row's -inf is matched exactly either way.
+
+    ``lse_rtol`` is the next 1-2-5 step at or above 4x the largest row-relative error the
+    operator's valid kernels measured over its captured workloads and three seeds. ``out``
+    follows the same rule at 2x: bf16 has 8 significand bits, so one ulp is 7.8e-3 of the
+    row max, every kernel measures 1 to 1.2 ulps (7.8e-3 .. 9.4e-3), and 4x would be the
+    5e-2 ceiling, looser than the elementwise 0.01 + 0.01|ref| these operators were held to
+    before for any row whose max is above 0.25. 2e-2 is 2.56 ulps.
+    (``python -m tests._measure_tolerances`` re-measures; ``tests/measured_errors.json``
+    is the measurement these values are pinned to.)
+    """
+    return (Tolerance(rtol=out_rtol), Tolerance(rtol=lse_rtol, atol=LSE_ATOL))
+
 
 # The expected kernels are a test contract and stay in the source tree; only a checkout has them.
 EXPECTED_KERNELS_DIR = (
@@ -45,7 +71,10 @@ class DynamicOperator:
     workloads: tuple
     # axes -> (inputs, expected outputs) for one workload.
     reference: Callable = field(repr=False)
-    tolerance: Tolerance = GATHER_TOLERANCE
+    # The declared (out, lse) validation bounds; every operator states its own.
+    tolerance: tuple
+    # (distribution, axes) adversarial workloads; validated on only when asked for.
+    adversarial: tuple = ()
     page_size: int = 1
     scale: float | None = None
 
@@ -57,8 +86,8 @@ class DynamicOperator:
         """(inputs, expected outputs) for every captured workload, built one at a time."""
         return (self.reference(axes) for axes in self.workloads)
 
-    def keyed_workloads(self, *, keep: int = 0):
-        return keyed_workloads(self.name, keep=keep)
+    def keyed_workloads(self, *, keep: int = 0, adversarial: bool = False):
+        return keyed_workloads(self.name, keep=keep, adversarial=adversarial)
 
     def kernel_source(self) -> str:
         """The TileLang the pipeline emits for this operator at its tuned tiling."""
@@ -72,7 +101,7 @@ class DynamicOperator:
         return EXPECTED_KERNELS_DIR / f"{self.name}.py"
 
 
-def _operator(name, spec, tuned_tiling, dims, page_size=1, scale=None) -> DynamicOperator:
+def _operator(name, spec, tuned_tiling, dims, tolerance, page_size=1, scale=None) -> DynamicOperator:
     return DynamicOperator(
         name=name,
         spec=spec,
@@ -80,6 +109,8 @@ def _operator(name, spec, tuned_tiling, dims, page_size=1, scale=None) -> Dynami
         dims=dims,
         workloads=_wl.WORKLOADS[name],
         reference=partial(_wl.case, name, dims=dims, page_size=page_size, scale=scale),
+        tolerance=tolerance,
+        adversarial=_wl.ADVERSARIAL_WORKLOADS[name],
         page_size=page_size,
         scale=scale,
     )
@@ -96,6 +127,7 @@ OPERATORS: dict[str, DynamicOperator] = {
             PagingSpec(num_qo_heads=32, num_kv_heads=8),
             _GQA,
             (32, 8, 128),
+            _tolerance(out_rtol=2e-2, lse_rtol=2e-6),
         ),
         _operator(
             "gqa_paged_decode_h32_kv4_d128_ps1",
@@ -103,6 +135,7 @@ OPERATORS: dict[str, DynamicOperator] = {
             PagingSpec(num_qo_heads=32, num_kv_heads=4, grid_order=("head", "batch")),
             _GQA,
             (32, 4, 128),
+            _tolerance(out_rtol=2e-2, lse_rtol=1e-6),
         ),
         _operator(
             "gqa_paged_decode_h32_kv8_d128_ps64",
@@ -119,6 +152,7 @@ OPERATORS: dict[str, DynamicOperator] = {
             ),
             _GQA,
             (32, 8, 128, 64),
+            _tolerance(out_rtol=2e-2, lse_rtol=2e-6),
             page_size=64,
         ),
         _operator(
@@ -128,12 +162,14 @@ OPERATORS: dict[str, DynamicOperator] = {
             # measured -- the captured requests' causal windows are a handful of tokens.
             _GQA_PREFILL,
             (32, 8, 128),
+            _tolerance(out_rtol=2e-2, lse_rtol=5e-6),
         ),
         _operator(
             "gqa_paged_prefill_causal_h32_kv4_d128_ps1",
             PagingSpec(num_qo_heads=32, num_kv_heads=4, kind=PAGED_PREFILL_CAUSAL, causal=True),
             _GQA_PREFILL,
             (32, 4, 128),
+            _tolerance(out_rtol=2e-2, lse_rtol=5e-6),
         ),
         _operator(
             "gqa_ragged_prefill_causal_h32_kv8_d128",
@@ -150,6 +186,7 @@ OPERATORS: dict[str, DynamicOperator] = {
             ),
             dict(query_rows=64, kv_tile=64, head_dim=128),
             (32, 8, 128),
+            _tolerance(out_rtol=2e-2, lse_rtol=5e-6),
         ),
         _operator(
             "gqa_ragged_prefill_causal_h32_kv4_d128",
@@ -163,6 +200,7 @@ OPERATORS: dict[str, DynamicOperator] = {
             ),
             dict(query_rows=64, kv_tile=64, head_dim=128),
             (32, 4, 128),
+            _tolerance(out_rtol=2e-2, lse_rtol=2e-6),
         ),
         _operator(
             "mla_paged_decode_h16_ckv512_kpe64_ps1",
@@ -171,6 +209,7 @@ OPERATORS: dict[str, DynamicOperator] = {
             MLASpec(num_qo_heads=16),
             dict(query_rows=16, kv_tile=64, n_threads=256, ckv=512, kpe=64),
             (16, 512, 64),
+            _tolerance(out_rtol=2e-2, lse_rtol=5e-6),
             scale=_wl.MLA_SM_SCALE,
         ),
         _operator(
@@ -190,6 +229,7 @@ OPERATORS: dict[str, DynamicOperator] = {
             ),
             dict(query_rows=16, kv_tile=64, n_threads=128, ckv=512, kpe=64),
             (16, 512, 64),
+            _tolerance(out_rtol=2e-2, lse_rtol=1e-5),
             scale=_wl.MLA_SM_SCALE,
         ),
     )
@@ -212,11 +252,13 @@ def workloads(operator):
     return OPERATORS[operator].cases()
 
 
-def keyed_workloads(operator, *, keep: int = 0):
+def keyed_workloads(operator, *, keep: int = 0, adversarial: bool = False):
     """A zero-arg factory yielding ``(workload_key, inputs, reference)``.
 
     ``keep=0`` is every captured workload; ``keep>0`` a stratified sample of that many (a
     prefix would sample only the degenerate shapes, since ``WORKLOADS`` is smallest-first).
+    ``adversarial`` appends the operator's adversarial softmax workloads
+    (``workloads.ADVERSARIAL_WORKLOADS``), keyed ``<workload>@<distribution>``.
     """
     from ..runtime.autotune import sampled, workload_key
 
@@ -227,5 +269,9 @@ def keyed_workloads(operator, *, keep: int = 0):
     def factory():
         for axes in wanted:
             yield (workload_key(axes), *op.reference(axes))
+        if adversarial:
+            for distribution, axes in op.adversarial:
+                yield (f"{workload_key(axes)}@{distribution}",
+                       *op.reference(axes, distribution=distribution))
 
     return factory

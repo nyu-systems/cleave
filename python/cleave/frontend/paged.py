@@ -173,6 +173,9 @@ class PagedProgram:
         return t
 
     def input(self, name: str, spec) -> Tensor:
+        if isinstance(spec, TensorSpec) and (spec.equals is not None or spec.sample is not None):
+            raise SpecError(f"input {name!r}: declared inputs (cl.Equals / cl.Sample) are not "
+                            "supported in paged programs")
         if isinstance(spec, ScalarSpec):
             t = self._rec("scalar", (), [()], spec.dtype or f32, name=name)
         else:
@@ -574,12 +577,16 @@ class DenseBody(Program):
 # ----------------------------------------------------------------------------- workloads
 @dataclasses.dataclass(frozen=True)
 class PagedDecodeWorkloads:
-    """Every ``batch`` x ``samples`` log-spaced KV lengths in ``kv_len`` (ragged below)."""
+    """Every ``batch`` x ``samples`` log-spaced KV lengths in ``kv_len`` (ragged below).
+
+    ``distribution``: ``"normal"``, or an adversarial softmax case (``"large_logits"``,
+    ``"increasing"``; see ``cleave.dynamic.reference.apply_distribution``)."""
 
     batch: tuple = (1, 7, 64)
     kv_len: tuple = (1, 8192)
     samples: int = 3
     seed: int = 0
+    distribution: str = "normal"
 
     def axes(self) -> list[tuple[int, int]]:
         lo, hi = self.kv_len
@@ -607,7 +614,10 @@ class PagedDecodeWorkloads:
                 lens = self.lengths(b, n)
                 pages = sum(-(-x // page) for x in lens)
                 dims = (b, *heads, pages, pages)
-                inputs = reference.gqa_paged_decode_inputs(dims, lens, page_size=page)
+                inputs = reference.apply_distribution(
+                    "gqa_paged_decode",
+                    reference.gqa_paged_decode_inputs(dims, lens, page_size=page),
+                    self.distribution)
                 yield workload_key((b, n)), inputs, reference.gqa_paged_decode_reference(
                     dims, lens, page_size=page)(*inputs)
 

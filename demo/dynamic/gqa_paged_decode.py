@@ -44,8 +44,8 @@ PRESETS = {
     "ps64": dict(PAGE=64, hints=cl.ScheduleHints(grid_order=("head", "batch"), pass_configs={})),
 }
 # Validation/timing uses the registry's captured workloads; --synthetic uses these instead.
+# Either way the bounds are the ones the operator declares in cleave.dynamic.registry.
 WORKLOADS = cl.workloads.paged_decode(batch=(1, 7, 64), kv_len=(1, 8192))
-TOLERANCE = dict(rtol=1e-2, atol=1e-2)
 
 
 def build(preset="kv8"):
@@ -58,8 +58,7 @@ def build(preset="kv8"):
 def main(argv=None, preset=None):
     from demo.dynamic._frontend import main as run_main
 
-    return run_main(__doc__, PRESETS, build, argv, preset or "kv8",
-                    tolerance=cl.Tolerance(**TOLERANCE), synthetic=WORKLOADS)
+    return run_main(__doc__, PRESETS, build, argv, preset or "kv8", synthetic=WORKLOADS)
 
 
 if __name__ == "__main__":

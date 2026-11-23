@@ -3,7 +3,9 @@ from dataclasses import dataclass
 from math import prod
 from typing import Dict, List, Optional, Set
 from tilelang.carver.roller.node import Edge
+from ..core.errors import ScheduleRejected
 from ..ir.graph import (
+    ComputeOpNode,
     Graph,
     OutputNode,
     GraphNode,
@@ -12,9 +14,13 @@ from ..ir.graph import (
     ViewOpNode,
 )
 from ..ir.ops import ReduceSum
+from .policy.hint import INTER, INTRA
 from ..ir.offsets import OffsetTerm, TileOffset, get_offset_lambda
 from ..ir.analysis import (
+    build_output_axis_provenance,
+    build_reduction_axis_provenance,
     infer_output_axis_dependencies,
+    nearest_reductions,
 )
 from ..ir.graph_utils import (
     get_op_ancestors,
@@ -590,14 +596,507 @@ def _normalize_inner_reduction_axes(graph_node: GraphNode, itile_map: dict):
         node.axis_arg = visible_axis
 
 
+def _iterative_reductions(nodes, rstep_map):
+    """The reductions of ``nodes`` that are stepped below their extent."""
+    return [
+        n
+        for n in nodes
+        if len(n.raxis) > 0
+        and n in rstep_map
+        and _get_rstep_for_axis(n, rstep_map[n]) < n.raxis[0].dom.extent
+    ]
+
+
+def absorbed_reductions(nodes, rstep_map):
+    """The reductions of ``nodes`` that ``apply_tiling`` schedules inside another's loop.
+
+    A reduction that iterates (step < extent) while one of its descendant reductions
+    also iterates is absorbed into that descendant's loop (see the merge in
+    ``apply_tiling``). The loop has a single counter, which advances the loop's own
+    axis; it cannot also advance the absorbed reduction's axis. An absorbed reduction
+    is therefore computed over its whole axis in every iteration, whatever its step:
+    the tiling is the kernel of the one that steps it at its extent.
+    """
+    active = _iterative_reductions(nodes, rstep_map)
+    return [
+        a
+        for a in active
+        if any(r is not a and a in get_op_ancestors(r) for r in active)
+    ]
+
+
+def _absorbed_axis_tokens(ordered_nodes, rstep_map):
+    """``(absorbed, pinned tokens, provenance)`` of the absorbed reductions of a tiling.
+
+    Raises ``ScheduleRejected`` for a tiling in which another reduction steps an absorbed
+    reduction's axis: its loop would have to advance an axis that has to stay whole.
+    """
+    absorbed = absorbed_reductions(ordered_nodes, rstep_map)
+    if not absorbed:
+        return absorbed, set(), None
+
+    out_tokens = build_output_axis_provenance(ordered_nodes)
+    red_tokens = build_reduction_axis_provenance(ordered_nodes, out_tokens)
+
+    def axis_tokens(node):
+        tokens = red_tokens.get(node)
+        return tokens[0] if tokens else set()
+
+    # These are refusals, not asserts: without them the tiling would be scheduled into
+    # a kernel that reads the wrong slices, and ``python -O`` drops an assert.
+    pinned = set()
+    for node in absorbed:
+        tokens = axis_tokens(node)
+        if not tokens:
+            raise ScheduleRejected(
+                f"No axis provenance for the reduction axis of {node.name}; cannot tell "
+                "which tensor dims it runs over."
+            )
+        pinned |= tokens
+    for node in _iterative_reductions(ordered_nodes, rstep_map):
+        # Keeping a loop's own axis at block extent would stop the loop from advancing.
+        if node not in absorbed and pinned & axis_tokens(node):
+            raise ScheduleRejected(
+                f"Reduction axis of {node.name} is shared with an absorbed ancestor "
+                "reduction; one loop cannot both advance it and hold it whole."
+            )
+    return absorbed, pinned, out_tokens
+
+
+def _pin_absorbed_reduction_axes(ordered_nodes, rstep_map, tile_map, itile_map):
+    """Iteration tiles with every absorbed reduction axis kept at its block extent.
+
+    Each tensor dim that carries the axis of an absorbed reduction (see
+    ``absorbed_reductions``) keeps its block tile, so ``assign_tensor_map`` does not
+    slice it with the counter of the loop the reduction was absorbed into.
+
+    Raises ``ScheduleRejected`` as ``_absorbed_axis_tokens`` does.
+    """
+    absorbed, pinned, out_tokens = _absorbed_axis_tokens(ordered_nodes, rstep_map)
+    if not absorbed:
+        return itile_map
+
+    itile_map = dict(itile_map)
+    for (node, out_id), dim_tokens in out_tokens.items():
+        if out_id != 0 or node.name not in itile_map:
+            continue
+        tile, itile = tile_map[node.name], list(itile_map[node.name])
+        if len(dim_tokens) != len(itile) or len(tile) != len(itile):
+            continue
+        for dim, tokens in enumerate(dim_tokens):
+            if tokens & pinned:
+                itile[dim] = tile[dim]
+        itile_map[node.name] = itile
+    return itile_map
+
+
+def _merge_into_loop(
+    gnode,
+    new_nodes,
+    existing_placeholders,
+    tile_map,
+    itile_map,
+    node_to_graph,
+    graphs,
+    top_bind_node,
+):
+    """Move ``new_nodes`` (gathered ancestors) into the loop graph of ``gnode``.
+
+    Nodes already in the loop are skipped; ``existing_placeholders`` (outer
+    placeholders the loop already binds) are rewired onto the loop's own placeholders.
+    """
+    new_nodes = [n for n in new_nodes if n not in gnode.graph.nodes]
+    new_nodes = [n for n in new_nodes if n not in existing_placeholders]
+
+    # reconnect existing placeholder nodes
+    # TODO merge this code with assign_placeholder_nodes
+    if existing_placeholders:
+        inner_placeholders_map = {}
+        for n in gnode.graph.nodes:
+            if isinstance(n, PlaceHolderNode):
+                inner_placeholders_map[top_bind_node[n.name].name] = n
+        for ph in existing_placeholders:
+            inner_node = inner_placeholders_map[
+                top_bind_node[ph.name].name
+            ]
+            for edge in list(ph.outputs):
+                if edge.dst_node in new_nodes:
+                    edge.src_node = inner_node
+                    inner_node._out_edges.append(edge)
+                    ph._out_edges.remove(edge)
+
+    # add new nodes to the graph
+    prev_nodes = list(gnode.graph.nodes)
+    gnode.graph.nodes.extend(new_nodes)
+    gnode._assign_placeholder_nodes(skip=prev_nodes)
+    gnode._assign_accum_nodes()
+    assign_tensor_map(
+        gnode,
+        tile_map,
+        itile_map,
+        node_to_graph,
+        graphs,
+        top_bind_node,
+        node_to_graph[gnode.name],
+    )
+    _normalize_inner_reduction_axes(gnode, itile_map)
+
+
+def _reduction_axis_tokens(ops) -> Dict[str, set]:
+    """Source axes (provenance tokens) of each reduction's first axis, by node name.
+
+    Read on the graph as the policy saw it: removing split views loses the provenance.
+    """
+    out_tokens = build_output_axis_provenance(ops)
+    return {
+        node.name: set(tokens[0]) if tokens else set()
+        for node, tokens in build_reduction_axis_provenance(ops, out_tokens).items()
+    }
+
+
+def _check_iterates_with_loop(
+    node, gnode, rstep_map, reduction_axis_tokens, *, shares_nodes
+):
+    """Refuse to merge reduction ``node`` into the loop of ``gnode`` where it cannot run.
+
+    The loop has one counter. An ancestor of the loop's reductions is absorbed (its axis
+    is held whole, see ``_pin_absorbed_reduction_axes``). Any other reduction steps with
+    the counter:
+    - it needs the loop's trip count, or the kernel reads past the shorter axis or
+      covers only part of it (and an input the two share is sliced once, with one
+      step, for both: LoRA's X@W and X@A at different K steps gave TileLang
+      ``T.gemm K shape check failed``); the policy steps such siblings together;
+    - sharing nodes with the loop (whose tiles are sliced along the loop's axis), it
+      must run over that axis, when the provenance of both axes is known.
+    Raises ``ScheduleRejected`` (a second loop in one kernel is not supported by code
+    generation).
+    """
+    loop_reductions = [n for n in gnode.graph.accum_nodes if n.raxis]
+    if any(node in get_op_ancestors(r) for r in loop_reductions):
+        return
+    step = _get_rstep_for_axis(node, rstep_map[node])
+    trips = int(node.raxis[0].dom.extent) // step
+    if trips != int(gnode.graph.extent):
+        raise ScheduleRejected(
+            f"Reduction {node.name} takes {trips} steps of {step} but would join the "
+            f"loop of {gnode.name}, which takes {gnode.graph.extent}."
+        )
+    if shares_nodes:
+        axis_tokens = reduction_axis_tokens()
+        tokens = axis_tokens.get(node.name, set())
+        loop_tokens = set().union(
+            *(axis_tokens.get(r.name, set()) for r in loop_reductions)
+        )
+        if tokens and loop_tokens and not tokens & loop_tokens:
+            raise ScheduleRejected(
+                f"Reduction {node.name} shares nodes with the loop of {gnode.name} but "
+                "runs over another axis; one loop cannot advance both."
+            )
+
+
+def _inter_chains(cand) -> Dict[str, List[str]]:
+    """For each inter output of ``cand``, its node and the nodes down to its reduction.
+
+    Names, top (the node feeding the OutputNode) first, reduction last. The policy only
+    makes an output inter when this chain is single-input and linear.
+    """
+    chains = {}
+    for node, context in getattr(cand, "accumulation", {}).items():
+        if context != INTER:
+            continue
+        chain, n = [node.name], node
+        while not n.raxis:
+            n = n.inputs[0].src_node
+            chain.append(n.name)
+        chains[node.name] = chain
+    return chains
+
+
+def _select_launch_output_node(output_nodes, accumulation):
+    """The canonical output: among the intra outputs when contexts are assigned."""
+    if accumulation:
+        output_nodes = [
+            n
+            for n in output_nodes
+            if accumulation.get(_get_output_binding_node(n).name) == INTRA
+        ]
+    return _select_canonical_output_node(output_nodes)
+
+
+def _inter_output_coord_exprs(canonical_node, output_node, launch_axis_plan):
+    """Launch coordinates of an inter output's block: its batch axes only.
+
+    The block spans every other axis whole (the loop variable selects the iteration's
+    tile inside it), so it has no launch-axis mapping there.
+    """
+    canonical_flags = list(getattr(canonical_node, "is_batch_dim", []) or [])
+    output_flags = list(getattr(output_node, "is_batch_dim", []) or [])
+    canonical_batch = [a for a, is_batch in enumerate(canonical_flags) if is_batch]
+    output_batch = [a for a, is_batch in enumerate(output_flags) if is_batch]
+    if len(canonical_batch) != len(output_batch):
+        raise ScheduleRejected(
+            f"Inter output {output_node.name} does not have the batch axes of the launch."
+        )
+    coord_exprs = [None] * len(output_node.get_shape())
+    for axis, canonical_axis in zip(output_batch, canonical_batch):
+        coord_exprs[axis] = launch_axis_plan.axis_coord_exprs[canonical_axis]
+    return coord_exprs
+
+
+def _join_inter_outputs(
+    cand_rstep_map,
+    accumulation,
+    inter_chains,
+    intra_reductions,
+    graphs,
+    tile_map,
+    itile_map,
+    node_to_graph,
+    top_bind_node,
+    ordered_nodes,
+):
+    """Move every inter output, with its ancestors, into the loop of the intra outputs.
+
+    The inter output's iteration tile then follows the loop counter (``assign_tensor_map``
+    slices its block with it) and the loop graph's ``accumulation`` marks it ``inter``;
+    the main graph's ``accumulation`` gives the context of each ``OutputNode``.
+    """
+    by_name = {n.name: n for n in ordered_nodes}
+    loops = {node_to_graph[name] for name in intra_reductions}
+    gnodes = [
+        n for n in graphs["main"].nodes if isinstance(n, GraphNode) and n.name in loops
+    ]
+    if len(loops) != 1 or len(gnodes) != 1:
+        raise ScheduleRejected(
+            "Inter outputs need the intra outputs to accumulate in exactly one loop; "
+            f"their reductions are in {sorted(loops)}."
+        )
+    (gnode,) = gnodes
+
+    for top_name in inter_chains:
+        lock_graph(gnode.graph)
+        new_nodes = gather_all_nodes(by_name[top_name], descending=False)
+        unlock_graph(gnode.graph)
+        elsewhere = [
+            n.name
+            for n in new_nodes
+            if not isinstance(n, PlaceHolderNode)
+            and n not in gnode.graph.nodes
+            and node_to_graph.get(n.name, "main") != "main"
+        ]
+        if elsewhere:
+            raise ScheduleRejected(
+                f"Inter output {top_name} depends on {elsewhere}, which iterate in "
+                "another loop; nested loops are not supported."
+            )
+        # A loop's finished result (a GraphNode) below the inter output: e.g. delta =
+        # rowsum(P * dP) over SKV, merged into the SKV loop with its sibling dQ, feeding
+        # the inter dK. Each iteration would need the sum of all iterations: a second loop.
+        loop_results = [n.name for n in new_nodes if isinstance(n, GraphNode)]
+        if loop_results:
+            raise ScheduleRejected(
+                f"Inter output {top_name} reads the finished result of {loop_results}; "
+                "it would need a second loop over that axis."
+            )
+        # A reduction below the inter output that steps with the loop counter, without
+        # being absorbed by the intra reductions, would hand it a running partial sum.
+        stepping = [
+            n.name
+            for n in _iterative_reductions(
+                [m for m in new_nodes if not isinstance(m, PlaceHolderNode)], cand_rstep_map
+            )
+            if n.name not in inter_chains[top_name]
+            and n.name not in intra_reductions
+            and not any(n in get_op_ancestors(by_name[r]) for r in intra_reductions)
+        ]
+        if stepping:
+            raise ScheduleRejected(
+                f"Inter output {top_name} reads reductions {stepping} that step with the "
+                "loop; each iteration needs their whole sum."
+            )
+        top_bind_inner_nodes = [
+            top_bind_node[n.name]
+            for n in gnode.graph.nodes
+            if isinstance(n, PlaceHolderNode)
+        ]
+        existing_placeholders = [
+            n
+            for n in new_nodes
+            if isinstance(n, PlaceHolderNode)
+            and top_bind_node[n.name] in top_bind_inner_nodes
+        ]
+        _merge_into_loop(
+            gnode,
+            new_nodes,
+            existing_placeholders,
+            tile_map,
+            itile_map,
+            node_to_graph,
+            graphs,
+            top_bind_node,
+        )
+
+    accum_names = [n.name for n in gnode.graph.accum_nodes]
+    missing = [name for name in inter_chains if name not in accum_names]
+    if missing:
+        raise ScheduleRejected(
+            f"Inter outputs {missing} are also consumed inside the loop; their partial "
+            "sums cannot feed another node."
+        )
+    gnode.graph.accumulation = {
+        n: INTER if n.name in inter_chains else INTRA for n in gnode.graph.accum_nodes
+    }
+    graphs["main"].accumulation = {
+        n: accumulation.get(_get_output_binding_node(n).name, INTRA)
+        for n in graphs["main"].nodes
+        if isinstance(n, OutputNode)
+    }
+
+
+def loop_invariant_nodes(graph: Graph) -> List:
+    """Compute nodes of iterative ``graph`` whose value is the same on every iteration.
+
+    A placeholder is invariant when its tile spans its whole block (``tmap`` has no dim
+    the loop counter slices: the caller loads it once, before the loop). A compute node is
+    invariant when it neither accumulates across iterations nor reads a runtime scalar,
+    its own tile does not follow the counter, and every input is an invariant node of
+    ``graph`` (transitively, so the loop dims of all its sources are absent). Topological
+    order.
+    """
+    def fixed(node):
+        tmap = graph.tmap.get(node)
+        return tmap is not None and tuple(tmap.shape) == tuple(tmap.tile_size)
+
+    skip = set(graph.accum_nodes) | set(graph.prefetch_nodes) | set(graph.window_nodes)
+    invariant, result = set(), []
+    for node in find_topo_sort(graph.nodes):
+        if isinstance(node, PlaceHolderNode):
+            if node in graph.nodes and fixed(node):
+                invariant.add(node)
+            continue
+        if (
+            isinstance(node, ComputeOpNode)
+            and node in graph.nodes
+            and node not in skip
+            and not getattr(node, "scalar_args", ())
+            and getattr(node, "producer_op", None) is None
+            and fixed(node)
+            and node.inputs
+            and all(e.src_node in invariant for e in node.inputs)
+        ):
+            invariant.add(node)
+            result.append(node)
+    return result
+
+
+def _with_token_axis_deps(output_axis_deps, flat_graph, output_node, inter_chains):
+    """``output_axis_deps`` completed, by axis provenance, for every node it misses.
+
+    A dim of such a node depends on canonical axis ``a`` when its source axes meet the
+    axes of ``a``, or the axes an inter reduction sums over where that reduction meets
+    ``a`` (the launch tiles ``a``, so it also tiles the inter reduction's axis).
+    """
+    ops = [n for n in flat_graph.nodes if not n.is_placeholder() and not n.is_output()]
+    out_tokens = build_output_axis_provenance(ops)
+    red_tokens = build_reduction_axis_provenance(ops, out_tokens)
+    canonical = _get_output_binding_node(output_node)
+    by_name = {n.name: n for n in ops}
+    inter_axes = [
+        set().union(*red_tokens.get(by_name[chain[-1]], [set()]))
+        for chain in inter_chains.values()
+    ]
+    axis_classes = []
+    for tokens in out_tokens.get((canonical, 0), []):
+        tokens = set(tokens)
+        for axes in inter_axes:
+            if axes & tokens:
+                tokens |= axes
+        axis_classes.append(tokens)
+    # A dim an inter output keeps and shares with one canonical axis (a batch dim) is
+    # launched with it: its tokens join that axis, so a tensor only the inter output
+    # reads (``exp(x2)`` of ``S^T @ exp(x2)``) gets that axis through its own tokens.
+    for chain in inter_chains.values():
+        for tokens in out_tokens.get((by_name[chain[0]], 0), []):
+            meets = [cls for cls in axis_classes if cls & tokens]
+            if len(meets) == 1:
+                meets[0] |= tokens
+
+    deps = dict(output_axis_deps)
+    for (node, out_id), dim_tokens in out_tokens.items():
+        if out_id != 0 or node.name in deps:
+            continue
+        deps[node.name] = [
+            {a for a, cls in enumerate(axis_classes) if tokens & cls}
+            for tokens in dim_tokens
+        ]
+    return deps
+
+
+def _with_sibling_axis_deps(output_axis_deps, output_nodes, output_node, inter_chains):
+    """``output_axis_deps`` completed for the tensors only an intra sibling output reads.
+
+    A sibling launched with the canonical output (``e @ u`` next to ``e @ v``) has its
+    own ancestors (``u``); their dims depend on the canonical axes the sibling's axes
+    map onto (``_get_same_launch_output_axis_map``). Nodes already mapped through the
+    canonical output keep their dependencies (single-output programs are unchanged).
+    """
+    canonical = _get_output_binding_node(output_node)
+    deps = output_axis_deps
+    for sibling in output_nodes:
+        bound = _get_output_binding_node(sibling)
+        if sibling is output_node or bound.name in inter_chains:
+            continue
+        sibling_deps = infer_output_axis_dependencies(sibling)
+        if all(name in deps for name in sibling_deps):
+            continue
+        try:
+            axis_map = _get_same_launch_output_axis_map(canonical, bound)
+        except NotImplementedError:  # not a same-launch sibling: left as it was
+            continue
+        if deps is output_axis_deps:
+            deps = dict(output_axis_deps)
+        for name, dim_deps in sibling_deps.items():
+            if name in deps:
+                continue
+            deps[name] = [
+                {axis_map[a] for a in axes if 0 <= a < len(axis_map)} for axes in dim_deps
+            ]
+    return deps
+
+
 def apply_tiling(cand: List) -> List[Graph]:
+    # accumulation context per output-feeding node name (empty: every output intra)
+    accumulation = {
+        k.name: v for k, v in (getattr(cand, "accumulation", None) or {}).items()
+    }
+    inter_chains = _inter_chains(cand)
+    inter_chain_nodes = {name for chain in inter_chains.values() for name in chain}
+    flat_ops = [
+        n for n in cand.flat_graph.nodes if not n.is_placeholder() and not n.is_output()
+    ]
+    intra_reductions = [  # names, read before the graph is restructured
+        r.name
+        for n in flat_ops
+        if accumulation.get(n.name) == INTRA
+        for r in nearest_reductions(n, flat_ops)
+    ]
+    # read lazily (only a sibling merge needs it), on the graph before it is restructured
+    reduction_axis_tokens = lambda: _reduction_axis_tokens(flat_ops)  # noqa: E731
     output_nodes = [n for n in cand.flat_graph.nodes if n.is_output()]
-    output_node = _select_canonical_output_node(output_nodes)
+    output_node = _select_launch_output_node(output_nodes, accumulation)
 
     # this needs to be called before any graph modifications
     # to correctly infer output axis dependencies for the
     # original output node
     output_axis_deps = infer_output_axis_dependencies(output_node)
+    output_axis_deps = _with_sibling_axis_deps(
+        output_axis_deps, output_nodes, output_node, inter_chains
+    )
+    if inter_chains:
+        # tensors only an inter output reads are not ancestors of the canonical output
+        output_axis_deps = _with_token_axis_deps(
+            output_axis_deps, cand.flat_graph, output_node, inter_chains
+        )
 
     # remove the split ops and extract the split extent if applicable
     split_extent, flat_graph = _extract_split_extent(cand.flat_graph)
@@ -610,7 +1109,7 @@ def apply_tiling(cand: List) -> List[Graph]:
     ]
     output_nodes = [n for n in graphs["main"].nodes if n.is_output()]
     main_output_nodes = list(output_nodes)
-    output_node = _select_canonical_output_node(output_nodes)
+    output_node = _select_launch_output_node(output_nodes, accumulation)
     node_to_graph, graph_to_node = {
         node.name: "main" for node in gather_all_nodes(*ordered_nodes)
     }, {}
@@ -624,6 +1123,9 @@ def apply_tiling(cand: List) -> List[Graph]:
     # serialization (avoid mutation node issues)
     tile_map = {k.name: v for k, v in cand.tile_map.items()}
     itile_map = {k.name: v for k, v in cand.itile_map.items()}
+    itile_map = _pin_absorbed_reduction_axes(
+        ordered_nodes, cand.rstep_map, tile_map, itile_map
+    )
 
     # set top level threadblock extent and tmap based on the
     # candidate tile and reduction step choices
@@ -653,6 +1155,8 @@ def apply_tiling(cand: List) -> List[Graph]:
     graphs["main"].extent = launch_axis_plan.extent
 
     for node in reversed(ordered_nodes):
+        if node.name in inter_chain_nodes:
+            continue  # joins the intra loop below, after that loop is built
         if (
             len(node.raxis) > 0
             and node in cand.rstep_map
@@ -671,8 +1175,9 @@ def apply_tiling(cand: List) -> List[Graph]:
                     # merge node and its ancestors into an existing graph when
                     # they already share inner nodes/placeholders, even if the
                     # reduction-step choice differs. In that case the existing
-                    # inner graph extent wins and the incompatible candidate
-                    # choice is ignored instead of failing the whole schedule.
+                    # inner graph extent wins. An ancestor of the loop's
+                    # reductions that is merged this way does not iterate at
+                    # all: _pin_absorbed_reduction_axes kept its axis whole.
                     lock_graph(gnode.graph)
                     new_nodes = gather_all_nodes(node, descending=False)
                     unlock_graph(gnode.graph)
@@ -701,43 +1206,25 @@ def apply_tiling(cand: List) -> List[Graph]:
                     ):
                         continue
 
+                    _check_iterates_with_loop(
+                        node,
+                        gnode,
+                        cand.rstep_map,
+                        reduction_axis_tokens,
+                        shares_nodes=bool(shared_inner_nodes),
+                    )
                     found_compatible_graph = True
 
-                    new_nodes = [n for n in new_nodes if n not in gnode.graph.nodes]
-                    new_nodes = [n for n in new_nodes if n not in existing_placeholders]
-
-                    # reconnect existing placeholder nodes
-                    # TODO merge this code with assign_placeholder_nodes
-                    if existing_placeholders:
-                        inner_placeholders_map = {}
-                        for n in gnode.graph.nodes:
-                            if isinstance(n, PlaceHolderNode):
-                                inner_placeholders_map[top_bind_node[n.name].name] = n
-                        for ph in existing_placeholders:
-                            inner_node = inner_placeholders_map[
-                                top_bind_node[ph.name].name
-                            ]
-                            for edge in list(ph.outputs):
-                                if edge.dst_node in new_nodes:
-                                    edge.src_node = inner_node
-                                    inner_node._out_edges.append(edge)
-                                    ph._out_edges.remove(edge)
-
-                    # add new nodes to the graph
-                    prev_nodes = list(gnode.graph.nodes)
-                    gnode.graph.nodes.extend(new_nodes)
-                    gnode._assign_placeholder_nodes(skip=prev_nodes)
-                    gnode._assign_accum_nodes()
-                    assign_tensor_map(
+                    _merge_into_loop(
                         gnode,
+                        new_nodes,
+                        existing_placeholders,
                         tile_map,
                         itile_map,
                         node_to_graph,
                         graphs,
                         top_bind_node,
-                        node_to_graph[gnode.name],
                     )
-                    _normalize_inner_reduction_axes(gnode, itile_map)
 
                     break
 
@@ -780,6 +1267,25 @@ def apply_tiling(cand: List) -> List[Graph]:
                 parent_graph_name,
             )
             _normalize_inner_reduction_axes(graph_node, itile_map)
+
+    if inter_chains:
+        _join_inter_outputs(
+            cand.rstep_map,
+            accumulation,
+            inter_chains,
+            intra_reductions,
+            graphs,
+            tile_map,
+            itile_map,
+            node_to_graph,
+            top_bind_node,
+            ordered_nodes,
+        )
+        # Only kernels with accumulation contexts: there, an op of the dQ side (D =
+        # sum_D(dO * o)) is loop-invariant in the dK/dV loop. Other kernels keep their text.
+        for gnode in graphs["main"].nodes:
+            if isinstance(gnode, GraphNode) and gnode.graph.accumulation:
+                gnode.graph.invariant_nodes = loop_invariant_nodes(gnode.graph)
     lock_graph(graphs["main"])  # graph structure is fixed after this point
 
     graphs["main"].nodes = find_topo_sort(main_output_nodes)
@@ -802,11 +1308,18 @@ def apply_tiling(cand: List) -> List[Graph]:
             bound_node = _get_output_binding_node(node)
             logical_shape = list(bound_node.get_shape())
             logical_tile_size = list(tile_size)
-            axis_map = _get_same_launch_output_axis_map(canonical_output_binding, bound_node)
-            logical_coord_exprs = [
-                launch_axis_plan.axis_coord_exprs[canonical_axis]
-                for canonical_axis in axis_map
-            ]
+            if bound_node.name in inter_chains:
+                logical_coord_exprs = _inter_output_coord_exprs(
+                    canonical_output_binding, bound_node, launch_axis_plan
+                )
+            else:
+                axis_map = _get_same_launch_output_axis_map(
+                    canonical_output_binding, bound_node
+                )
+                logical_coord_exprs = [
+                    launch_axis_plan.axis_coord_exprs[canonical_axis]
+                    for canonical_axis in axis_map
+                ]
 
             physical_shape = logical_shape
             physical_tile_size = logical_tile_size

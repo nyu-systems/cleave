@@ -4,15 +4,20 @@
 Each demo runs as ``__main__`` with ``cleave.examples``' compile stubbed (no search, no GPU).
 """
 
+import json
 import runpy
 import subprocess
 import sys
+import types
 from pathlib import Path
 
 import pytest
 
 import cleave.examples as examples
+from cleave.runtime.validate import Tolerance
 
+from .._measure_tolerances import MEASURED, expected_declaration
+from .._tolerances import CEILING
 from ..frontend.test_trace_equivalence import normalized, spy
 from ._snapshot import SNAPSHOT, record, updating
 
@@ -59,6 +64,7 @@ CASES = [
     *[(f"{v}_prefill", f"{v}_prefill", []) for v in ("mha", "gqa", "mqa", "mla")],
     ("mla_decode", "mla_decode", []),
     ("qknorm", "qknorm", []),
+    ("mha_backward", "mha_backward", []),
 ]
 
 
@@ -84,6 +90,48 @@ def test_every_demo_has_a_case():
     covered = {c[1] for c in CASES}
     assert set(DEMOS) - covered == {"staged", "mha_decode_exact"}
     assert {c[0] for c in CASES} == set(SNAPSHOT["demos"])
+
+
+def _assert_declared(config, name):
+    """One measured bound for the operator (or one per output), within the ceiling; normal
+    inputs only."""
+    tolerance = config.tolerance
+    per_output = (tolerance,) if isinstance(tolerance, Tolerance) else tolerance
+    assert isinstance(per_output, tuple) and per_output, "the demo declares no tolerance"
+    for t in per_output:
+        assert isinstance(t, Tolerance) and 0 < t.rtol <= CEILING and t.atol == 0
+    # ... and exactly the one(s) the rule gives for the pinned measurement of this demo
+    outputs = json.loads(MEASURED.read_text())[f"demo:{name}"]
+    assert tolerance == expected_declaration(tolerance, outputs)
+    # the adversarial input distributions exist but are not switched on for any operator yet
+    assert config.distributions == ("normal",)
+
+
+@pytest.mark.parametrize("name", [d for d in DEMOS if d != "staged"])
+def test_demo_declares_its_own_tolerance(monkeypatch, name):
+    # There is no default bound to fall back to: a demo without one cannot validate.
+    _assert_declared(run_demo(monkeypatch, name, [])["ev"], name)
+
+
+def test_staged_demo_declares_its_own_tolerance(monkeypatch):
+    import cleave.pipeline as pipeline
+
+    seen = {}
+
+    def fake_build(plans, workers=None, *, config=None):
+        seen["config"] = config
+        raise _Stop
+
+    monkeypatch.setattr(pipeline, "superoptimize", lambda program, config=None: "graphs")
+    monkeypatch.setattr(pipeline, "schedule",
+                        lambda graphs, config=None: types.SimpleNamespace(summary=lambda: ""))
+    monkeypatch.setattr(pipeline, "build", fake_build)
+    monkeypatch.setattr(sys, "argv", [str(DEMO / "staged.py")])
+    monkeypatch.syspath_prepend(str(DEMO))
+    with pytest.raises(_Stop):
+        runpy.run_path(str(DEMO / "staged.py"), run_name="__main__")
+    _assert_declared(seen["config"], "staged")
+    assert (seen["config"].warmup, seen["config"].iters) == (16, 1000)
 
 
 def test_mha_decode_exact_config(monkeypatch):

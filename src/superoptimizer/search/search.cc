@@ -17,6 +17,7 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <numeric>
 #include <thread>
 
 namespace cleave_superoptimizer {
@@ -83,7 +84,7 @@ std::vector<typename GraphType::TensorType>
   std::vector<typename GraphType::TensorType> output_tensors;
   for (auto const &op : g.operators) {
     for (auto const &tensor : op->output_tensors) {
-      if (get_num_consumers(g, tensor) == 0) {
+      if (get_num_consumers(g, tensor) == 0 && !is_declared_input(op)) {
         output_tensors.push_back(tensor);
       }
     }
@@ -204,6 +205,7 @@ void KernelGraphGenerator::generate_next_operator(
     return;
   }
   std::vector<DTensor> all_tensors = get_all_tensors(*c.kn_graph);
+  int branch = 0; // index of the next child state, in enumeration order
   for (type::KNOperatorType op_type : dim_strategy.get_knop_cand()) {
     CSO_VLOG(2) << std::string(depth * 2, ' ')
                 << "trying knop " << static_cast<int>(op_type)
@@ -250,9 +252,11 @@ void KernelGraphGenerator::generate_next_operator(
 
       if (new_op) {
         c.kn_graph->operators.push_back(new_op);
+        c.path.push_back(branch++);
         if (depth < max_depth) {
           num_tasks++;
-          SearchContext c_tmp{std::shared_ptr<kernel::Graph>(c.kn_graph->clone())};
+          SearchContext c_tmp{std::shared_ptr<kernel::Graph>(c.kn_graph->clone()),
+                              c.path};
 #pragma omp task
           {
             try {
@@ -264,6 +268,7 @@ void KernelGraphGenerator::generate_next_operator(
         } else {
           generate_next_operator(c, verify, depth + 1);
         }
+        c.path.pop_back();
         delete c.kn_graph->operators.back();
         c.kn_graph->operators.pop_back();
       }
@@ -291,8 +296,11 @@ void KernelGraphGenerator::generate_next_operator(
             continue;
           }
           if (spec.input_pattern &&
-              input_patterns[0]->to_string() !=
-                  spec.input_pattern->to_string()) {
+              (has_declared_inputs
+                   ? ac_canonical_string(*input_patterns[0]) !=
+                         spec.input_canonical
+                   : input_patterns[0]->to_string() !=
+                         spec.input_pattern->to_string())) {
             continue;
           }
           std::shared_ptr<AbstractExpr> pattern =
@@ -310,9 +318,11 @@ void KernelGraphGenerator::generate_next_operator(
             continue;
           }
           c.kn_graph->operators.push_back(scalar_op);
+          c.path.push_back(branch++);
           if (depth < max_depth) {
             num_tasks++;
-            SearchContext c_tmp{std::shared_ptr<kernel::Graph>(c.kn_graph->clone())};
+            SearchContext c_tmp{std::shared_ptr<kernel::Graph>(c.kn_graph->clone()),
+                                c.path};
 #pragma omp task
             {
               try {
@@ -324,6 +334,7 @@ void KernelGraphGenerator::generate_next_operator(
           } else {
             generate_next_operator(c, verify, depth + 1);
           }
+          c.path.pop_back();
           delete c.kn_graph->operators.back();
           c.kn_graph->operators.pop_back();
         }
@@ -346,8 +357,10 @@ void KernelGraphGenerator::generate_kernel_graphs() {
   c.kn_graph = std::make_shared<kernel::Graph>();
 
   for (auto const &input_attr : computation_graph_input_attrs) {
-    auto [dim, can_reduce, can_split, dtype] = input_attr;
+    auto [dim, can_reduce, can_split, dtype, declaration] = input_attr;
     c.kn_graph->new_input(dim, can_reduce, can_split, dtype);
+    static_cast<kernel::KNInputOp *>(c.kn_graph->operators.back())
+        ->declaration = declaration;
   }
 
   CSO_LOG(INFO) << "[Search] Starting kernel graph generation with "
@@ -360,7 +373,7 @@ void KernelGraphGenerator::generate_kernel_graphs() {
         generate_next_operator(
             c,
             [this](SearchContext const &c) {
-              return this->verify(*c.kn_graph);
+              return this->verify(*c.kn_graph, c.path);
             },
             0);
       } catch (...) {
@@ -374,6 +387,7 @@ void KernelGraphGenerator::generate_kernel_graphs() {
 
   CSO_LOG(INFO) << "[Search] Generated " << num_tasks.load() << " tasks";
 
+  sort_generated_graphs();
   save_results();
 
   CSO_LOG(INFO) << "[Search] Finished kernel graph generation in "
@@ -398,7 +412,17 @@ void KernelGraphGenerator::preprocess(kernel::Graph const &computation_graph) {
                      op->output_tensors[0].can_reduce),
            to_vector(op->output_tensors[0].num_dims,
                      op->output_tensors[0].can_split),
-           op->output_tensors[0].dtype});
+           op->output_tensors[0].dtype,
+           static_cast<kernel::KNInputOp const *>(op)->declaration});
+    }
+  }
+  has_declared_inputs = computation_graph.has_declared_inputs();
+  if (has_declared_inputs) {
+    bool declared_seen = false;
+    for (kernel::KNInputOp const *op : computation_graph.input_ops()) {
+      CSO_REQUIRE(op->declaration || !declared_seen, std::invalid_argument,
+                  "declared inputs must be the last inputs of the graph");
+      declared_seen = declared_seen || op->declaration != nullptr;
     }
   }
 
@@ -410,6 +434,10 @@ void KernelGraphGenerator::preprocess(kernel::Graph const &computation_graph) {
     if (op->op_type == type::KNOperatorType::KN_OUTPUT_OP) {
       computation_graph_output_patterns.push_back(
           computation_graph_patterns.at(op->input_tensors[0].guid));
+      if (has_declared_inputs) {
+        computation_graph_output_subterms.emplace_back(
+            *computation_graph_output_patterns.back());
+      }
     }
   }
 
@@ -427,16 +455,22 @@ void KernelGraphGenerator::preprocess(kernel::Graph const &computation_graph) {
               spec.scalar == bin_op->scalar &&
               spec.scalar_on_left == bin_op->scalar_on_left &&
               spec.input_pattern &&
-              spec.input_pattern->to_string() == input_pattern->to_string()) {
+              (has_declared_inputs
+                   ? spec.input_canonical == ac_canonical_string(*input_pattern)
+                   : spec.input_pattern->to_string() ==
+                         input_pattern->to_string())) {
             seen = true;
             break;
           }
         }
         if (!seen) {
-          scalar_binary_specs.push_back({op->op_type,
-                                         bin_op->scalar,
-                                         bin_op->scalar_on_left,
-                                         input_pattern});
+          scalar_binary_specs.push_back(
+              {op->op_type,
+               bin_op->scalar,
+               bin_op->scalar_on_left,
+               input_pattern,
+               has_declared_inputs ? ac_canonical_string(*input_pattern)
+                                   : std::string()});
         }
       }
     }
@@ -467,18 +501,27 @@ bool KernelGraphGenerator::check_pattern(
       break;
     }
   }
+  // A declared input's substituted pattern nests reductions in other orders
+  // than the target's: Z3 often gives up on those (dO * sum_SKV(P * v) in
+  // sum_SKV(P * sum_D(dO * v))). Programs with declared inputs only.
+  for (size_t i = 0; !result && i < computation_graph_output_subterms.size();
+       i++) {
+    result = computation_graph_output_subterms[i].contains_subpattern(*pattern);
+  }
   std::unique_lock<std::shared_mutex> lock(seen_patterns_mutex);
   seen_patterns[key] = result;
   return result;
 }
 
-bool KernelGraphGenerator::verify(kernel::Graph &g) {
+bool KernelGraphGenerator::verify(kernel::Graph &g,
+                                  std::vector<int> const &path) {
   std::vector<DTensor> outputs = get_output_tensors(g);
 
     auto save_graph = [&]() {
 #pragma omp critical
       { 
         generated_graphs.push_back(json(g)); 
+        generated_graph_paths.push_back(path);
         _on_valid_graph();
       }
     };
@@ -542,6 +585,28 @@ bool KernelGraphGenerator::verify(kernel::Graph &g) {
   }
 
   return false;
+}
+
+// The tasks finish in any order, so generated_graphs is in completion order
+// and differs from run to run. Put it in depth-first order of the search tree
+// (each state's branches in enumeration order): the list then depends neither
+// on the thread count nor on timing, and a search returns it every time.
+void KernelGraphGenerator::sort_generated_graphs() {
+  std::vector<size_t> order(generated_graphs.size());
+  std::iota(order.begin(), order.end(), size_t{0});
+  std::stable_sort(order.begin(), order.end(), [this](size_t a, size_t b) {
+    return generated_graph_paths[a] < generated_graph_paths[b];
+  });
+  std::vector<json> graphs;
+  std::vector<std::vector<int>> paths;
+  graphs.reserve(order.size());
+  paths.reserve(order.size());
+  for (size_t i : order) {
+    graphs.push_back(std::move(generated_graphs[i]));
+    paths.push_back(std::move(generated_graph_paths[i]));
+  }
+  generated_graphs = std::move(graphs);
+  generated_graph_paths = std::move(paths);
 }
 
 void KernelGraphGenerator::save_results() const {

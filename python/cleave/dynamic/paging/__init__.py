@@ -5,7 +5,7 @@ softmax, runtime trip counts, symbolic grid). The KV proxy extent does not survi
 """
 
 from .apply import apply_paging, apply_paging_split, build_split_decode
-from .constraints import can_page, paging_accept
+from .constraints import can_page, paging_accept, stage_as_layer
 from .errors import InvalidSpec, NotDenseAttention, PagingRefusal, UnsupportedTiling
 from .kinds import (
     CAUSAL_KINDS,
@@ -20,6 +20,7 @@ from .kinds import (
     PARTIAL_ROWSUM,
     PARTIAL_VALUE,
     RAGGED_PREFILL_CAUSAL,
+    REGISTER_P_KINDS,
     SLAB_KINDS,
     SPLIT_KINDS,
 )
@@ -51,6 +52,7 @@ __all__ = [
     "PARTIAL_ROWSUM",
     "PARTIAL_VALUE",
     "RAGGED_PREFILL_CAUSAL",
+    "REGISTER_P_KINDS",
     "SLAB_KINDS",
     "SPLIT_KINDS",
     "CombineTiling",
@@ -73,4 +75,5 @@ __all__ = [
     "read_dense_mla",
     "read_dense_mla_partial",
     "read_dense_partial",
+    "stage_as_layer",
 ]

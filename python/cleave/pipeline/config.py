@@ -27,11 +27,24 @@ class SuperoptConfig(_Replace):
     split: tuple[str, ...] = ()
     concat_matmul: bool = False
     cache: bool = True
+    # Search each output on its own (``Program.for_output``) and merge one graph per output
+    # (pipeline/superopt.py). "auto": iff the program has an ``equals=`` input and more than
+    # one output; every other program is searched whole, as before.
+    per_output: bool | Literal["auto"] = "auto"
 
     def __post_init__(self):
         object.__setattr__(self, "split", split_names(self.split))
+        if self.per_output not in ("auto", True, False):
+            raise SpecError(f"per_output must be 'auto', True or False, got {self.per_output!r}")
         if self.max_ops != "auto" and (not isinstance(self.max_ops, int) or self.max_ops < 1):
             raise SpecError(f"max_ops must be 'auto' or a positive int, got {self.max_ops!r}")
+
+    def resolve_per_output(self, program) -> bool:
+        if self.per_output != "auto":
+            return bool(self.per_output)
+        declared = any(getattr(s, "equals", None) is not None
+                       for s in getattr(program, "inputs", ()))
+        return declared and len(getattr(program, "outputs", ())) > 1
 
     def resolve_max_ops(self, program) -> int:
         if self.max_ops != "auto":
@@ -63,9 +76,21 @@ class ScheduleConfig(_Replace):
 class EvalConfig(_Replace):
     warmup: int = 16
     iters: int = 1000
-    tolerance: Any = None  # cleave.runtime.validate.Tolerance; None -> runtime default
+    # The operator's declared bound: a cleave.lang.Tolerance for every output, or one per
+    # output when every plan has that many (a split partial has more outputs than its combine
+    # and the solo plans, so a split program declares one). There is no default; building
+    # kernels without one is an error.
+    tolerance: Any = None
     max_parallel: int = 8
     timeout_s: float | None = None  # None -> Settings.compile_timeout_secs
+    # Input distributions every candidate is validated on (cleave.runtime.inputs.DISTRIBUTIONS);
+    # it is timed on the first.
+    distributions: tuple[str, ...] = ("normal",)
+
+    def __post_init__(self):
+        names = self.distributions
+        object.__setattr__(self, "distributions",
+                           (names,) if isinstance(names, str) else tuple(names))
 
 
 @dataclass(frozen=True)

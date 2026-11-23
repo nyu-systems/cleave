@@ -2,6 +2,7 @@ import tilelang.language as T
 
 from tests._graphs import matmul_rowsum_graph
 from cleave.runtime.compile import compile_and_run_prim_func
+from tests._tolerances import tolerance_for
 
 DTYPE = "float16"
 
@@ -72,7 +73,8 @@ def _run_matmul_rowsum(dims):
         threads=128,
     )
     compile_and_run_prim_func(
-        func, graph=matmul_rowsum_graph(M, N, K), dtype=DTYPE
+        func, graph=matmul_rowsum_graph(M, N, K), dtype=DTYPE,
+        tolerance=tolerance_for(matmul_rowsum_graph),
     )
 
 

@@ -6,7 +6,7 @@ import dataclasses
 import time
 from typing import Callable
 
-from ..core.errors import CleaveError
+from ..core.errors import CleaveError, SpecError
 from . import cache
 from .build import build, evaluate
 from ..frontend.tensor import as_dtype, split_names
@@ -66,17 +66,26 @@ def _kernel_key(program, so: SuperoptConfig, sc: ScheduleConfig, ev: EvalConfig)
 
     # names are not in the fingerprint but are baked into the Kernel's call signature
     names = [[s.name for s in program.inputs], [o.name for o in program.outputs]]
-    return cache.digest("kernel", program.fingerprint(), names, so.resolve_max_ops(program),
-                        fields(so, "threads", "cache", "max_ops"), fields(sc),
-                        fields(ev, "max_parallel", "timeout_s"))
+    # per_output enters only where it is on: every other program keeps its key
+    per_output = ["per_output"] if so.resolve_per_output(program) else []
+    return cache.digest("kernel", cache.VALIDATION, program.fingerprint(), names,
+                        so.resolve_max_ops(program),
+                        fields(so, "threads", "cache", "max_ops", "per_output"),
+                        fields(sc), fields(ev, "max_parallel", "timeout_s"), *per_output)
 
 
 def compile(fn_or_program, *, shapes: dict | None = None, dtype=None, preset="default",
             superopt: SuperoptConfig | None = None, schedule: ScheduleConfig | None = None,
             eval: EvalConfig | None = None, split=None, cache_kernels: bool | None = None,
-            progress: Callable[[str, object], None] | None = None, **paged_options) -> Kernel:
+            tolerance=None, progress: Callable[[str, object], None] | None = None,
+            **paged_options) -> Kernel:
     """Compile a traced function or ``Program`` to its fastest validated kernel.
 
+    ``tolerance``: the bound every candidate is validated at, a ``cl.Tolerance`` or one per
+    output (also ``@cleave.jit(tolerance=...)`` or ``EvalConfig.tolerance``). One per output
+    needs every plan to have that many outputs, so a program with split plans declares a
+    single one. There is no default: a dense program must declare one; a paged program
+    without one uses its registry operator's.
     ``split``: dim name / ``cl.Split`` / tuple; ``None``: the Program's own, ``False``: off.
     ``cache_kernels`` (default ``superopt.cache``) reuses a saved kernel. Paged programs go to
     ``pipeline.dynamic.compile_dynamic`` (``hints``, ``workloads``, ...).
@@ -91,7 +100,9 @@ def compile(fn_or_program, *, shapes: dict | None = None, dtype=None, preset="de
         superopt = superopt or opts.pop("superopt", None)
         schedule = schedule or opts.pop("schedule", None)
         eval = eval or opts.pop("eval", None)
-        for k in ("preset", "superopt", "schedule", "eval"):
+        if tolerance is None:
+            tolerance = opts.pop("tolerance", None)
+        for k in ("preset", "superopt", "schedule", "eval", "tolerance"):
             opts.pop(k, None)
         paged_options = {**opts, **paged_options}
         if split is None:
@@ -100,13 +111,20 @@ def compile(fn_or_program, *, shapes: dict | None = None, dtype=None, preset="de
         from .dynamic import compile_dynamic
 
         return compile_dynamic(fn_or_program, dtype=dtype, preset=preset, superopt=superopt,
-                               schedule=schedule, eval=eval, split=split, progress=progress,
-                               **paged_options)
+                               schedule=schedule, eval=eval, split=split, tolerance=tolerance,
+                               progress=progress, **paged_options)
     if paged_options:
         raise TypeError(f"compile() got unexpected options {sorted(paged_options)}")
     program = as_program(fn_or_program, shapes, dtype)
     so, sc, ev = resolve_configs(program, preset=preset, superopt=superopt, schedule=schedule,
                                  eval=eval, split=split)
+    if tolerance is not None:
+        ev = ev.replace(tolerance=tolerance)
+    if ev.tolerance is None:
+        raise SpecError(
+            f"{getattr(program, 'name', 'program')}: no validation tolerance declared; there "
+            "is no default bound. Pass tolerance=cl.Tolerance(rtol=...) (or one per output), "
+            "set from the operator's measured error")
     use_cache = so.cache if cache_kernels is None else cache_kernels
     note = progress or (lambda stage, value: None)
     kdir = cache.kernel_dir(getattr(program, "name", "kernel"), _kernel_key(program, so, sc, ev))

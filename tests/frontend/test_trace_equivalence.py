@@ -11,7 +11,7 @@ from cleave.superoptimizer.core import DTensor
 from ..demo._snapshot import SNAPSHOT, record, updating
 from . import _programs as P
 
-_METHODS = ("create_tiled_input", "create_tiled_output", "matmul", "add", "mul", "div", "exp",
+_METHODS = ("create_tiled_input", "create_tiled_output", "matmul", "add", "sub", "mul", "div", "exp",
             "sqrt", "silu", "reduce_sum")
 
 

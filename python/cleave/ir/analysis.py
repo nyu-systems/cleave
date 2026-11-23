@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Set, Tuple
+from dataclasses import dataclass
+from typing import Dict, FrozenSet, List, Optional, Set, Tuple
 
-from .graph import OutputNode
+from .graph import OutputNode, PlaceHolderNode
 from tvm import tirx  # after ..graph: tilelang puts tvm on sys.path
 from .ops import (
     Add,
@@ -372,3 +373,144 @@ def build_reduction_axis_provenance(ordered_nodes, output_axis_provenance):
         reduction_axis_provenance[node] = axis_tokens
 
     return reduction_axis_provenance
+
+
+@dataclass(frozen=True)
+class ReductionGroup:
+    """Outputs that accumulate over the same reduction axis.
+
+    ``outputs`` are the nodes that feed an ``OutputNode`` (in the order given),
+    ``reductions`` the nearest reduction of each (the one that sums into it), and
+    ``axis_tokens`` the source axes those reductions run over (provenance tokens).
+    """
+
+    outputs: Tuple[object, ...]
+    reductions: Tuple[object, ...]
+    axis_tokens: FrozenSet[Tuple[int, int, int]]
+
+
+def nearest_reductions(node, ordered_nodes) -> List[object]:
+    """The reductions reached from ``node`` (itself included) through non-reductions."""
+    members = set(ordered_nodes)
+    found, seen, stack = [], set(), [node]
+    while stack:
+        n = stack.pop()
+        if n in seen or n not in members:
+            continue
+        seen.add(n)
+        if n.raxis:
+            found.append(n)
+            continue
+        stack.extend(edge.src_node for edge in n.inputs)
+    return [n for n in ordered_nodes if n in found]
+
+
+def find_orthogonal_reduction_groups(
+    ordered_nodes,
+    output_nodes,
+    output_axis_provenance,
+    reduction_axis_provenance,
+) -> List[ReductionGroup]:
+    """The outputs partitioned into reduction groups over orthogonal axes, or ``[]``.
+
+    Each output sums over the axes of its nearest reductions; outputs whose axes
+    overlap form one group. Two groups are orthogonal when each sums over an axis the
+    other keeps as an output axis (attention backward: dK, dV sum over SQ and keep
+    SKV; dQ sums over SKV and keeps SQ). One CTA can then hold only one group's output
+    tile still while it loops over the other axis.
+
+    Returns ``[]`` (the feature is inactive) unless there are at least two groups, every
+    output has a reduction with known axes, and every pair of groups is orthogonal.
+    """
+    if len(output_nodes) < 2:
+        return []
+
+    def red_tokens(node):
+        tokens = set()
+        for axis_tokens in reduction_axis_provenance.get(node, []):
+            tokens |= axis_tokens
+        return tokens
+
+    def out_tokens(node):
+        tokens = set()
+        for axis_tokens in output_axis_provenance.get((node, 0), []):
+            tokens |= axis_tokens
+        return tokens
+
+    per_output = []
+    for out in output_nodes:
+        reductions = nearest_reductions(out, ordered_nodes)
+        tokens = set()
+        for r in reductions:
+            tokens |= red_tokens(r)
+        if not reductions or not tokens:
+            return []
+        per_output.append((out, reductions, tokens))
+
+    # outputs whose reduction axes overlap accumulate over the same loop
+    parent = list(range(len(per_output)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in range(len(per_output)):
+        for j in range(i + 1, len(per_output)):
+            if per_output[i][2] & per_output[j][2]:
+                parent[find(j)] = find(i)
+
+    members: Dict[int, List[int]] = {}
+    for i in range(len(per_output)):
+        members.setdefault(find(i), []).append(i)
+    if len(members) < 2:
+        return []
+
+    groups = []
+    for idx in members.values():
+        reductions = []
+        for i in idx:
+            reductions += [r for r in per_output[i][1] if r not in reductions]
+        groups.append(
+            ReductionGroup(
+                outputs=tuple(per_output[i][0] for i in idx),
+                reductions=tuple(reductions),
+                axis_tokens=frozenset().union(*(per_output[i][2] for i in idx)),
+            )
+        )
+
+    kept = [frozenset().union(*(out_tokens(o) for o in g.outputs)) for g in groups]
+    for a in range(len(groups)):
+        for b in range(a + 1, len(groups)):
+            if not (groups[a].axis_tokens & kept[b] and groups[b].axis_tokens & kept[a]):
+                return []
+    return groups
+
+
+def is_mla_value_gemm(node) -> bool:
+    """The value gemm ``exp(...) @ kv`` of MLA decode, whose kv also feeds the score gemm.
+
+    ``annotate_mla_accumulation_layout_conflict`` stages its softmax operand through shared.
+    """
+    if not isinstance(node, Matmul) or len(node.inputs) != 2:
+        return False
+    lhs_node = node.inputs[0].src_node
+    rhs_node = node.inputs[1].src_node
+    if not isinstance(lhs_node, Exp) or not isinstance(rhs_node, PlaceHolderNode):
+        return False
+    if not any(isinstance(edge.dst_node, ReduceSum) for edge in lhs_node.outputs):
+        return False
+    worklist = [edge.src_node for edge in lhs_node.inputs]
+    visited = set()
+    while worklist:
+        cur_node = worklist.pop()
+        cur_node_id = id(cur_node)
+        if cur_node_id in visited:
+            continue
+        visited.add(cur_node_id)
+        if isinstance(cur_node, Matmul) and len(cur_node.inputs) == 2:
+            if cur_node.transpose_B and cur_node.inputs[1].src_node is rhs_node:
+                return True
+        worklist.extend(edge.src_node for edge in getattr(cur_node, "inputs", []))
+    return False

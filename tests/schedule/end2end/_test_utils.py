@@ -16,19 +16,21 @@ def run_end2end_candidates(
     dtype: str,
     *,
     min_success: int,
+    tolerance,
     log: bool = True,
     compiler_pass_options: CompilerPassOptions | None = None,
 ):
     """Compile/validate scheduled candidates and assert a minimum success count.
 
     Correctness is checked by the graph executor against ``candidates[0].flat_graph``
-    (the pre-tiling source graph), so no ``op_name``/``dims`` are needed.
+    (the pre-tiling source graph), so no ``op_name``/``dims`` are needed; ``tolerance`` is
+    the bound the operator declares.
     """
     log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "log", name)
     if os.path.exists(log_dir):
         shutil.rmtree(log_dir)
 
-    results = run_candidates(candidates, dtype, max_parallel=MAX_PARALLEL,
+    results = run_candidates(candidates, dtype, max_parallel=MAX_PARALLEL, tolerance=tolerance,
                              compiler_pass_options=compiler_pass_options)
     ok = [r for r in results if r.ok]
     failed = [r for r in results if not r.ok]
@@ -49,6 +51,7 @@ def run_end2end_candidates(
             for i, r in enumerate(ok):
                 f.write(f"--- Success {i + 1} ---\n")
                 f.write(f"RStep Map: {r.cand.rstep_map}\nOutput tile: {r.cand.output_tile}\n")
+                f.write(f"Measured error: {r.measured}\n")
                 f.write(f"Candidate:\n{r.cand}\n\nTilelang Code:\n{r.code}\n\nCUDA Code:\n{r.cuda_src}\n\n")
 
     assert len(ok) >= min_success, (

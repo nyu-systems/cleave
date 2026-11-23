@@ -96,10 +96,17 @@ KNInputOp::KNInputOp(Graph *_graph,
 KNInputOp::~KNInputOp() {}
 
 KNInputOp::operator json() const {
-  return json{{"op_type", op_type},
-              {"input_map", input_map},
-              {"input_tensors", input_tensors},
-              {"output_tensors", output_tensors}};
+  json j{{"op_type", op_type},
+         {"input_map", input_map},
+         {"input_tensors", input_tensors},
+         {"output_tensors", output_tensors}};
+  if (declaration) {
+    json definition;
+    to_json(definition, *declaration->definition);
+    j["declaration"] = json{{"sources", declaration->sources},
+                            {"definition", definition}};
+  }
+  return j;
 }
 
 } // namespace kernel

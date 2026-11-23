@@ -50,9 +50,10 @@ def build_tiled_candidate(main_graph, output_tile, rstep_by_name):
     return cand
 
 
-def assert_candidate_compiles_and_runs(cand, *, compiler_pass_options=None):
+def assert_candidate_compiles_and_runs(cand, tolerance, *, compiler_pass_options=None):
     """Compile+run the single candidate through the graph-executor correctness path.
 
+    ``tolerance`` is the bound the operator declares (``tests/_tolerances.py``).
     ``compiler_pass_options`` forwards op-specific compiler passes (e.g. MLA decode
     needs ``CompilerPassOptions(mla_decode_pass=True)``); the default suits every
     other op.
@@ -61,5 +62,6 @@ def assert_candidate_compiles_and_runs(cand, *, compiler_pass_options=None):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required to compile and run candidates.")
 
-    (result,) = run_candidates([cand], DTYPE, max_parallel=1, compiler_pass_options=compiler_pass_options)
+    (result,) = run_candidates([cand], DTYPE, max_parallel=1, tolerance=tolerance,
+                               compiler_pass_options=compiler_pass_options)
     assert result.ok, f"Candidate failed to compile/run: {result.error}"

@@ -18,6 +18,11 @@ def sqrt(x):
     return x.sqrt() if _traced(x) else __import__("torch").sqrt(x)
 
 
+def log(x):
+    """Natural log; traced, it is reference-only (a ``cl.Sample`` fn), never lowered to a kernel."""
+    return x.log() if _traced(x) else __import__("torch").log(x)
+
+
 def silu(x):
     return x.silu() if _traced(x) else __import__("torch").nn.functional.silu(x)
 

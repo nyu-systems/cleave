@@ -6,25 +6,66 @@ from ..ir.graph import (
     ComputeOpNode,
     ViewOpNode,
 )
+from ..ir.analysis import is_mla_value_gemm
 from ..ir.graph_utils import find_topo_sort
 from ..ir.ops import Div, Exp, Matmul, ReduceSum
+from ..ir.ops.elementwise import BinaryElementwise
 
 
 # TODO: have all levels of the graph with OutputNode (this should make this function smoother)
 def annotate_args(graph: Graph, is_main: bool = False) -> Graph:
+    # The kernel's outputs are its trailing parameters (``graph_out_indices``): an output
+    # stored straight from the main graph (no reduction loop around it) can come before
+    # a placeholder in topological order, so outputs go after every placeholder.
+    outputs = []
     for node in find_topo_sort(graph.nodes):
         if is_main:
             if isinstance(node, PlaceHolderNode):
                 graph.args.append(node)
             elif isinstance(node, OutputNode):
-                graph.args.append(node)
+                outputs.append(node)
         if isinstance(node, GraphNode):
             in_args = [i.src_node for i in node.inputs]
             # TODO: output nodes
             node.graph.args.extend(in_args)
             annotate_args(node.graph, is_main=False)
-
+    graph.args.extend(outputs)
     return graph
+
+
+def _read_transposed_by_gemm(node) -> bool:
+    """Whether a gemm reads ``node``'s tensor transposed (``A^T @ x``, ``x @ A^T``).
+
+    A multi-consumer placeholder is loaded into registers once; a transposed gemm read of
+    that fragment conflicts with the untransposed operand layout of its other consumers
+    (TileLang "Layout infer conflict ... A_ptr"), so such a placeholder stays in shared
+    memory (it is staged through shared on its way to registers anyway).
+    """
+    for edge in node.outputs:
+        dst = edge.dst_node
+        if isinstance(dst, Matmul):
+            flags = (dst.transpose_A, dst.transpose_B)
+            if any(flag and e is edge for e, flag in zip(dst.inputs, flags)):
+                return True
+    return False
+
+
+def _feeds_reduction_outside(src, matmul, graph: Graph) -> bool:
+    """Does ``src`` reach a whole (not loop-accumulated) ReduceSum of ``graph`` through a
+    consumer other than ``matmul``, without passing through a gemm?"""
+    stack = [e.dst_node for e in src.outputs if e.dst_node is not matmul]
+    seen = set()
+    while stack:
+        n = stack.pop()
+        if id(n) in seen or n not in graph.nodes or isinstance(n, Matmul):
+            continue
+        seen.add(id(n))
+        if isinstance(n, ReduceSum):
+            if n not in graph.accum_nodes:
+                return True
+            continue
+        stack.extend(e.dst_node for e in n.outputs)
+    return False
 
 
 def annotate_tinfo(graph: Graph, is_main: bool = False) -> Graph:
@@ -45,7 +86,9 @@ def annotate_tinfo(graph: Graph, is_main: bool = False) -> Graph:
         if isinstance(node, (PlaceHolderNode, OutputNode)):
             graph.tinfo_map[node] = (
                 node.name,
-                "g" if is_main else ("r" if len(node.outputs) > 1 else "s"),
+                "g" if is_main else (
+                    "r" if len(node.outputs) > 1 and not _read_transposed_by_gemm(node) else "s"
+                ),
             )
         elif isinstance(node, ComputeOpNode):
             graph.tinfo_map[node] = (getname("t_" + node.name), "r")
@@ -101,6 +144,35 @@ def annotate_tinfo(graph: Graph, is_main: bool = False) -> Graph:
                             graph.tinfo_map[smallest_placeholder][0],
                             "s",
                         )
+                # A computed operand read transposed (``P^T @ dO``) cannot be used from
+                # registers: TileLang's gemm wants the fragment in the untransposed
+                # operand layout its producer loop did not use. Stage it through
+                # shared memory, like the two-fragment case above.
+                transposed = {
+                    i
+                    for i, (edge, flag) in enumerate(
+                        zip(node.inputs, (node.transpose_A, node.transpose_B))
+                    )
+                    if flag
+                    and isinstance(edge.src_node, (ComputeOpNode, GraphNode))
+                    and input_tinfos[i] == "r"
+                }
+                if transposed:
+                    node.stage_fragment_operands_in_shared = tuple(
+                        sorted(set(node.stage_fragment_operands_in_shared) | transposed)
+                    )
+                # An input held in registers for this gemm takes the gemm's operand layout;
+                # a row sum of it (``sum_D(dO * o)`` next to ``dO @ v^T``) must then reduce
+                # over that layout, which TileLang's ReduceOp cannot always lower
+                # ("source index depends on a thread-owned reduce segment"). Keep it shared.
+                for edge in node.inputs:
+                    src = edge.src_node
+                    if (
+                        isinstance(src, PlaceHolderNode)
+                        and graph.tinfo_map[src][1] == "r"
+                        and _feeds_reduction_outside(src, node, graph)
+                    ):
+                        graph.tinfo_map[src] = (graph.tinfo_map[src][0], "s")
         elif isinstance(node, ViewOpNode):
             src_tinfo = graph.tinfo_map[node.inputs[0].src_node]
             graph.tinfo_map[node] = (getname("v_" + node.name), src_tinfo[1])
@@ -202,6 +274,38 @@ def annotate_fragment_layout_conflicts(graph: Graph) -> Graph:
 
         return True
 
+    def has_matmul_ancestor(cur_node, cur_graph: Graph) -> bool:
+        stack, seen = [cur_node], set()
+        while stack:
+            n = stack.pop()
+            if id(n) in seen or n not in cur_graph.nodes:
+                continue
+            seen.add(id(n))
+            if isinstance(n, Matmul):
+                return True
+            stack.extend(e.src_node for e in getattr(n, "inputs", []))
+        return False
+
+    def is_independent_row_broadcast(cur_node, cur_graph: Graph) -> bool:
+        """``C = A <op> rowsum(X)`` in one loop body, A from a gemm, X from no gemm.
+
+        TileLang must give the reduction result the gemm accumulator's row layout and
+        X's reduction its own; when X comes from plain loads (``sum_D(dO * o)``) it can
+        find no layout for both ("no available layout found").
+        """
+        if not isinstance(cur_node, BinaryElementwise) or cur_node.const is not None:
+            return False
+        if cur_node.broadcast == -1 or len(cur_node.inputs) != 2:
+            return False
+        lhs, rhs = (e.src_node for e in cur_node.inputs)
+        if not isinstance(rhs, ReduceSum) or rhs not in cur_graph.nodes:
+            return False
+        if cur_graph.tinfo_map.get(rhs, (None, None))[1] != "r":
+            return False
+        return has_matmul_ancestor(lhs, cur_graph) and not has_matmul_ancestor(
+            rhs, cur_graph
+        )
+
     def annotate_graph(cur_graph: Graph) -> None:
         for cur_node in cur_graph.nodes:
             if isinstance(cur_node, GraphNode):
@@ -211,6 +315,11 @@ def annotate_fragment_layout_conflicts(graph: Graph) -> Graph:
                 cur_node, cur_graph
             ):
                 cur_node.resolve_operand_layout = "rhs"
+            if isinstance(cur_node, BinaryElementwise):
+                # Stage the reduced row through shared memory (``_resolve_operand``).
+                cur_node.stage_fragment_operands_in_shared = (
+                    (1,) if is_independent_row_broadcast(cur_node, cur_graph) else ()
+                )
 
     reset_graph(graph)
     annotate_graph(graph)
@@ -225,52 +334,16 @@ def annotate_mla_accumulation_layout_conflict(graph: Graph) -> Graph:
             if isinstance(cur_node, GraphNode):
                 reset_graph(cur_node.graph)
 
-    def has_reduction_consumer(exp_node: Exp) -> bool:
-        return any(isinstance(edge.dst_node, ReduceSum) for edge in exp_node.outputs)
-
-    def has_upstream_score_matmul(exp_node: Exp, rhs_node: PlaceHolderNode) -> bool:
-        worklist = [edge.src_node for edge in exp_node.inputs]
-        visited = set()
-
-        while worklist:
-            cur_node = worklist.pop()
-            cur_node_id = id(cur_node)
-            if cur_node_id in visited:
-                continue
-            visited.add(cur_node_id)
-
-            if isinstance(cur_node, Matmul) and len(cur_node.inputs) == 2:
-                if cur_node.transpose_B and cur_node.inputs[1].src_node is rhs_node:
-                    return True
-
-            worklist.extend(edge.src_node for edge in getattr(cur_node, "inputs", []))
-
-        return False
-
     def annotate_graph(cur_graph: Graph) -> None:
         for cur_node in cur_graph.nodes:
             if isinstance(cur_node, GraphNode):
                 annotate_graph(cur_node.graph)
                 continue
-
-            if not isinstance(cur_node, Matmul) or len(cur_node.inputs) != 2:
-                continue
-
-            lhs_node = cur_node.inputs[0].src_node
-            rhs_node = cur_node.inputs[1].src_node
-            if not isinstance(lhs_node, Exp):
-                continue
-            if not isinstance(rhs_node, PlaceHolderNode):
-                continue
-            if not has_reduction_consumer(lhs_node):
-                continue
-            if not has_upstream_score_matmul(lhs_node, rhs_node):
-                continue
-
-            # MLA decode reuses the KV tensor for both score and value paths.
-            # Stage the softmax fragment through swizzled shared memory before
-            # the value matmul to avoid TileLang fragment layout conflicts.
-            cur_node.stage_fragment_operands_in_shared = (0,)
+            if is_mla_value_gemm(cur_node):
+                # MLA decode reuses the KV tensor for both score and value paths.
+                # Stage the softmax fragment through swizzled shared memory before
+                # the value matmul to avoid TileLang fragment layout conflicts.
+                cur_node.stage_fragment_operands_in_shared = (0,)
 
     reset_graph(graph)
     annotate_graph(graph)

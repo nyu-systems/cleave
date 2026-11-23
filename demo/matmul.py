@@ -14,4 +14,9 @@ def matmul(x: cl.Tensor["M", "K"], w: cl.Tensor["K", "N"]):
 
 
 if __name__ == "__main__":
-    cleave.examples.main(matmul, shapes=dict(M=128, N=128, K=4096), dtype=cl.f16)
+    cleave.examples.main(
+        matmul,
+        shapes=dict(M=128, N=128, K=4096),
+        dtype=cl.f16,
+        tolerance=cl.Tolerance(rtol=5e-3),
+    )

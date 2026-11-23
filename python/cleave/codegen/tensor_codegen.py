@@ -47,6 +47,40 @@ def gen_copy(
     return copy_code
 
 
+def gen_atomic_add(src: str, dst: str, blocked_width=None, rank: int = 2) -> str:
+    """Add the tile ``src`` (a fragment) into ``dst`` (a global view of the same extents)
+    atomically, so partial sums from every CTA land in one fp32 buffer.
+
+    The tile-region form, not a ``T.Parallel`` of scalar atomics: TileLang vectorises it
+    (``AtomicAddx2``/``x4`` for fp32) along the fragment's contiguous elements.
+
+    With ``blocked_width`` (the buffer's last extent N; see ``kernel.inter_blocked_width``)
+    the buffer is stored 8x8-blocked: element ``(m, n)`` of each ``[M, N]`` plane lives at
+    ``(m // 8) * 8N + (n // 8) * 64 + (m % 8) * 8 + n % 8``. Each warp's vectorised add then
+    covers 256 contiguous bytes instead of 8 rows of 32 B (the mma fragment's 8x8 pieces).
+    ``dst`` is this iteration's tile of whole rows starting at a multiple of 8, so the same
+    arithmetic holds relative to it; TileLang still vectorises the element form.
+    """
+    if blocked_width is None:
+        return f"T.atomic_add({dst}, {src})\n"
+    ivs = [f"ai{d}" for d in range(rank)]
+    a, b = ivs[-2:]
+    if blocked_width == INTER_BLOCK * INTER_BLOCK:
+        row, col = f"{a} // 8 * 8 + {b} // 8", f"{a} % 8 * 8 + {b} % 8"
+    else:
+        q = f"{b} // 8 * 64 + {a} % 8 * 8 + {b} % 8"
+        row, col = f"{a} // 8 * 8 + ({q}) // {blocked_width}", f"({q}) % {blocked_width}"
+    index = ", ".join(ivs[:-2] + [row, col])
+    return (
+        f"for {', '.join(ivs)} in T.Parallel(*{src}.shape):\n"
+        f"    T.atomic_add({dst}[{index}], {src}[{', '.join(ivs)}])\n"
+    )
+
+
+# Side of the square blocks an inter output's fp32 buffer is stored in (gen_atomic_add).
+INTER_BLOCK = 8
+
+
 def gen_tensor_allocation_str(
     tname: str, tile_shape: tuple, dtype: str, scope: str, is_tc_layout: bool = False
 ):
@@ -59,7 +93,9 @@ def gen_tensor_allocation_str(
         alloc_code += f"{ts}, "
     alloc_code += f"), '{dtype}')\n"
 
-    if scope == "s" and is_tc_layout:
+    # TileLang's swizzled layout needs a rank >= 2 buffer (a 1-D broadcast row of a
+    # tensor-core chain is read element-wise, never by the gemm).
+    if scope == "s" and is_tc_layout and len(tile_shape) >= 2:
         alloc_code += (
             f"T.annotate_layout({{{tname}: tl.layout.make_swizzled_layout({tname})}})\n"
         )

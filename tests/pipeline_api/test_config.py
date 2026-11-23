@@ -1,6 +1,8 @@
 """CPU-only: configs, presets, the max_ops="auto" rule, cache keys, CLI parsing."""
 
 import dataclasses
+import importlib
+import types
 
 import pytest
 
@@ -19,6 +21,10 @@ from cleave.pipeline import (
 )
 from cleave.pipeline import cache
 from tests.frontend import _programs as P
+
+# the package exports the functions build() and compile() under the modules' names
+build_mod = importlib.import_module("cleave.pipeline.build")
+compile_mod = importlib.import_module("cleave.pipeline.compile")
 
 
 def test_presets_are_frozen_and_listed():
@@ -87,6 +93,21 @@ def test_superopt_cache_key_is_stable_and_content_addressed(monkeypatch, tmp_pat
     assert str(path).startswith(str(tmp_path / "persistent" / "superopt")) and key in str(path)
 
 
+def test_cache_schema_retires_kernels_built_before_a_scheduler_fix(monkeypatch):
+    """A kernel-cache hit returns the saved kernel as it is, so a fix that changes what the
+    same program and configs build has to move the key: the schema is in every one."""
+    from cleave.pipeline.compile import _kernel_key
+
+    prog = trace(P.matmul, dict(M=128, N=128, K=4096), cl.f16)
+    cfgs = resolve_configs(prog)
+    # 1: a reduction absorbed into another's loop was sliced with that loop's counter, and
+    # demo/mha_prefill.py's saved winner was such a kernel.
+    assert cache.SCHEMA >= 2
+    key = _kernel_key(prog, *cfgs)
+    monkeypatch.setattr(cache, "SCHEMA", 1)
+    assert _kernel_key(prog, *cfgs) != key
+
+
 def test_resolve_configs_split():
     prog = trace(P.matmul, dict(M=128, N=128, K=4096), cl.f16)
     so, sc, _ = resolve_configs(prog, split=cl.Split("K", (4, 8)))
@@ -130,6 +151,124 @@ def test_kernel_cache_key_covers_io_names():
     cfgs = resolve_configs(prog("x", "w"))
     assert prog("x", "w").fingerprint() == prog("a", "b").fingerprint()
     assert _kernel_key(prog("x", "w"), *cfgs) != _kernel_key(prog("a", "b"), *cfgs)
+
+
+def test_kernel_cache_key_covers_validation():
+    """A saved kernel is returned without validating, so everything that decides what
+    "validated" means is in its key: the tolerance, the input distributions, and the
+    comparator's own version."""
+    from cleave.pipeline.compile import _kernel_key
+
+    prog = trace(P.matmul, dict(M=16, N=8, K=32), cl.f16)
+    so, sc, ev = resolve_configs(prog)
+
+    def key(config):
+        return _kernel_key(prog, so, sc, config)
+
+    declared = ev.replace(tolerance=cl.Tolerance(rtol=1e-3))
+    assert key(declared) == key(ev.replace(tolerance=cl.Tolerance(rtol=1e-3)))
+    assert key(declared) != key(ev.replace(tolerance=cl.Tolerance(rtol=2e-3)))
+    assert key(declared) != key(ev.replace(tolerance=cl.Tolerance(rtol=1e-3, atol=1e-6)))
+    assert key(declared) != key(declared.replace(distributions=("normal", "large_logits")))
+    assert key(declared) == key(declared.replace(max_parallel=2, timeout_s=5.0))
+    assert cache.VALIDATION >= 2  # 1: elementwise assert_close with a 0.5/0.5 default
+    before = key(declared)
+    cache.VALIDATION += 1
+    try:
+        assert key(declared) != before
+    finally:
+        cache.VALIDATION -= 1
+
+
+def test_compile_and_build_require_a_declared_tolerance(monkeypatch):
+    """There is no default bound: a dense program without one is refused before the search."""
+    import cleave
+
+    prog = trace(P.matmul, dict(M=16, N=8, K=32), cl.f16)
+    monkeypatch.setattr(compile_mod, "superoptimize",
+                        lambda *a, **k: pytest.fail("searched without a tolerance"))
+    with pytest.raises(SpecError, match="no validation tolerance declared"):
+        cleave.compile(prog, preset="fast")
+    with pytest.raises(SpecError, match="no validation tolerance declared"):
+        cleave.compile(prog, eval=EvalConfig(warmup=1, iters=1))
+    assert EvalConfig().tolerance is None and EvalConfig().distributions == ("normal",)
+
+    plan = types.SimpleNamespace(tile=None, program=prog)
+    with pytest.raises(SpecError, match="no validation tolerance declared"):
+        build_mod.build([plan])
+    with pytest.raises(SpecError, match="input distributions must be drawn from"):
+        build_mod.build([plan], config=EvalConfig(tolerance=cl.Tolerance(rtol=1e-3),
+                                                  distributions=("normal", "bogus")))
+    assert len(build_mod.build([])) == 0  # nothing to validate, nothing to declare
+
+
+def test_a_per_output_tolerance_must_fit_every_plan(monkeypatch):
+    """A split partial has more outputs than its combine and the solo plans, and all
+    candidates share one declaration: a sequence that cannot fit them all is refused by
+    ``build()`` before any candidate runs, not by every mismatching candidate at validate."""
+    import cleave.runtime.evaluate as evaluate_mod
+    import cleave.runtime.reference as reference_mod
+
+    one, two = object(), object()
+    outputs = {id(one): ["o"], id(two): ["l", "o"]}
+    monkeypatch.setattr(reference_mod, "output_order", lambda graph: outputs[id(graph)])
+    ran = []
+    monkeypatch.setattr(evaluate_mod, "run_candidates",
+                        lambda tiles, dtype, **kw: ran.append(kw["tolerance"]) or
+                        [types.SimpleNamespace(code=None) for _ in tiles])
+
+    def plan(graph, role):
+        return types.SimpleNamespace(tile=types.SimpleNamespace(flat_graph=graph), role=role,
+                                     label=f"g0 {role}", program=None)
+
+    solo, partial, combine = plan(one, "main"), plan(two, "partial"), plan(one, "combine")
+    t = cl.Tolerance(rtol=5e-3)
+
+    def build(plans, tolerance):
+        return build_mod.build(plans, config=EvalConfig(tolerance=tolerance))
+
+    # one Tolerance covers every output of every plan
+    assert len(build([solo, partial, combine], t)) == 3
+    # one per output is fine while every plan has that many
+    assert len(build([partial], (t, t))) == 1 and len(build([solo, combine], [t])) == 2
+    assert ran == [t, (t, t), [t]]
+    for plans, tolerance, message in (
+            ([solo, partial, combine], (t, t),
+             r"2 tolerances were declared, but plan 'g0 main' \(main\) has 1 output"),
+            ([partial, combine], (t,),
+             r"1 tolerances were declared, but plan 'g0 partial' \(partial\) has 2 output"),
+            ([partial, solo], [t, t], "A per-output tolerance must fit every plan"),
+            ([solo], (t, 1e-3), "must be a Tolerance or a sequence of them"),
+            ([solo], 1e-3, "must be a Tolerance or a sequence of them")):
+        with pytest.raises(SpecError, match=message):
+            build(plans, tolerance)
+    assert len(ran) == 3  # nothing ran for the refused declarations
+
+
+def test_compile_takes_the_tolerance_from_jit_options_or_the_keyword(monkeypatch):
+    import cleave
+
+    seen = []
+
+    def stop(program, so, sc, ev):
+        seen.append(ev.tolerance)
+        raise RuntimeError("stop")
+
+    monkeypatch.setattr(compile_mod, "_kernel_key", stop)
+
+    @cleave.jit(tolerance=cl.Tolerance(rtol=1e-3))
+    def mm(x: cl.Tensor["M", "K"], w: cl.Tensor["K", "N"]):
+        return x @ w
+
+    shapes = dict(M=16, N=16, K=64)
+    for call in (lambda: cleave.compile(mm, shapes=shapes),
+                 lambda: mm.compile(**shapes),
+                 lambda: cleave.compile(mm, shapes=shapes, tolerance=cl.Tolerance(rtol=5e-3)),
+                 lambda: cleave.compile(mm.fn, shapes=shapes, preset="fast",
+                                        tolerance=cl.Tolerance(rtol=2e-3))):
+        with pytest.raises(RuntimeError, match="stop"):
+            call()
+    assert [t.rtol for t in seen] == [1e-3, 1e-3, 5e-3, 2e-3]
 
 
 def test_compile_rejects_dtype_for_a_program():

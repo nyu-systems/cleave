@@ -106,6 +106,14 @@ class Graph:
     accum_nodes: List[Node] = field(
         default_factory=list
     )  # nodes that require accumulation
+    accumulation: dict[Node, str] = field(
+        default_factory=dict
+    )  # accumulation context, set by `apply_tiling` only when outputs reduce over
+    # orthogonal axes (empty otherwise: every accum node is "intra"). On an iterative
+    # graph, keyed by accum node: "intra" sums over the loop in registers and is written
+    # once after it; "inter" is a partial per iteration whose tile (`tmap`) follows the
+    # loop counter, to be summed across CTAs (atomic adds into a zero-initialised fp32
+    # buffer). On the main graph, keyed by OutputNode: the context of that output.
     binding: dict[str, Node] = field(
         default_factory=dict
     )  # map PlaceHolder/Output nodes in the supergraph to nodes in the subgraph
@@ -158,6 +166,12 @@ class Graph:
         # `window_nodes`. Required whenever there are any: without it every iteration would
         # refill, which is what hoisting is meant to avoid.
     )
+    invariant_nodes: List[Node] = field(
+        default_factory=list
+    )  # compute nodes of an iterative graph that read nothing the loop counter selects
+    # (set by `apply_tiling`, see `loop_invariant_nodes`). Code generation evaluates them
+    # once, on the first iteration, into buffers allocated before the loop that the later
+    # iterations read: `sum_D(dO * o)` of an attention backward looping over KV blocks.
     dyn_dims: List[str] = field(
         default_factory=list
     )  # symbolic extent names; each must appear bare in some tensor shape so the
@@ -300,7 +314,11 @@ class PlaceHolderNode(Node):
     producer_op = None  # op that fills this inner placeholder's tile (see codegen)
 
     def __init__(self, name=""):
-        super().__init__(name="PlaceHolder_" + name)
+        super().__init__(name=self.full_name(name))
+
+    @staticmethod
+    def full_name(name: str) -> str:
+        return "PlaceHolder_" + name
 
     def is_placeholder(self):
         return True
@@ -309,7 +327,10 @@ class PlaceHolderNode(Node):
         return "placeholder"
 
     def __hash__(self):
-        return hash((self.name, tuple(e.dst_node for e in self.outputs)))
+        # The name only, not the consumers ``__eq__`` also compares: a placeholder is a
+        # key of ``Graph.tmap`` while ``apply_tiling`` is still giving it consumers, and
+        # a key whose hash moves can no longer be found in the dict it is in.
+        return hash(self.name)
 
     def __eq__(self, other):
         if not isinstance(other, PlaceHolderNode):
@@ -593,12 +614,9 @@ class PrimFuncNode(Node):
         targets = [t.name for t in self.args[read_idx_offset:]]
         shapes, _ = self.propagate(tile, rstep, targets)
         results = []
-        for i, arg in enumerate(self.args[read_idx_offset:]):
-            # should not exceed original shape
-            trimmed_shape = list(
-                map(min, zip(shapes[arg.name], self.input_buffers[i].shape))
-            )
-            results.append(trimmed_shape)
+        for arg in self.args[read_idx_offset:]:
+            # should not exceed the output's own shape
+            results.append(list(map(min, zip(shapes[arg.name], arg.shape))))
         return results
 
     def propagate_reduction_inputs(

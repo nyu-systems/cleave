@@ -3,6 +3,9 @@ from typing import Any, Dict, Optional
 
 from tilelang.carver.roller.hint import Stride  # noqa: F401  (re-exported)
 
+# accumulation contexts of an output (``TileDict.accumulation``, ``Graph.accumulation``)
+INTRA, INTER = "intra", "inter"
+
 
 @dataclass(eq=False, repr=False)
 class TileDict:
@@ -16,6 +19,11 @@ class TileDict:
     output_strides_map: Dict = field(default_factory=dict)
     tensor_strides_map: Dict = field(default_factory=dict)
     n_threads: Optional[int] = None  # set by the policy per candidate
+    # Accumulation context of each output (keyed by the node that feeds an OutputNode),
+    # set only for a graph whose outputs reduce over orthogonal axes: "intra" outputs
+    # define the launch tile and accumulate over the CTA's loop; an "inter" output's tile
+    # follows the loop variable and is summed across CTAs. Empty: every output is intra.
+    accumulation: Dict = field(default_factory=dict)
 
     # analysis
     traffic: int = -1

@@ -12,9 +12,18 @@ from cleave.dynamic.dense import (
     mla_attention_sd_graph,
     tiled_dense_attention,
 )
-from cleave.dynamic.workloads import WORKLOADS
-from cleave.dynamic.paging import MLASpec, PagingRefusal, PagingSpec, apply_paging, can_page
+from cleave.dynamic.registry import LSE_ATOL
+from cleave.dynamic.workloads import ADVERSARIAL_WORKLOADS, WORKLOADS
+from cleave.dynamic.paging import (
+    MLASpec,
+    PagingRefusal,
+    PagingSpec,
+    apply_paging,
+    can_page,
+    stage_as_layer,
+)
 from cleave.schedule import apply_tiling, search_tiling
+from tests._tolerances import CEILING, FP32_CEILING
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -44,7 +53,15 @@ def test_every_operator_is_complete(name):
     assert op.workloads == WORKLOADS[name] and op.workloads
     assert callable(op.reference)
     assert op.expected_kernel_path.is_file()
-    assert op.tolerance.rtol > 0
+    # Its own declared bound per output, never a shared default, both relative to the row
+    # and within their ceilings: the bf16 output with no absolute part (an empty row is
+    # exactly 0), the fp32 lse with only the fixed floor for an lse of exactly 0.
+    out, lse = op.tolerance
+    assert 0 < out.rtol <= CEILING and out.atol == 0
+    assert 0 < lse.rtol <= FP32_CEILING and lse.atol == LSE_ATOL
+    # The adversarial softmax workloads live apart from the captured ones.
+    assert op.adversarial == ADVERSARIAL_WORKLOADS[name]
+    assert {axes for _, axes in op.adversarial} <= set(op.workloads)
     if op.is_mla:
         assert op.scale is not None
 
@@ -77,10 +94,13 @@ def _pinned(spec):
 
 
 def _searched(spec, *, keep=8):
-    """Up to ``keep`` searched tilings ``can_page`` accepts and ``keep`` it refuses."""
+    """Up to ``keep`` searched tilings ``can_page`` accepts and ``keep`` it refuses.
+
+    Searched as ``schedule_paged`` searches: the dense body marked as the layer builds it.
+    """
     rows = 16 if isinstance(spec, MLASpec) or "decode" in spec.kind else 64
     yes, no = [], []
-    for cand in search_tiling(_dense(spec, rows), topk=1000):
+    for cand in search_tiling(stage_as_layer(_dense(spec, rows), spec), topk=1000):
         try:
             graph = apply_tiling(cand)
         except Exception:  # noqa: BLE001

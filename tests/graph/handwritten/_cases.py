@@ -10,10 +10,10 @@ from dataclasses import dataclass, field
 import importlib
 from typing import Callable
 
-from cleave.dynamic import GATHER_TOLERANCE
-from cleave.runtime.validate import DEFAULT_TOLERANCE, Tolerance
+from cleave.dynamic import OPERATORS
 
 from tests import _graphs as g
+from tests._tolerances import tolerance_for
 from cleave.dynamic.workloads import cases
 
 
@@ -27,17 +27,18 @@ class Case:
 
     ``source(*dims)`` builds the reference graph. A fused case checks against
     ``source(*source_dims)`` with scratch partials; a paged case (``out_idx`` set) runs
-    the captured workloads for the operator instead.
+    the captured workloads for the operator instead. ``tolerance`` is the bound the
+    operator declares (``tests/_tolerances.py``, or the registry for a paged operator).
     """
 
     name: str
     parts: tuple
+    tolerance: object
     source: Callable | None = None
     source_dims: tuple | None = None
     out_idx: list | None = None
     workload_kw: dict = field(default_factory=dict)
     dtype: str = "float16"
-    tolerance: Tolerance = DEFAULT_TOLERANCE
 
     def graph(self):
         graphs = [_schedule(s).get_handwritten_scheduled_graph(dims=d) for s, d in self.parts]
@@ -59,7 +60,7 @@ class Case:
 
 
 def _static(name, dims, source):
-    return Case(name, ((name, dims),), source=source)
+    return Case(name, ((name, dims),), tolerance_for(source), source=source)
 
 
 def _fused(name, partial, combine, partial_dims, source):
@@ -67,6 +68,7 @@ def _fused(name, partial, combine, partial_dims, source):
     return Case(
         name,
         ((partial, partial_dims), (combine, (*lead, split_k, m, n))),
+        tolerance_for(source),
         source=source,
         source_dims=(*lead, m, n, split_k * k_partial),
     )
@@ -76,8 +78,8 @@ def _paged(name, dims, out_idx, **workload_kw):
     if name.startswith("mla"):
         workload_kw["scale"] = _schedule(name).SM_SCALE
     return Case(
-        name, ((name, dims),), out_idx=out_idx, workload_kw=workload_kw,
-        dtype="bfloat16", tolerance=GATHER_TOLERANCE,
+        name, ((name, dims),), OPERATORS[name].tolerance, out_idx=out_idx,
+        workload_kw=workload_kw, dtype="bfloat16",
     )
 
 

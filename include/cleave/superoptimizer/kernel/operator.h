@@ -2,12 +2,25 @@
 
 #include "cleave/superoptimizer/kernel/device_tensor.h"
 #include "cleave/superoptimizer/utils/json_utils.h"
+#include <memory>
 #include <vector>
 
 namespace cleave_superoptimizer {
 namespace kernel {
 
 class Graph;
+
+// An input that IS a function of earlier inputs of its graph: `definition`
+// is a small graph whose inputs stand, in order, for the host graph's inputs
+// at positions `sources` (positions among the host's input operators), and
+// whose one output is the declared input. Immutable once made, so clones
+// (and every candidate graph of a search) share it.
+struct InputDeclaration {
+  std::shared_ptr<Graph const> definition;
+  std::vector<int> sources;
+  // The definition's result: the tensor its output operator reads.
+  DTensor const &result() const;
+};
 
 class KNOperator {
 public:
@@ -52,6 +65,8 @@ public:
 public:
   int3 input_map;
   bool infer_can_split = false;
+  // Set for a declared input only.
+  std::shared_ptr<InputDeclaration const> declaration;
 };
 
 class KNOutputOp : public KNOperator {

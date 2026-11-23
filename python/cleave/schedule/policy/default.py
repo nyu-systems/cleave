@@ -5,19 +5,36 @@ from .common import (
     coalesced_tensor_shape,
 )
 from .bestfit import BestFit
-from .hint import TileDict, Stride
-from ...ir.graph import ViewOpNode
+from .hint import INTER, INTRA, TileDict, Stride
+from ...ir.graph import ComputeOpNode, ViewOpNode
+from ...core.errors import ScheduleRejected
 from ...ir.analysis import (
     build_output_axis_provenance,
     build_reduction_axis_provenance,
+    find_orthogonal_reduction_groups,
+    get_output_axis_tokens,
 )
+from ...ir.analysis import is_mla_value_gemm
+from ...ir.ops import Copy, Div, Matmul, Mul, ReduceSum
+from ...ir.ops.elementwise import BinaryElementwise
 
 import copy
 import numpy as np
+import tvm
 from queue import Queue, PriorityQueue
 
 
 DEFAULT_N_THREADS = 128
+
+# Accumulation contexts (see ``DefaultPolicy._for_assignment``). An ``inter`` output is
+# summed across CTAs with an atomic add into an fp32 buffer: every element of its block is
+# read and written back once per CTA, hence the weight on its 4-byte elements.
+ATOMIC_ACCUM_BYTES = 4
+ATOMIC_COST_WEIGHT = 2
+# Ops an inter output may apply between its reduction and the output: linear in the
+# reduction's result (one input; a scalar operand is folded into the op), so the sum of
+# the per-CTA partials is the output.
+_LINEAR_POST_OPS = (Mul, Div, Copy)
 
 
 class DefaultPolicy:
@@ -65,6 +82,16 @@ class DefaultPolicy:
         self.force_fusion = force_fusion
         self.flat_graph = flat_graph
         self.canonical_output_node = self._select_canonical_output_node()
+        # Output groups that reduce over orthogonal axes (attention backward: dQ sums over
+        # SKV, dK/dV over SQ). Empty for every other graph, which keeps the policy as is.
+        self.reduction_groups = find_orthogonal_reduction_groups(
+            self.ordered_nodes,
+            self.output_nodes,
+            self.output_axis_provenance,
+            self.reduction_axis_provenance,
+        )
+        # Set only on the per-assignment copies made by ``_for_assignment``.
+        self.accumulation = {}
 
     def _select_canonical_output_node(self):
         if not self.output_nodes:
@@ -236,6 +263,9 @@ class DefaultPolicy:
             self.canonical_output_node, tile
         )
         for node in self.output_nodes:
+            if self.accumulation.get(node) == INTER:
+                tile_map[node] = self._inter_block_tile(node)
+                continue
             tile_map[node] = self._project_canonical_tile_to_output(
                 canonical_tile, node
             )
@@ -331,7 +361,9 @@ class DefaultPolicy:
 
         return normalized_shapes
 
-    def _propagate_inputs_from_output_rank_collapse(self, node, tile, rstep):
+    def _compress_tile_to_stage_rank(self, node, tile):
+        """``tile`` (in the node's output space) in its stage's spatial space, when the stage
+        fuses output dims (e.g. a batched matmul reindexed to one batch dim); else ``None``."""
         if len(node.output_buffers) == 0:
             return None
 
@@ -372,6 +404,12 @@ class DefaultPolicy:
             compressed_tile.append(grouped_tile)
 
         if logical_idx != len(output_shape):
+            return None
+        return compressed_tile
+
+    def _propagate_inputs_from_output_rank_collapse(self, node, tile, rstep):
+        compressed_tile = self._compress_tile_to_stage_rank(node, tile)
+        if compressed_tile is None:
             return None
 
         compensated = []
@@ -573,6 +611,12 @@ class DefaultPolicy:
     def _compute_memory_traffic(self, output_tile, rstep_map):
         op_tile_map = self._get_output_tile_map(output_tile)
         op_itile_map = op_tile_map.copy()
+        if self.accumulation:
+            loop_step = self._intra_loop_step(rstep_map)
+            for node, loop_dim in self._inter_loop_dims.items():
+                itile = list(op_itile_map[node])
+                itile[loop_dim] = loop_step
+                op_itile_map[node] = itile
         traffic = 0
         irregular_fusion = False
         active_desc_reduction_axes = {}
@@ -608,11 +652,22 @@ class DefaultPolicy:
                     active_desc_reduction_axes[node] = node_active_axes
 
             tile, itile = op_tile_map[node], op_itile_map[node]
-            input_shapes = self._propagate_inputs_full_rank(node, tile)
+            if self.accumulation and node in self._inter_rstep_dims:
+                # An inter reduction sums its block's slice of the axis the launch
+                # tiles (one step per CTA), not the whole axis.
+                input_shapes = self._propagate_inputs_full_rank(
+                    node, tile, rstep=rstep_map[node]
+                )
+            else:
+                input_shapes = self._propagate_inputs_full_rank(node, tile)
             input_iter_shapes = self._propagate_inputs_full_rank(
                 node, itile, rstep=rstep_map[node]
             )
-            output_shapes = node.propagate_outputs(tile)
+            # the tile is in the node's output space; a stage that fuses output dims reads
+            # it in its own (fewer) dims
+            output_shapes = node.propagate_outputs(
+                self._compress_tile_to_stage_rank(node, tile) or tile
+            )
             for i, edge in enumerate(node.inputs):
                 op_tile_map[edge.src_node], op_itile_map[edge.src_node] = (
                     input_shapes[i],
@@ -632,7 +687,18 @@ class DefaultPolicy:
                 # TODO (david): add extra traffic whenever we need to load from higher-level memory again?
                 # e.g., nodes out of reduction block? this may happen when force_fusion is set to True.
             for edge in node.outputs:
-                if edge.dst_node.is_output():
+                if edge.dst_node.is_output() and self.accumulation.get(node) == INTER:
+                    # summed across CTAs: an atomic add per element of the block
+                    traffic += (
+                        coalesced_tensor_shape(
+                            tile,
+                            node.get_shape(edge.src_id),
+                            self.arch.transaction_size[0] // ATOMIC_ACCUM_BYTES,
+                        )
+                        * ATOMIC_ACCUM_BYTES
+                        * ATOMIC_COST_WEIGHT
+                    )
+                elif edge.dst_node.is_output():
                     nbytes = (edge.src_node.get_dtype().bits + 7) // 8
                     write_transaction_elements = self.arch.transaction_size[0] // nbytes
                     traffic += (
@@ -666,13 +732,84 @@ class DefaultPolicy:
             tensor_strides_map,
         )
 
-    def infer_node_smem_usage(self, td, node):
+    def infer_node_smem_usage(self, td, node, own_loops):
         # view ops are alias-only and should not contribute internal shared-memory footprint.
         if isinstance(node, ViewOpNode):
             return 0, []
-        return node.footprint(
+        internal, cached = node.footprint(
             td.get_itile(node), td.get_rstep(node), td.tensor_strides_map[node]
         )
+        return internal + self._staged_operand_bytes(td, node, own_loops), cached
+
+    def _staged_operand_indices(self, node, own_loops):
+        """Inputs of ``node`` that codegen copies from registers into shared memory.
+
+        Mirrors two stagings of ``codegen/passes.py`` on the graph ``apply_tiling`` builds:
+        a computed gemm operand read transposed (``annotate_tinfo``: ``P^T @ dO``), and a
+        row sum of plain loads broadcast into a gemm-derived fragment of the same loop body
+        (``annotate_fragment_layout_conflicts``: ``dP - sum_D(dO * o)``). ``own_loops``: the
+        reductions that get a loop of their own; their consumers read them through the loop
+        node, which that pass does not look through. The older two-fragment gemm staging is
+        not counted.
+        """
+        if isinstance(node, Matmul):
+            return tuple(
+                i
+                for i, (edge, flag) in enumerate(
+                    zip(node.inputs, (node.transpose_A, node.transpose_B))
+                )
+                if flag and isinstance(edge.src_node, ComputeOpNode)
+            )
+        if not (
+            isinstance(node, BinaryElementwise)
+            and node.const is None
+            and node.broadcast != -1
+            and len(node.inputs) == 2
+        ):
+            return ()
+
+        def has_matmul_ancestor(start):
+            stack, seen = [start], set()
+            while stack:
+                n = stack.pop()
+                if id(n) in seen or n in own_loops:
+                    continue
+                seen.add(id(n))
+                if isinstance(n, Matmul):
+                    return True
+                stack.extend(e.src_node for e in getattr(n, "inputs", []))
+            return False
+
+        lhs, rhs = (e.src_node for e in node.inputs)
+        if (
+            isinstance(rhs, ReduceSum)
+            and rhs not in own_loops
+            and has_matmul_ancestor(lhs)
+            and not has_matmul_ancestor(rhs)
+        ):
+            return (1,)
+        return ()
+
+    def _staged_operand_bytes(self, td, node, own_loops):
+        """Shared bytes of the staging buffers codegen allocates for ``node``'s inputs:
+        the producer's tile in the consumer's input dtype (``_resolve_operand``).
+        """
+        total = 0
+        for i in self._staged_operand_indices(node, own_loops):
+            src = node.inputs[i].src_node
+            nbytes = (tvm.DataType(node.dtype).bits + 7) // 8
+            total += int(np.prod(td.get_itile(src))) * nbytes
+        return total
+
+    def _own_loop_reductions(self, td):
+        """The reductions ``apply_tiling`` gives a loop node of their own."""
+        from ..tiling import _iterative_reductions, absorbed_reductions
+
+        absorbed = absorbed_reductions(self.ordered_nodes, td.rstep_map)
+        return {
+            n for n in _iterative_reductions(self.ordered_nodes, td.rstep_map)
+            if n not in absorbed
+        }
 
     def _compute_shared_memory_usage(self, td):
         self._compute_stride_map(td)
@@ -680,6 +817,7 @@ class DefaultPolicy:
         block_map = {}
         processed = set()
         cached_tensors_map = {}
+        own_loops = self._own_loop_reductions(td)
 
         def resolve_materialized_source(node, out_id):
             visited = set()
@@ -719,7 +857,7 @@ class DefaultPolicy:
 
         for node in self.ordered_nodes:
             node_internal_bytes, cached_tensors_map[node] = self.infer_node_smem_usage(
-                td, node
+                td, node, own_loops
             )
             block = allocator.malloc(node_internal_bytes)
             allocator.free(block)
@@ -754,8 +892,15 @@ class DefaultPolicy:
         return allocator.limit, cached_tensors_map
 
     def compute_tile_dict(self, output_tile: list[int], rstep_map):
+        if self.accumulation:
+            rstep_map = self._assignment_rstep_map(output_tile, rstep_map)
+            if rstep_map is None:
+                td = TileDict(output_tile, {}, flat_graph=self.flat_graph)
+                td.valid = False
+                return td
         td = TileDict(output_tile, rstep_map, flat_graph=self.flat_graph)
         td.n_threads = DEFAULT_N_THREADS
+        td.accumulation = dict(self.accumulation)
         td.traffic, td.tile_map, td.itile_map, irregular_fusion = (
             self._compute_memory_traffic(output_tile, rstep_map)
         )
@@ -938,15 +1083,257 @@ class DefaultPolicy:
         return smem_tile_candidates
 
     def emit_config(self, topk, accept=None):
-        base_tile = self.get_base_tile()
-        if base_tile is None:
-            return []
-        smem_tile_candidates = self.propose_iterative_tiles(base_tile)
+        if self.reduction_groups:
+            smem_tile_candidates = self._propose_assignment_tiles()
+        else:
+            base_tile = self.get_base_tile()
+            if base_tile is None:
+                return []
+            smem_tile_candidates = self.propose_iterative_tiles(base_tile)
+            # Filtered here, not marked invalid: the tile walk still passes through such tiles.
+            smem_tile_candidates = [
+                c for c in smem_tile_candidates if not self._reads_placeholder_unevenly(c)
+            ]
         smem_tile_candidates = self.get_num_threads(smem_tile_candidates)
         if accept is not None:
             smem_tile_candidates = [c for c in smem_tile_candidates if accept(c)]
 
         return smem_tile_candidates[:topk]
+
+    # ---- accumulation contexts (orthogonal reduction groups) ------------------------
+    #
+    # With reduction groups over orthogonal axes (``self.reduction_groups``) one CTA can
+    # hold only one group's output tile still: it owns that tile (the launch tile) and
+    # loops over the group's reduction axis, accumulating the group in registers
+    # (``intra``). Every other group (``inter``) is summed over the axis the launch tiles:
+    # each iteration computes a partial of its output for the tile the loop variable
+    # selects, and the CTAs add their partials up (atomic adds). Each assignment (which
+    # group is intra) is searched by a copy of the policy (``_for_assignment``) and all are
+    # ranked together, the atomic adds counted in the traffic.
+
+    def _propose_assignment_tiles(self):
+        candidates, absorbed_conflicts = [], []
+        for intra_id in range(len(self.reduction_groups)):
+            policy = self._for_assignment(intra_id)
+            if policy is None:
+                continue
+            base_tile = policy._pin_full_launch_dims(policy.get_base_tile())
+            # the uneven-read filter needs the assignment's policy: an inter reduction reads
+            # only its block's slice of the axis the launch tiles
+            for c in policy.propose_iterative_tiles(base_tile):
+                if policy._reads_placeholder_unevenly(c):
+                    continue
+                conflict = self._absorbed_axis_conflict(c)
+                if conflict is not None:
+                    absorbed_conflicts.append(conflict)
+                    continue
+                candidates.append(c)
+        if not candidates and absorbed_conflicts:
+            raise ScheduleRejected(
+                "every tiling needs a second loop: " + absorbed_conflicts[0]
+            )
+        # each assignment's list is sorted by this key already (expand_iterative_tiles);
+        # the stable sort keeps assignment order on ties
+        return sorted(candidates, key=lambda td: (td.traffic + 1) * td.num_wave)
+
+    def _absorbed_axis_conflict(self, td):
+        """``apply_tiling``'s refusal of ``td`` for an absorbed reduction, or ``None``.
+
+        A reduction feeding a loop's reductions over its own axis (``delta = rowsum(P*dP)``
+        over SKV of the naive attention-backward dS, inside the loop over SKV) must be
+        complete before the loop's first iteration: a second loop over that axis, which
+        ``apply_tiling`` does not build (repro: notes/p13-merged.md, issue 2). Only
+        accumulation-context tilings are checked here; every other graph keeps its
+        candidate list (the refusal happens in ``apply_tiling`` as before).
+        """
+        from ..tiling import _absorbed_axis_tokens
+
+        try:
+            _absorbed_axis_tokens(self.ordered_nodes, td.rstep_map)
+        except ScheduleRejected as e:
+            return str(e)
+        return None
+
+    def _for_assignment(self, intra_id):
+        """This policy with group ``intra_id`` intra and the others inter, or ``None``.
+
+        ``None`` when the assignment cannot be scheduled: an inter output whose reduction
+        is not a single-axis reduction feeding it through linear ops only, an axis that
+        does not map onto exactly one dim of the launch tile or the inter output, or an
+        intra reduction over more than one axis.
+        """
+        intra = self.reduction_groups[intra_id]
+        inter = [g for i, g in enumerate(self.reduction_groups) if i != intra_id]
+        if any(len(r.raxis) != 1 for r in intra.reductions):
+            return None
+
+        # the first highest-rank intra output in graph output order, as apply_tiling picks
+        outputs = list(intra.outputs)
+        if self.flat_graph is not None:
+            order = [n.inputs[0].src_node for n in self.flat_graph.nodes if n.is_output()]
+            outputs.sort(key=lambda n: order.index(n) if n in order else len(order))
+        canonical = outputs[0]
+        for node in outputs[1:]:
+            if len(node.get_space_dim()) > len(canonical.get_space_dim()):
+                canonical = node
+        canonical_flags = self._get_visible_batch_dim_flags(canonical)
+        canonical_vis = self._visible_dim_ids(canonical)
+
+        def dim_tokens(node, dim):
+            return get_output_axis_tokens(self.output_axis_provenance, node, 0, dim)
+
+        def red_tokens(node):
+            return set().union(*self.reduction_axis_provenance.get(node, [set()]))
+
+        inter_rstep_dims, inter_loop_dims, launch_dims = {}, {}, set()
+        for group in inter:
+            for out in group.outputs:
+                reds = [r for r in group.reductions if r in self._reduction_chain(out)]
+                if len(reds) != 1 or len(reds[0].raxis) != 1:
+                    return None
+                (red,) = reds
+                if not self._is_linear_chain(out, red):
+                    return None
+                dims = [
+                    d
+                    for d, is_batch in enumerate(canonical_flags)
+                    if not is_batch and dim_tokens(canonical, d) & red_tokens(red)
+                ]
+                if len(dims) != 1:
+                    return None
+                inter_rstep_dims[red] = canonical_vis[dims[0]]
+                launch_dims.add(canonical_vis[dims[0]])
+
+                out_flags = self._get_visible_batch_dim_flags(out)
+                if sum(out_flags) != sum(canonical_flags):
+                    return None
+                loop_dims = [
+                    d
+                    for d, is_batch in enumerate(out_flags)
+                    if not is_batch and dim_tokens(out, d) & intra.axis_tokens
+                ]
+                if len(loop_dims) != 1:
+                    return None
+                inter_loop_dims[out] = loop_dims[0]
+
+        policy = copy.copy(self)
+        policy.canonical_output_node = canonical
+        policy.accumulation = {o: INTRA for o in intra.outputs}
+        policy.accumulation.update({o: INTER for g in inter for o in g.outputs})
+        policy._intra_reductions = tuple(intra.reductions)
+        policy._inter_rstep_dims = inter_rstep_dims
+        policy._inter_loop_dims = inter_loop_dims
+        # launch dims that no inter reduction runs over stay whole: a CTA must cover all
+        # of them, or two CTAs would add the same partial of an inter output
+        policy._full_launch_dims = [
+            v
+            for d, (v, is_batch) in enumerate(zip(canonical_vis, canonical_flags))
+            if not is_batch and v not in launch_dims
+        ]
+        # an inter reduction's step is set by the launch tile, not searched
+        policy.compatible_reduction_groups = [
+            kept
+            for kept in (
+                [n for n in group if n not in inter_rstep_dims]
+                for group in self.compatible_reduction_groups
+            )
+            if kept
+        ]
+        return policy
+
+    def _visible_dim_ids(self, node):
+        """For each dim of ``node``, its dim in the visible (batch-collapsed) shape."""
+        flags = self._get_visible_batch_dim_flags(node)
+        if len(self._get_visible_output_shape(node)) == len(flags):
+            return list(range(len(flags)))
+        ids, next_id = [], 1
+        for is_batch in flags:
+            ids.append(0 if is_batch else next_id)
+            next_id += 0 if is_batch else 1
+        return ids
+
+    def _reduction_chain(self, out):
+        """``out`` and the single-input nodes below it, down to the first reduction."""
+        chain, node = [], out
+        while True:
+            chain.append(node)
+            if node.raxis or len(node.inputs) != 1:
+                return chain
+            node = node.inputs[0].src_node
+
+    def _is_linear_chain(self, out, red):
+        chain = self._reduction_chain(out)
+        return chain[-1] is red and all(
+            type(n) in _LINEAR_POST_OPS for n in chain[:-1]
+        )
+
+    def _inter_block_tile(self, node):
+        """An inter output's block: whole but for a single entry of each batch dim."""
+        flags = self._get_visible_batch_dim_flags(node)
+        return [
+            1 if is_batch else int(extent)
+            for extent, is_batch in zip(node.get_space_dim(), flags)
+        ]
+
+    def _intra_loop_step(self, rstep_map):
+        (step,) = {
+            int(next(iter(rstep_map[r].values()))) for r in self._intra_reductions
+        }
+        return step
+
+    def _pin_full_launch_dims(self, tile):
+        tile = list(tile)
+        shape = self._get_visible_output_shape(self.canonical_output_node)
+        for dim in self._full_launch_dims:
+            tile[dim] = int(shape[dim])
+        return tile
+
+    def _assignment_rstep_map(self, output_tile, rstep_map):
+        """``rstep_map`` with each inter reduction stepped by its launch tile, or ``None``.
+
+        ``None`` for a tiling this assignment cannot run: a launch dim of
+        ``_full_launch_dims`` split, intra reductions stepped differently (they share
+        one loop), or no loop at all (the intra axis in one step).
+        """
+        shape = self._get_visible_output_shape(self.canonical_output_node)
+        if any(int(output_tile[d]) != int(shape[d]) for d in self._full_launch_dims):
+            return None
+        steps = {
+            int(next(iter(rstep_map[r].values()))) for r in self._intra_reductions
+        }
+        if len(steps) != 1:
+            return None
+        (step,) = steps
+        if all(step >= int(r.raxis[0].dom.extent) for r in self._intra_reductions):
+            return None
+        rstep_map = dict(rstep_map)
+        for red, dim in self._inter_rstep_dims.items():
+            rstep_map[red] = {red.raxis[0].var.name: int(output_tile[dim])}
+        return rstep_map
+
+    def _reads_placeholder_unevenly(self, td) -> bool:
+        """Whether two consumers of one input need different tiles of it.
+
+        A placeholder gets one tile per CTA; e.g. ``k`` in ``(q @ k^T) @ k`` needs every
+        column for the score but only the output's column tile for the second matmul, so a
+        tile narrower than the head dim would hand that matmul the wrong operand.
+        """
+        seen = {}
+        for node in self.ordered_nodes:
+            if self.accumulation and node in self._inter_rstep_dims:
+                # an inter reduction reads only its block's slice of the axis the launch tiles
+                shapes = self._propagate_inputs_full_rank(
+                    node, td.tile_map[node], rstep=td.rstep_map[node]
+                )
+            else:
+                shapes = self._propagate_inputs_full_rank(node, td.tile_map[node])
+            for edge, shape in zip(node.inputs, shapes):
+                if not edge.src_node.is_placeholder():
+                    continue
+                tile = tuple(int(x) for x in shape)
+                if seen.setdefault(edge.src_node, tile) != tile:
+                    return True
+        return False
 
     def get_num_threads(self, candidates):
         for candidate in candidates:
@@ -977,7 +1364,14 @@ class DefaultPolicy:
             if not memo_ancestors[node1].intersection(memo_ancestors[node2]):
                 return False
 
-            # 2. descendant reduction nodes must match
+            # 2. siblings (neither feeds the other) that share an ancestor run in one
+            # loop: apply_tiling merges a reduction into the loop it shares a node or
+            # an input with, and the loop has one counter, so they have to step
+            # together (LoRA's X@W and X@A, which share X)
+            if node1 not in memo_ancestors[node2] and node2 not in memo_ancestors[node1]:
+                return True
+
+            # 3. descendant reduction nodes must match
             if memo_descendant_reductions[node1] != memo_descendant_reductions[node2]:
                 return False
 
@@ -1097,6 +1491,62 @@ class TCPolicy(DefaultPolicy):
                 return True
         return False
 
+    @staticmethod
+    def _reads_gemm_accumulator(node):
+        """Does ``node`` compute (through register ops only) from a gemm accumulator?"""
+        stack, seen = [node], set()
+        while stack:
+            current = stack.pop()
+            if isinstance(current, Matmul):
+                return True
+            if current in seen or not isinstance(current, (ComputeOpNode, ViewOpNode)):
+                continue
+            seen.add(current)
+            stack.extend(edge.src_node for edge in current.inputs)
+        return False
+
+    def _register_operand_layout_conflict(self, candidate, n_threads):
+        """Would a gemm read its A operand from registers in a layout TileLang cannot match?
+
+        TileLang 0.1.13 limitation on sm_90 (the vendored TileLang cannot be patched): the
+        accumulator layout of a gemm and the register A-operand layout of a later gemm fed
+        from it (directly or through elementwise ops, e.g. FlashAttention's
+        ``exp(q k^T) @ v``) differ unless the block's M gives every warp at least 16 rows,
+        and, with two warpgroups (256 threads), exactly 16 (M = 128); lowering fails with
+        ``Layout infer conflict between <frag> and <frag>/A_ptr``. An A operand computed
+        only from loaded tiles lowers at every M. Repros (lowering only, no GPU), in
+        cleave-attn-bwd-evidence/scratch: p8-staging/repro_rs_gemm_layout.py,
+        p8b-rsgemm/repro_variants.py (32..256 threads x M 16..256), p13-merged/repro_rs_m32.py.
+        A transposed A, or a gemm whose operands are both computed, is staged through
+        shared memory by codegen, so it is not read from registers; so is MLA decode's
+        value gemm under ``mla_decode_pass``, and an A operand the graph already marks
+        ``stage_fragment_operands_in_shared`` (the paged layers' value matmul): staged, it
+        lowers at every M (scratch/p8c-paged/repro_policy.py).
+        """
+        if getattr(self.arch, "sm_version", None) != 90:
+            return False
+        warps = n_threads // 32
+        for node in self.ordered_nodes:
+            if not isinstance(node, Matmul) or node.transpose_A:
+                continue
+            a_src, b_src = (edge.src_node for edge in node.inputs)
+            if not isinstance(a_src, ComputeOpNode) or isinstance(b_src, ComputeOpNode):
+                continue
+            if not self._reads_gemm_accumulator(a_src):
+                continue
+            if 0 in node.stage_fragment_operands_in_shared:
+                # Codegen copies A to shared first (a paged layer's value matmul, marked by
+                # cleave.dynamic.paging.stage_as_layer): no register A operand, no conflict.
+                continue
+            if is_mla_value_gemm(node):
+                # CompilerPassOptions.mla_decode_pass stages this A operand through shared
+                # (codegen/passes.py), and the candidate then compiles.
+                continue
+            rows_per_warp = int(candidate.get_tile(node)[-2]) / warps
+            if rows_per_warp < 16 or (warps > 4 and rows_per_warp != 16):
+                return True
+        return False
+
     def get_num_threads(self, candidates):
         expanded_candidates = []
         for candidate in candidates:
@@ -1104,6 +1554,8 @@ class TCPolicy(DefaultPolicy):
             if self._requires_low_thread_counts(candidate):
                 n_threads_options.extend(self.LOW_N_THREADS)
             for n_threads in n_threads_options:
+                if self._register_operand_layout_conflict(candidate, n_threads):
+                    continue
                 expanded = copy.copy(candidate)
                 expanded.n_threads = n_threads
                 expanded_candidates.append(expanded)

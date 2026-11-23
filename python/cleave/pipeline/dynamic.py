@@ -14,6 +14,7 @@ from ..core.errors import CleaveError, SpecError
 from .compile import resolve_configs
 from .kernel import Kernel, Stage
 from .plans import Plan, PlanSet, Refusal
+from .report import format_measured, tolerance_dicts, validation_kind, worst_measured
 from .superopt import superoptimize
 
 
@@ -50,7 +51,7 @@ def schedule_paged(graphs, spec, config, *, split_graphs=(), filter_before_topk=
     split-K MLA body), the pairs are derived from the single-kernel tilings."""
     from ..lower import to_ir
     from ..dynamic.paging import (SPLIT_KINDS, MLASpec, apply_paging, paging_accept, read_dense_attention,
-                          read_dense_mla)
+                          read_dense_mla, stage_as_layer)
     from ..schedule import apply_tiling
 
     t0 = time.perf_counter()
@@ -67,7 +68,8 @@ def schedule_paged(graphs, spec, config, *, split_graphs=(), filter_before_topk=
     read = read_dense_mla if isinstance(spec, MLASpec) else read_dense_attention
     accept = paging_accept(spec) if filter_before_topk else None
     for g in graphs:
-        ir = to_ir(g.structure, symbol_map=g.symbol_map, dtype=g.dtype, out_dtype=g.dtype)
+        ir = stage_as_layer(
+            to_ir(g.structure, symbol_map=g.symbol_map, dtype=g.dtype, out_dtype=g.dtype), spec)
         for rank, tile in enumerate(_tilings(ir, config.topk, accept)):
             try:
                 tiled = apply_tiling(tile)
@@ -90,7 +92,7 @@ def _schedule_split(g, spec, config, add, refused):
     """Split-KV pairs: the partial tilings the layer reads, each with the first combine tiling."""
     from ..lower.process import to_bundles
     from ..dynamic.paging import (MLASpec, apply_paging_split, read_dense_combine, read_dense_mla_partial,
-                          read_dense_partial)
+                          read_dense_partial, stage_as_layer)
     from ..schedule import apply_tiling
 
     read_partial = read_dense_mla_partial if isinstance(spec, MLASpec) else read_dense_partial
@@ -105,7 +107,7 @@ def _schedule_split(g, spec, config, add, refused):
             continue
         for partial_graph, combine_graph in bundles:
             partials, combine = {}, None
-            for tile in _tilings(partial_graph, config.topk):
+            for tile in _tilings(stage_as_layer(partial_graph, spec), config.topk):
                 try:
                     tiled = apply_tiling(tile)
                     dense, found = read_partial(tiled)
@@ -150,25 +152,40 @@ def _derive_split(spec, solo, factors, add, refused):
 
 
 # ----------------------------------------------------------------------------- workloads
-def resolve_workloads(attention, workloads=None, tolerance=None):
-    """``(factory(keep), tolerance)``. ``workloads``: None (the registry's, else
-    ``cl.workloads.paged_decode()``), a ``cl.workloads`` spec, or a zero-arg factory."""
-    from ..dynamic import GATHER_TOLERANCE
+def resolve_workloads(attention, workloads=None, tolerance=None, adversarial=False):
+    """``(factory(keep, adversarial=False), tolerance)``. ``workloads``: None (the registry's,
+    else ``cl.workloads.paged_decode()``), a ``cl.workloads`` spec, or a zero-arg factory.
+
+    The tolerance is the one given, else the one the registry operator of this name and
+    shape declares; there is no generic fallback. ``adversarial`` asks for the registry
+    operator's adversarial softmax workloads on top of its captured ones (validation only).
+    Nothing here touches a GPU: ``compile_dynamic`` calls it before it searches, so a program
+    that cannot be validated is refused first.
+    """
     from ..frontend.paged import workloads as wl
 
-    tol = tolerance or GATHER_TOLERANCE
+    op = _registry_op(attention)
+    if workloads is None and op is None and (attention.is_mla or attention.is_prefill):
+        raise SpecError(f"{attention.program.name}: no captured {attention.kind} workloads; "
+                        "pass workloads=")
+    tol = tolerance if tolerance is not None else getattr(op, "tolerance", None)
+    if tol is None:
+        raise SpecError(f"{attention.program.name}: no validation tolerance declared and no "
+                        "registry operator of this name and shape to take one from; pass "
+                        "tolerance=cl.Tolerance(rtol=..., atol=...) (one per output)")
+    if workloads is None and op is not None:
+        return (lambda keep=0, adversarial=False:
+                op.keyed_workloads(keep=keep, adversarial=adversarial)), tol
+    if adversarial:
+        raise SpecError(f"{attention.program.name}: adversarial workloads are defined for the "
+                        "registry operators' captured workloads only; give a cl.workloads "
+                        "spec its own distribution= instead")
     if workloads is None:
-        op = _registry_op(attention)
-        if op is not None:
-            return (lambda keep=0: op.keyed_workloads(keep=keep)), tolerance or op.tolerance
-        if attention.is_mla or attention.is_prefill:
-            raise SpecError(f"{attention.program.name}: no captured {attention.kind} workloads; "
-                            "pass workloads=")
         workloads = wl.paged_decode()
     if hasattr(workloads, "factory"):
-        return (lambda keep=0: workloads.factory(attention, keep=keep)), tol
+        return (lambda keep=0, adversarial=False: workloads.factory(attention, keep=keep)), tol
     if callable(workloads):
-        return (lambda keep=0: workloads), tol
+        return (lambda keep=0, adversarial=False: workloads), tol
     raise TypeError(f"workloads must be a cl.workloads spec or a factory, got {workloads!r}")
 
 
@@ -245,10 +262,12 @@ def calibrate_dispatch(pair, solo, factory, spec) -> dict:  # factory(keep) -> w
 # ----------------------------------------------------------------------------- report
 class DynamicReport:
     def __init__(self, plans: PlanSet, candidates, errors, *, workloads: int, timings: dict,
-                 expected: str | None = None, tuned=None, dispatch: dict | None = None):
+                 expected: str | None = None, tuned=None, dispatch: dict | None = None,
+                 tolerance=None):
         self.plans, self.candidates, self.errors = plans, list(candidates), list(errors)
         self.n_workloads, self.timings, self.expected = workloads, dict(timings), expected
         self.tuned, self.dispatch = tuned, dispatch
+        self.tolerance = tolerance  # what the candidates were validated at
 
     @property
     def correct(self):
@@ -273,13 +292,25 @@ class DynamicReport:
         return dict(Counter(f"{type(e).__name__}: {(str(e).strip().splitlines() or [''])[0][:100]}"
                             for _, e in self.errors).most_common())
 
+    def validation_failures(self) -> dict:
+        """The candidates that failed on a workload, as mismatch / non_finite / launch_crash."""
+        kinds = Counter(validation_kind(e) for _, e in self.errors)
+        kinds.pop("other", None)  # compile errors
+        return dict(kinds.most_common())
+
+    def measured_error(self) -> list | None:
+        """Per output, the largest error measured over the correct candidates' workloads."""
+        return worst_measured(c.measured for c in self.correct)
+
     def summary(self) -> str:
         graphs, t = self.plans.graphs, self.timings
         rows = [("superoptimize", f"{len(graphs)} dense graph(s), "
                  f"{'cache hit' if graphs.from_cache else 'searched'}", t.get("superoptimize")),
                 ("schedule", self.plans.summary().replace("\n  ", "  "), t.get("schedule")),
                 ("validate", f"{len(self.correct)} of {len(self.candidates)} correct over "
-                 f"{self.n_workloads} workloads", t.get("validate"))]
+                 f"{self.n_workloads} workloads"
+                 + (f"  max error {format_measured(self.measured_error(), self.tolerance)}"
+                    if self.measured_error() else ""), t.get("validate"))]
         rows += [("", f"  {n}x {k}", None) for k, n in self.histogram().items()]
         if self.expected:
             rows.append(("", f"  reproduces the expected kernel: {self.expected}", None))
@@ -306,7 +337,17 @@ class DynamicReport:
 
     def to_dict(self) -> dict:
         return {"candidates": len(self.candidates), "correct": len(self.correct),
-                "failures": self.histogram(), "timings_s": self.timings,
+                "failures": self.histogram(),
+                "validation": {
+                    "tolerance": tolerance_dicts(self.tolerance),
+                    "failures": self.validation_failures(),
+                    "max_error": self.measured_error(),
+                    "measured": [{"plan": c.label, "ok": c.correct, "workloads": c.checked,
+                                  "rel": [m.rel for m in c.measured],
+                                  "abs": [m.abs for m in c.measured]}
+                                 for c in self.candidates if c.measured is not None],
+                },
+                "timings_s": self.timings,
                 "refused": len(self.plans.refused),
                 "latency_us": {c.label: c.geomean_us for c in self.timed},
                 "tuned": None if self.tuned is None else self.tuned.origin,
@@ -423,11 +464,14 @@ class PagedKernel(Kernel):
 def compile_dynamic(fn, *, dtype=None, preset="default", superopt=None, schedule=None, eval=None,
                     split=None, hints=None, workloads=None, tolerance=None, max_workloads: int = 6,
                     filter_before_topk: bool = False, reference: bool = True, dispatch: bool = True,
+                    adversarial: bool = False,
                     progress: Callable[[str, object], None] | None = None, **unused) -> PagedKernel:
     """``split``: the KV dim (``cl.Split("kv_len", (4, 8))``) to also search split-KV pairs
     (decode kinds only); candidates are validated on every workload and timed on
     ``max_workloads`` of them. ``reference``: also measure the registry's tuned kernel (it
-    cannot win). ``dispatch``: with split pairs, calibrate the split/single choice per workload."""
+    cannot win). ``dispatch``: with split pairs, calibrate the split/single choice per workload.
+    ``tolerance``: one ``cl.Tolerance`` per output (default: the registry operator's).
+    ``adversarial``: also validate on the registry operator's adversarial softmax workloads."""
     from ..frontend.paged import trace_paged
     from ..dynamic.paging import SPLIT_KINDS
     from ..runtime.autotune import (benchmark_over_workloads, compile_and_validate_over_workloads,
@@ -451,6 +495,10 @@ def compile_dynamic(fn, *, dtype=None, preset="default", superopt=None, schedule
                                  eval=eval, split=split)
     if split is False:
         sc = sc.replace(split_k=())
+    # Before the search: a program with no declared tolerance (or no workloads) cannot be
+    # validated, and that is known now.
+    factory, tol = resolve_workloads(
+        attention, workloads, tolerance if tolerance is not None else ev.tolerance, adversarial)
     t0 = time.perf_counter()
     graphs = superoptimize(body, so.replace(split=()))
     split_graphs = superoptimize(body, so).filter(lambda g: g.is_split) if so.split else ()
@@ -462,7 +510,6 @@ def compile_dynamic(fn, *, dtype=None, preset="default", superopt=None, schedule
     if not plans:
         raise CleaveError(f"{program.name}: the access layer refused every tiling\n{plans.summary()}")
     t2 = time.perf_counter()
-    factory, tol = resolve_workloads(attention, workloads, tolerance or ev.tolerance)
     by_cand = {}
     for p in plans:
         c = WorkloadCandidate(label=p.label, source=p.source, origin=p.origin, tiling=p.dense,
@@ -471,7 +518,8 @@ def compile_dynamic(fn, *, dtype=None, preset="default", superopt=None, schedule
     cands = [c for c, _ in by_cand.values()]
     tuned = _tuned_reference(attention, spec, cands) if reference else None
     success, errors = [], []
-    compile_and_validate_over_workloads(cands, factory(0), success, errors, tolerance=tol)
+    compile_and_validate_over_workloads(cands, factory(0, adversarial), success, errors,
+                                        tolerance=tol)
     t3 = time.perf_counter()
     if any(c.eligible for c in success):
         benchmark_over_workloads(success, factory(max_workloads))
@@ -480,7 +528,7 @@ def compile_dynamic(fn, *, dtype=None, preset="default", superopt=None, schedule
     report = DynamicReport(plans, cands, errors, workloads=max((c.checked for c in cands), default=0),
                            timings={"superoptimize": t1 - t0, "schedule": t2 - t1,
                                     "validate": t3 - t2, "benchmark": t4 - t3},
-                           expected=expected, tuned=tuned)
+                           expected=expected, tuned=tuned, tolerance=tol)
     best = report.best()
     if best is None:
         note("evaluate", report)

@@ -161,6 +161,23 @@ private:
   void propagate_reduce_max_op(KNOperator *op);
 
 public:
+  // Declared inputs (see InputDeclaration). `input` must be an input of this
+  // graph that comes after every one of `sources` (inputs of this graph, not
+  // declared themselves); `definition` has one input per source, of the same
+  // shape, and one output, of the shape of `input`. The definition is copied.
+  void declare_input(DTensor const &input,
+                     Graph const &definition,
+                     std::vector<DTensor> const &sources);
+  bool has_declared_inputs() const;
+  std::vector<KNInputOp *> input_ops() const;
+  // The tensors of the sources of `decl`, in this graph.
+  std::vector<DTensor> declaration_sources(InputDeclaration const &decl) const;
+  // `definition` rebuilt over fresh inputs with the dims, flags and dtypes of
+  // `inputs` (one per definition input); its result is recomputed by the op
+  // constructors (shapes, forward reducibility).
+  static std::unique_ptr<Graph> instantiate(Graph const &definition,
+                                            std::vector<DTensor> const &inputs);
+
   // Deep copy with fresh guids; caller owns the result.
   Graph *clone() const;
 
@@ -174,6 +191,11 @@ public:
   using OpType = KNOperator;
   using TensorType = DTensor;
 };
+
+// A guid-free JSON text of `op`'s declaration ("" for anything else): its
+// sources and its definition (each op: type, operand positions, output dims
+// and dtype, attributes). For checkpoint keys.
+std::string declaration_key(KNOperator const *op);
 
 void to_json(json &j, Graph const &g);
 void from_json(json const &j, Graph &g);

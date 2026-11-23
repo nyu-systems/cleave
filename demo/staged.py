@@ -31,10 +31,12 @@ def main():
     plans = schedule(graphs, cleave.ScheduleConfig(topk=args.topk, split_k=(4, 8, 16, 32)))
     print(plans.summary())
 
-    # 3. codegen + compile + validate in worker processes; 4. benchmark
-    built = cleave.build(plans, workers=args.max_parallel)
+    # 3. codegen + compile + validate in worker processes (at the operator's declared
+    #    tolerance; there is no default) and time the survivors; 4. the report
+    config = cleave.EvalConfig(warmup=16, iters=1000, tolerance=cl.Tolerance(rtol=5e-3))
+    built = cleave.build(plans, workers=args.max_parallel, config=config)
     print(built)
-    report = cleave.evaluate(built, cleave.EvalConfig(warmup=16, iters=1000))
+    report = cleave.evaluate(built)
     print(report.summary())
     print(report.table(top=5, by="variant"))
     best = report.best()

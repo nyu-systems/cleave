@@ -21,6 +21,9 @@ CAUSAL_KINDS = (PAGED_PREFILL_CAUSAL, RAGGED_PREFILL_CAUSAL)
 PAGED_KINDS = (PAGED_DECODE, PAGED_DECODE_SLAB, PAGED_PREFILL_CAUSAL)
 # The layers whose page table is indexed in pages rather than tokens.
 SLAB_KINDS = (PAGED_DECODE_SLAB,)
+# The layers whose value matmul reads P from its fragment (wgmma_rs); every other layer,
+# MLA included, stages P through shared for it (`stage_fragment_operands_in_shared`).
+REGISTER_P_KINDS = (RAGGED_PREFILL_CAUSAL,)
 
 MLA_PAGED_DECODE = "mla_paged_decode"
 MLA_PAGED_PREFILL_CAUSAL = "mla_paged_prefill_causal"
