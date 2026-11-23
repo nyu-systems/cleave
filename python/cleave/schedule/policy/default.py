@@ -1003,6 +1003,10 @@ class DefaultPolicy:
                 return []
             smem_tile_candidates = self.propose_iterative_tiles(base_tile)
         smem_tile_candidates = self.get_num_threads(smem_tile_candidates)
+        # Filtered here, not marked invalid: the tile walk still passes through such tiles.
+        smem_tile_candidates = [
+            c for c in smem_tile_candidates if not self._reads_placeholder_unevenly(c)
+        ]
         if accept is not None:
             smem_tile_candidates = [c for c in smem_tile_candidates if accept(c)]
 
@@ -1187,6 +1191,24 @@ class DefaultPolicy:
         for red, dim in self._inter_rstep_dims.items():
             rstep_map[red] = {red.raxis[0].var.name: int(output_tile[dim])}
         return rstep_map
+
+    def _reads_placeholder_unevenly(self, td) -> bool:
+        """Whether two consumers of one input need different tiles of it.
+
+        A placeholder gets one tile per CTA; e.g. ``k`` in ``(q @ k^T) @ k`` needs every
+        column for the score but only the output's column tile for the second matmul, so a
+        tile narrower than the head dim would hand that matmul the wrong operand.
+        """
+        seen = {}
+        for node in self.ordered_nodes:
+            shapes = self._propagate_inputs_full_rank(node, td.tile_map[node])
+            for edge, shape in zip(node.inputs, shapes):
+                if not edge.src_node.is_placeholder():
+                    continue
+                tile = tuple(int(x) for x in shape)
+                if seen.setdefault(edge.src_node, tile) != tile:
+                    return True
+        return False
 
     def get_num_threads(self, candidates):
         for candidate in candidates:
