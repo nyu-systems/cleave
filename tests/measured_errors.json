@@ -1055,12 +1055,12 @@
  ],
  "test:softmax_plus_exp": [
   {
-   "abs": 0.0078125,
+   "abs": 0.015625,
    "absolute": false,
    "dtype": "float16",
-   "rel": 0.0003373819054104388,
+   "rel": 0.000974658876657486,
    "seeds": 3,
-   "validated": 18
+   "validated": 33
   }
  ],
  "test:sum_of_matmuls": [

@@ -4,7 +4,10 @@ what the rule gives for the measurement pinned in ``tests/measured_errors.json``
 There is no default tolerance to fall back to, so a fixture whose operator is missing from
 ``tests/_tolerances.py`` cannot validate at all; these checks fail first and say which one.
 A declared value that was edited by hand, in either direction, fails here: re-measure
-(``python -m tests._measure_tolerances --out DIR --pin``) instead.
+(``python -m tests._measure_tolerances --out DIR --pin``) instead. The one exception is
+``HELD``: a declaration that the rule, on a new measurement, would loosen is not loosened by
+whoever re-measures; it is held at its old value, tighter than the rule, until someone
+decides, and is listed there with the numbers.
 """
 
 import json
@@ -30,6 +33,17 @@ from tests._measure_tolerances import (
 from tests._tolerances import CEILING, FP32_CEILING, TOLERANCES, tolerance_for
 
 PINNED = json.loads(MEASURED.read_text())
+
+# Declarations held below what the rule gives the pinned measurement, each with its reason.
+# A held bound is tighter than the rule, never looser, and still above every error measured
+# (every measured kernel validates under it); once the rule gives it again, or it is raised
+# to the rule's value, its entry has to go.
+HELD = {
+    # 2e-3 is what the rule gave the hand-derived pass's measurement (3.4e-4 over 18
+    # kernels). With the max in the flat graph three seeds measure 9.7e-4 over 33 kernels,
+    # just under one float16 ulp of the row max (9.8e-4), for which the rule gives 5e-3.
+    "softmax_plus_exp": "the rule would loosen 2e-3 to 5e-3 on the three-seed measurement",
+}
 
 
 def test_declared_tolerances_are_row_relative_bounds_within_the_ceiling():
@@ -82,15 +96,25 @@ def test_every_declared_tolerance_follows_from_the_pinned_measurement():
     """declared == rule(measured), for every test operator and every paged operator.
 
     (``tests/demo/test_demos.py`` holds the demos to the same file.) Nothing may be looser
-    than its measurement supports, and nothing tighter than the rule's margin either.
+    than its measurement supports, and nothing tighter than the rule's margin either, except
+    a declaration in ``HELD``.
     """
+    assert set(HELD) <= set(TOLERANCES)
     unmeasured = set()
     for name, tolerance in TOLERANCES.items():
         outputs = PINNED.get(f"test:{name}")
         if outputs is None:
             unmeasured.add(name)
         elif isinstance(tolerance, dict):
+            assert name not in HELD, name
             assert tolerance == expected_tolerances_by_role(outputs), name
+            assert all(o["seeds"] >= 3 for o in outputs), name
+        elif name in HELD:
+            # tighter than the rule, with no absolute part either, and above every error
+            # measured: held, not loosened, and no measured kernel fails it
+            rule = expected_tolerance(outputs)
+            assert tolerance.rtol < rule.rtol and tolerance.atol == rule.atol == 0, name
+            assert all(o["rel"] <= tolerance.rtol for o in outputs), name
             assert all(o["seeds"] >= 3 for o in outputs), name
         else:
             assert tolerance == expected_declaration(tolerance, outputs), name

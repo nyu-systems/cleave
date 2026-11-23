@@ -33,7 +33,9 @@ Declare that value (``demo/<name>.py``,
 ``--pin`` writes the measurement to ``tests/measured_errors.json``.
 ``tests/test_tolerance_declarations.py`` and ``tests/demo/test_demos.py`` hold every
 declaration to what the rule gives for that file, so after re-measuring the failing tests
-list exactly the declarations to change.
+list exactly the declarations to change. One that the new measurement would loosen is not
+raised by whoever re-measures: it keeps its value, goes into ``HELD`` of
+``tests/test_tolerance_declarations.py`` with its numbers, and is reported for a decision.
 
 A measurement of a part (``--only``, ``--names``) pins the operators it measured in full
 and leaves the others as they are pinned: a demo's operator is fed by that demo's runs, a
