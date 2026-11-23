@@ -732,6 +732,57 @@ def _merge_into_loop(
     _normalize_inner_reduction_axes(gnode, itile_map)
 
 
+def _reduction_axis_tokens(ops) -> Dict[str, set]:
+    """Source axes (provenance tokens) of each reduction's first axis, by node name.
+
+    Read on the graph as the policy saw it: removing split views loses the provenance.
+    """
+    out_tokens = build_output_axis_provenance(ops)
+    return {
+        node.name: set(tokens[0]) if tokens else set()
+        for node, tokens in build_reduction_axis_provenance(ops, out_tokens).items()
+    }
+
+
+def _check_iterates_with_loop(
+    node, gnode, rstep_map, reduction_axis_tokens, *, shares_nodes, shares_inputs
+):
+    """Refuse to merge reduction ``node`` into the loop of ``gnode`` where it cannot run.
+
+    The loop has one counter. An ancestor of the loop's reductions is absorbed (its axis
+    is held whole, see ``_pin_absorbed_reduction_axes``). Any other reduction steps with
+    the counter:
+    - joining only because its step equals the loop's (no node or input in common), it
+      needs the loop's trip count too, or the kernel reads past the shorter axis;
+    - sharing nodes with the loop (whose tiles are sliced along the loop's axis), it
+      must run over that axis, when the provenance of both axes is known.
+    Raises ``ScheduleRejected`` (a second loop in one kernel is not supported by code
+    generation). A reduction that shares only inputs keeps the historical merge, in
+    which the loop's extent wins.
+    """
+    loop_reductions = [n for n in gnode.graph.accum_nodes if n.raxis]
+    if any(node in get_op_ancestors(r) for r in loop_reductions):
+        return
+    if not shares_nodes and not shares_inputs:
+        step = _get_rstep_for_axis(node, rstep_map[node])
+        trips = int(node.raxis[0].dom.extent) // step
+        if trips != int(gnode.graph.extent):
+            raise ScheduleRejected(
+                f"Reduction {node.name} takes {trips} steps of {step} but would join the "
+                f"loop of {gnode.name}, which takes {gnode.graph.extent}."
+            )
+    if shares_nodes:
+        tokens = reduction_axis_tokens.get(node.name, set())
+        loop_tokens = set().union(
+            *(reduction_axis_tokens.get(r.name, set()) for r in loop_reductions)
+        )
+        if tokens and loop_tokens and not tokens & loop_tokens:
+            raise ScheduleRejected(
+                f"Reduction {node.name} shares nodes with the loop of {gnode.name} but "
+                "runs over another axis; one loop cannot advance both."
+            )
+
+
 def _inter_chains(cand) -> Dict[str, List[str]]:
     """For each inter output of ``cand``, its node and the nodes down to its reduction.
 
@@ -782,6 +833,7 @@ def _inter_output_coord_exprs(canonical_node, output_node, launch_axis_plan):
 
 
 def _join_inter_outputs(
+    cand_rstep_map,
     accumulation,
     inter_chains,
     intra_reductions,
@@ -825,6 +877,22 @@ def _join_inter_outputs(
             raise ScheduleRejected(
                 f"Inter output {top_name} depends on {elsewhere}, which iterate in "
                 "another loop; nested loops are not supported."
+            )
+        # A reduction below the inter output that steps with the loop counter, without
+        # being absorbed by the intra reductions, would hand it a running partial sum.
+        stepping = [
+            n.name
+            for n in _iterative_reductions(
+                [m for m in new_nodes if not isinstance(m, PlaceHolderNode)], cand_rstep_map
+            )
+            if n.name not in inter_chains[top_name]
+            and n.name not in intra_reductions
+            and not any(n in get_op_ancestors(by_name[r]) for r in intra_reductions)
+        ]
+        if stepping:
+            raise ScheduleRejected(
+                f"Inter output {top_name} reads reductions {stepping} that step with the "
+                "loop; each iteration needs their whole sum."
             )
         top_bind_inner_nodes = [
             top_bind_node[n.name]
@@ -916,6 +984,7 @@ def apply_tiling(cand: List) -> List[Graph]:
         if accumulation.get(n.name) == INTRA
         for r in nearest_reductions(n, flat_ops)
     ]
+    reduction_axis_tokens = _reduction_axis_tokens(flat_ops)
     output_nodes = [n for n in cand.flat_graph.nodes if n.is_output()]
     output_node = _select_launch_output_node(output_nodes, accumulation)
 
@@ -1037,6 +1106,14 @@ def apply_tiling(cand: List) -> List[Graph]:
                     ):
                         continue
 
+                    _check_iterates_with_loop(
+                        node,
+                        gnode,
+                        cand.rstep_map,
+                        reduction_axis_tokens,
+                        shares_nodes=bool(shared_inner_nodes),
+                        shares_inputs=bool(existing_placeholders),
+                    )
                     found_compatible_graph = True
 
                     _merge_into_loop(
@@ -1094,6 +1171,7 @@ def apply_tiling(cand: List) -> List[Graph]:
 
     if inter_chains:
         _join_inter_outputs(
+            cand.rstep_map,
             accumulation,
             inter_chains,
             intra_reductions,
