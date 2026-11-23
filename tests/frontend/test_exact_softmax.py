@@ -500,7 +500,9 @@ def test_gpu_exact_softmax_wide_values_are_rescaled_every_iteration_and_validate
     ev = P.EvalConfig(warmup=2, iters=20, max_parallel=4,
                       tolerance=tolerance_for("exact_attention"))
     built = P.build(wide, config=ev)
-    assert len(built.correct) >= 1, built
+    # the claim is about 256 elements a thread: a 128-thread kernel validates (a 256-thread
+    # one, 128 elements a thread, does not stand in for it)
+    assert [r for r in built.correct if r.plan.n_threads == 128], built
     assert all(r.cases == ("normal",) + ADVERSARIAL for r in built)
     assert not [r for r in built if r.error_type in ("NonFiniteOutput", "OutputMismatch")], built
     for r in built.correct:
