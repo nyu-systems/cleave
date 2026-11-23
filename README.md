@@ -73,6 +73,7 @@ All demos share the same flags (`python demo/<name>.py --help`):
 | `{mha,gqa,mqa}_decode.py` | decode attention, split along `SKV` by default |
 | `mha_decode_exact.py` | decode attention with the exact `exp(s - max(s)) / sum` softmax |
 | `{mha,gqa,mqa,mla}_prefill.py`, `mla_decode.py`, `qknorm.py` | prefill / MLA / QK-norm attention |
+| `mha_backward.py` | attention backward: `dQ, dK, dV` in one fused kernel (declared inputs `L`, `o`) |
 | `staged.py` | the pipeline one stage at a time (research view) |
 
 `demo/dynamic/` holds the paged-KV dynamic-shape demos.
@@ -118,6 +119,51 @@ if __name__ == "__main__":  # candidate workers are spawned processes
 ```
 
 See `demo/staged.py` for a complete runnable version.
+
+### Declared inputs and multi-output programs
+
+An input can say where it comes from. `cl.Sample(fn)` only tells validation how to draw it
+(the forward's log-sum-exp `L`, which random values would make overflow); `cl.Equals(fn)` says
+the input *is* `fn` of earlier inputs, so the search may use it in place of its definition.
+`fn` takes earlier inputs by parameter name and is traced, never compiled. The attention
+backward (`demo/mha_backward.py`) declares the forward's output `o` without reading it:
+
+```python
+import cleave
+import cleave.lang as cl
+
+
+def log_sum_exp(q, k):
+    s = q @ k.mT * 0.125
+    m = cl.max(s, -1, keepdim=True)
+    return m + cl.log(cl.sum(cl.exp(s - m), -1, keepdim=True))
+
+
+def forward_output(q, k, v, L):
+    return cl.exp(q @ k.mT * 0.125 - L) @ v
+
+
+@cleave.jit
+def mha_backward(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
+                 v: cl.Tensor["H", "SKV", "D"], dO: cl.Tensor["H", "SQ", "D"],
+                 L: cl.Tensor["H", "SQ", 1, cl.f32, cl.Sample(log_sum_exp)],
+                 o: cl.Tensor["H", "SQ", "D", cl.Equals(forward_output)]):
+    P = cl.exp(q @ k.mT * 0.125 - L)
+    dP = dO @ v.mT
+    dS = P * (dP - cl.sum(P * dP, -1, keepdim=True))
+    return {"dQ": (dS @ k) * 0.125, "dK": (dS.mT @ q) * 0.125, "dV": P.mT @ dO}
+```
+
+The row reduction `sum_SKV(P * dP)` spans the whole key axis; since `o = P @ v`, the search
+replaces it with `sum_D(dO * o)`, a reduction over the head dim only, which a tile can compute
+on its own. A program with an `Equals` input and several outputs is searched once per output
+(`cleave.SuperoptConfig(per_output="auto")`); the per-output graphs are then merged by sharing
+identical operations, here `S`, `P`, `dP`, `D` and `dS` across `dQ`, `dK` and `dV`. In the fused
+kernel each thread block owns a tile of one axis and loops over the other: the outputs that
+reduce along the loop accumulate in registers, the others across thread blocks, with atomic
+adds into a zeroed fp32 buffer that is then cast to the output dtype (zeroing and cast are
+part of every timed launch). Atomic accumulation makes the result order-dependent, so such
+kernels are validated at their tolerance, never compared bit for bit.
 
 ### Validation
 
