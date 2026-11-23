@@ -124,7 +124,7 @@ def test_an_explicit_max_is_an_exact_softmax():
     def publish(cache_dir, graph, dtype, distributions):
         held.append(distributions)
 
-    reference = _reference_fn(("normal",), trace(flash_by_hand, shapes, cl.f16), publish)
+    reference = _reference_fn(("normal",), publish)
 
     assert softmax_axis(node_of(ir, Exp)) == -1
     assert softmax_axis(node_of(queries, Exp)) == -2

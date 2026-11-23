@@ -174,35 +174,32 @@ def _program_dtype(plans) -> str:
     return str(getattr(_program(plans), "dtype", None) or "float16")
 
 
-def _reference_fn(distributions, program, publish):
+def _reference_fn(distributions, publish):
     """``publish(cache_dir, graph, dtype)`` over the input cases the kernels are held to.
 
-    ``distributions`` is what the caller asked for. A program whose softmax is exact
-    (``cl.softmax`` recorded the stabilize request) is right at any logit scale, so its
-    kernels are also held to every adversarial softmax case its inputs can be shaped into
+    ``distributions`` is what the caller asked for. A graph whose softmax is exact -- an exp
+    that reads ``x - max(x)`` (``cleave.runtime.inputs.softmax_axis``), whoever wrote it:
+    ``cl.softmax`` records that max -- is right at any logit scale, so its kernels are also
+    held to every adversarial softmax case its inputs can be shaped into
     (``cleave.runtime.inputs.adversarial_cases``), whether asked or not; they are timed on
-    the first case, as always. An ``exp / sum`` written out by hand makes no such
-    claim (its reference overflows on those inputs) and is validated on what was asked.
+    the first case, as always. An ``exp / sum`` without the max makes no such claim (its
+    reference overflows on those inputs) and is validated on what was asked.
 
     The returned function remembers what each graph was held to: ``held`` maps
-    ``id(flat graph)`` to ``(cases, note)``, ``note`` saying why a graph of an exact program
-    got fewer than every adversarial case (``""`` when it got them all, and for a program
-    that makes no claim).
+    ``id(flat graph)`` to ``(cases, note)``, ``note`` saying why an exact graph got fewer
+    than every adversarial case (``""`` when it got them all, and for a graph that makes
+    no claim).
     """
-    exact = bool(getattr(program, "stabilize_requests", ()))
     held = {}
 
-    def explicit(graph) -> bool:
-        # A graph whose exp reads ``x - max(x)`` is exact by structure, whoever wrote it
-        # (``runtime.inputs.softmax_axis``).
+    def exact(graph) -> bool:
         from ..runtime.inputs import softmax_axis
 
-        return any(getattr(n, "stabilize", None) is None and softmax_axis(n) is not None
-                   for n in graph.nodes)
+        return any(softmax_axis(n) is not None for n in graph.nodes)
 
     def reference(reference_cache_dir, graph, dtype):
         cases, note = distributions, ""
-        if exact or explicit(graph):
+        if exact(graph):
             from ..runtime.inputs import adversarial_cases, why_not_adversarial
 
             cases += tuple(d for d in adversarial_cases(graph) if d not in distributions)
@@ -318,7 +315,7 @@ def build(plans: PlanSet | Sequence[Plan], workers: int | None = None, *,
         return _publish_reference(publish_reference, distributions, plans_by_graph,
                                   reference_cache_dir, graph, dtype)
 
-    reference_fn = _reference_fn(distributions, _program(plans), publish)
+    reference_fn = _reference_fn(distributions, publish)
     _check_tolerance_fits(plan_list, config.tolerance)
     t0 = time.perf_counter()
     runs = run_candidates([p.tile for p in plan_list], _program_dtype(plans),

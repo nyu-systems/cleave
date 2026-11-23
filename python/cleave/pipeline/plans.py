@@ -96,9 +96,7 @@ class PlanSet(Sequence):
 def lower(graph: SearchedGraph, split_factor: int | None = None) -> list:
     """``[graph]`` for solo, ``[partial, combine]`` for a split graph at ``split_factor``."""
     bundle = _lower_structure(graph, graph.structure, split_factor)
-    if getattr(graph.program, "stabilize_requests", ()):
-        bundle = _annotate_softmax(graph, bundle)
-    elif not graph.is_split:
+    if not graph.is_split:
         _derive_updates(graph, bundle[0])
     return bundle
 
@@ -161,50 +159,6 @@ def _lower_structure(graph: SearchedGraph, structure, split_factor: int | None =
     if len(bundle) != (2 if graph.is_split else 1):
         raise LoweringRejected(f"graph {graph.index}: expected {2 if graph.is_split else 1} "
                                f"stage(s), got {len(bundle)}")
-    return bundle
-
-
-def _annotate_softmax(graph: SearchedGraph, bundle: list) -> list:
-    """The freshly lowered graph(s) of a program that asked for a softmax, with its exps
-    marked.
-
-    ``cl.softmax`` records a plain ``exp`` plus a request; which Exp of *this* graph the
-    request means is derived by the scale analysis. The flat graph stays shift-free (the
-    tiling policy must not see a max ahead of the sums): the mark is what the reference
-    honours and what the per-schedule stabilization consumes after tiling.
-
-    A split pair keeps a softmax on either side of the cut: the partial's, whose shift it
-    exports as one more output, and the combine's over the split axis, which weights the
-    partials by that shift (``cleave.lower.scale.stabilize_split``).
-
-    The search computes a value once: where the program wrote several exps of one tensor
-    (``cl.softmax(x) + cl.exp(x)``, two softmaxes of ``x`` over different axes) the solo
-    graph it returns has one, whose factor does not cancel. Such a graph is lowered with
-    that exp computed again for a part of its readers (``cleave.lower.unmerge``): the first
-    such structure the analysis accepts, in a fixed order, so lowering the graph again
-    gives the same one. The structure of the searched graph itself is left as it is.
-    """
-    from ..lower.scale import ScaleError, annotate, stabilize_split, written_exps
-    from ..lower.unmerge import exp_ops, unmerged
-
-    try:
-        if graph.is_split:
-            return list(stabilize_split(*bundle, graph.program))
-        annotate(bundle[0], graph.program)
-    except ScaleError as e:
-        merged = 0 if graph.is_split else written_exps(graph.program) - exp_ops(graph.structure)
-        for structure in unmerged(graph.structure, merged):
-            try:
-                served = _lower_structure(graph, structure)
-                annotate(served[0], graph.program)
-            except (LoweringRejected, ScaleError):
-                continue
-            return served
-        why = ("; the search merged exps the program wrote apart, and computing the merged "
-               "one again for a part of its readers does not serve the softmax either"
-               if merged > 0 else "")
-        raise LoweringRejected(
-            f"graph {graph.index}: softmax cannot be stabilized: {e}{why}") from e
     return bundle
 
 

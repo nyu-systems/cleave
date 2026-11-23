@@ -275,8 +275,8 @@ def test_the_reference_publishing_holds_an_explicit_softmax_to_every_case():
         published.append(tuple(distributions))
         return "ok"
 
-    _reference_fn(("normal",), prog, publish)("dir", ir, "float16")
-    _reference_fn(("normal",), plain_prog, publish)("dir", plain, "float16")
+    _reference_fn(("normal",), publish)("dir", ir, "float16")
+    _reference_fn(("normal",), publish)("dir", plain, "float16")
     assert published == [("normal",) + ADVERSARIAL, ("normal",)]
 
 

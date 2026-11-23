@@ -673,7 +673,7 @@ def test_adversarial_inputs_are_switched_on_per_path():
     def held_to(program, asked, graph=None):
         if graph is None:
             graph = to_ir(program.to_graph_structure(), dtype=DTYPE, out_dtype=DTYPE)
-        assert _reference_fn(asked, program, publish)("dir", graph, DTYPE) == "published"
+        assert _reference_fn(asked, publish)("dir", graph, DTYPE) == "published"
         return seen[-1]
 
     shapes = dict(H=2, SQ=8, SKV=96, D=16)

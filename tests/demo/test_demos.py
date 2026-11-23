@@ -301,7 +301,7 @@ def test_qknorm_says_which_inputs_its_kernels_are_validated_on():
         sys.path.remove(str(DEMO))
     program = qknorm.trace(HQ=4, HKV=2, SQ=16, SKV=64, D=32)
     held = []
-    reference = _reference_fn(("normal",), program,
+    reference = _reference_fn(("normal",),
                               lambda cache_dir, graph, dtype, distributions:
                               held.append(distributions) or "published")
     graph = to_ir(program.to_graph_structure(), dtype="float16", out_dtype="float16")
