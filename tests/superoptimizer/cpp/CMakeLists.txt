@@ -59,3 +59,8 @@ add_executable(test_symbolic_dims
   kernel/test_symbolic_dims.cc)
 target_link_libraries(test_symbolic_dims cleave_superoptimizer)
 add_test(NAME test_symbolic_dims COMMAND test_symbolic_dims)
+
+add_executable(test_declared_inputs
+  kernel/test_declared_inputs.cc)
+target_link_libraries(test_declared_inputs cleave_superoptimizer)
+add_test(NAME test_declared_inputs COMMAND test_declared_inputs)
