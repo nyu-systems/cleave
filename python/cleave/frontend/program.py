@@ -171,6 +171,58 @@ class Program:
                 live.update(a for a in r.args if isinstance(a, int))
         return [r for r in self._records if r.kind in ("input", "output") or r.out in live]
 
+    def for_output(self, output) -> tuple["Program", tuple[int, ...]]:
+        """The program of one output (a name or an index into ``outputs``).
+
+        It keeps that output's live compute, the inputs it reads (in this program's order) and
+        every declared input whose sources are all kept; a declared input it reads whose sources
+        are not all kept becomes a plain (free) input. Declared ``equals=`` inputs stay last.
+        Returns ``(program, kept)``: ``kept[j]`` = this program's position of its input ``j``.
+        """
+        names = [o.name for o in self.outputs]
+        i = names.index(output) if isinstance(output, str) else int(output)
+        out = self.outputs[i]
+        live = {out.tensor.id}
+        for r in reversed(self._records):
+            if r.out in live:
+                live.update(a for a in r.args if isinstance(a, int))
+        ids = [r.out for r in self._records if r.kind == "input"]
+        read = {k for k, v in enumerate(ids) if v in live}
+        kept = set(read)
+        for k, s in enumerate(self.inputs):  # unread: kept iff the search may substitute it
+            if s.equals is not None and k not in read and set(s.over) <= read:
+                kept.add(k)
+        keeps_declaration = {k for k in kept if self.inputs[k].declaration is not None
+                             and set(self.inputs[k].over) <= kept}
+        is_equals = lambda k: k in keeps_declaration and self.inputs[k].equals is not None  # noqa: E731
+        order = sorted(kept, key=lambda k: (is_equals(k), k))
+        position = {k: j for j, k in enumerate(order)}
+
+        sub = Program(f"{self.name}.{out.name}", self.dtype)
+        sub.split, sub._dims = self.split, dict(self._dims)
+        env = {}
+        records = {r.out: r for r in self._records if r.kind == "input"}
+        for k in order:
+            s, r = self.inputs[k], records[ids[k]]
+            attrs = {kk: v for kk, v in r.attrs if kk not in ("equals", "sample", "over")}
+            if k in keeps_declaration:
+                over = tuple(position[j] for j in s.over)
+                s = dataclasses.replace(s, over=over)
+                kind = "equals" if s.equals is not None else "sample"
+                attrs.update({kind: s.declaration.fingerprint(), "over": over})
+            else:
+                s = dataclasses.replace(s, equals=None, sample=None, over=())
+            sub.inputs.append(s)
+            env[ids[k]] = sub._emit("input", (), s.dims, s.dtype, **attrs).id
+        for r in self._records:
+            if r.kind in ("input", "output") or r.out not in live:
+                continue
+            t = self._values[r.out]
+            args = tuple(env[a] if isinstance(a, int) else a for a in r.args)
+            env[r.out] = sub._emit(r.kind, args, t.dims, t.dtype, **dict(r.attrs)).id
+        sub.output(sub._values[env[out.tensor.id]], out.name)
+        return sub, tuple(order)
+
     @property
     def op_count(self) -> int:
         """Input + compute ops; the search budget adds ``len(outputs)`` on top."""

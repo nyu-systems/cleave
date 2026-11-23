@@ -27,11 +27,24 @@ class SuperoptConfig(_Replace):
     split: tuple[str, ...] = ()
     concat_matmul: bool = False
     cache: bool = True
+    # Search each output on its own (``Program.for_output``) and merge one graph per output
+    # (pipeline/superopt.py). "auto": iff the program has an ``equals=`` input and more than
+    # one output; every other program is searched whole, as before.
+    per_output: bool | Literal["auto"] = "auto"
 
     def __post_init__(self):
         object.__setattr__(self, "split", split_names(self.split))
+        if self.per_output not in ("auto", True, False):
+            raise SpecError(f"per_output must be 'auto', True or False, got {self.per_output!r}")
         if self.max_ops != "auto" and (not isinstance(self.max_ops, int) or self.max_ops < 1):
             raise SpecError(f"max_ops must be 'auto' or a positive int, got {self.max_ops!r}")
+
+    def resolve_per_output(self, program) -> bool:
+        if self.per_output != "auto":
+            return bool(self.per_output)
+        declared = any(getattr(s, "equals", None) is not None
+                       for s in getattr(program, "inputs", ()))
+        return declared and len(getattr(program, "outputs", ())) > 1
 
     def resolve_max_ops(self, program) -> int:
         if self.max_ops != "auto":
