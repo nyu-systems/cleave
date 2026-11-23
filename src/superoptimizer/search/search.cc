@@ -455,7 +455,10 @@ void KernelGraphGenerator::preprocess(kernel::Graph const &computation_graph) {
               spec.scalar == bin_op->scalar &&
               spec.scalar_on_left == bin_op->scalar_on_left &&
               spec.input_pattern &&
-              spec.input_pattern->to_string() == input_pattern->to_string()) {
+              (has_declared_inputs
+                   ? spec.input_canonical == ac_canonical_string(*input_pattern)
+                   : spec.input_pattern->to_string() ==
+                         input_pattern->to_string())) {
             seen = true;
             break;
           }
