@@ -676,7 +676,7 @@ class DefaultPolicy:
                     # summed across CTAs: an atomic add per element of the block
                     traffic += (
                         coalesced_tensor_shape(
-                            output_shapes[edge.src_id],
+                            tile,
                             node.get_shape(edge.src_id),
                             self.arch.transaction_size[0] // ATOMIC_ACCUM_BYTES,
                         )
