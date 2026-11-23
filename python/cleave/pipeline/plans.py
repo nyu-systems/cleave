@@ -350,6 +350,7 @@ def _schedule_once(graphs: GraphSet, config: ScheduleConfig, force: bool):
             plans.append(Plan(g.index, variant, role, t, label, rank, factor, g, inputs))
 
     combined = set()
+    state_split = getattr(graphs, "state_split", ())
     for g in graphs:
         if g.invalid_split:
             why = f" ({g.split_rejection})" if g.split_rejection else ""
@@ -361,8 +362,10 @@ def _schedule_once(graphs: GraphSet, config: ScheduleConfig, force: bool):
                 (ir,) = lower(g)
             except LoweringRejected as e:
                 refused.append(Refusal(g.index, "solo", "main", e))
-                continue
-            add(g, "solo", "main", ir, None, bind_inputs(ir, program))
+            else:
+                add(g, "solo", "main", ir, None, bind_inputs(ir, program))
+            if state_split:
+                _refuse_state_split(g, graphs, config, refused)
             continue
         if not config.split_k:
             refused.append(Refusal(g.index, "split", "partial",
@@ -380,6 +383,24 @@ def _schedule_once(graphs: GraphSet, config: ScheduleConfig, force: bool):
                 combined.add(f)
                 add(g, variant, "combine", combine, f)
     return plans, refused
+
+
+# The split of a program over the dim its max reduces is built from the loop state of a solo
+# graph (a partial that returns each split's state, a combine that applies the proven
+# repair); until that construction is wired in, such a program runs unsplit, and every
+# split it asked for is refused with this reason, one per solo graph and factor.
+NO_STATE_SPLIT = "no partial/combine pair is built for a graph with a max over that dim"
+
+
+def _refuse_state_split(g, graphs, config, refused) -> None:
+    """The split plans of solo graph ``g`` of a ``GraphSet`` with ``state_split``: one
+    refusal per factor of ``config.split_k``."""
+    from .superopt import max_split_dims
+
+    dims = ",".join(max_split_dims(graphs.program, graphs.state_split))
+    for f in config.split_k:
+        refused.append(Refusal(g.index, f"split-k={f}", "partial", LoweringRejected(
+            f"graph {g.index}: split over {dims}: {NO_STATE_SPLIT}")))
 
 
 def schedule(graphs: GraphSet | Sequence[SearchedGraph], config: ScheduleConfig | None = None) -> PlanSet:

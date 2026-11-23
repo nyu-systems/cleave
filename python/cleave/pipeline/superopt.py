@@ -62,13 +62,24 @@ class SearchedGraph:
 
 
 class GraphSet(Sequence):
+    """The searched graphs of a program.
+
+    ``state_split``: the split the program asked for (``SuperoptConfig.split``) where a max
+    of the program reduces one of its dims. The search returns no valid split graph for a
+    flat graph with such a max in it, so it runs unsplit; a split of such a program is built
+    from the loop state of its solo graphs (``pipeline.plans._schedule_once``). ``()`` for
+    every other program, whose split graphs come from the search as they always did.
+    """
+
     def __init__(self, graphs, program=None, config: SuperoptConfig | None = None, *,
                  max_ops: int | None = None, checkpoint: str | None = None,
-                 from_cache: bool = False, seconds: float = 0.0, parts: tuple = ()):
+                 from_cache: bool = False, seconds: float = 0.0, parts: tuple = (),
+                 state_split: tuple = ()):
         self.graphs = list(graphs)
         self.parts = tuple(parts)  # per-output search: one GraphSet per output, in output order
         self.program, self.config, self.max_ops = program, config, max_ops
         self.checkpoint, self.from_cache, self.seconds = checkpoint, from_cache, seconds
+        self.state_split = tuple(state_split)
 
     def __len__(self):
         return len(self.graphs)
@@ -79,7 +90,8 @@ class GraphSet(Sequence):
     def filter(self, fn: Callable[[SearchedGraph], bool]) -> "GraphSet":
         return GraphSet([g for g in self.graphs if fn(g)], self.program, self.config,
                         max_ops=self.max_ops, checkpoint=self.checkpoint,
-                        from_cache=self.from_cache, seconds=self.seconds, parts=self.parts)
+                        from_cache=self.from_cache, seconds=self.seconds, parts=self.parts,
+                        state_split=self.state_split)
 
     @property
     def dtype(self) -> str:
@@ -97,6 +109,23 @@ class GraphSet(Sequence):
         return "\n".join([head] + [f"  {g.index}: {g.summary()}" for g in self])
 
 
+def max_split_dims(program, split) -> tuple[str, ...]:
+    """The dims of ``split`` that a ``reduce_max`` record of ``program`` reduces (the
+    softmax dim of ``cl.softmax``), in the order ``split`` names them."""
+    from ..frontend.tensor import Dim, split_names
+
+    names = split_names(split)
+    records = getattr(program, "_records", ())
+    values = getattr(program, "_values", {})
+    reduced = set()
+    for r in records:
+        if r.kind == "reduce_max":
+            dim = values[r.args[0]].dims[r.attr("dim")]
+            if isinstance(dim, Dim):
+                reduced.add(dim.name)
+    return tuple(n for n in names if n in reduced)
+
+
 def superoptimize(program, config: SuperoptConfig | None = None) -> GraphSet:
     import cleave.superoptimizer as csopt
     from ..lower.split import Rejected, _contains_split_ops, _renumber_graph, cut_split_graph
@@ -104,9 +133,14 @@ def superoptimize(program, config: SuperoptConfig | None = None) -> GraphSet:
     config = config or SuperoptConfig()
     if config.resolve_per_output(program):
         return _superoptimize_per_output(program, config)
-    max_ops = config.resolve_max_ops(program)
+    # A split over the dim a max reduces: the search would return no valid split graph (the
+    # max is opaque to it), so it runs unsplit, on the budget and with the cache entry of
+    # the unsplit search, and the result says which split was asked for.
+    state_split = config.split if max_split_dims(program, config.split) else ()
+    searched = config.replace(split=()) if state_split else config
+    max_ops = searched.resolve_max_ops(program)
     t0 = time.perf_counter()
-    tile_graph = program.to_tile_graph(split=config.split)  # SpecError on a bad split dim
+    tile_graph = program.to_tile_graph(split=searched.split)  # SpecError on a bad split dim
     try:
         symbolic, symbol_map = csopt.create_symbolic_tile_graph(tile_graph)
         search_cfg = symbolic.setup_search_config()
@@ -115,7 +149,7 @@ def superoptimize(program, config: SuperoptConfig | None = None) -> GraphSet:
             search_cfg.search_thread = int(config.threads)
         ckpt, from_cache = "", False
         if config.cache:
-            key = cache.superopt_key(program, max_ops, config.split, config.concat_matmul)
+            key = cache.superopt_key(program, max_ops, searched.split, config.concat_matmul)
             ckpt = str(cache.checkpoint_path(key))
             from_cache = _checkpoint_valid(symbolic, ckpt, config.concat_matmul, search_cfg)
         found = symbolic.search_tile_graph(ckpt, config.concat_matmul, False, search_cfg)
@@ -135,7 +169,8 @@ def superoptimize(program, config: SuperoptConfig | None = None) -> GraphSet:
                                     program, config.split, invalid_split=rejected is not None,
                                     split_rejection=rejected))
     return GraphSet(graphs, program, config, max_ops=max_ops, checkpoint=ckpt or None,
-                    from_cache=from_cache, seconds=time.perf_counter() - t0)
+                    from_cache=from_cache, seconds=time.perf_counter() - t0,
+                    state_split=state_split)
 
 
 def _checkpoint_valid(symbolic, ckpt: str, concat: bool, search_cfg) -> bool:
