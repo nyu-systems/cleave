@@ -173,6 +173,9 @@ class PagedProgram:
         return t
 
     def input(self, name: str, spec) -> Tensor:
+        if isinstance(spec, TensorSpec) and (spec.equals is not None or spec.sample is not None):
+            raise SpecError(f"input {name!r}: declared inputs (cl.Equals / cl.Sample) are not "
+                            "supported in paged programs")
         if isinstance(spec, ScalarSpec):
             t = self._rec("scalar", (), [()], spec.dtype or f32, name=name)
         else:

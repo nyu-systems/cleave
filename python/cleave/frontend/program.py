@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import inspect
 import json
 import operator
 
@@ -13,13 +14,25 @@ from .tensor import Dim, DType, Tensor, _scalar, as_dtype, extent, f16, split_na
 _UNARY = ("exp", "sqrt", "silu")
 _BINARY = {"add": operator.add, "sub": operator.sub, "mul": operator.mul, "div": operator.truediv}
 _REDUCE = ("reduce_sum", "reduce_max")  # record kinds named like their csopt builder methods
+_REFERENCE_ONLY = ("log",)  # evaluated by Program.reference only; no kernel lowers them
 
 
 @dataclasses.dataclass(frozen=True)
 class InputSpec:
+    """A program input. A declared input carries a one-output sub-``Program`` over earlier
+    inputs (``over``: their positions in ``Program.inputs``, in the sub-program's input order):
+    ``equals`` (the input IS that value) or ``sample`` (only how it is sampled)."""
+
     name: str
     dims: tuple  # Dim | int (literal extent)
     dtype: DType
+    equals: "Program | None" = None
+    sample: "Program | None" = None
+    over: tuple = ()
+
+    @property
+    def declaration(self) -> "Program | None":
+        return self.equals if self.equals is not None else self.sample
 
     @property
     def shape(self) -> tuple[int, ...]:
@@ -72,7 +85,9 @@ class Program:
             return old  # bare name reference
         raise SpecError(f"dim {d.name!r} redeclared: {old} vs {d}")
 
-    def input(self, name: str, dims, dtype=None) -> Tensor:
+    def input(self, name: str, dims, dtype=None, *, equals=None, sample=None) -> Tensor:
+        """A program input. ``equals=fn``: the input is ``fn(...)`` of earlier inputs (named by
+        ``fn``'s parameters); ``sample=fn``: only how it is sampled (it stays a free input)."""
         if any(i.name == name for i in self.inputs):
             raise SpecError(f"duplicate input name {name!r}")
         ds = []
@@ -87,8 +102,48 @@ class Program:
                 raise SpecError(f"input {name!r}: bad dim {d!r}")
             ds.append(d)
         spec = InputSpec(name, tuple(ds), as_dtype(dtype) or self.dtype)
+        attrs = {}
+        if equals is not None or sample is not None:
+            spec = self._declare(spec, equals, sample)
+            kind = "equals" if spec.equals is not None else "sample"
+            attrs = {kind: spec.declaration.fingerprint(), "over": spec.over}
         self.inputs.append(spec)
-        return self._emit("input", (), spec.dims, spec.dtype, name=name)
+        return self._emit("input", (), spec.dims, spec.dtype, name=name, **attrs)
+
+    def _declare(self, spec: InputSpec, equals, sample) -> InputSpec:
+        """Trace a declaration's function over the earlier inputs into a sub-``Program``."""
+        what = f"input {spec.name!r}"
+        if equals is not None and sample is not None:
+            raise SpecError(f"{what}: give equals= or sample=, not both")
+        kind, fn = ("equals", equals) if equals is not None else ("sample", sample)
+        fn = getattr(fn, "fn", fn)  # a @jit function
+        if not callable(fn):
+            raise SpecError(f"{what}: {kind}= must be a function, got {type(fn).__name__}")
+        earlier = {s.name: i for i, s in enumerate(self.inputs)}
+        sub = Program(f"{self.name}.{spec.name}.{kind}", self.dtype)
+        args, over = [], []
+        for p in inspect.signature(fn).parameters.values():
+            if p.name in earlier:
+                src = self.inputs[earlier[p.name]]
+                if kind == "equals" and src.equals is not None:
+                    raise SpecError(f"{what}: an equals= function may not read another equals= "
+                                    f"input ({p.name!r})")
+                over.append(earlier[p.name])
+                args.append(sub.input(p.name, src.dims, src.dtype))
+            elif p.default is not inspect.Parameter.empty:
+                args.append(p.default)
+            else:
+                raise SpecError(f"{what}: {kind}= parameter {p.name!r} is not an earlier input "
+                                f"(declared inputs come after every input they read; earlier: "
+                                f"{list(earlier)})")
+        out = fn(*args)
+        if not isinstance(out, Tensor) or out.program is not sub:
+            raise SpecError(f"{what}: {kind}= must return one cl.Tensor computed from its inputs, "
+                            f"got {out!r}")
+        if out.shape != spec.shape:
+            raise SpecError(f"{what}: {kind}= gives shape {out.shape}, the input is {spec.shape}")
+        sub.output(out, spec.name)
+        return dataclasses.replace(spec, over=tuple(over), **{kind: sub})
 
     def output(self, t: Tensor, name: str | None = None) -> None:
         self._check(t, "output")
@@ -216,6 +271,25 @@ class Program:
     def _max(self, a, dim) -> Tensor:
         return self._reduction(a, dim, "reduce_max")
 
+    def _log(self, a) -> Tensor:
+        return self._unary("log", a)  # reference-only: refused by to_tile_graph/to_graph_structure
+
+    def _lowerable(self, what: str) -> None:
+        """Refuse reference-only ops (``log``) before anything is built."""
+        bad = sorted({r.kind for r in self._records if r.kind in _REFERENCE_ONLY})
+        if bad:
+            raise SpecError(f"{self.name}: {what}: {bad} are reference-only ops (usable inside a "
+                            "sample= function); no kernel lowers them")
+
+    def _unread_inputs(self) -> list[InputSpec]:
+        """Inputs no output depends on."""
+        live = {o.tensor.id for o in self.outputs}
+        for r in reversed(self._records):
+            if r.out in live:
+                live.update(a for a in r.args if isinstance(a, int))
+        ids = [r.out for r in self._records if r.kind == "input"]
+        return [s for s, i in zip(self.inputs, ids) if i not in live]
+
     # ---------------------------------------------------------------- lowering
     def can_split(self, split=()) -> list[tuple[bool, ...]]:
         """Per-input can_split flags: every axis whose dim name is in ``split``."""
@@ -231,7 +305,13 @@ class Program:
         import cleave.superoptimizer as csopt
         from cleave.superoptimizer import core
 
+        self._lowerable("to_tile_graph")
         flags = self.can_split(split)
+        for s in self._unread_inputs():
+            if s.equals is None:  # the C++ symbolizer aborts on an input no op touches
+                raise SpecError(f"{self.name}: input {s.name!r} is not read by any output")
+            raise SpecError(f"{self.name}: equals= input {s.name!r} is not read by any output; "
+                            "the search does not support declared inputs yet")
         graph = csopt.new_tile_graph(split_enabled=any(map(any, flags)))
         flags = iter(flags)
         env = {}
@@ -240,6 +320,10 @@ class Program:
             if r.kind == "input":
                 t = self._values[r.out]
                 env[r.out] = graph.create_tiled_input(t.shape, next(flags), core.dtype(t.dtype.name))
+                if r.attr("equals") is not None:
+                    # THE point where an equals= declaration reaches C++ (the definition graph
+                    # and its source inputs ``r.attr("over")``). Not passed yet: a plain input.
+                    pass
             elif r.kind == "output":
                 graph.create_tiled_output(env[r.args[0]])
             elif r.kind == "matmul":
@@ -253,6 +337,7 @@ class Program:
 
     def to_graph_structure(self) -> list[dict]:
         """The un-optimized program as a ``get_graph_structure()`` list (for to_ir)."""
+        self._lowerable("to_graph_structure")
         input_ids = {r.out for r in self._records if r.kind == "input"}
 
         def desc(i):
@@ -295,10 +380,15 @@ class Program:
 
     def reference(self, *inputs, **named) -> list:
         """Run the program eagerly in torch (fp32 compute); one tensor per output."""
+        outs = self._evaluate(self._bind(inputs, named))
+        return [x.to(o.tensor.dtype.torch) for x, o in zip(outs, self.outputs)]
+
+    def _evaluate(self, inputs) -> list:
+        """The outputs in fp32 (no cast to their dtype)."""
         import torch
 
         env = {}
-        it = iter(self._bind(inputs, named))
+        it = iter(inputs)
         val = lambda a: env[a] if isinstance(a, int) else a  # noqa: E731
         for r in self._records:
             if r.kind == "input":
@@ -314,11 +404,25 @@ class Program:
                 env[r.out] = env[r.args[0]].amax(r.attr("dim"), keepdim=True)
             elif r.kind == "silu":
                 env[r.out] = torch.nn.functional.silu(env[r.args[0]])
-            elif r.kind in _UNARY:
+            elif r.kind in _UNARY or r.kind in _REFERENCE_ONLY:
                 env[r.out] = getattr(torch, r.kind)(env[r.args[0]])
             else:
                 env[r.out] = _BINARY[r.kind](*map(val, r.args))
-        return [env[o.tensor.id].to(o.tensor.dtype.torch) for o in self.outputs]
+        return [env[o.tensor.id] for o in self.outputs]
+
+    def derive_inputs(self, values) -> list:
+        """``values`` (one per input; declared positions may be ``None``) with every declared
+        input (re)computed, in order, from the inputs it reads: fp32 compute, cast straight to
+        the declared dtype, on the device of its first source."""
+        values = list(values)
+        if len(values) != len(self.inputs):
+            raise TypeError(f"{self.name}: expected {len(self.inputs)} inputs, got {len(values)}")
+        for i, s in enumerate(self.inputs):
+            if s.declaration is not None:
+                srcs = [values[j] for j in s.over]
+                (x,) = s.declaration._evaluate(s.declaration._bind(srcs, {}))
+                values[i] = x.to(dtype=s.dtype.torch, device=srcs[0].device)
+        return values
 
     def random_inputs(self, seed: int = 0, device: str = "cuda") -> list:
         import torch
@@ -327,6 +431,9 @@ class Program:
         positive = self._positive_inputs()
         out = []
         for s in self.inputs:
+            if s.declaration is not None:
+                out.append(None)  # derived below; draws nothing from ``gen``
+                continue
             if s.dtype.name == "int32":
                 x = torch.randint(0, 16, s.shape, generator=gen, dtype=torch.int32)
             elif s.name in positive:
@@ -334,6 +441,8 @@ class Program:
             else:
                 x = torch.randn(s.shape, generator=gen)
             out.append(x.to(dtype=s.dtype.torch, device=device))
+        if any(s.declaration is not None for s in self.inputs):
+            out = self.derive_inputs(out)
         return out
 
     def _positive_inputs(self) -> set:

@@ -82,10 +82,26 @@ def extent(d) -> int:
 
 
 @dataclasses.dataclass(frozen=True)
+class Equals:
+    """``cl.Tensor[..., cl.Equals(fn)]``: the input IS ``fn(earlier inputs by name)``."""
+
+    fn: object
+
+
+@dataclasses.dataclass(frozen=True)
+class Sample:
+    """``cl.Tensor[..., cl.Sample(fn)]``: the input is sampled as ``fn(earlier inputs by name)``."""
+
+    fn: object
+
+
+@dataclasses.dataclass(frozen=True)
 class TensorSpec:
     dims: tuple  # Dim | int
     dtype: DType | None = None
     optional: bool = False  # ``cl.Tensor[...] | None``
+    equals: object = None  # the function of a ``cl.Equals`` item
+    sample: object = None  # the function of a ``cl.Sample`` item
 
     def __or__(self, other):
         if other is not None:
@@ -152,17 +168,22 @@ class Tensor:
 
     def __class_getitem__(cls, items):
         items = items if isinstance(items, tuple) else (items,)
-        dtype, ds = None, []
+        dtype, ds, declared = None, [], {}
         for it in items:
             if isinstance(it, DType):
                 dtype = it
+            elif isinstance(it, (Equals, Sample)):
+                key = type(it).__name__.lower()
+                if key in declared:
+                    raise TypeError(f"cl.Tensor annotation: more than one cl.{type(it).__name__}")
+                declared[key] = it.fn
             elif isinstance(it, str):
                 ds.append(Dim(it))
             elif isinstance(it, Dim) or (isinstance(it, int) and not isinstance(it, bool)):
                 ds.append(it)
             else:
                 raise TypeError(f"bad cl.Tensor annotation item {it!r}")
-        return TensorSpec(tuple(ds), dtype)
+        return TensorSpec(tuple(ds), dtype, **declared)
 
     def __init__(self, program, id: int, dims: tuple, dtype: DType, trans: bool = False):
         self.program, self.id, self.dims, self.dtype, self._trans = program, id, tuple(dims), dtype, trans
@@ -252,6 +273,13 @@ class Tensor:
 
     def silu(self):
         return self.program._unary("silu", self)
+
+    def log(self):
+        """Natural log: reference-only (e.g. inside a ``sample`` function); no kernel lowers it."""
+        log = getattr(self.program, "_log", None)
+        if log is None:
+            raise SpecError(".log is only usable in a dense program's reference (e.g. a cl.Sample fn)")
+        return log(self)
 
     def rsqrt(self):
         return 1.0 / self.sqrt()
