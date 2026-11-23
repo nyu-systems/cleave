@@ -593,5 +593,39 @@ std::string ac_canonical_string(AbstractExpr const &e) {
   return canonical_text(canonical(e));
 }
 
+namespace {
+
+void collect_canonical(
+    AbstractExpr const &e,
+    std::vector<std::pair<int, std::vector<std::string>>> &terms) {
+  Canonical c = canonical(e);
+  std::sort(c.factors.begin(), c.factors.end());
+  terms.emplace_back(c.sums, std::move(c.factors));
+  for (auto const &child : children(e)) {
+    if (child) {
+      collect_canonical(*child, terms);
+    }
+  }
+}
+
+} // namespace
+
+CanonicalSubterms::CanonicalSubterms(AbstractExpr const &pattern) {
+  collect_canonical(pattern, terms);
+}
+
+bool CanonicalSubterms::contains_subpattern(AbstractExpr const &e) const {
+  Canonical c = canonical(e);
+  std::sort(c.factors.begin(), c.factors.end());
+  for (auto const &[sums, factors] : terms) {
+    if (c.sums <= sums &&
+        std::includes(factors.begin(), factors.end(), c.factors.begin(),
+                      c.factors.end())) {
+      return true;
+    }
+  }
+  return false;
+}
+
 } // namespace search
 } // namespace cleave_superoptimizer

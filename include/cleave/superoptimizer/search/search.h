@@ -57,6 +57,8 @@ private:
   // The target declares inputs: unread declared inputs are no outputs, and
   // scalar ops compare patterns in AC-canonical form.
   bool has_declared_inputs = false;
+  // the output patterns' canonical subterms (has_declared_inputs only)
+  std::vector<CanonicalSubterms> computation_graph_output_subterms;
   std::vector<ScalarBinarySpec> scalar_binary_specs;
 
   // Statistics-related fields

@@ -434,6 +434,10 @@ void KernelGraphGenerator::preprocess(kernel::Graph const &computation_graph) {
     if (op->op_type == type::KNOperatorType::KN_OUTPUT_OP) {
       computation_graph_output_patterns.push_back(
           computation_graph_patterns.at(op->input_tensors[0].guid));
+      if (has_declared_inputs) {
+        computation_graph_output_subterms.emplace_back(
+            *computation_graph_output_patterns.back());
+      }
     }
   }
 
@@ -493,6 +497,13 @@ bool KernelGraphGenerator::check_pattern(
       result = true;
       break;
     }
+  }
+  // A declared input's substituted pattern nests reductions in other orders
+  // than the target's: Z3 often gives up on those (dO * sum_SKV(P * v) in
+  // sum_SKV(P * sum_D(dO * v))). Programs with declared inputs only.
+  for (size_t i = 0; !result && i < computation_graph_output_subterms.size();
+       i++) {
+    result = computation_graph_output_subterms[i].contains_subpattern(*pattern);
   }
   std::unique_lock<std::shared_mutex> lock(seen_patterns_mutex);
   seen_patterns[key] = result;

@@ -36,6 +36,22 @@ public:
 // does not hold (no distributivity).
 std::string ac_canonical_string(AbstractExpr const &e);
 
+// The subterms of a pattern in that canonical form, for a structural
+// subpattern test that sees through those axioms: `e` is a subpattern if
+// some subterm is sum(b, mul(G)) and e is sum(a, mul(F)) with a <= b and F a
+// sub-multiset of G (subpattern(x, mul(x, y)), sum(a, x) <= sum(b, x)).
+// Sound for those axioms; used where substituted declared inputs make Z3
+// give up (programs with declared inputs only).
+class CanonicalSubterms {
+public:
+  explicit CanonicalSubterms(AbstractExpr const &pattern);
+  bool contains_subpattern(AbstractExpr const &e) const;
+
+private:
+  // (sums, sorted factors) of every subterm
+  std::vector<std::pair<int, std::vector<std::string>>> terms;
+};
+
 class Var : public AbstractExpr {
 public:
   Var(std::string const &name);
