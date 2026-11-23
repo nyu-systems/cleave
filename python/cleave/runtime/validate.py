@@ -301,12 +301,16 @@ def _reference_cache_file(reference_cache_dir):
     return Path(reference_cache_dir) / _REFERENCE_FILE_NAME
 
 
-def _reference_cases(graph, dtype, distributions):
-    """``([(distribution, inputs_by_name, reference), ...], out_idx)``, one case per name."""
+def _reference_cases(graph, dtype, distributions, derive=None):
+    """``([(distribution, inputs_by_name, reference), ...], out_idx)``, one case per name.
+
+    ``derive`` recomputes the declared inputs of each case after its distribution is applied
+    (``cleave.runtime.reference.declared_inputs_hook``); None draws every input.
+    """
     cases, out_idx = [], None
     for distribution in distributions:
         inputs_by_name, reference, out_idx = build_inputs_and_reference(
-            graph, dtype, distribution=distribution
+            graph, dtype, distribution=distribution, derive=derive
         )
         cases.append((distribution, inputs_by_name, list(reference)))
     if not cases:
@@ -314,20 +318,21 @@ def _reference_cases(graph, dtype, distributions):
     return cases, out_idx
 
 
-def publish_reference(reference_cache_dir, graph, dtype, distributions=("normal",)):
+def publish_reference(reference_cache_dir, graph, dtype, distributions=("normal",), derive=None):
     """Build the (inputs, reference) cases once in the parent and persist them to disk.
 
     The cleave ``graph`` wraps TVM objects that need not cross the ``spawn``
     boundary; every candidate worker instead loads the plain tensors written here.
     There is one case per input distribution (``cleave.runtime.inputs.DISTRIBUTIONS``);
-    a kernel is validated on all of them and timed on the first.
+    a kernel is validated on all of them and timed on the first. ``derive``: the declared
+    inputs, see :func:`_reference_cases`.
     GPU work is serialized by ``_gpu_exec_guard``. Returns ``(out_idx, io_bytes)``
     where ``io_bytes`` is the input+output footprint used to size parallelism.
     """
     import torch
 
     with _gpu_exec_guard():
-        cases, out_idx = _reference_cases(graph, dtype, distributions)
+        cases, out_idx = _reference_cases(graph, dtype, distributions, derive)
         path = _reference_cache_file(reference_cache_dir)
         tmp_path = path.with_name(f"{path.name}.tmp.{os.getpid()}")
         os.makedirs(reference_cache_dir, exist_ok=True)
@@ -396,12 +401,14 @@ def _validate_kernel_outputs(kernel, inputs, reference, *, tolerance, what: str 
 def _check_kernel(
     kernel, *, graph=None, dtype=None, reference_cache_dir=None,
     tolerance=None, benchmark: BenchOptions | None = None, distributions=("normal",),
+    derive=None,
 ):
     """Validate ``kernel`` against the graph reference, then optionally time it.
 
     Either ``reference_cache_dir`` (worker mode: load the parent-built tensors) or
     ``graph`` + ``dtype`` (standalone mode: build the reference in-process, one case per
-    name in ``distributions``) must be provided. A missing ``tolerance`` is an error.
+    name in ``distributions``, declared inputs recomputed by ``derive``) must be provided.
+    A missing ``tolerance`` is an error.
     Timing happens under the same GPU lock hold as validation, on the first case's inputs.
     Returns ``(measured error per output, mean latency in ms or None)``.
     """
@@ -412,7 +419,7 @@ def _check_kernel(
             if reference_cache_dir is not None:
                 cases = _load_reference(reference_cache_dir)
             else:
-                cases, _ = _reference_cases(graph, dtype, distributions)
+                cases, _ = _reference_cases(graph, dtype, distributions, derive)
 
             measured, timing_inputs = None, None
             for distribution, inputs_by_name, reference in cases:

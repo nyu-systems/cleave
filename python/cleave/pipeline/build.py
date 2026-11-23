@@ -180,6 +180,30 @@ def _check_tolerance_fits(plan_list, tolerance) -> None:
                 "and the solo plans; declare one Tolerance for all outputs")
 
 
+def _plans_by_graph(plan_list) -> dict:
+    """id(flat graph) -> the plan it was lowered for (plans of one graph share it)."""
+    return {id(p.tile.flat_graph): p for p in plan_list}
+
+
+def derive_for(plan, graph):
+    """The ``derive`` of ``make_inputs`` for ``plan``'s ``graph``: every input its Program
+    declares (``equals=`` / ``sample=``) recomputed from the drawn ones, else None.
+
+    A combine stage reads the partial's outputs, no Program input, so it draws them all.
+    """
+    from ..runtime.reference import declared_inputs_hook
+
+    if plan is None or plan.role == "combine":
+        return None
+    return declared_inputs_hook(plan.program, plan.inputs, graph)
+
+
+def _publish_reference(publish, distributions, plans_by_graph, cache_dir, graph, dtype):
+    """``publish_reference`` with the declared inputs of the plan the graph belongs to."""
+    derive = derive_for(plans_by_graph.get(id(graph)), graph)
+    return publish(cache_dir, graph, dtype, distributions=distributions, derive=derive)
+
+
 def build(plans: PlanSet | Sequence[Plan], workers: int | None = None, *,
           config: EvalConfig | None = None, compiler_pass_options=None) -> BuildSet:
     """Compile, validate and time every plan in its own worker (a crash fails one candidate).
@@ -202,8 +226,9 @@ def build(plans: PlanSet | Sequence[Plan], workers: int | None = None, *,
     if plan_list and config.tolerance is None:
         raise SpecError("build(): no validation tolerance declared; there is no default bound. "
                         "Pass config=EvalConfig(tolerance=cl.Tolerance(rtol=...))")
-    reference_fn = functools.partial(publish_reference,
-                                     distributions=check_distributions(config.distributions))
+    reference_fn = functools.partial(_publish_reference, publish_reference,
+                                     check_distributions(config.distributions),
+                                     _plans_by_graph(plan_list))
     _check_tolerance_fits(plan_list, config.tolerance)
     t0 = time.perf_counter()
     runs = run_candidates([p.tile for p in plan_list], _program_dtype(plans),

@@ -153,13 +153,14 @@ def build_candidate_code(cand, options: CompilerPassOptions | None = None):
 
 def check_code(
     code_str, *, graph=None, dtype=None, out_idx=None, reference_cache_dir=None,
-    tolerance=None, benchmark: BenchOptions | None = None,
+    tolerance=None, benchmark: BenchOptions | None = None, derive=None,
 ):
     """``(cuda_src, latency_ms | None, measured)``: compile, validate and optionally time
     one kernel; ``measured`` is the error per output the comparison found.
 
     Workers (the default ``check_fn``) pass ``out_idx`` + ``reference_cache_dir`` (the
-    parent built the reference); standalone callers pass ``graph`` + ``dtype``.
+    parent built the reference); standalone callers pass ``graph`` + ``dtype`` (and the
+    ``derive`` of ``cleave.runtime.reference.declared_inputs_hook`` for declared inputs).
     ``tolerance`` is the operator's declared bound and has no default: a kernel nobody
     declared a tolerance for fails here, before it is compiled.
     """
@@ -176,6 +177,6 @@ def check_code(
 
     measured, latency_ms = _check_kernel(
         kernel, graph=graph, dtype=dtype, reference_cache_dir=reference_cache_dir,
-        tolerance=tolerance, benchmark=benchmark,
+        tolerance=tolerance, benchmark=benchmark, derive=derive,
     )
     return kernel.get_kernel_source(), latency_ms, measured

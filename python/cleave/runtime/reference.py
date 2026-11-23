@@ -310,12 +310,15 @@ def _eval_node(node, args):
     raise TypeError(f"graph_executor has no torch reference for node type {name}")
 
 
-def make_inputs(graph, dtype, *, seed=None, device="cuda", distribution="normal"):
+def make_inputs(graph, dtype, *, seed=None, device="cuda", distribution="normal",
+                derive=None):
     """Sample the graph's placeholder inputs (in kernel argument order).
 
     ``distribution`` is ``"normal"`` (iid N(0,1), or U(0.5,1.5) where positivity is needed)
     or one of the adversarial softmax cases of :mod:`cleave.runtime.inputs`, which rewrite
     the normal sample afterwards: the normal stream is the same whatever is requested.
+    ``derive`` (see :func:`declared_inputs_hook`) then recomputes the inputs the Program
+    declares from the drawn ones; every input is still drawn, so the stream is unchanged.
     """
     import torch
 
@@ -336,11 +339,63 @@ def make_inputs(graph, dtype, *, seed=None, device="cuda", distribution="normal"
         else:
             tensor = torch.randn(shape, device=device)
         inputs.append(tensor.to(dt))
+    inputs = tuple(inputs)
     if distribution != "normal":
         from .inputs import apply_distribution
 
-        return apply_distribution(graph, tuple(inputs), distribution)
-    return tuple(inputs)
+        inputs = apply_distribution(graph, inputs, distribution)
+    if derive is not None:
+        inputs = tuple(derive(inputs))
+    return inputs
+
+
+def declared_inputs_hook(program, input_names, graph):
+    """The ``derive`` of :func:`make_inputs` for ``graph`` lowered from ``program``, or None.
+
+    None when the Program declares no input (``equals=`` / ``sample=``): its inputs are drawn
+    exactly as before. Otherwise a function of the drawn inputs (in :func:`placeholder_order`)
+    that recomputes every declared input with ``program.derive_inputs`` from the drawn values
+    of the inputs it reads, so a kernel is validated (and timed) on, say, a real
+    log-sum-exp rather than noise. ``input_names`` is the placeholder of each Program input
+    (``Plan.inputs``); the inputs are matched by that name, never by position.
+    """
+    from ..core.errors import SpecError
+
+    specs = list(getattr(program, "inputs", None) or ())
+    if not any(getattr(s, "declaration", None) is not None for s in specs):
+        return None
+    name = getattr(program, "name", "program")
+    if input_names is None:
+        raise SpecError(
+            f"{name}: the kernel's placeholders could not be bound to the Program inputs, so "
+            "its declared inputs cannot be derived for validation"
+        )
+    order = [ph.name for ph in placeholder_order(graph)]
+    if len(input_names) != len(specs) or len(set(input_names)) != len(specs) \
+            or not set(input_names) <= set(order):
+        raise SpecError(
+            f"{name}: placeholders {tuple(input_names)} do not name one kernel input per "
+            f"Program input ({len(specs)}) among {tuple(order)}"
+        )
+    positions = [order.index(n) for n in input_names]
+
+    def derive(inputs):
+        inputs = list(inputs)
+        values = [inputs[i].reshape(s.shape) for i, s in zip(positions, specs)]
+        derived = program.derive_inputs(values)
+        for i, s, x in zip(positions, specs, derived):
+            if s.declaration is None:
+                continue
+            drawn = inputs[i]
+            if x.dtype != drawn.dtype:
+                raise SpecError(
+                    f"{name}: input {s.name!r} is declared {x.dtype} but its kernel "
+                    f"placeholder {order[i]!r} is {drawn.dtype}"
+                )
+            inputs[i] = x.reshape(drawn.shape).to(drawn.device).contiguous()
+        return tuple(inputs)
+
+    return derive
 
 
 def _placeholder_torch_dtype(placeholder, base_dtype):
@@ -438,7 +493,7 @@ def reconcile_output_layout(reference, actual_shape):
 
 
 def build_inputs_and_reference(graph, dtype, *, seed=None, device="cuda",
-                               distribution="normal"):
+                               distribution="normal", derive=None):
     """Return ``(inputs_by_name, reference, out_idx)`` for a cleave graph.
 
     ``inputs_by_name`` maps each placeholder name to its tensor. Scheduling can
@@ -446,10 +501,12 @@ def build_inputs_and_reference(graph, dtype, *, seed=None, device="cuda",
     inputs are keyed by name and ordered against the compiled kernel's actual
     parameter names at call time (see :func:`order_inputs_for_kernel`). ``reference``
     is a list with one tensor per output node and ``out_idx`` is the matching
-    ``tl.compile`` index.
+    ``tl.compile`` index. ``derive``: see :func:`make_inputs`; the reference is computed
+    from the derived inputs.
     """
     placeholders = placeholder_order(graph)
-    tensors = make_inputs(graph, dtype, seed=seed, device=device, distribution=distribution)
+    tensors = make_inputs(graph, dtype, seed=seed, device=device, distribution=distribution,
+                          derive=derive)
     inputs_by_name = {ph.name: t for ph, t in zip(placeholders, tensors)}
     reference = execute(graph, tensors)
     return inputs_by_name, reference, graph_out_indices(graph)

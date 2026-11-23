@@ -394,8 +394,9 @@ def run_candidates(
 class _SerialBench:
     """Recompile and time kernels one at a time in this process (after the workers)."""
 
-    def __init__(self, dtype, warmup, iters):
+    def __init__(self, dtype, warmup, iters, derive_for=None):
         self.dtype, self.warmup, self.iters = dtype, warmup, iters
+        self.derive_for = derive_for
         self.graph_inputs = {}  # id(flat_graph) -> (inputs_by_name, out_idx)
 
     def _inputs_for(self, graph):
@@ -404,9 +405,10 @@ class _SerialBench:
         key = id(graph)
         if key not in self.graph_inputs:
             placeholders = placeholder_order(graph)
+            derive = None if self.derive_for is None else self.derive_for(graph)
             inputs_by_name = {
                 ph.name: t
-                for ph, t in zip(placeholders, make_inputs(graph, self.dtype))
+                for ph, t in zip(placeholders, make_inputs(graph, self.dtype, derive=derive))
             }
             self.graph_inputs[key] = (inputs_by_name, graph_out_indices(graph))
         return self.graph_inputs[key]
@@ -439,13 +441,15 @@ class _SerialBench:
         torch.cuda.ipc_collect()
 
 
-def benchmark_results(results, dtype, warmup=16, iters=1000) -> list[CandidateResult]:
+def benchmark_results(results, dtype, warmup=16, iters=1000, *,
+                      derive_for=None) -> list[CandidateResult]:
     """Copies of ``results`` with ``latency_ms`` filled on the ok ones (serial re-time).
 
     Timing takes the GPU lock per kernel; a kernel that fails to time comes back failed
-    at stage ``"bench"``.
+    at stage ``"bench"``. ``derive_for(flat_graph)``: the ``derive`` of
+    ``cleave.runtime.reference.make_inputs`` for a graph whose Program declares inputs.
     """
-    bench = _SerialBench(dtype, warmup, iters)
+    bench = _SerialBench(dtype, warmup, iters, derive_for)
     timed = []
     try:
         for result in results:
