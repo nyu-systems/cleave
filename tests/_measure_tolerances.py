@@ -103,6 +103,7 @@ GPU_TESTS = [
     "tests/reference", "tests/runtime/test_run_candidates.py", "tests/pipeline_api/test_e2e.py",
     "tests/frontend/test_exact_softmax.py", "tests/frontend_dynamic/test_paged_pipeline.py",
     "tests/pipeline_api/test_declared_validation.py", "tests/runtime/test_inter_outputs.py",
+    "tests/pipeline_api/test_per_output_gpu.py",
 ]
 
 
@@ -263,6 +264,8 @@ def _test_operators():
             return "lse_attention"
         if path == "tests/runtime/test_inter_outputs.py":
             return "inter_pair"
+        if path == "tests/pipeline_api/test_per_output_gpu.py":
+            return "per_output_pair"
         return node
 
     return operator

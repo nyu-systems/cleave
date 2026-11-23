@@ -69,6 +69,7 @@ TOLERANCES = {
     "exact_attention": Tolerance(rtol=5e-3),
     "lse_attention": Tolerance(rtol=5e-3),
     "inter_pair": Tolerance(rtol=5e-3),
+    "per_output_pair": Tolerance(rtol=5e-3),
 }
 
 

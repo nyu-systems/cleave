@@ -629,6 +629,24 @@
    "validated": 86
   }
  ],
+ "test:per_output_pair": [
+  {
+   "abs": 0.125,
+   "absolute": false,
+   "dtype": "float16",
+   "rel": 0.0009302325779572129,
+   "seeds": 3,
+   "validated": 75
+  },
+  {
+   "abs": 0.0,
+   "absolute": false,
+   "dtype": "float16",
+   "rel": 0.0,
+   "seeds": 3,
+   "validated": 75
+  }
+ ],
  "test:qknorm_graph": [
   {
    "abs": 0.0001220703125,
