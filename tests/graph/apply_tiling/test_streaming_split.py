@@ -13,8 +13,12 @@ over 8 kv heads, 64 queries, 4 splits of 64 keys):
   negative finite float32 -- and takes it in place where a tile holds the split; either way
   it returns it in float32, in front of its two float32 sums;
 * the combine carries a running max over the split axis where it loops over the partials
-  (in a plain loop: it weights the partials it loads), takes it in place where a tile holds
-  all of them, and is refused where a step holds one partial or a tile a single row.
+  (in a plain loop: it weights the partials it loads, so no asynchronous copy may refill
+  one in flight), takes it in place where a tile holds all of them, and is refused where a
+  step holds one partial or a tile a single row.
+
+The loop bodies (both looped stages, and the combine that holds every partial) are pinned
+statement by statement, and lowered to CUDA source.
 
 ``test_search_*``: the pair is built from a searched graph (root conftest marks).
 """
@@ -41,7 +45,7 @@ from cleave.schedule import apply_tiling, search_tiling
 from cleave.schedule.streaming import _reason_key, sites, streaming_accept
 
 from tests._lowering import lower_to_cuda
-from tests.graph.apply_tiling.test_streaming import _calls, _find, _macro_calls
+from tests.graph.apply_tiling.test_streaming import _calls, _find, _macro_calls, _steps
 
 SHAPES = dict(HQ=32, HKV=8, SQ=64, SKV=256, D=64)
 FACTOR = 4
@@ -82,6 +86,13 @@ def _loop_kinds(code):
 def _plain(calls):
     """Macro calls with the placeholders' names folded."""
     return [re.sub(r"PlaceHolder_\w+", "P", c) for c in calls]
+
+
+def _statements(code, macro):
+    """The macro calls and copies of one macro body, in order, each on one line."""
+    body = " ".join(_calls(code, macro))
+    found = re.findall(r"(?:ukernel_\w+|T\.copy)\([^()]*\)", body)
+    return [re.sub(r"\(\s+", "(", re.sub(r",?\s+\)", ")", s)) for s in found]
 
 
 # ---------------------------------------------------------------------------- the partial
@@ -160,7 +171,10 @@ def test_search_the_looped_partial_emits_the_loop_of_an_attention_kernel(pair):
     main = _calls(code, "main_kernel_iter")
     assert f"T.fill(t_reduce_max_3_7, {FILL})" in main
     assert "T.clear(t_reduction_3_10)" in main and "T.clear(t_mma_11)" in main
-    lower_to_cuda(code)
+    # TileLang keeps the start value (the most negative finite float32, not -inf) and the
+    # max the loop folds in
+    cuda = lower_to_cuda(code)
+    assert "-0x1.fffffep+127f" in cuda and "tl::MaxOp" in cuda
 
 
 # ---------------------------------------------------------------------------- the combine
@@ -170,29 +184,44 @@ def test_search_the_combine_carries_the_max_over_the_splits_in_a_plain_loop(pair
     _, combine = pair
     (m,) = [n for n in combine.nodes if type(n) is ReduceMax]
     assert m.name == "state_max" and m.streaming is not None
+    loops = m.streaming.loops  # the combined sums
     accept = streaming_accept(combine)
     cases, refused = Counter(), Counter()
     for cand, tiled in _tilings(combine):
+        # the max over the splits steps with the two sums it repairs
+        steps = set(_steps(cand).values())
+        assert len(steps) == 1 and set(_steps(cand)) == {m.name, *loops}
+        (step,) = steps
+        rows = list(cand.output_tile)[1]
         if isinstance(tiled, ScheduleRejected):
             assert not accept(cand)
             refused[_reason_key(tiled)] += 1
+            assert step == 1 or rows == 1, (cand.output_tile, step)
             continue
         if not accept(cand):  # built, and refused by the build after it
             with pytest.raises(ScheduleRejected) as info:
                 build_candidate(cand)
             refused[_reason_key(info.value)] += 1
+            assert step == 1 or rows == 1, (cand.output_tile, step)
             continue
-        code, _ = build_candidate(cand)
+        assert rows > 1
+        code, layouts = build_candidate(cand)
+        assert layouts == (((0, 1, 2), 0),)  # the output, stored as it is read
         found = sites(tiled)
         if found:
             cases["looped"] += 1
             (site,) = found
-            assert (site.step, site.block) == (2, FACTOR)
+            assert (site.full, site.extent, site.step, site.block) == (m.name, FACTOR, 2, FACTOR)
+            assert sorted(site.repaired) == sorted(loops)
             tier, owner, mt = _find(tiled, m.name)
+            assert site.tier == owner.name and step == 2
+            assert sorted(n.name for n in tier.accum_nodes) == sorted([m.name, *loops])
+            assert [n.name for n in tier.lag_nodes] == [f"{m.name}_prev"]
             assert tier.loop_kind == "serial" and _loop_kinds(code) == ["serial"]
             assert mt.accum_init == NEG_FLT_MAX and f"T.fill(t_state_max, {FILL})" in code
         else:
             cases["one tile"] += 1
+            assert step == FACTOR and _find(tiled, m.name)[1] is None  # in the block's tier
             assert _loop_kinds(code) == [] and FILL not in code
     assert cases == {"looped": 6, "one tile": 6}
     assert refused == {
@@ -228,4 +257,60 @@ def test_search_the_looped_combine_repairs_the_partials_and_its_own_sums(pair):
         "ukernel_rescale_lead1_2dims_rr(t_state_max_upd1, t_mma_9_combined)",
         "ukernel_reduction_axis0_rr(t_mma_9_repaired, t_mma_9_combined)",
     ]
-    lower_to_cuda(code)
+    # each partial is loaded once, the max of the splits once for its two readers, and
+    # the float32 partials are weighted as they arrive; the epilogue runs after the loop
+    assert _statements(code, f"{site.tier}_iter") == [
+        "T.copy(PlaceHolder_state_reduction_2_8, PlaceHolder_state_reduction_2_88)",
+        "T.copy(PlaceHolder_state_max, PlaceHolder_state_maxx)",
+        "ukernel_copy_1dims_rr(t_state_max, t_state_max_prev)",
+        "ukernel_reduce_max_axis0_rr(PlaceHolder_state_maxx, t_state_max)",
+        "ukernel_sub_broadcast_1_2dims_rrr(PlaceHolder_state_maxx, t_state_max, t_state_upd0)",
+        "ukernel_exp_2dims_rr(t_state_upd0, t_state_upd1)",
+        "ukernel_mul_2dims_srr(PlaceHolder_state_reduction_2_88, t_state_upd1, "
+        "t_reduction_2_8_repaired)",
+        "ukernel_sub_1dims_rrr(t_state_max_prev, t_state_max, t_state_max_upd0)",
+        "ukernel_exp_1dims_rr(t_state_max_upd0, t_state_max_upd1)",
+        "ukernel_rescale_1dims_rr(t_state_max_upd1, t_reduction_2_8_combined)",
+        "ukernel_reduction_axis0_rr(t_reduction_2_8_repaired, t_reduction_2_8_combined)",
+        "T.copy(PlaceHolder_state_mma_9, PlaceHolder_state_mma_99)",
+        "ukernel_mul_broadcast_0_3dims_srr(PlaceHolder_state_mma_99, t_state_upd1, "
+        "t_mma_9_repaired)",
+        "ukernel_rescale_lead1_2dims_rr(t_state_max_upd1, t_mma_9_combined)",
+        "ukernel_reduction_axis0_rr(t_mma_9_repaired, t_mma_9_combined)",
+    ]
+    assert _statements(code, "main_kernel_iter") == [
+        "ukernel_div_broadcast_0_resolve_rhs_layout_2dims_rrr(t_mma_9_combined, "
+        "t_reduction_2_8_combined, t_div_10)",
+        "T.copy(t_div_10, OutputNode)",
+    ]
+    # a plain loop down to the CUDA source: no asynchronous copy of a partial that the
+    # previous iteration may still be reading (no TMA load, no barrier), and the start value
+    # of the running max
+    cuda = lower_to_cuda(code)
+    assert "-0x1.fffffep+127f" in cuda and "tma_load" not in cuda and "mbarrier" not in cuda
+
+
+def test_search_the_combine_that_holds_every_partial_takes_the_max_in_place(pair):
+    """A tile with all the splits in it: the max over them, the weights and both weighted
+    sums in the block's own tier, each sum cleared as it is taken, then the epilogue; no
+    loop and no carried state."""
+    _, combine = pair
+    cand = next(c for c, t in _tilings(combine) if not isinstance(t, ScheduleRejected)
+                and not sites(t) and list(c.output_tile) == [1, 16, 64])
+    code, _ = build_candidate(cand)
+    assert _statements(code, "main_kernel_iter") == [
+        "ukernel_reduce_max_axis0_gr_clear(PlaceHolder_state_max, t_state_max)",
+        "ukernel_sub_broadcast_1_2dims_grr(PlaceHolder_state_max, t_state_max, t_state_upd0)",
+        "ukernel_exp_2dims_rr(t_state_upd0, t_state_upd1)",
+        "ukernel_mul_broadcast_0_3dims_grr(PlaceHolder_state_mma_9, t_state_upd1, "
+        "t_mma_9_repaired)",
+        "ukernel_reduction_axis0_rr_clear(t_mma_9_repaired, t_mma_9_combined)",
+        "ukernel_mul_2dims_grr(PlaceHolder_state_reduction_2_8, t_state_upd1, "
+        "t_reduction_2_8_repaired)",
+        "ukernel_reduction_axis0_rr_clear(t_reduction_2_8_repaired, t_reduction_2_8_combined)",
+        "ukernel_div_broadcast_0_resolve_rhs_layout_2dims_rrr(t_mma_9_combined, "
+        "t_reduction_2_8_combined, t_div_10)",
+        "T.copy(t_div_10, OutputNode)",
+    ]
+    assert _loop_kinds(code) == [] and "_prev" not in code and FILL not in code
+    assert "tl::MaxOp" in lower_to_cuda(code)
