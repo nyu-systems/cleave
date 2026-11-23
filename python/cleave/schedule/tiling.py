@@ -824,8 +824,13 @@ _SCHEDULED_AXES: dict = {}
 
 def _structure(flat_graph) -> tuple:
     """The nodes of ``flat_graph`` and how they are wired, by name, with the streaming
-    record of each (what ``_ScheduledAxes.carried`` is read from)."""
-    return tuple(
+    record of each (what ``_ScheduledAxes.carried`` is read from).
+
+    A graph that carries a record also gives its ``signature``: whether a record is
+    honoured depends on every semantic attribute and dtype its key hashes
+    (``streaming.streamed``), so an edit of one of them in place reads the graph again,
+    and ``carried`` agrees with what the policy is told."""
+    wiring = tuple(
         (
             n.name,
             tuple((e.src_node.name, e.src_id) for e in n.inputs),
@@ -833,6 +838,11 @@ def _structure(flat_graph) -> tuple:
         )
         for n in flat_graph.nodes
     )
+    if all(record is None for _, _, record in wiring):
+        return wiring
+    from ..ir.update_rule import signature
+
+    return wiring + (signature(flat_graph, dtypes=True),)
 
 
 def _scheduled_axes(flat_graph) -> _ScheduledAxes:

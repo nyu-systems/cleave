@@ -366,6 +366,43 @@ def test_a_record_of_another_graph_is_not_served(foreign):
         assert served(ir) == {full.name: list(record.loops)}
 
 
+def test_an_edit_after_the_record_was_served_is_seen_by_apply_tiling():
+    """``apply_tiling`` reads what is carried from a memo per flat graph. An edit in place of
+    an attribute the record's key covers (the scaling of the scores), made after the memo
+    was filled with the record served, must reach it too: otherwise the policy pins the
+    sums (it asks the key afresh) while ``apply_tiling`` still carries the max, and the
+    tilings that step the max alone are refused for a carried max that is not carried."""
+    plain = lowered(flash_by_hand, SHORT)  # no record: what is kept, and why the rest is not
+    plain.streaming_refusals = [f"{node_of(plain, ReduceMax).name}: it has no update rule"]
+    plain_kept, plain_reasons = tilings(plain)
+    ir = lowered(flash_by_hand, SHORT)
+    full, record = record_by_hand(ir)
+    assert {n.name for n in carried_reductions(ir)} == {full.name}  # the memo, served
+    kept, reasons = tilings(ir)
+    assert len(kept) == 32 and not reasons
+    looped = next(cand for cand in kept if sites(schedule_kernel(cand)))
+    node_of(ir, Div).const = 2.0
+    assert served(ir) == {} and carried_reductions(ir) == {}
+    assert ir.streaming_refusals == [f"{full.name}: {FOREIGN_RECORD}"]
+    # a looped candidate made before the edit is refused by the tiler, as it would be on a
+    # graph without a record: nothing is carried, so the max is held whole under the sums
+    with pytest.raises(ScheduleRejected, match="is shared with an absorbed ancestor") as no:
+        schedule_kernel(looped)
+    assert not isinstance(no.value, StreamingRefused)
+    kept, reasons = tilings(ir)
+    assert len(kept) == len(plain_kept) == 8
+    assert all(not sites(schedule_kernel(cand)) for cand in kept)
+    # the same tilings are kept, and the others dropped for the same reason, as on the
+    # graph without a record
+    assert {tuple(steps(c)) for c in kept} == {tuple(steps(c)) for c in plain_kept}
+    assert reasons == plain_reasons and sum(reasons.values()) == 24
+    (reason,) = reasons
+    assert "is computed per iteration of" in reason and "outside it" in reason
+    node_of(ir, Div).const = 8.0  # undone: the record is served again, to both
+    assert {n.name for n in carried_reductions(ir)} == {full.name}
+    assert served(ir) == {full.name: list(record.loops)}
+
+
 def test_a_long_row_with_a_record_of_another_graph_has_no_tiling_and_says_why(monkeypatch):
     """The report of a graph without tilings names why its max is not carried instead."""
     import cleave.lang as cl
