@@ -7,6 +7,7 @@ from .common import (
 from .bestfit import BestFit
 from .hint import INTER, INTRA, TileDict, Stride
 from ...ir.graph import ComputeOpNode, ViewOpNode
+from ...core.errors import ScheduleRejected
 from ...ir.analysis import (
     build_output_axis_provenance,
     build_reduction_axis_provenance,
@@ -1110,7 +1111,7 @@ class DefaultPolicy:
     # ranked together, the atomic adds counted in the traffic.
 
     def _propose_assignment_tiles(self):
-        candidates = []
+        candidates, absorbed_conflicts = [], []
         for intra_id in range(len(self.reduction_groups)):
             policy = self._for_assignment(intra_id)
             if policy is None:
@@ -1118,13 +1119,39 @@ class DefaultPolicy:
             base_tile = policy._pin_full_launch_dims(policy.get_base_tile())
             # the uneven-read filter needs the assignment's policy: an inter reduction reads
             # only its block's slice of the axis the launch tiles
-            candidates += [
-                c for c in policy.propose_iterative_tiles(base_tile)
-                if not policy._reads_placeholder_unevenly(c)
-            ]
+            for c in policy.propose_iterative_tiles(base_tile):
+                if policy._reads_placeholder_unevenly(c):
+                    continue
+                conflict = self._absorbed_axis_conflict(c)
+                if conflict is not None:
+                    absorbed_conflicts.append(conflict)
+                    continue
+                candidates.append(c)
+        if not candidates and absorbed_conflicts:
+            raise ScheduleRejected(
+                "every tiling needs a second loop: " + absorbed_conflicts[0]
+            )
         # each assignment's list is sorted by this key already (expand_iterative_tiles);
         # the stable sort keeps assignment order on ties
         return sorted(candidates, key=lambda td: (td.traffic + 1) * td.num_wave)
+
+    def _absorbed_axis_conflict(self, td):
+        """``apply_tiling``'s refusal of ``td`` for an absorbed reduction, or ``None``.
+
+        A reduction feeding a loop's reductions over its own axis (``delta = rowsum(P*dP)``
+        over SKV of the naive attention-backward dS, inside the loop over SKV) must be
+        complete before the loop's first iteration: a second loop over that axis, which
+        ``apply_tiling`` does not build (repro: notes/p13-merged.md, issue 2). Only
+        accumulation-context tilings are checked here; every other graph keeps its
+        candidate list (the refusal happens in ``apply_tiling`` as before).
+        """
+        from ..tiling import _absorbed_axis_tokens
+
+        try:
+            _absorbed_axis_tokens(self.ordered_nodes, td.rstep_map)
+        except ScheduleRejected as e:
+            return str(e)
+        return None
 
     def _for_assignment(self, intra_id):
         """This policy with group ``intra_id`` intra and the others inter, or ``None``.

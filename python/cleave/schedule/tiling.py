@@ -624,19 +624,15 @@ def absorbed_reductions(nodes, rstep_map):
     ]
 
 
-def _pin_absorbed_reduction_axes(ordered_nodes, rstep_map, tile_map, itile_map):
-    """Iteration tiles with every absorbed reduction axis kept at its block extent.
+def _absorbed_axis_tokens(ordered_nodes, rstep_map):
+    """``(absorbed, pinned tokens, provenance)`` of the absorbed reductions of a tiling.
 
-    Each tensor dim that carries the axis of an absorbed reduction (see
-    ``absorbed_reductions``) keeps its block tile, so ``assign_tensor_map`` does not
-    slice it with the counter of the loop the reduction was absorbed into.
-
-    Raises ``ScheduleRejected`` for a tiling in which another reduction steps that same
-    axis: its loop would have to advance an axis that has to stay whole.
+    Raises ``ScheduleRejected`` for a tiling in which another reduction steps an absorbed
+    reduction's axis: its loop would have to advance an axis that has to stay whole.
     """
     absorbed = absorbed_reductions(ordered_nodes, rstep_map)
     if not absorbed:
-        return itile_map
+        return absorbed, set(), None
 
     out_tokens = build_output_axis_provenance(ordered_nodes)
     red_tokens = build_reduction_axis_provenance(ordered_nodes, out_tokens)
@@ -663,6 +659,21 @@ def _pin_absorbed_reduction_axes(ordered_nodes, rstep_map, tile_map, itile_map):
                 f"Reduction axis of {node.name} is shared with an absorbed ancestor "
                 "reduction; one loop cannot both advance it and hold it whole."
             )
+    return absorbed, pinned, out_tokens
+
+
+def _pin_absorbed_reduction_axes(ordered_nodes, rstep_map, tile_map, itile_map):
+    """Iteration tiles with every absorbed reduction axis kept at its block extent.
+
+    Each tensor dim that carries the axis of an absorbed reduction (see
+    ``absorbed_reductions``) keeps its block tile, so ``assign_tensor_map`` does not
+    slice it with the counter of the loop the reduction was absorbed into.
+
+    Raises ``ScheduleRejected`` as ``_absorbed_axis_tokens`` does.
+    """
+    absorbed, pinned, out_tokens = _absorbed_axis_tokens(ordered_nodes, rstep_map)
+    if not absorbed:
+        return itile_map
 
     itile_map = dict(itile_map)
     for (node, out_id), dim_tokens in out_tokens.items():
@@ -876,6 +887,15 @@ def _join_inter_outputs(
             raise ScheduleRejected(
                 f"Inter output {top_name} depends on {elsewhere}, which iterate in "
                 "another loop; nested loops are not supported."
+            )
+        # A loop's finished result (a GraphNode) below the inter output: e.g. delta =
+        # rowsum(P * dP) over SKV, merged into the SKV loop with its sibling dQ, feeding
+        # the inter dK. Each iteration would need the sum of all iterations: a second loop.
+        loop_results = [n.name for n in new_nodes if isinstance(n, GraphNode)]
+        if loop_results:
+            raise ScheduleRejected(
+                f"Inter output {top_name} reads the finished result of {loop_results}; "
+                "it would need a second loop over that axis."
             )
         # A reduction below the inter output that steps with the loop counter, without
         # being absorbed by the intra reductions, would hand it a running partial sum.
