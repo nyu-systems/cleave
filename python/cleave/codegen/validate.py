@@ -1,5 +1,6 @@
 from ..core.errors import CodegenError
-from ..ir.graph import ComputeOpNode, GraphNode, OutputNode, PlaceHolderNode
+from ..ir.graph import AccumEdge, ComputeOpNode, GraphNode, OutputNode, PlaceHolderNode
+from ..schedule.policy.hint import INTER, INTRA
 
 
 class GraphValidator:
@@ -23,14 +24,7 @@ class GraphValidator:
 
         assert graph.nodes, f"{where}: no nodes."
 
-        # A raise, not an assert: emitting an inter output as an intra one would
-        # silently miscompile (it would accumulate the wrong tiles), and `-O` drops asserts.
-        inter = [n.name for n, context in graph.accumulation.items() if context != "intra"]
-        if inter:
-            raise CodegenError(
-                f"{where}: inter accumulation (summed across CTAs) of {inter} is not "
-                "implemented in code generation."
-            )
+        self._validate_accumulation(graph, is_main=is_main, where=where)
 
         # --- args: only declared IO, inputs first, each fully described -----------------
         seen_output = False
@@ -238,6 +232,79 @@ class GraphValidator:
             return
         entries = "".join(f'    "{k}": {v!r},\n' for k, v in sorted(merged.items()))
         self.pass_code = f"PASS_CONFIGS = {{\n{entries}}}\n"
+
+    def _validate_accumulation(self, graph, *, is_main: bool, where: str):
+        """Refuse an accumulation context the emitter cannot honour.
+
+        Raises, not asserts: emitting an inter output as an intra one would silently
+        miscompile (it would accumulate the wrong tiles), and ``-O`` drops asserts.
+        Supported: the main graph's inter OutputNodes are each fed by an accum node of
+        one of its loops that the loop marks inter; static extents; no split kernel.
+        """
+        if not graph.accumulation:
+            return
+        unknown = sorted({c for c in graph.accumulation.values()} - {INTRA, INTER})
+        if unknown:
+            raise CodegenError(f"{where}: unknown accumulation contexts {unknown}.")
+        inter = [n for n, c in graph.accumulation.items() if c == INTER]
+        if not inter:
+            return
+
+        def refuse(why):
+            raise CodegenError(
+                f"{where}: inter accumulation (summed across CTAs) of "
+                f"{[n.name for n in inter]} is not supported: {why}."
+            )
+
+        if getattr(graph, "dyn_dims", ()):
+            refuse("symbolic extents (the fp32 buffers are allocated per static shape)")
+        for node in inter:
+            tmap = graph.tmap[node]
+            if not all(isinstance(e, int) for e in (*tmap.shape, *tmap.tile_size)):
+                refuse(f"{node.name} has a symbolic tile {tuple(tmap.tile_size)}")
+            if is_main:
+                edge = node.inputs[0] if isinstance(node, OutputNode) else None
+                loop = edge.src_node if isinstance(edge, AccumEdge) else None
+                if loop not in graph.nodes or not isinstance(loop, GraphNode):
+                    refuse(f"{node.name} is not fed by an accumulator of a loop")
+                if loop.graph.accumulation.get(edge.accum_node) != INTER:
+                    refuse(
+                        f"{node.name} reads {edge.accum_node.name}, which its loop does "
+                        "not sum across CTAs"
+                    )
+            else:
+                if node not in graph.accum_nodes:
+                    refuse(f"{node.name} is not an accumulator of its loop")
+                if any(e.dst_node in graph.nodes for e in node.outputs):
+                    refuse(f"{node.name}'s per-iteration partial feeds another node")
+
+    @staticmethod
+    def _refuse_split_inter(graphs):
+        from .kernel import inter_nodes
+
+        if any(inter_nodes(g) for g in graphs):
+            raise CodegenError(
+                "inter accumulation (summed across CTAs) is not supported in split kernels."
+            )
+
+    def _declare_inter_outputs(self, graph):
+        """Emit ``INTER_OUTPUTS = {param: dtype}`` for the outputs summed across CTAs.
+
+        The kernel takes each as an fp32 buffer that must be zero when it starts and is
+        cast to ``dtype`` afterwards; the runtime (``runtime.compile._compile``) reads this
+        to do both around every launch. Nothing is emitted for any other kernel.
+        """
+        from .kernel import inter_nodes
+
+        outputs = inter_nodes(graph)
+        if not outputs:
+            return
+        entries = "".join(
+            f'    "{n.name}": "{n.get_dtype(0)}",\n'
+            for n in graph.args
+            if n in outputs
+        )
+        self.pass_code += f"INTER_OUTPUTS = {{\n{entries}}}\n"
 
     def _declare_dyn_dims(self, graph):
         """Emit ``name = T.symbolic("name")`` for every symbolic extent in the graph.

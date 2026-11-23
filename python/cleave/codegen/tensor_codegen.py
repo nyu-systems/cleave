@@ -47,6 +47,16 @@ def gen_copy(
     return copy_code
 
 
+def gen_atomic_add(src: str, dst: str) -> str:
+    """Add the tile ``src`` (a fragment) into ``dst`` (a global view of the same extents)
+    atomically, so partial sums from every CTA land in one fp32 buffer.
+
+    The tile-region form, not a ``T.Parallel`` of scalar atomics: TileLang vectorises it
+    (``AtomicAddx2``/``x4`` for fp32) along the fragment's contiguous elements.
+    """
+    return f"T.atomic_add({dst}, {src})\n"
+
+
 def gen_tensor_allocation_str(
     tname: str, tile_shape: tuple, dtype: str, scope: str, is_tc_layout: bool = False
 ):

@@ -27,10 +27,107 @@ class CompilerPassOptions:
 
 
 def _compile(prim_func, out_idx):
-    """tl.compile under whatever pass configs the generated kernel declared."""
+    """tl.compile under whatever pass configs the generated kernel declared.
+
+    A kernel with outputs summed across CTAs (``INTER_OUTPUTS``) comes back wrapped in
+    an :class:`InterOutputKernel`, which owns their fp32 buffers.
+    """
     _create_parallel_env()
     configs = getattr(prim_func, "_cleave_pass_configs", None)
-    return tl.compile(prim_func, out_idx=out_idx, pass_configs=configs or None)
+    inter = getattr(prim_func, "_cleave_inter_outputs", None)
+    if not inter:
+        return tl.compile(prim_func, out_idx=out_idx, pass_configs=configs or None)
+    if out_idx is None:
+        raise NotImplementedError(
+            "A kernel with inter (atomically accumulated) outputs allocates them itself; "
+            "it cannot be compiled with caller-owned outputs (out_idx=None)."
+        )
+    positions = _inter_positions(prim_func, inter, out_idx)
+    kernel = tl.compile(
+        prim_func,
+        out_idx=[i for i in _normalized_out_idx(prim_func, out_idx) if i not in positions],
+        pass_configs=configs or None,
+    )
+    return InterOutputKernel(kernel, prim_func, out_idx, positions)
+
+
+def _normalized_out_idx(prim_func, out_idx) -> list[int]:
+    n = len(prim_func.params)
+    out_idx = [out_idx] if isinstance(out_idx, int) else list(out_idx)
+    return sorted(i % n for i in out_idx)
+
+
+def _inter_positions(prim_func, inter, out_idx) -> dict[int, tuple]:
+    """``{param index: (shape, accumulation torch dtype, output torch dtype)}``."""
+    from .reference import torch_dtype
+
+    out_idx = _normalized_out_idx(prim_func, out_idx)
+    positions = {}
+    for idx, param in enumerate(prim_func.params):
+        buffer = prim_func.buffer_map.get(param)
+        if buffer is None or buffer.name not in inter:
+            continue
+        if idx not in out_idx:
+            raise ValueError(f"inter output {buffer.name!r} is not among out_idx {out_idx}")
+        shape = tuple(int(d) for d in buffer.shape)  # static: codegen refuses symbolic
+        positions[idx] = (shape, torch_dtype(buffer.dtype), torch_dtype(inter[buffer.name]))
+    missing = set(inter) - {
+        prim_func.buffer_map[prim_func.params[i]].name for i in positions
+    }
+    if missing:
+        raise ValueError(f"INTER_OUTPUTS names {sorted(missing)}, which are not parameters")
+    return positions
+
+
+class InterOutputKernel:
+    """A compiled kernel whose inter outputs are summed across CTAs with atomic adds.
+
+    Each call zeroes a fresh fp32 buffer per inter output, launches the kernel (which
+    takes those buffers as parameters), then casts them to the output dtype. All three
+    run on the current stream, so a CUDA graph captured around a call replays the zeroing
+    and the cast too: timing covers them, and no replay sees a previous launch's sums.
+    Callers see TileLang's interface: inputs in, outputs (declared dtypes) out, and an
+    ``adapter`` whose ``result_idx`` counts the inter outputs as results.
+    """
+
+    def __init__(self, kernel, prim_func, out_idx, positions):
+        self.kernel = kernel
+        self.positions = positions
+        self.out_idx = _normalized_out_idx(prim_func, out_idx)
+        self.adapter = _InterAdapter(kernel.adapter, prim_func, self.out_idx)
+
+    def __call__(self, *inputs):
+        import torch
+
+        device = next(x for x in inputs if isinstance(x, torch.Tensor)).device
+        sums = {
+            idx: torch.zeros(shape, dtype=acc, device=device)
+            for idx, (shape, acc, _) in sorted(self.positions.items())
+        }
+        res = self.kernel(*inputs, *sums.values())
+        if len(self.out_idx) == len(self.positions):
+            res = []
+        own = iter(res if isinstance(res, (list, tuple)) else [res])
+        outs = [
+            sums[idx].to(self.positions[idx][2]) if idx in sums else next(own)
+            for idx in self.out_idx
+        ]
+        return outs[0] if len(outs) == 1 else outs
+
+    def __getattr__(self, name):
+        return getattr(self.kernel, name)
+
+
+class _InterAdapter:
+    """The wrapped kernel's adapter, with the inter outputs counted as results."""
+
+    def __init__(self, adapter, prim_func, out_idx):
+        self._adapter = adapter
+        self.prim_func = prim_func
+        self.result_idx = list(out_idx)
+
+    def __getattr__(self, name):
+        return getattr(self._adapter, name)
 
 
 def _load_main_kernel_from_code(code_str):
@@ -53,6 +150,8 @@ def _load_main_kernel_from_code(code_str):
         # A kernel that is only correct under certain tilelang passes carries them with
         # it, so every caller compiles it the same way (see Graph.pass_configs).
         main_kernel._cleave_pass_configs = getattr(tmp_module, "PASS_CONFIGS", {})
+        # Outputs summed across CTAs, ``{param name: output dtype}`` (see _compile).
+        main_kernel._cleave_inter_outputs = getattr(tmp_module, "INTER_OUTPUTS", {})
 
     return main_kernel
 
