@@ -10,10 +10,12 @@ before (``test_search_reproducible.py`` and the pipeline snapshots hold the rest
 
 An input that no op reads aborted the same way (no rule mentions any of its dims). The native
 search now runs on it and finds no graph: it counts every tensor that nothing reads as an
-output, so no graph has the program's outputs. ``superoptimize`` refuses such a program with a
-``SpecError`` before the search, and any search that finds no graph (a reduction over a dim of
-one element, a ``max_ops`` below the program's own size) with a ``SuperoptError`` that says
-so; both returned an empty ``GraphSet`` that ``schedule`` turned into no plan and no refusal.
+output, so no graph has the program's outputs. ``superoptimize`` refuses such a program, and
+one that returns an input, with a ``SpecError`` before the search, and any search that finds
+no graph (a reduction over a dim of one element, a ``max_ops`` below the program's own size)
+with a ``SuperoptError`` that says so. Before, an empty ``GraphSet`` came back, which
+``schedule`` turned into no plan and no refusal, and a returned input was refused by lowering
+with the text of an internal assert.
 
 Every program runs in a fresh interpreter on the CPU, so an abort fails its case instead of
 taking the test session with it.
@@ -101,11 +103,17 @@ NO_GRAPH = "f: the search found no graph equal to the program within max_ops="
 UNIT_DIM = "reduces one element, and the search builds no reduction over a dim of one element"
 UNREAD = ("f: input 'y' is read by no op; the search counts a tensor that nothing reads as an "
           "output, so none of its graphs can equal the program (drop the input or read it)")
+RETURNED = ("f: output 'out0' is input 'x'; no op writes such an output, so no kernel computes "
+            "it (return a computed value)")
 
 REFUSED = {
     "unread_input": (XY, "cl.exp(x)", WIDE, "", "SpecError", UNREAD),
     "unread_input_next_to_a_sum": (XY, "cl.sum(x, -1, keepdim=True)", WIDE, "", "SpecError",
                                    UNREAD),
+    # returned as it is: its one graph has no op, and lowering refused it with an internal
+    # assert ("OutputNode can only connect to ..."); next to its exp the search found none
+    "returned_input": (X, "x", WIDE, "", "SpecError", RETURNED),
+    "returned_input_next_to_its_exp": (X, "(x, cl.exp(x))", WIDE, "", "SpecError", RETURNED),
     "sum_over_a_unit_dim": (X, "cl.sum(x, -1, keepdim=True)", UNIT, "", "SuperoptError",
                             f"{NO_GRAPH}13; its sum over dim C {UNIT_DIM}"),
     "max_over_a_unit_dim": (X, "cl.max(x, -1, keepdim=True)", UNIT, "", "SuperoptError",

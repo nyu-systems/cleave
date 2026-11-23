@@ -137,6 +137,13 @@ def _unread_inputs(program) -> list[str]:
             if i not in read and getattr(spec, "equals", None) is None]
 
 
+def _returned_inputs(program) -> list[tuple[str, str]]:
+    """``(output name, input name)`` for every output of ``program`` that is an input."""
+    names = {r.out: r.attr("name") for r in getattr(program, "_records", ()) if r.kind == "input"}
+    return [(o.name, names[o.tensor.id]) for o in getattr(program, "outputs", ())
+            if o.tensor.id in names]
+
+
 def _no_graph(program, max_ops: int) -> str:
     """Why the search returned no graph, as far as the program shows it."""
     from ..frontend.tensor import Dim, extent
@@ -164,23 +171,29 @@ def superoptimize(program, config: SuperoptConfig | None = None) -> GraphSet:
 
     Raises ``SpecError`` for a program with an input that nothing reads (the search counts
     every tensor that nothing reads as an output, so none of its graphs can equal the
-    program), and ``SuperoptError`` when the search fails or finds no graph (with the cause
-    where the program shows it: a reduction over a dim of one element, a ``max_ops`` below
-    the program's own size).
+    program) or with an output that is an input (no op writes it), and ``SuperoptError``
+    when the search fails or finds no graph (with the cause where the program shows it: a
+    reduction over a dim of one element, a ``max_ops`` below the program's own size).
     """
     import cleave.superoptimizer as csopt
     from ..lower.split import Rejected, _contains_split_ops, _renumber_graph, cut_split_graph
 
     config = config or SuperoptConfig()
     program.can_split(config.split)  # SpecError on a bad split dim, whatever the search runs
+    name = getattr(program, "name", "program")
     unread = _unread_inputs(program)
     if unread:
         what = (f"input {unread[0]!r} is" if len(unread) == 1
                 else f"inputs {', '.join(map(repr, unread))} are")
         raise SpecError(
-            f"{getattr(program, 'name', 'program')}: {what} read by no op; the search counts "
-            "a tensor that nothing reads as an output, so none of its graphs can equal the "
-            "program (drop the input or read it)")
+            f"{name}: {what} read by no op; the search counts a tensor that nothing reads as "
+            "an output, so none of its graphs can equal the program (drop the input or read it)")
+    returned = _returned_inputs(program)
+    if returned:
+        raise SpecError(
+            f"{name}: " + ", ".join(f"output {o!r} is input {i!r}" for o, i in returned)
+            + "; no op writes such an output, so no kernel computes it (return a computed "
+            "value)")
     if config.resolve_per_output(program):
         return _superoptimize_per_output(program, config)
     # A split over the dim a max reduces: the search would return no valid split graph (the

@@ -125,6 +125,7 @@ served wrongly):
 
 A program with an input that no op reads is a `SpecError` in `superoptimize`: the search
 counts a tensor that nothing reads as an output, so none of its graphs could equal the program.
+So is a program that returns one of its inputs as it is: no op writes that output.
 
 `cl.softmax(x)` next to another `exp` of the same tensor is served under the limit of a
 softmax that is returned: the softmax's exp reads `x - max(x)`, a value of its own that the
