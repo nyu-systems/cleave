@@ -154,3 +154,20 @@ def derivation(graph, ir=None, **kw):
     ir = lowered(graph) if ir is None else ir
     ob = the_obstacle(ir)
     return engine.run(ir, ob, Recipe.of(graph), key=loop_key(ir, ob.full, ob.loops), **kw)
+
+
+MHA = tuple(dict(H=32, SQ=4096, SKV=4096, D=64).items())  # demo/mha_prefill.py
+
+
+def flash(graphs):
+    """The graph whose row sum and value matmul are siblings (the divide comes last)."""
+    (graph,) = [g for g in graphs if g.summary().endswith("sum>matmul>div")]
+    return graph
+
+
+@functools.lru_cache(maxsize=None)
+def mha_derivation(budgets=(4,)):
+    """The derivation of MHA prefill's flash form (``max_ops=11``) at ``budgets``."""
+    _, graphs = searched(attention, MHA, 11)
+    with use_searched_updates():
+        return derivation(flash(graphs), budgets=budgets)

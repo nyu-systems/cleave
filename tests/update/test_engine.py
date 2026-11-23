@@ -5,7 +5,6 @@ are made by ``engine.run`` itself (no in-process memo, no store), so every list 
 what the search, the proof and the ranking produce now.
 """
 
-import functools
 import json
 import os
 import subprocess
@@ -22,10 +21,9 @@ from cleave.pipeline import plans
 from cleave.pipeline.update import engine
 
 from ._attention import FACTOR
-from ._programs import attention, derivation, qknorm, searched
+from ._programs import MHA, attention, derivation, mha_derivation, qknorm, searched
 
 ROOT = Path(__file__).resolve().parents[2]
-MHA = tuple(dict(H=32, SQ=4096, SKV=4096, D=64).items())
 QKNORM = tuple(dict(HQ=64, HKV=8, SQ=4096, SKV=4096, D=128).items())
 CANONICAL = "(r + (a * exp((m - m'))))"
 
@@ -40,12 +38,8 @@ def traced(graphs):
     return graph
 
 
-@functools.lru_cache(maxsize=None)
 def mha(budgets=(4,)):
-    """The derivation of MHA prefill's flash form at ``budgets``."""
-    _, graphs = searched(attention, MHA, 11)
-    with use_searched_updates():
-        return derivation(flash(graphs), budgets=budgets)
+    return mha_derivation(budgets)
 
 
 def listed(d):
