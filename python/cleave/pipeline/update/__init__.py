@@ -51,12 +51,12 @@ def derive(flat_graph, obstacle, recipe):
         key = loop_key(flat_graph, obstacle.full, tuple(obstacle.loops))
         if key in _DERIVED:
             return _DERIVED[key]
-        mine = (key, recipe.key)
-        if mine in _DERIVED:
-            return _DERIVED[mine]
+        mine = recipe.key
+        if (key, mine) in _DERIVED:
+            return _DERIVED[(key, mine)]
         found = store.load(key, flat_graph, obstacle)
         if found is None:
-            found = store.load(key, flat_graph, obstacle, recipe_key=recipe.key)
+            found = store.load(key, flat_graph, obstacle, recipe_key=mine)
         if found is None:
             found = run(flat_graph, obstacle, recipe, key=key)
             store.save(found)
