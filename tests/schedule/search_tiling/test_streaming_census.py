@@ -268,9 +268,21 @@ def test_search_a_split_job_censuses_the_partial_and_the_combine(monkeypatch, tm
     (combine,) = [rows for g, rows in by_graph.items() if g.endswith(".combine")]
     assert Counter(r["tiling"] for r in partial if r["accepted"]) == {"looped": 16, "one tile": 8}
     assert Counter(r["tiling"] for r in combine if r["accepted"]) == {"looped": 21, "one tile": 3}
+    # (raw candidates, accepted, looped, one tile): 1119's counts for its exact pair. The
+    # 12 combines that are not accepted step one partial at a time or hold a single row
+    assert _split_counts(partial) == (24, 24, 16, 8)
+    assert _split_counts(combine) == (36, 24, 21, 3)
+    assert tool.SPLITS["mha_decode@32"] == ("mha_decode", 32)
     assert any("no pair: LoweringRejected" in line
                and "carries no proven update over that dim: reduce_max_2_5" in line
                for line in lines)
+
+
+def _split_counts(rows):
+    """(raw candidates, accepted, accepted looped, accepted in one tile) of a split stage."""
+    accepted = [r for r in rows if r["accepted"]]
+    return (len(rows), len(accepted), sum(r["tiling"] == "looped" for r in accepted),
+            sum(r["tiling"] == "one tile" for r in accepted))
 
 
 def test_search_a_split_job_of_a_softmax_over_an_input(monkeypatch, tmp_path, capsys):
@@ -282,9 +294,14 @@ def test_search_a_split_job_of_a_softmax_over_an_input(monkeypatch, tmp_path, ca
     monkeypatch.setenv("CLEAVE_CACHE_ROOT", str(tmp_path / "cache"))
     status, lines, report = _run(tmp_path, capsys, "split:rows@4")
     assert status == 0 and lines[-1] == "split:rows@4: ok", lines[-8:]
+    assert not report["unchecked"] and not report["problems"]
     partial = [r for r in report["rows"] if r["graph"].endswith(".partial")]
+    combine = [r for r in report["rows"] if r["graph"].endswith(".combine")]
     assert Counter(r["tiling"] for r in partial) == {"looped": 8, "one tile": 4}
     assert all(r["accepted"] for r in partial)
+    assert _split_counts(partial) == (12, 12, 8, 4)
+    assert _split_counts(combine) == (21, 12, 6, 6)  # 1119's counts, as above
+    assert sorted(tool.PROGRAM_SPLITS) == ["rows@4", "rows@8"]
 
 
 def test_the_split_check_fails_a_pipelined_loop_over_the_splits(monkeypatch, tmp_path,
@@ -311,6 +328,72 @@ def test_the_split_check_fails_a_pipelined_loop_over_the_splits(monkeypatch, tmp
     assert status == 1 and lines[-1].startswith("split:rows@4: FAILED")
     assert report["problems"] and all(
         p.startswith("(g) ") and "the loop over the splits is" in p for p in report["problems"])
+
+
+def test_the_split_check_fails_a_partial_that_does_not_return_its_carried_max(monkeypatch,
+                                                                              tmp_path):
+    """Check (g) has teeth on the partial too. On the pair of ``split:rows@4`` it passes a
+    looped and a one-tile tiling as they are built, and names what a looped partial loses:
+    the carried max as the value it returns, its start value, its place among the loop's
+    accumulators, its lag copy, a repair; on either kind, the order and roles of what the
+    partial returns; and a one-tile partial whose output reads a carried value."""
+    from cleave.ir.graph import AccumEdge
+    from cleave.runtime.reference import output_order
+
+    monkeypatch.setenv("CLEAVE_CACHE_ROOT", str(tmp_path / "cache"))
+    graphs, _, notes, _ = tool._split_graphs("split:rows@4")
+    assert not notes
+    ((_, partial, _, check),) = [g for g in graphs if g[0].endswith(".partial")]
+    tilings = {}
+    for cand in tool.search_tiling(partial, topk=1000):
+        tilings.setdefault(bool(tool.sites(tool.apply_tiling(cand))), cand)
+    assert set(tilings) == {True, False}
+
+    def tiled(looped):
+        """A fresh tiling, and for a looped one the loop that carries the max, and the max."""
+        graph = tool.apply_tiling(tilings[looped])
+        if not looped:
+            return graph, None, None
+        (site,) = tool.sites(graph)
+        (tier,) = [t for t, o in tool.graph_tiers(graph) if o is not None and o.name == site.tier]
+        (full,) = [n for n in tier.nodes if n.name == site.full]
+        return graph, tier, full
+
+    assert check(tiled(True)[0]) is None and check(tiled(False)[0]) is None
+
+    graph, tier, full = tiled(True)
+    (edge,) = output_order(graph)[0].inputs
+    edge.accum_node = next(n for n in tier.accum_nodes if n is not full)
+    assert check(graph) == "the returned max is not the carried one"
+
+    graph, tier, full = tiled(True)
+    full.accum_init = float("-inf")
+    assert check(graph) == "the max is not carried from the most negative float32"
+
+    graph, tier, full = tiled(True)
+    tier.accum_nodes = [n for n in tier.accum_nodes if n is not full]
+    assert check(graph) == "the max is not carried from the most negative float32"
+
+    graph, tier, full = tiled(True)
+    tier.lag_nodes = []
+    assert check(graph) == "lag copies []"
+
+    graph, tier, full = tiled(True)
+    kept = sorted(tier.accum_scale, key=lambda a: a.name)[0]
+    tier.accum_scale = {kept: tier.accum_scale[kept]}
+    assert check(graph) == f"repairs {[kept.name]}"
+
+    for looped in (True, False):
+        graph = tiled(looped)[0]
+        shift = output_order(graph)[0]
+        shift.boundary = shift.boundary._replace(role="")
+        assert check(graph) == (
+            "the partial does not return its float32 max first, then two float32 sums")
+
+    graph = tiled(False)[0]
+    (edge,) = output_order(graph)[0].inputs
+    edge.__class__ = type("Carried", (AccumEdge,), {})  # what the check tells a carried max by
+    assert check(graph) == "the returned max is carried"
 
 
 def test_importing_the_tool_leaves_the_process_alone():
