@@ -637,6 +637,16 @@
    "validated": 156
   }
  ],
+ "test:flash_rows": [
+  {
+   "abs": 6.103515625e-05,
+   "absolute": false,
+   "dtype": "float16",
+   "rel": 0.0009606147650629282,
+   "seeds": 3,
+   "validated": 84
+  }
+ ],
  "test:gqa_bhsd_graph": [
   {
    "abs": 0.0001220703125,
@@ -1021,6 +1031,16 @@
    "rel": 0.00024108003708533943,
    "seeds": 3,
    "validated": 87
+  }
+ ],
+ "test:softmax_first_axis": [
+  {
+   "abs": 7.62939453125e-06,
+   "absolute": false,
+   "dtype": "float16",
+   "rel": 0.0001401345361955464,
+   "seeds": 3,
+   "validated": 2457
   }
  ],
  "test:softmax_mid": [

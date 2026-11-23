@@ -102,9 +102,9 @@ TOLERANCES = {
     "l2_normalize": Tolerance(rtol=5e-3),
     # the softmax with its max in the flat graph, carried by the loop (test_streaming_gpu.py):
     # of an fp16 input, then the value matmul, in the flash form
-    "flash_rows": Tolerance(rtol=CEILING),
+    "flash_rows": Tolerance(rtol=5e-3),
     # ... and over the first non-batch axis, sum(softmax(x, 1) * y, 1): every plan
-    "softmax_first_axis": Tolerance(rtol=CEILING),
+    "softmax_first_axis": Tolerance(rtol=1e-3),
     # ---- the one float32 operator (tests/reference/test_matmul_tf32.py)
     # A float32 matmul on operands TF32 holds exactly, against their float32 product. On
     # ordinary float32 operands the same kernels are 1e-3 off, the TF32 instruction's
