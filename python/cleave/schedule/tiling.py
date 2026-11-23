@@ -743,32 +743,32 @@ def _reduction_axis_tokens(ops) -> Dict[str, set]:
 
 
 def _check_iterates_with_loop(
-    node, gnode, rstep_map, reduction_axis_tokens, *, shares_nodes, shares_inputs
+    node, gnode, rstep_map, reduction_axis_tokens, *, shares_nodes
 ):
     """Refuse to merge reduction ``node`` into the loop of ``gnode`` where it cannot run.
 
     The loop has one counter. An ancestor of the loop's reductions is absorbed (its axis
     is held whole, see ``_pin_absorbed_reduction_axes``). Any other reduction steps with
     the counter:
-    - joining only because its step equals the loop's (no node or input in common), it
-      needs the loop's trip count too, or the kernel reads past the shorter axis;
+    - it needs the loop's trip count, or the kernel reads past the shorter axis or
+      covers only part of it (and an input the two share is sliced once, with one
+      step, for both: LoRA's X@W and X@A at different K steps gave TileLang
+      ``T.gemm K shape check failed``); the policy steps such siblings together;
     - sharing nodes with the loop (whose tiles are sliced along the loop's axis), it
       must run over that axis, when the provenance of both axes is known.
     Raises ``ScheduleRejected`` (a second loop in one kernel is not supported by code
-    generation). A reduction that shares only inputs keeps the historical merge, in
-    which the loop's extent wins.
+    generation).
     """
     loop_reductions = [n for n in gnode.graph.accum_nodes if n.raxis]
     if any(node in get_op_ancestors(r) for r in loop_reductions):
         return
-    if not shares_nodes and not shares_inputs:
-        step = _get_rstep_for_axis(node, rstep_map[node])
-        trips = int(node.raxis[0].dom.extent) // step
-        if trips != int(gnode.graph.extent):
-            raise ScheduleRejected(
-                f"Reduction {node.name} takes {trips} steps of {step} but would join the "
-                f"loop of {gnode.name}, which takes {gnode.graph.extent}."
-            )
+    step = _get_rstep_for_axis(node, rstep_map[node])
+    trips = int(node.raxis[0].dom.extent) // step
+    if trips != int(gnode.graph.extent):
+        raise ScheduleRejected(
+            f"Reduction {node.name} takes {trips} steps of {step} but would join the "
+            f"loop of {gnode.name}, which takes {gnode.graph.extent}."
+        )
     if shares_nodes:
         axis_tokens = reduction_axis_tokens()
         tokens = axis_tokens.get(node.name, set())
@@ -1112,7 +1112,6 @@ def apply_tiling(cand: List) -> List[Graph]:
                         cand.rstep_map,
                         reduction_axis_tokens,
                         shares_nodes=bool(shared_inner_nodes),
-                        shares_inputs=bool(existing_placeholders),
                     )
                     found_compatible_graph = True
 

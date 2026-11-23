@@ -1250,7 +1250,14 @@ class DefaultPolicy:
             if not memo_ancestors[node1].intersection(memo_ancestors[node2]):
                 return False
 
-            # 2. descendant reduction nodes must match
+            # 2. siblings (neither feeds the other) that share an ancestor run in one
+            # loop: apply_tiling merges a reduction into the loop it shares a node or
+            # an input with, and the loop has one counter, so they have to step
+            # together (LoRA's X@W and X@A, which share X)
+            if node1 not in memo_ancestors[node2] and node2 not in memo_ancestors[node1]:
+                return True
+
+            # 3. descendant reduction nodes must match
             if memo_descendant_reductions[node1] != memo_descendant_reductions[node2]:
                 return False
 
