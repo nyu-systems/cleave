@@ -15,18 +15,31 @@ struct ThreadFingerprintScope {
     kernel::clear_thread_fingerprints();
   }
 };
-} // namespace
-
-ProbabilisticVerifier::ProbabilisticVerifier(kernel::Graph const &input_graph) {
-  ThreadFingerprintScope scope;
+// Input k's fingerprint is a function of k; a declared input's is its
+// definition's over its sources' (the same in the target and every
+// candidate).
+void fingerprint_graph(kernel::Graph const &g) {
   int input_id = 0;
-  for (auto const &op : input_graph.operators) {
+  for (auto const &op : g.operators) {
     if (op->op_type == type::KNOperatorType::KN_INPUT_OP) {
-      static_cast<kernel::KNInputOp *>(op)->fingerprint(input_id++);
+      auto *input = static_cast<kernel::KNInputOp *>(op);
+      if (input->declaration) {
+        kernel::compute_declared_input_fingerprint(g, *input);
+      } else {
+        input->fingerprint(input_id);
+      }
+      input_id++;
     } else {
       op->fingerprint();
     }
   }
+}
+
+} // namespace
+
+ProbabilisticVerifier::ProbabilisticVerifier(kernel::Graph const &input_graph) {
+  ThreadFingerprintScope scope;
+  fingerprint_graph(input_graph);
 
   for (kernel::KNOperator *op : input_graph.operators) {
     if (op->op_type == type::KNOperatorType::KN_OUTPUT_OP) {
@@ -47,18 +60,11 @@ OutputMatch ProbabilisticVerifier::verify(kernel::Graph const &graph) {
 
   std::vector<kernel::DTensor> fingerprints;
 
-  int input_id = 0;
-  for (auto const &op : graph.operators) {
-    if (op->op_type == type::KNOperatorType::KN_INPUT_OP) {
-      static_cast<kernel::KNInputOp *>(op)->fingerprint(input_id++);
-    } else {
-      op->fingerprint();
-    }
-  }
+  fingerprint_graph(graph);
 
   for (auto const &op : graph.operators) {
     for (auto const &tensor : op->output_tensors) {
-      if (get_num_consumers(graph, tensor) == 0) {
+      if (get_num_consumers(graph, tensor) == 0 && !is_declared_input(op)) {
         fingerprints.push_back(tensor);
       }
     }

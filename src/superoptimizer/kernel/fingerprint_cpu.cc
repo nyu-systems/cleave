@@ -620,6 +620,31 @@ void clear_thread_fingerprints() {
   get_store().fingerprints.clear();
 }
 
+void compute_declared_input_fingerprint(Graph const &host,
+                                        KNInputOp const &input) {
+  InputDeclaration const &decl = *input.declaration;
+  Store &store = get_store();
+  std::vector<DTensor> sources = host.declaration_sources(decl);
+  std::vector<KNInputOp *> def_inputs = decl.definition->input_ops();
+  for (size_t k = 0; k < sources.size(); k++) {
+    auto it = store.fingerprints.find(sources[k].guid);
+    CSO_CHECK(it != store.fingerprints.end())
+        << "declared input: source " << k << " has no fingerprint";
+    std::vector<FingerprintType> values = it->second;
+    std::copy(values.begin(), values.end(),
+              store.get_buffer(def_inputs[k]->output_tensors[0]));
+  }
+  for (KNOperator *op : decl.definition->operators) {
+    if (op->op_type != cleave_superoptimizer::type::KN_INPUT_OP) {
+      op->fingerprint();
+    }
+  }
+  std::vector<FingerprintType> values =
+      store.fingerprints.at(decl.result().guid);
+  std::copy(values.begin(), values.end(),
+            store.get_buffer(input.output_tensors[0]));
+}
+
 cleave_superoptimizer::type::FingerprintType *
     CpuFingerprintEngine::Store::get_buffer(DTensor const &tensor) {
   auto &buffer = fingerprints[tensor.guid];

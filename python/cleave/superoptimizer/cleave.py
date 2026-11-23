@@ -53,6 +53,15 @@ class TileGraph:
         """Max over ``dim`` (keepdim)."""
         return self.cygraph.reduce_max(A, dim)
 
+    def declare_input(self, tensor: DTensor, definition: "TileGraph", sources) -> None:
+        """``tensor`` (an input) IS ``definition`` over the inputs ``sources``: see
+        ``CyTileGraph.declare_input``."""
+        definition = getattr(definition, "cygraph", definition)
+        self.cygraph.declare_input(tensor, definition, list(sources))
+
+    def has_declared_inputs(self) -> bool:
+        return self.cygraph.has_declared_inputs()
+
     def get_graph_structure(self):
         return self.cygraph.get_graph_structure()
 

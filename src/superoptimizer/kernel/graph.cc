@@ -20,6 +20,13 @@
 namespace cleave_superoptimizer {
 namespace kernel {
 
+namespace {
+std::vector<int> dims_of(DTensor const &t) {
+  return std::vector<int>(t.dim, t.dim + t.num_dims);
+}
+
+} // namespace
+
 Graph::Graph() {}
 
 Graph::~Graph() {
@@ -69,9 +76,47 @@ Graph *Graph::create_symbolic_graph(
       tensor_guids.push_back(tensor.guid);
     }
   }
+  // A declaration's tensors come after the graph's own (positions of the
+  // graph's tensors, and so the symbols of undeclared graphs, do not move).
+  for (KNInputOp const *input_op : input_ops()) {
+    if (input_op->declaration) {
+      for (auto const &op : input_op->declaration->definition->operators) {
+        for (auto const &tensor : op->output_tensors) {
+          tensor_guids.push_back(tensor.guid);
+        }
+      }
+    }
+  }
   DimensionGrouper grouper(tensor_guids);
   for (auto const &op : operators) {
     GroupingRules::apply_grouping(op, grouper);
+  }
+  // A definition's dims are grouped like any graph's; its inputs' dims are
+  // its sources' and its result's are the declared input's.
+  for (KNInputOp const *input_op : input_ops()) {
+    if (!input_op->declaration) {
+      continue;
+    }
+    InputDeclaration const &decl = *input_op->declaration;
+    for (auto const &op : decl.definition->operators) {
+      GroupingRules::apply_grouping(op, grouper);
+    }
+    std::vector<DTensor> sources = declaration_sources(decl);
+    std::vector<KNInputOp *> def_inputs = decl.definition->input_ops();
+    auto merge_dims = [&](DTensor const &a, DTensor const &b) {
+      for (int i = 0; i < a.num_dims; i++) {
+        if (a.dim[i] == 1) {
+          grouper.mark_broadcast({a.guid, i});
+          grouper.mark_broadcast({b.guid, i});
+        } else {
+          grouper.merge({a.guid, i}, {b.guid, i});
+        }
+      }
+    };
+    for (size_t k = 0; k < sources.size(); k++) {
+      merge_dims(sources[k], def_inputs[k]->output_tensors[0]);
+    }
+    merge_dims(input_op->output_tensors[0], decl.result());
   }
 
   // Step 2: Symbolization pass - assign distinct symbols to groups
@@ -113,6 +158,24 @@ Graph *Graph::create_symbolic_graph(
         DTensor sym_tensor =
             symbolic_graph->new_input(sym_dims, can_reduce_vec, can_split_vec,
                                       orig_tensor.dtype);
+        auto const *orig_input = static_cast<KNInputOp const *>(op);
+        if (orig_input->declaration) {
+          // The definition over the symbolic sources.
+          InputDeclaration const &decl = *orig_input->declaration;
+          std::vector<DTensor> sym_sources;
+          for (DTensor const &source : declaration_sources(decl)) {
+            sym_sources.push_back(guid_to_symbolic_tensor.at(source.guid));
+          }
+          auto sym_decl = std::make_shared<InputDeclaration>();
+          sym_decl->sources = decl.sources;
+          sym_decl->definition = std::shared_ptr<Graph const>(
+              instantiate(*decl.definition, sym_sources).release());
+          CSO_CHECK(dims_of(sym_decl->result()) == sym_dims)
+              << "symbolic declaration of input " << orig_tensor.guid
+              << " does not have the input's shape";
+          static_cast<KNInputOp *>(symbolic_graph->operators.back())
+              ->declaration = sym_decl;
+        }
 
         // Store mapping
         guid_to_symbolic_tensor[orig_tensor.guid] = sym_tensor;
@@ -340,6 +403,24 @@ void Graph::infer_reducibility() {
   for (int op_idx = operators.size() - 1; op_idx >= 0; op_idx--) {
     KNOperator *op = operators[op_idx];
     propagate_reducibility_backward(op);
+  }
+
+  // Phase 2b: a declared input is reducible where its readers make it so
+  // (above) and where its definition is, forward from its sources' flags
+  // (a target that does not read it gives it no flags at all).
+  for (KNInputOp *input_op : input_ops()) {
+    if (!input_op->declaration) {
+      continue;
+    }
+    std::unique_ptr<Graph> def = instantiate(
+        *input_op->declaration->definition,
+        declaration_sources(*input_op->declaration));
+    InputDeclaration evaluated{std::shared_ptr<Graph const>(def.release()), {}};
+    DTensor const &result = evaluated.result();
+    DTensor &tensor = input_op->output_tensors[0];
+    for (int i = 0; i < tensor.num_dims; i++) {
+      tensor.can_reduce[i] = tensor.can_reduce[i] || result.can_reduce[i];
+    }
   }
 
   // Phase 3: Finalize input can_split. Auto-mode inputs infer it from
@@ -578,6 +659,7 @@ struct OpSpec {
   float min_val = 0.0f, max_val = 0.0f;
   int reduction_size = 1;
   int normalized_size = 0;
+  std::shared_ptr<InputDeclaration const> declaration;
 };
 
 // Appends the op described by `s` to `g`; returns its output (nullptr for
@@ -589,6 +671,7 @@ DTensor const *append_op(Graph &g, OpSpec const &s) {
     case OpCategory::INPUT:
       op = g.create_input_op(s.dims, s.can_reduce, s.can_split, s.dtype);
       static_cast<KNInputOp *>(op)->infer_can_split = s.infer_can_split;
+      static_cast<KNInputOp *>(op)->declaration = s.declaration;
       break;
     case OpCategory::OUTPUT:
       g.mark_output(s.inputs.at(0), /*infer_output_reducibility=*/false);
@@ -646,56 +729,247 @@ DTensor const *append_op(Graph &g, OpSpec const &s) {
   return &op->output_tensors[0];
 }
 
+// The attributes of `op` (all but its operands).
+OpSpec spec_of(KNOperator const *op) {
+  OpSpec s;
+  s.op_type = op->op_type;
+  switch (type::op_category(op->op_type)) {
+    case type::OpCategory::INPUT: {
+      DTensor const &t = op->output_tensors[0];
+      s.dims.assign(t.dim, t.dim + t.num_dims);
+      s.can_reduce.assign(t.can_reduce, t.can_reduce + t.num_dims);
+      s.can_split.assign(t.can_split, t.can_split + t.num_dims);
+      s.dtype = t.dtype;
+      s.infer_can_split = static_cast<KNInputOp const *>(op)->infer_can_split;
+      s.declaration = static_cast<KNInputOp const *>(op)->declaration;
+      break;
+    }
+    case type::OpCategory::MATMUL: {
+      auto const *m = static_cast<KNMatmulOp const *>(op);
+      s.trans_A = m->trans_A;
+      s.trans_B = m->trans_B;
+      break;
+    }
+    case type::OpCategory::CLAMP: {
+      auto const *c = static_cast<KNClampUnaryOp const *>(op);
+      s.min_val = c->min_val;
+      s.max_val = c->max_val;
+      break;
+    }
+    case type::OpCategory::BINARY: {
+      auto const *b = static_cast<KNElementBinaryOp const *>(op);
+      s.has_scalar = b->has_scalar;
+      s.scalar = b->scalar;
+      s.scalar_on_left = b->scalar_on_left;
+      break;
+    }
+    case type::OpCategory::REDUCE_SUM:
+      s.reduction_size =
+          static_cast<KNReduceSumOp const *>(op)->reduction_dim_size;
+      break;
+    case type::OpCategory::RMS_NORM:
+      s.normalized_size = static_cast<KNRMSNormOp const *>(op)->normalized_size;
+      break;
+    default:
+      break;
+  }
+  return s;
+}
+
+int input_position(Graph const &g, DTensor const &t) {
+  int position = 0;
+  for (KNOperator const *op : g.operators) {
+    if (op->op_type == type::KN_INPUT_OP) {
+      if (op->output_tensors[0].guid == t.guid) {
+        return position;
+      }
+      position++;
+    }
+  }
+  return -1;
+}
+
 } // namespace
+
+DTensor const &InputDeclaration::result() const {
+  for (KNOperator const *op : definition->operators) {
+    if (op->op_type == type::KN_OUTPUT_OP) {
+      return op->input_tensors.at(0);
+    }
+  }
+  CSO_THROW(std::logic_error, "input declaration without an output");
+}
+
+std::vector<KNInputOp *> Graph::input_ops() const {
+  std::vector<KNInputOp *> inputs;
+  for (KNOperator *op : operators) {
+    if (op->op_type == type::KN_INPUT_OP) {
+      inputs.push_back(static_cast<KNInputOp *>(op));
+    }
+  }
+  return inputs;
+}
+
+bool Graph::has_declared_inputs() const {
+  for (KNInputOp const *op : input_ops()) {
+    if (op->declaration) {
+      return true;
+    }
+  }
+  return false;
+}
+
+std::vector<DTensor>
+    Graph::declaration_sources(InputDeclaration const &decl) const {
+  std::vector<KNInputOp *> inputs = input_ops();
+  std::vector<DTensor> sources;
+  for (int position : decl.sources) {
+    CSO_REQUIRE(position >= 0 && position < static_cast<int>(inputs.size()),
+                std::runtime_error,
+                "declared input reads input " << position << " of a graph with "
+                                              << inputs.size() << " inputs");
+    sources.push_back(inputs[position]->output_tensors[0]);
+  }
+  return sources;
+}
+
+std::unique_ptr<Graph> Graph::instantiate(Graph const &definition,
+                                          std::vector<DTensor> const &inputs) {
+  std::unique_ptr<Graph> g(new Graph());
+  std::unordered_map<type::GuidType, DTensor> mapped;
+  size_t next_input = 0;
+  for (KNOperator const *op : definition.operators) {
+    OpSpec s = spec_of(op);
+    for (DTensor const &t : op->input_tensors) {
+      s.inputs.push_back(mapped.at(t.guid));
+    }
+    if (op->op_type == type::KN_INPUT_OP) {
+      CSO_REQUIRE(next_input < inputs.size(), std::invalid_argument,
+                  "definition has more inputs than given");
+      DTensor const &like = inputs[next_input++];
+      s.dims = dims_of(like);
+      s.can_reduce.assign(like.can_reduce, like.can_reduce + like.num_dims);
+      s.can_split.assign(like.can_split, like.can_split + like.num_dims);
+      s.dtype = like.dtype;
+      s.infer_can_split = false;
+      s.declaration = nullptr;
+    }
+    DTensor const *out = append_op(*g, s);
+    if (out != nullptr) {
+      mapped[op->output_tensors[0].guid] = *out;
+    }
+  }
+  CSO_REQUIRE(next_input == inputs.size(), std::invalid_argument,
+              "definition has " << next_input << " inputs, " << inputs.size()
+                                << " given");
+  return g;
+}
+
+void Graph::declare_input(DTensor const &input,
+                          Graph const &definition,
+                          std::vector<DTensor> const &sources) {
+  int position = input_position(*this, input);
+  CSO_REQUIRE(position >= 0, std::invalid_argument,
+              "declare_input: tensor " << input.guid
+                                       << " is not an input of this graph");
+  KNInputOp *op = input_ops()[position];
+  CSO_REQUIRE(!op->declaration, std::invalid_argument,
+              "declare_input: input " << position << " is already declared");
+  auto decl = std::make_shared<InputDeclaration>();
+  for (DTensor const &source : sources) {
+    int p = input_position(*this, source);
+    CSO_REQUIRE(p >= 0, std::invalid_argument,
+                "declare_input: a source is not an input of this graph");
+    CSO_REQUIRE(p < position, std::invalid_argument,
+                "declare_input: source input " << p
+                                               << " does not come before the "
+                                                  "declared input "
+                                               << position);
+    CSO_REQUIRE(!input_ops()[p]->declaration, std::invalid_argument,
+                "declare_input: source input " << p << " is declared itself");
+    decl->sources.push_back(p);
+  }
+  std::vector<KNInputOp *> def_inputs = definition.input_ops();
+  CSO_REQUIRE(def_inputs.size() == sources.size(), std::invalid_argument,
+              "declare_input: the definition has " << def_inputs.size()
+                                                   << " inputs for "
+                                                   << sources.size()
+                                                   << " sources");
+  int num_outputs = 0;
+  for (KNOperator const *def_op : definition.operators) {
+    num_outputs += def_op->op_type == type::KN_OUTPUT_OP;
+    CSO_REQUIRE(type::op_category(def_op->op_type) != type::OpCategory::SPLIT,
+                std::invalid_argument,
+                "declare_input: the definition contains a split");
+  }
+  CSO_REQUIRE(num_outputs == 1, std::invalid_argument,
+              "declare_input: the definition has " << num_outputs
+                                                   << " outputs, not one");
+  for (size_t i = 0; i < sources.size(); i++) {
+    CSO_REQUIRE(dims_of(def_inputs[i]->output_tensors[0]) ==
+                    dims_of(sources[i]),
+                std::invalid_argument,
+                "declare_input: definition input " << i
+                                                   << " has another shape than "
+                                                      "its source");
+  }
+  // A copy over inputs shaped like the sources (dtypes included).
+  std::unique_ptr<Graph> copy = instantiate(definition, sources);
+  decl->definition = std::shared_ptr<Graph const>(copy.release());
+  CSO_REQUIRE(dims_of(decl->result()) == dims_of(input), std::invalid_argument,
+              "declare_input: the definition's result has another shape than "
+              "the declared input");
+  op->declaration = decl;
+  // Reducibility depends on the declaration once outputs are marked.
+  for (KNOperator const *other : operators) {
+    if (other->op_type == type::KN_OUTPUT_OP) {
+      infer_reducibility();
+      break;
+    }
+  }
+}
+
+std::string declaration_key(KNOperator const *op) {
+  if (op->op_type != type::KN_INPUT_OP) {
+    return "";
+  }
+  auto const *input = static_cast<KNInputOp const *>(op);
+  if (!input->declaration) {
+    return "";
+  }
+  InputDeclaration const &decl = *input->declaration;
+  std::unordered_map<type::GuidType, int> index;
+  json ops = json::array();
+  for (KNOperator const *def_op : decl.definition->operators) {
+    OpSpec s = spec_of(def_op);
+    std::vector<int> operands;
+    for (DTensor const &t : def_op->input_tensors) {
+      operands.push_back(index.at(t.guid));
+    }
+    json outs = json::array();
+    for (DTensor const &t : def_op->output_tensors) {
+      index[t.guid] = static_cast<int>(index.size());
+      outs.push_back(json{{"dims", dims_of(t)},
+                          {"dtype", type::data_type_to_string(t.dtype)}});
+    }
+    ops.push_back(json{{"op_type", static_cast<int>(s.op_type)},
+                       {"inputs", operands},
+                       {"outputs", outs},
+                       {"trans", {s.trans_A, s.trans_B}},
+                       {"scalar", {s.has_scalar, s.scalar, s.scalar_on_left}},
+                       {"clamp", {s.min_val, s.max_val}},
+                       {"sizes", {s.reduction_size, s.normalized_size}}});
+  }
+  return json{{"sources", decl.sources}, {"definition", ops}}.dump();
+}
 
 Graph *Graph::clone() const {
   std::unique_ptr<Graph> g(new Graph());
   std::unordered_map<type::GuidType, DTensor> mapped;
   for (KNOperator const *op : operators) {
-    OpSpec s;
-    s.op_type = op->op_type;
+    OpSpec s = spec_of(op);
     for (DTensor const &t : op->input_tensors) {
       s.inputs.push_back(mapped.at(t.guid));
-    }
-    switch (type::op_category(op->op_type)) {
-      case type::OpCategory::INPUT: {
-        DTensor const &t = op->output_tensors[0];
-        s.dims.assign(t.dim, t.dim + t.num_dims);
-        s.can_reduce.assign(t.can_reduce, t.can_reduce + t.num_dims);
-        s.can_split.assign(t.can_split, t.can_split + t.num_dims);
-        s.dtype = t.dtype;
-        s.infer_can_split = static_cast<KNInputOp const *>(op)->infer_can_split;
-        break;
-      }
-      case type::OpCategory::MATMUL: {
-        auto const *m = static_cast<KNMatmulOp const *>(op);
-        s.trans_A = m->trans_A;
-        s.trans_B = m->trans_B;
-        break;
-      }
-      case type::OpCategory::CLAMP: {
-        auto const *c = static_cast<KNClampUnaryOp const *>(op);
-        s.min_val = c->min_val;
-        s.max_val = c->max_val;
-        break;
-      }
-      case type::OpCategory::BINARY: {
-        auto const *b = static_cast<KNElementBinaryOp const *>(op);
-        s.has_scalar = b->has_scalar;
-        s.scalar = b->scalar;
-        s.scalar_on_left = b->scalar_on_left;
-        break;
-      }
-      case type::OpCategory::REDUCE_SUM:
-        s.reduction_size =
-            static_cast<KNReduceSumOp const *>(op)->reduction_dim_size;
-        break;
-      case type::OpCategory::RMS_NORM:
-        s.normalized_size =
-            static_cast<KNRMSNormOp const *>(op)->normalized_size;
-        break;
-      default:
-        break;
     }
     DTensor const *out = append_op(*g, s);
     if (out != nullptr) {
@@ -740,6 +1014,15 @@ void from_json(json const &j, Graph &g) {
       s.can_reduce = to_vector(num_dim, can_reduce_arr);
       s.can_split = to_vector(num_dim, can_split_arr);
       s.dtype = type::data_type_from_string(jout.value("dtype", std::string()));
+      if (jop.contains("declaration")) {
+        json const &jdecl = jop.at("declaration");
+        auto decl = std::make_shared<InputDeclaration>();
+        jdecl.at("sources").get_to(decl->sources);
+        auto definition = std::make_shared<Graph>();
+        from_json(jdecl.at("definition"), *definition);
+        decl->definition = definition;
+        s.declaration = decl;
+      }
     } else {
       // Scalar binary ops serialize their single tensor operand only.
       size_t n = jop.contains("scalar") ? 1 : jop.at("input_tensors").size();

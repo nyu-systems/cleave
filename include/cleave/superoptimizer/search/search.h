@@ -42,6 +42,8 @@ private:
     float scalar;
     bool scalar_on_left;
     std::shared_ptr<AbstractExpr> input_pattern;
+    // ac_canonical_string(input_pattern), for programs with declared inputs
+    std::string input_canonical;
   };
 
   // Computation graph-related fields
@@ -49,8 +51,12 @@ private:
   std::vector<std::tuple<std::vector<int>,
                          std::vector<bool>,
                          std::vector<bool>,
-                         type::DataType>>
+                         type::DataType,
+                         std::shared_ptr<kernel::InputDeclaration const>>>
       computation_graph_input_attrs;
+  // The target declares inputs: unread declared inputs are no outputs, and
+  // scalar ops compare patterns in AC-canonical form.
+  bool has_declared_inputs = false;
   std::vector<ScalarBinarySpec> scalar_binary_specs;
 
   // Statistics-related fields

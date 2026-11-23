@@ -37,5 +37,10 @@ private:
 // KNOperator::fingerprint()).
 void clear_thread_fingerprints();
 
+// The fingerprint of declared input `input` of `host`: its definition run on
+// the fingerprints of its sources (which must be computed already).
+void compute_declared_input_fingerprint(Graph const &host,
+                                        KNInputOp const &input);
+
 } // namespace kernel
 } // namespace cleave_superoptimizer

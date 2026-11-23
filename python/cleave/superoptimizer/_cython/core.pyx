@@ -607,6 +607,25 @@ cdef class CyTileGraph:
         """Max over ``dim`` (keepdim)."""
         return self._wrap_dtensor(self.p_tgraph.reduce_max(_cptr(A)[0], dim))
 
+    def declare_input(self, DTensor tensor, CyTileGraph definition not None, sources):
+        """Declare input ``tensor`` of this graph to BE ``definition`` over ``sources``.
+
+        ``definition`` is another tile graph with one input per source (in order, each of
+        its source's shape) and one output (of ``tensor``'s shape); ``sources`` are inputs
+        of this graph that come before ``tensor`` and are not declared themselves. The
+        search may then read ``tensor`` wherever its definition occurs; an unread declared
+        input is not an output. The definition is copied: ``definition`` may be dropped.
+        """
+        cdef vector[CppDTensor] csources
+        cdef DTensor source
+        for source in sources:
+            csources.push_back(_cptr(source)[0])
+        self.p_tgraph.tile_graph.declare_input(_cptr(tensor)[0], definition.p_tgraph.tile_graph,
+                                               csources)
+
+    def has_declared_inputs(self):
+        return _pybool(self.p_tgraph.tile_graph.has_declared_inputs())
+
     def kn_graph(self):
         """Non-owning CyKNGraph view of this tile graph (keeps ``self`` alive)."""
         return CyKNGraph(ctypes.c_void_p(<unsigned long long>&self.p_tgraph.tile_graph), self)
@@ -622,6 +641,7 @@ cdef class CyTileGraph:
 
     def _structure_key(self):
         """Canonical, guid-free description of the graph (shapes, flags, dtypes, op attrs)."""
+        import json
         cdef size_t i, k
         cdef int d
         cdef CppKNOperator* op
@@ -650,6 +670,10 @@ cdef class CyTileGraph:
                 bin_op = <CppKNElementBinaryOp*> op
                 if bin_op.has_scalar:
                     entry.append([float(bin_op.scalar), _pybool(bin_op.scalar_on_left)])
+            elif op.op_type == KN_INPUT_OP:
+                declared = declaration_key(op).decode("utf-8")
+                if declared:  # declared inputs only: other keys do not move
+                    entry.append({"declared": json.loads(declared)})
             ops.append(entry)
         return ops
 

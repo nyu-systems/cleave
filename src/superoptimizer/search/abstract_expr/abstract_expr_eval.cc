@@ -9,9 +9,15 @@
 namespace cleave_superoptimizer {
 namespace search {
 
-void abstract_expr_eval(
+namespace {
+
+// `inputs`, when given, are the patterns of g's inputs (a definition evaluated
+// over its sources' patterns); otherwise input k is Var("v_k"), and a declared
+// input is its definition over its sources' patterns (substitution).
+void eval_graph(
     kernel::Graph const &g,
-    std::unordered_map<int64_t, std::shared_ptr<AbstractExpr>> &patterns) {
+    std::unordered_map<int64_t, std::shared_ptr<AbstractExpr>> &patterns,
+    std::vector<std::shared_ptr<AbstractExpr>> const *inputs) {
   auto make_scalar_name = [](float scalar) {
     std::ostringstream oss;
     oss << "c_" << scalar;
@@ -28,8 +34,23 @@ void abstract_expr_eval(
     if (op->op_type == type::KNOperatorType::KN_OUTPUT_OP) {
       continue;
     } else if (op->op_type == type::KNOperatorType::KN_INPUT_OP) {
-      patterns.insert({op->output_tensors[0].guid,
-                       std::make_shared<Var>("v_" + std::to_string(input_id))});
+      auto const *input_op = static_cast<kernel::KNInputOp const *>(op);
+      std::shared_ptr<AbstractExpr> pattern;
+      if (inputs) {
+        pattern = inputs->at(input_id);
+      } else if (input_op->declaration) {
+        kernel::InputDeclaration const &decl = *input_op->declaration;
+        std::vector<std::shared_ptr<AbstractExpr>> sources;
+        for (kernel::DTensor const &source : g.declaration_sources(decl)) {
+          sources.push_back(patterns.at(source.guid));
+        }
+        std::unordered_map<int64_t, std::shared_ptr<AbstractExpr>> inner;
+        eval_graph(*decl.definition, inner, &sources);
+        pattern = inner.at(decl.result().guid);
+      } else {
+        pattern = std::make_shared<Var>("v_" + std::to_string(input_id));
+      }
+      patterns.insert({op->output_tensors[0].guid, pattern});
       input_id++;
     } else if (op->op_type == type::KNOperatorType::KN_RMS_NORM_OP) {
       std::shared_ptr<AbstractExpr> input_pattern =
@@ -92,6 +113,14 @@ void abstract_expr_eval(
       }
     }
   }
+}
+
+} // namespace
+
+void abstract_expr_eval(
+    kernel::Graph const &g,
+    std::unordered_map<int64_t, std::shared_ptr<AbstractExpr>> &patterns) {
+  eval_graph(g, patterns, nullptr);
 }
 
 } // namespace search

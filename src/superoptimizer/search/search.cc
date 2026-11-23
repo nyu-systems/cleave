@@ -84,7 +84,7 @@ std::vector<typename GraphType::TensorType>
   std::vector<typename GraphType::TensorType> output_tensors;
   for (auto const &op : g.operators) {
     for (auto const &tensor : op->output_tensors) {
-      if (get_num_consumers(g, tensor) == 0) {
+      if (get_num_consumers(g, tensor) == 0 && !is_declared_input(op)) {
         output_tensors.push_back(tensor);
       }
     }
@@ -296,8 +296,11 @@ void KernelGraphGenerator::generate_next_operator(
             continue;
           }
           if (spec.input_pattern &&
-              input_patterns[0]->to_string() !=
-                  spec.input_pattern->to_string()) {
+              (has_declared_inputs
+                   ? ac_canonical_string(*input_patterns[0]) !=
+                         spec.input_canonical
+                   : input_patterns[0]->to_string() !=
+                         spec.input_pattern->to_string())) {
             continue;
           }
           std::shared_ptr<AbstractExpr> pattern =
@@ -354,8 +357,10 @@ void KernelGraphGenerator::generate_kernel_graphs() {
   c.kn_graph = std::make_shared<kernel::Graph>();
 
   for (auto const &input_attr : computation_graph_input_attrs) {
-    auto [dim, can_reduce, can_split, dtype] = input_attr;
+    auto [dim, can_reduce, can_split, dtype, declaration] = input_attr;
     c.kn_graph->new_input(dim, can_reduce, can_split, dtype);
+    static_cast<kernel::KNInputOp *>(c.kn_graph->operators.back())
+        ->declaration = declaration;
   }
 
   CSO_LOG(INFO) << "[Search] Starting kernel graph generation with "
@@ -407,7 +412,17 @@ void KernelGraphGenerator::preprocess(kernel::Graph const &computation_graph) {
                      op->output_tensors[0].can_reduce),
            to_vector(op->output_tensors[0].num_dims,
                      op->output_tensors[0].can_split),
-           op->output_tensors[0].dtype});
+           op->output_tensors[0].dtype,
+           static_cast<kernel::KNInputOp const *>(op)->declaration});
+    }
+  }
+  has_declared_inputs = computation_graph.has_declared_inputs();
+  if (has_declared_inputs) {
+    bool declared_seen = false;
+    for (kernel::KNInputOp const *op : computation_graph.input_ops()) {
+      CSO_REQUIRE(op->declaration || !declared_seen, std::invalid_argument,
+                  "declared inputs must be the last inputs of the graph");
+      declared_seen = declared_seen || op->declaration != nullptr;
     }
   }
 
@@ -442,10 +457,13 @@ void KernelGraphGenerator::preprocess(kernel::Graph const &computation_graph) {
           }
         }
         if (!seen) {
-          scalar_binary_specs.push_back({op->op_type,
-                                         bin_op->scalar,
-                                         bin_op->scalar_on_left,
-                                         input_pattern});
+          scalar_binary_specs.push_back(
+              {op->op_type,
+               bin_op->scalar,
+               bin_op->scalar_on_left,
+               input_pattern,
+               has_declared_inputs ? ac_canonical_string(*input_pattern)
+                                   : std::string()});
         }
       }
     }
