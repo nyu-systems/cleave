@@ -522,4 +522,9 @@ def to_ir(
     if not ctx.outputs:
         raise ValueError("No output nodes found in graph structure.")
     nodes = gather_all_nodes(*ctx.outputs)
-    return Graph(nodes=find_topo_sort([n for n in nodes if n.is_output()]))
+    # The outputs in the structure's order (the Program's): the kernel returns them in this
+    # order. The traversal above finds them in another one when a later output is reached
+    # through a shared input before an earlier one.
+    rank = {id(n): i for i, n in enumerate(ctx.outputs)}
+    outputs = sorted((n for n in nodes if n.is_output()), key=lambda n: rank.get(id(n), len(rank)))
+    return Graph(nodes=find_topo_sort(outputs))
