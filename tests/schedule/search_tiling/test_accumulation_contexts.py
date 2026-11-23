@@ -134,7 +134,12 @@ def test_detection_silent_on_test_graphs(name):
     assert policy.accumulation == {}
 
 
-@pytest.mark.parametrize("case", DEMO_CASES, ids=[c[0] for c in DEMO_CASES])
+# The attention-backward demo is the one demo whose outputs reduce over orthogonal axes.
+ORTHOGONAL_DEMOS = {"mha_backward"}
+SILENT_DEMO_CASES = [c for c in DEMO_CASES if c[0] not in ORTHOGONAL_DEMOS]
+
+
+@pytest.mark.parametrize("case", SILENT_DEMO_CASES, ids=[c[0] for c in SILENT_DEMO_CASES])
 def test_detection_silent_on_demos(monkeypatch, case):
     _, demo, argv = case
     program = run_demo(monkeypatch, demo, argv)["program"]
@@ -143,6 +148,17 @@ def test_detection_silent_on_demos(monkeypatch, case):
     for cand in search_tiling(graph, topk=4):
         assert cand.accumulation == {}
         assert "acc=" not in describe_tile(cand)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [c for c in DEMO_CASES if c[0] in ORTHOGONAL_DEMOS],
+    ids=sorted(ORTHOGONAL_DEMOS),
+)
+def test_detection_finds_orthogonal_demos(monkeypatch, case):
+    _, demo, argv = case
+    program = run_demo(monkeypatch, demo, argv)["program"]
+    assert len(_policy(_lower(program)).reduction_groups) == 2
 
 
 @pytest.mark.parametrize("name", sorted(ORTHOGONAL))
