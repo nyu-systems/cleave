@@ -344,6 +344,34 @@ def test_split_combine_with_one_head_divides_by_the_row_sums(sq, d):
     torch.testing.assert_close(got.reshape(want.shape), want, rtol=1e-5, atol=1e-6)
 
 
+def test_search_one_head_attention_builds_its_split_pair():
+    """The same, from the search: ``cl.softmax`` attention with one head and S_Q == D,
+    split over the keys. The pair is built from the loop state of the flash graph
+    (``pipeline.plans.state_pair``): the combine divides the summed values by the summed
+    row sums along the rows (``broadcast == 0``), and the partial followed by the combine
+    computes the program."""
+    from tests._explicit_softmax import chained_reference
+
+    def fn(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
+           v: cl.Tensor["H", "SKV", "D"]):
+        return cl.softmax((q @ k.mT) / q.shape[-1] ** 0.5, dim=-1) @ v
+
+    prog = trace(fn, dict(H=1, SQ=16, SKV=64, D=16), cl.f16)
+    graphs = P.superoptimize(prog, P.SuperoptConfig(split=("SKV",), cache=False))
+    (graph,) = [g for g in graphs if g.summary().endswith("sum>matmul>div")]
+    torch.manual_seed(0)
+    inputs = [torch.randn(tuple(t.shape)).to(torch.float16) for t in prog.inputs]
+    (want,) = prog.reference(*inputs)
+    for factor in (2, 4):
+        partial, combine = lower(graph, factor)
+        (div,) = [n for n in combine.nodes if type(n) is Div]
+        assert div.broadcast == 0
+        _, (got,) = chained_reference(partial, combine, prog, inputs)
+        assert got.numel() == want.numel()
+        error = (got.float().reshape(want.shape) - want.float()).abs()
+        assert float((error / want.float().abs().amax(-1, keepdim=True)).max()) <= 2e-3
+
+
 def test_a_reduced_batch_axis_is_refused():
     # (B, M, N) / sum over B: the divisor is (M, N), which no broadcast index describes;
     # with B == M == N it used to pass for a row sum.

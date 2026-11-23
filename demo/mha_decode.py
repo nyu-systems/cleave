@@ -10,10 +10,15 @@ logits as well (x100, increasing / decreasing along the keys, a spike on the las
 constant rows, a common offset of -1e4).
 
 Split over the keys (the split-KV of FlashDecoding): the search does not split a graph whose
-max reduces the split dim, and the partial / combine pair built from the loop state is not
-wired in yet, so this demo runs unsplit for now and its report refuses each split factor
-with that reason. The tolerance is declared by boundary role for that split: ``"shift"`` for
-the float32 max a partial returns, ``""`` for every other output (all of them, unsplit).
+max reduces the split dim, so the split is built from the loop state of the flash graph.
+Each partial returns, for its own slice of the keys, the accumulators and the max they are
+relative to (float32 at the cut); the combine takes the max over the splits, repairs each
+partial by the proven update rule (``acc_i * exp(m_i - max_i m_i)``), sums over the splits
+and divides. Each stage gets its own derivation, so each loops where a tiling lets it: the
+partial over the keys of its split, the combine over the splits. The traced-order graph has
+no such pair (it needs two passes over the row), and the report says so. The tolerance is
+declared by boundary role: ``"shift"`` for the float32 max a partial returns, ``""`` for
+every other output.
 
     python demo/mha_decode.py
     python demo/mha_decode.py --split none          # solo kernels only

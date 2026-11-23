@@ -70,18 +70,19 @@ All demos share the same flags (`python demo/<name>.py --help`):
 | `rmsnorm_matmul.py` | `RMSNorm(X) @ W`; `--preset split-k` for the split-K shapes |
 | `swiglu.py`, `lora.py`, `matmul_rowsum.py` | SwiGLU, LoRA (`cleave.Program` builder), row-sum |
 | `matmul_matmul.py` | `(Q K^T) V`; `--preset split` for the split-KV decode shapes |
-| `{mha,gqa,mqa}_decode.py` | decode attention; they ask for a split along `SKV`, which runs unsplit for now (below) |
+| `{mha,gqa,mqa}_decode.py` | decode attention, split along `SKV` (the split-KV of FlashDecoding; below) |
 | `{mha,gqa,mqa,mla}_prefill.py`, `mla_decode.py`, `qknorm.py` | prefill / MLA / QK-norm attention |
 | `mha_backward.py` | attention backward: `dQ, dK, dV` in one fused kernel (declared inputs `L`, `o`) |
 | `staged.py` | the pipeline one stage at a time (research view) |
 
 `--split` is parsed by every demo, but not every demo has a split run: `mla_prefill.py` and
 `qknorm.py` declare a single tolerance and offer none (their docstrings say why), and
-`mla_decode.py` asks for none. For now no attention demo has a split run at all: the search
-does not split a graph whose max reduces the split dim (`--split SKV`), and the split pair
-built from the loop state (each partial returns the max of its split, the combine repairs
-the partials by it) is not wired in yet. Such a run is the unsplit one, and its report
-refuses every split factor with that reason.
+`mla_decode.py` asks for none. The search does not split a graph whose max reduces the split
+dim (`--split SKV` of an attention demo); the split is built from the loop state of each solo
+graph instead: each partial returns the accumulators of its split and the max they are
+relative to, and the combine takes the max over the splits, repairs every partial by the
+proven update rule, sums and divides. A graph that has no such pair (the traced order, which
+needs two passes over the row) is reported with the reason.
 
 `demo/dynamic/` holds the paged-KV dynamic-shape demos.
 
@@ -180,7 +181,7 @@ There is no default tolerance. Each operator declares its own `cl.Tolerance(rtol
 one, because a split partial has more outputs than its combine; a split partial that also
 returns a float32 max gets a bound of its own by boundary role,
 `{"": cl.Tolerance(...), "shift": cl.Tolerance(...)}`, which the decode demos declare for the
-split of their softmax that is not built yet), set from its measured error
+split of their softmax), set from its measured error
 (the next 1-2-5 step at or above 4x the largest error of its valid kernels, 2x for a bf16
 output, whose single ulp is already 0.8% of the row max; valid kernels sit within a few ulp of
 the reference, wrong kernels above 10% of the row max): `cleave.compile(..., tolerance=...)`,

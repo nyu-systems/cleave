@@ -281,6 +281,30 @@ def test_a_declaration_that_does_not_fit_ends_a_demo_in_one_line(monkeypatch):
         runpy.run_path(str(DEMO / "mla_prefill.py"), run_name="__main__")
 
 
+def test_search_split_of_a_demo_that_declares_one_tolerance_stops_before_it_builds(
+        monkeypatch, tmp_path):
+    """demo/mla_prefill.py declares one ``Tolerance`` and offers no split (its docstring
+    says why). Asked for one anyway, the run searches, builds the pair from the loop state
+    of its flash graph and schedules it, and then ends on one line that names the plan the
+    declaration does not cover -- before a kernel or a reference is built: the pipeline
+    refuses the declaration first, so ``run_candidates`` is never reached. (Small shapes;
+    the real search and scheduler, no GPU.)"""
+    import cleave.runtime.evaluate as evaluate_mod
+
+    monkeypatch.setenv("CLEAVE_CACHE_ROOT", str(tmp_path))
+    reached = []
+    monkeypatch.setattr(evaluate_mod, "run_candidates",
+                        lambda *a, **kw: reached.append(1) or [])
+    message = _run_to_exit(monkeypatch, "mla_prefill", [
+        "--H", "4", "--SQ", "64", "--SKV", "1024", "--D", "32", "--DV", "16",
+        "--split", "SKV:4", "--preset", "fast", "--topk", "4", "--no-cache"])
+    assert message.startswith("mla_prefill: build(): plan 'g") and "\n" not in message
+    assert "split-k=4 partial #0" in message and "(partial): one Tolerance covers" in message
+    assert message.endswith("declare the tolerance by role, "
+                            "tolerance={'': Tolerance(...), 'shift': Tolerance(...)}")
+    assert not reached
+
+
 def test_qknorm_says_which_inputs_its_kernels_are_validated_on():
     """The adversarial softmax cases shape inputs. qknorm's logits are computed from the
     normalized q and k, so its kernels are held to the normal inputs only (the build's

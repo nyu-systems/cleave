@@ -11,7 +11,9 @@ The demo is unsplit and declares one tolerance, for the outputs of its solo kern
 Splitting k/v along S_KV (``--split SKV``) is not offered: a split partial of an exact
 softmax also returns its max, which needs a tolerance declared by boundary role (see
 demo/mha_prefill.py). The flag is still parsed, as for every demo, and the run is the
-unsplit one: the split of a softmax is not built yet (see demo/mha_decode.py).
+unsplit one: the split is built from the loop state of a solo graph (see
+demo/mha_decode.py), and the queries are normalized on the way to that state from no split
+input, so no pair is built ("kn_mul_op on the way to the loop state reads no split input").
 """
 import cleave
 import cleave.lang as cl

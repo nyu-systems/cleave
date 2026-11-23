@@ -5,8 +5,9 @@ tolerance, for the outputs of its solo kernels. Splitting k/v along S_KV (``--sp
 is not offered at this shape: a split partial returns 128 x splits x 4096 x 128 values
 (2 GB at 16 splits) and is validated on seven input cases, which comes to about 190 GB of
 references on disk; and its max would need a tolerance declared by boundary role (see
-demo/mha_prefill.py). The flag is still parsed, as for every demo, and the run is the
-unsplit one: the split of a softmax is not built yet (see demo/mha_decode.py).
+demo/mha_prefill.py). The flag is still parsed, as for every demo: with it the split is
+built from the loop state (see demo/mha_decode.py), and the run stops before it builds a
+kernel, on the one line that says the declaration does not cover the partial's max.
 """
 import cleave
 import cleave.lang as cl

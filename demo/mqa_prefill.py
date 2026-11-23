@@ -1,8 +1,8 @@
 """MQA prefill, BHSD (32 query heads over 1 kv head, S_Q=S_KV=4096, D=64, fp16), unsplit.
 
-The softmax is exact (see demo/mha_decode.py). ``--split SKV`` runs unsplit for now (see
-there too). The tolerance is declared by boundary role for that split: ``"shift"`` for the
-float32 max a split partial returns, ``""`` every other output (all of them, unsplit).
+The softmax is exact (see demo/mha_decode.py). ``--split SKV`` builds the split from the
+loop state (see there too). The tolerance is declared by boundary role for that split:
+``"shift"`` for the float32 max a split partial returns, ``""`` every other output.
 """
 import cleave
 import cleave.lang as cl

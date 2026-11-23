@@ -1,9 +1,9 @@
 """MQA decode, BHSD (32 query heads over 1 kv head, S_Q=S_KV=4096, D=64, fp16); asks for a split of S_KV by 4,8,16.
 
-The softmax is exact (see demo/mha_decode.py). The split over S_KV of a softmax is not built
-yet (see there too): the run is the unsplit one, and its report says so. The tolerance is
-declared by boundary role for that split, ``"shift"`` for the float32 max a partial returns
-and ``""`` for every other output (all of them, unsplit).
+The softmax is exact, and its split over S_KV is built from the loop state of the flash graph
+(see demo/mha_decode.py): only K and V carry the keys, so each partial reads all query heads
+next to its split of the kv heads' keys. The tolerance is declared by boundary role,
+``"shift"`` for the float32 max a partial returns and ``""`` for every other output.
 """
 import cleave
 import cleave.lang as cl
