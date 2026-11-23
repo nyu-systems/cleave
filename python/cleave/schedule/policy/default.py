@@ -1002,11 +1002,11 @@ class DefaultPolicy:
             if base_tile is None:
                 return []
             smem_tile_candidates = self.propose_iterative_tiles(base_tile)
+            # Filtered here, not marked invalid: the tile walk still passes through such tiles.
+            smem_tile_candidates = [
+                c for c in smem_tile_candidates if not self._reads_placeholder_unevenly(c)
+            ]
         smem_tile_candidates = self.get_num_threads(smem_tile_candidates)
-        # Filtered here, not marked invalid: the tile walk still passes through such tiles.
-        smem_tile_candidates = [
-            c for c in smem_tile_candidates if not self._reads_placeholder_unevenly(c)
-        ]
         if accept is not None:
             smem_tile_candidates = [c for c in smem_tile_candidates if accept(c)]
 
@@ -1030,7 +1030,12 @@ class DefaultPolicy:
             if policy is None:
                 continue
             base_tile = policy._pin_full_launch_dims(policy.get_base_tile())
-            candidates += policy.propose_iterative_tiles(base_tile)
+            # the uneven-read filter needs the assignment's policy: an inter reduction reads
+            # only its block's slice of the axis the launch tiles
+            candidates += [
+                c for c in policy.propose_iterative_tiles(base_tile)
+                if not policy._reads_placeholder_unevenly(c)
+            ]
         # each assignment's list is sorted by this key already (expand_iterative_tiles);
         # the stable sort keeps assignment order on ties
         return sorted(candidates, key=lambda td: (td.traffic + 1) * td.num_wave)
@@ -1201,7 +1206,13 @@ class DefaultPolicy:
         """
         seen = {}
         for node in self.ordered_nodes:
-            shapes = self._propagate_inputs_full_rank(node, td.tile_map[node])
+            if self.accumulation and node in self._inter_rstep_dims:
+                # an inter reduction reads only its block's slice of the axis the launch tiles
+                shapes = self._propagate_inputs_full_rank(
+                    node, td.tile_map[node], rstep=td.rstep_map[node]
+                )
+            else:
+                shapes = self._propagate_inputs_full_rank(node, td.tile_map[node])
             for edge, shape in zip(node.inputs, shapes):
                 if not edge.src_node.is_placeholder():
                     continue
