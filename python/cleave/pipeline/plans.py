@@ -94,14 +94,129 @@ class PlanSet(Sequence):
 
 
 def lower(graph: SearchedGraph, split_factor: int | None = None) -> list:
-    """``[graph]`` for solo, ``[partial, combine]`` for a split graph at ``split_factor``."""
-    bundle = _lower_structure(graph, graph.structure, split_factor)
-    if not graph.is_split:
-        _derive_updates(graph, bundle[0])
-    return bundle
+    """``[ir]`` for a solo graph; ``[partial, combine]`` at ``split_factor`` for a split
+    graph the search returned, and for a solo graph whose program asked for a split over
+    the dim a max of it reduces (``SearchedGraph.split``): that pair is built from the
+    loop state of the solo graph (:func:`state_pair`)."""
+    if graph.is_split:
+        return _lower_structure(graph, graph.structure, split_factor)
+    from .update.instantiate import Recipe
+
+    (ir,) = _lower_structure(graph, graph.structure)
+    _derive_updates(ir, Recipe.of(graph))
+    if split_factor is None:
+        return [ir]
+    return state_pair(graph, ir, split_factor)
 
 
-def _derive_updates(graph: SearchedGraph, ir) -> None:
+# Why a solo graph has no pair built from its loop state (``state_pair``), after
+# ``graph {i}: split over {dim}: ``.
+NO_PROVEN_UPDATE = "this graph carries no proven update over that dim"  # P1 (+ ": {refusals}")
+NO_SPLIT_FACTOR = "the dim has {n} elements, which {f} does not divide"  # P5
+TWO_STATES = "{n} maxes are carried across a loop over that dim ({names}); a pair is built from one"
+NO_SPLIT_DIM = "a solo graph is split only over a dim a max of its program reduces; none is asked for"
+SEVERAL_DIMS = "a pair is built from the loop state over one dim at a time"
+UNSEARCHED = "the graph was not searched; a pair is built on the symbolic dims of a searched graph"
+
+
+def state_pair(graph: SearchedGraph, ir, split_factor: int) -> list:
+    """``[partial, combine]``: the split of solo graph ``graph`` (lowered to ``ir``, with
+    its records derived) over the dim of ``graph.split`` that a max of the program reduces,
+    built from the loop state of the streaming obstacle served over that dim
+    (``lower.state_split``; DESIGN 11).
+
+    The partial is the flat graph up to the loop state on a split of that dim: each split
+    returns its accumulators and its own max, float32 at the cut. The combine takes the max
+    over the splits, applies the proven repair of each accumulator with ``m := m_i``,
+    ``m' := max_i m_i``, sums over the splits and runs the solo graph's own epilogue. Both
+    are flat graphs with a max in front of their sums, so each gets its own derivation.
+
+    ``LoweringRejected("graph {i}: split over {dim}: {reason}")`` when no pair is built.
+    """
+    from ..frontend.tensor import split_names
+    from ..ir.graph_utils import boundary_signature
+    from ..lower.state_split import (SplitRefused, combine_graph, lower_partial, op_indices,
+                                     split_position)
+    from ..runtime.reference import output_order, placeholder_order
+    from .superopt import max_split_dims
+    from .update.instantiate import Recipe
+
+    dims = max_split_dims(graph.program, graph.split)
+    if len(dims) != 1:
+        names = ",".join(dims or split_names(graph.split)) or "no dim"
+        why = SEVERAL_DIMS if len(dims) > 1 else NO_SPLIT_DIM
+        raise LoweringRejected(f"graph {graph.index}: split over {names}: {why}")
+    (dim,) = dims
+    prefix = f"graph {graph.index}: split over {dim}: "
+    f = int(split_factor)
+    extent = int(graph.program.sizes[dim])
+    if f < 1 or extent % f:
+        raise LoweringRejected(prefix + NO_SPLIT_FACTOR.format(n=extent, f=f))
+    if graph.symbol_map is None:
+        raise LoweringRejected(prefix + UNSEARCHED)
+    served = _served_over(graph, ir, dim)
+    if not served:
+        refusals = "; ".join(getattr(ir, "streaming_refusals", None) or ())
+        raise LoweringRejected(prefix + NO_PROVEN_UPDATE + (f": {refusals}" if refusals else ""))
+    if len(served) > 1:
+        raise LoweringRejected(prefix + TWO_STATES.format(
+            n=len(served), names=", ".join(n.name for n in served)))
+    (node,) = served
+    full, record = node.name, node.streaming
+    accs, rules = tuple(record.loops), tuple(record.rules)
+    try:
+        full_op, acc_ops = op_indices(ir, full, accs)
+        partial = lower_partial(graph, full_op, acc_ops, f)
+        split_pos = split_position(ir, full, partial)
+        combine = combine_graph(ir, full, rules, f, split_pos, out_dtype=graph.dtype)
+    except SplitRefused as e:
+        raise LoweringRejected(prefix + str(e)) from e
+    except Exception as e:  # noqa: BLE001 - a lowering error names itself, as for any graph
+        raise LoweringRejected(prefix + f"{type(e).__name__}: {e}") from e
+    crossing = boundary_signature(output_order(partial))
+    if crossing != boundary_signature(placeholder_order(combine)):
+        raise LoweringRejected(  # a bug of the construction: never handed to the build
+            prefix + f"the partial returns {crossing} but the combine reads "
+            f"{boundary_signature(placeholder_order(combine))}")
+    _derive_updates(partial, Recipe.partial(graph, full, accs, solo=ir, split_factor=f))
+    _derive_updates(combine, Recipe.combine(graph, full, rules, split_pos, graph.dtype, solo=ir,
+                                            split_factor=f))
+    return [partial, combine]
+
+
+def _served_over(graph: SearchedGraph, ir, dim: str) -> list:
+    """The nodes of ``ir`` whose streaming obstacle is served (a record) and loops over the
+    program's dim ``dim``: the symbol of the searched structure at that dim's place in the
+    program's inputs."""
+    from ..frontend.tensor import Dim
+    from .update.engine import _looped
+    from .update.instantiate import Recipe
+
+    recorded = [n for n in ir.nodes if getattr(n, "streaming", None) is not None]
+    if not recorded:
+        return []
+    inputs = [op for op in graph.structure if op["op_type"] == "kn_input_op"]
+    wanted = set()
+    for spec, op in zip(graph.program.inputs, inputs):
+        t = op["output_tensors"][0]
+        symbols = t["dim"][: int(t.get("num_dims", len(t["dim"])))]
+        if len(symbols) == len(spec.dims):
+            wanted |= {s for d, s in zip(spec.dims, symbols)
+                       if isinstance(d, Dim) and d.name == dim}
+    recipe = Recipe.searched(graph)
+    served = []
+    for node in recorded:
+        try:
+            looped = _looped(recipe, ir, node.name)
+        except Exception:  # noqa: BLE001 - a looped dim that cannot be named is not this one
+            continue
+        found = set(looped) if isinstance(looped, frozenset) else {looped}
+        if found & wanted:
+            served.append(node)
+    return served
+
+
+def _derive_updates(ir, recipe) -> None:
     """Give every streaming obstacle of a freshly lowered flat graph its proven update
     rule, or the reason it has none.
 
@@ -115,6 +230,7 @@ def _derive_updates(graph: SearchedGraph, ir) -> None:
 
     ``ir.streaming_refusals`` (``["{full}: {reason}", ...]``) exists exactly when the graph
     has an obstacle; ``ir.derivations`` holds every derivation the engine made for it.
+    ``recipe`` (``pipeline.update.instantiate.Recipe``) builds ``ir`` again at other extents.
     """
     from ..schedule.streaming import obstacles
     from ..schedule.tiling import reduction_ancestors, scheduled_reductions
@@ -127,10 +243,8 @@ def _derive_updates(graph: SearchedGraph, ir) -> None:
     if not found:
         return
     from .update import derive
-    from .update.instantiate import Recipe
 
     ir.streaming_refusals = []
-    recipe = Recipe.of(graph)
     for ob in found:
         why = ob.refused
         if not why:
@@ -338,7 +452,7 @@ def _schedule_once(graphs: GraphSet, config: ScheduleConfig, force: bool):
             else:
                 add(g, "solo", "main", ir, None, bind_inputs(ir, program))
             if state_split:
-                _refuse_state_split(g, graphs, config, refused)
+                _state_split_plans(g, graphs, config, add, refused)
             continue
         if not config.split_k:
             refused.append(Refusal(g.index, "split", "partial",
@@ -358,29 +472,35 @@ def _schedule_once(graphs: GraphSet, config: ScheduleConfig, force: bool):
     return plans, refused
 
 
-# The split of a program over the dim its max reduces is built from the loop state of a solo
-# graph (a partial that returns each split's state, a combine that applies the proven
-# repair); until that construction is wired in, such a program runs unsplit, and every
-# split it asked for is refused with this reason, one per solo graph and factor.
-NO_STATE_SPLIT = "no partial/combine pair is built for a graph with a max over that dim"
-
-
-def _refuse_state_split(g, graphs, config, refused) -> None:
-    """The split plans of solo graph ``g`` of a ``GraphSet`` with ``state_split``: one
-    refusal per factor of ``config.split_k``, or one for the split when it names no factor.
-    A dim of the split that no max reduces is named as well: the search ran unsplit, so
-    that dim is not split either."""
+def _state_split_plans(g, graphs, config, add, refused) -> None:
+    """The split plans of solo graph ``g`` of a ``GraphSet`` with ``state_split``: per
+    factor of ``config.split_k`` the partial and the combine built from its loop state
+    (``lower(g, f)``), or the reason there is no pair (``Refusal(..., "partial", ...)``,
+    as for a searched split graph that has no cut). A split that names no factor is refused
+    once. No part of the split is dropped silently: a dim of it that no max reduces is not
+    split (the search ran unsplit), and one refusal per solo graph says so."""
     from ..frontend.tensor import split_names
     from .superopt import max_split_dims
 
     maxed = max_split_dims(graphs.program, graphs.state_split)
     others = [d for d in split_names(graphs.state_split) if d not in maxed]
-    why = f"graph {g.index}: split over {','.join(maxed)}: "
-    why += NO_STATE_SPLIT if config.split_k else "ScheduleConfig.split_k is empty"
+    head = f"graph {g.index}: split over {','.join(maxed)}: "
     if others:
-        why += f"; the search ran unsplit, so {','.join(others)} is not split either"
-    for variant in [f"split-k={f}" for f in config.split_k] or ["split"]:
-        refused.append(Refusal(g.index, variant, "partial", LoweringRejected(why)))
+        refused.append(Refusal(g.index, "split", "partial", LoweringRejected(
+            head + f"the search ran unsplit, so {','.join(others)} is not split")))
+    if not config.split_k:
+        refused.append(Refusal(g.index, "split", "partial",
+                               LoweringRejected(head + "ScheduleConfig.split_k is empty")))
+        return
+    for f in config.split_k:
+        variant = f"split-k={f}"
+        try:
+            partial, combine = lower(g, f)
+        except LoweringRejected as e:
+            refused.append(Refusal(g.index, variant, "partial", e))
+            continue
+        add(g, variant, "partial", partial, f, bind_inputs(partial, graphs.program))
+        add(g, variant, "combine", combine, f)  # one combine per solo graph and factor
 
 
 def schedule(graphs: GraphSet | Sequence[SearchedGraph], config: ScheduleConfig | None = None) -> PlanSet:

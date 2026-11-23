@@ -193,3 +193,20 @@ def streamed_ir(fn, shapes, *refused, dtype=cl.f16, factor=FACTOR):
     if found:
         ir.streaming_refusals = reasons
     return ir
+
+
+def chained_reference(partial, combine, program, inputs):
+    """``(crossing, outputs)``: the torch reference of a split pair on a Program's inputs.
+    ``crossing`` are the partial's outputs in boundary order (the tensors that cross the
+    cut); the combine reads each by its boundary record, as ``Kernel.__call__`` feeds a
+    combine kernel."""
+    from cleave.pipeline.plans import bind_inputs
+    from cleave.runtime.reference import execute, output_order, placeholder_order
+
+    names = bind_inputs(partial, program)
+    assert names is not None, "the partial's placeholders do not bind to the program inputs"
+    by_name = dict(zip(names, inputs))
+    outs = execute(partial, [by_name[p.name] for p in placeholder_order(partial)])
+    crossing = {o.boundary.index: x for o, x in zip(output_order(partial), outs)}
+    outputs = execute(combine, [crossing[p.boundary.index] for p in placeholder_order(combine)])
+    return [crossing[i] for i in sorted(crossing)], outputs

@@ -297,6 +297,34 @@ def test_variants_pair_a_partial_only_with_a_combine_of_its_own_boundary():
         apart.best()
 
 
+def test_a_pair_built_from_the_loop_state_pairs_with_its_own_graph_only():
+    """The split of a softmax program is built from the loop state of each solo graph
+    (``plans.state_pair``): each solo graph has a combine of its own, made of its own
+    epilogue and repair, so a partial of one solo graph never pairs with the combine of
+    another, however well the boundary records match. (A searched split graph's combine
+    is shared by every cut of the factor: above.)"""
+    partial, combine = _lower(8)
+
+    def built(role, latency_ms, label, index):
+        result = _result(partial if role == "partial" else combine, role, latency_ms, label)
+        result.plan.graph_index = index
+        result.plan.graph = SimpleNamespace(is_split=False)  # a solo graph's own pair
+        return result
+
+    report = Report([built("partial", 1.0, "fast partial of graph 0", 0),
+                     built("combine", 5.0, "slow combine of graph 0", 0),
+                     built("partial", 4.0, "slow partial of graph 1", 1),
+                     built("combine", 0.5, "fast combine of graph 1", 1)])
+    assert [m.label for m in report.variants()["split-k=8"].members] == [
+        "slow partial of graph 1", "fast combine of graph 1"]  # 4.5 ms, not 1.5 ms
+    alone = Report([built("partial", 1.0, "p", 0), built("combine", 0.5, "c", 1)])
+    assert alone.variants() == {}
+    sig = "[#0 (8, 8, 64) float32, #1 (8, 8, 64, 64) float32]"
+    assert alone.unpaired() == {"split-k=8": (
+        f"no partial writes what a combine reads: the partials write {sig} (graph 0), "
+        f"the combines read {sig} (graph 1)")}
+
+
 def _without_records(graph, only=None):
     """A copy of ``graph`` with the boundary records of its placeholders and outputs
     removed (of the node at position ``only`` of that list, when given)."""

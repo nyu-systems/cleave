@@ -99,7 +99,7 @@ ATTENTION = ["mha_decode", "gqa_decode", "mqa_decode", "mha_prefill", "gqa_prefi
 # The demos that declare one bound per boundary role: an exact softmax split over the keys
 # (by default for the decode demos, with ``--split SKV`` for the MHA / GQA / MQA prefill
 # demos), whose partials return their float32 max. That split is built from the loop state
-# and runs unsplit until it is wired in (the demos' docstrings say so). mla_decode,
+# of the solo graph (``pipeline.plans.state_pair``). mla_decode,
 # mla_prefill and qknorm offer no split: mla_decode asks for none, the split of mla_prefill
 # would need about 190 GB of references, and qknorm declares a single bound.
 BY_ROLE = set(ATTENTION) - {"mla_decode", "mla_prefill", "qknorm"}
@@ -171,7 +171,8 @@ def test_staged_demo_declares_its_own_tolerance(monkeypatch):
 def test_mha_decode_config(monkeypatch):
     """The decode demo: the max of ``cl.softmax`` in the program, the split over the keys,
     and the search budget the auto rule gives (15 with the split; the search itself runs
-    unsplit, at 13: ``tests/pipeline_api/test_softmax_split_unsplit.py``)."""
+    unsplit, at 13, and the pair is built from the loop state:
+    ``tests/pipeline_api/test_softmax_split.py``)."""
     seen = run_demo(monkeypatch, "mha_decode", [])
     program, so, sc = seen["program"], seen["so"], seen["sc"]
     assert [r.kind for r in program.ops if r.kind != "input"] == [

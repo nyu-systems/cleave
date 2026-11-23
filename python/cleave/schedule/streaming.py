@@ -343,12 +343,15 @@ def _locate(tier, owner, full, record, flat_graph=None):
     where = owner.name
     edge = full.inputs[0]
     operand = _stored_tile(tier, edge)
-    dims = tuple(int(s) for s in edge.src_node.get_shape(edge.src_id))
-    axis = operand.position(full.flat_axis, len(dims))
+    # The tile is over the dims of the value the max reads in this tier. That is not the
+    # max's own operand where it read an input through a split view (``apply_tiling``
+    # takes the views out: the logits of a split partial), so the reduced dim is mapped
+    # onto it (``ReduceSum.position_in``), and its extent is the max's own.
+    axis = full.position_in(operand)
     if axis is None:
         raise _refused(full, f"the dim it reduces is not in the tile "
                              f"{tuple(operand.tile_size)} of its operand")
-    extent = dims[full.flat_axis]
+    extent = int(full.dims[full.flat_axis])
     block, step = int(operand.shape[axis]), int(operand.tile_size[axis])
     if step == block:
         return None

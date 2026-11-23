@@ -24,8 +24,9 @@ Reused from the split plumbing of searched split graphs: ``Boundary`` records an
 the stored-layout record, the three-output partial, float32 at the cut, per-role
 tolerances, the hand-off.
 
-Nothing calls this module yet: the pipeline reaches it once split programs with a max are
-routed here (``pipeline.plans.lower``).
+The pipeline builds a pair here for a solo graph whose program asked for a split over the
+dim its max reduces (``pipeline.plans.state_pair``, from ``lower(graph, split_factor)``),
+and derives each stage's own update rule.
 """
 
 from __future__ import annotations
@@ -180,6 +181,26 @@ def lower_partial(searched, full_op: int, acc_ops: tuple, split_factor: int, *,
     return graph
 
 
+def split_position(solo, full: str, partial) -> int:
+    """Where the split axis sits in the state tensors ``partial`` returns: the axis whose
+    removal leaves the shape ``full`` has in ``solo`` (``combine_graph``'s ``split_pos``).
+
+    Lowering puts it behind the batch dims (``_normalize_split_graph_layouts``); where
+    several axes would do (a batch extent equal to the split factor) the one behind the
+    batch dims of ``full`` is taken.
+    """
+    rows = tuple(int(s) for s in next(n for n in solo.nodes if n.name == full).get_shape())
+    shift = next(o for o in partial.nodes if o.is_output()
+                 and getattr(o.boundary, "role", "") == SHIFT)
+    have = tuple(int(s) for s in shift.get_shape(0))
+    fits = [p for p in range(len(have)) if have[:p] + have[p + 1:] == rows]
+    if not fits:
+        raise SplitRefused(f"the partial returns its max as {have}, which is not {rows} with "
+                           "one more axis")
+    batch = int(getattr(next(n for n in solo.nodes if n.name == full), "n_batch_dims", 0) or 0)
+    return batch if batch in fits else fits[0]
+
+
 def combine_graph(solo, full: str, rules: tuple, split_factor: int, split_pos: int,
                   out_dtype: str):
     """The combine of a split pair, from the solo flat graph ``solo`` and the proven repair.
@@ -249,7 +270,21 @@ def combine_graph(solo, full: str, rules: tuple, split_factor: int, split_pos: i
         if not _feeds(edge.dst_node, [by_name[a] for a, _ in rules]):
             wire_input(top, edge.dst_node, edge.dst_id)
     outs = [n for n in solo.nodes if isinstance(n, OutputNode)]
-    return Graph(nodes=find_topo_sort(outs))
+    graph = Graph(nodes=find_topo_sort(outs))
+    state = {id(m_in)} | {id(s.inputs[0].src_node.inputs[0].src_node) for s in outputs_of.values()}
+    stray = [n for n in graph.nodes if n.is_placeholder() and id(n) not in state]
+    if stray:  # what the program computes behind the loop state from its own inputs
+        kept = {id(n) for n in graph.nodes}
+        readers = sorted({e.dst_node.name for n in stray for e in n.outputs
+                          if id(e.dst_node) in kept})
+        raise SplitRefused(READS_INPUTS.format(names=", ".join(readers),
+                                               inputs=", ".join(n.name for n in stray)))
+    return graph
+
+
+# A combine reads the partials' state and nothing else.
+READS_INPUTS = ("{names}, behind the loop state, read(s) {inputs}, an input of the program; the "
+                "combine reads only what the partials return")
 
 
 def _feeds(node, targets) -> bool:

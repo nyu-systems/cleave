@@ -6,8 +6,8 @@ with ``c = -50 / sqrt(D)``), so it has no max and its split pair is the cut as i
 partial with two outputs, the row sum and the value product, and nothing else across the
 boundary. It is the program these tests have always held: ``cl.softmax(s, shift=c)``
 recorded exactly these ops while it took a shift. (``cl.softmax`` is the exact softmax,
-with its max in the flat graph: the search does not split it,
-``test_softmax_split_unsplit.py``.)
+with its max in the flat graph: the search does not split it, and its split is built from
+the loop state, ``test_softmax_split.py`` and ``test_exact_split_attention.py``.)
 
 Until the records existed no static split-attention kernel could be used: a partial never
 validated (its reference was laid out by matching extents, which raises when ``S_Q == D``

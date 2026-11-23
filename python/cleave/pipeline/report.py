@@ -473,6 +473,8 @@ def _fastest_pair(partials, combines) -> tuple[list[Result] | None, str | None]:
     index, role, shape and dtype of every tensor crossing the cut -- not what the tensors
     hold: two cuts that pass equally shaped tensors with different contents would be
     paired. (Every cut of the programs searched today has one boundary and one combine.)
+    A pair built from the loop state of a solo graph is not shared: its combine is that
+    graph's own, and its partials pair with it alone (the graph is named in the reason).
 
     This is the pairing ``kernel.stages_for`` accepts. Plans without records (hand-built
     graphs) all compare equal, which is the pairing there was before the records. A side
@@ -494,13 +496,20 @@ def _fastest_pair(partials, combines) -> tuple[list[Result] | None, str | None]:
                 read[id(graph)] = (None, f"{result.label}: {error}")
         return read[id(graph)]
 
+    def owner(result):
+        # A pair built from the loop state of a solo graph (``plans.state_pair``) has a
+        # combine of its own, made of that graph's epilogue and repair: its stages pair
+        # with each other only. A searched split graph's combine is shared (None).
+        graph = getattr(result.plan, "graph", None)
+        return None if graph is None or graph.is_split else result.plan.graph_index
+
     sides: dict[object, dict[str, list[Result]]] = {}
     unreadable = []
     for role, results in (("partial", partials), ("combine", combines)):
         for r in results:
             found, error = signature(r)
             if error is None:
-                sides.setdefault(found, {}).setdefault(role, []).append(r)
+                sides.setdefault((found, owner(r)), {}).setdefault(role, []).append(r)
             elif error not in unreadable:
                 unreadable.append(error)
     pairs = [[_fastest(side["partial"]), _fastest(side["combine"])]
@@ -513,8 +522,10 @@ def _fastest_pair(partials, combines) -> tuple[list[Result] | None, str | None]:
         return None, "; ".join(unreadable)
 
     def tensors(role):
-        return " or ".join("tensors without boundary records" if found is None
-                           else _describe(found) for found, side in sides.items() if role in side)
+        return " or ".join(
+            ("tensors without boundary records" if found is None else _describe(found))
+            + ("" if graph is None else f" (graph {graph})")
+            for (found, graph), side in sides.items() if role in side)
 
     return None, (f"no partial writes what a combine reads: the partials write "
                   f"{tensors('partial')}, the combines read {tensors('combine')}")
