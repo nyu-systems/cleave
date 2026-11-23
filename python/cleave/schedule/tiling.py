@@ -975,6 +975,38 @@ def _with_token_axis_deps(output_axis_deps, flat_graph, output_node, inter_chain
     return deps
 
 
+def _with_sibling_axis_deps(output_axis_deps, output_nodes, output_node, inter_chains):
+    """``output_axis_deps`` completed for the tensors only an intra sibling output reads.
+
+    A sibling launched with the canonical output (``e @ u`` next to ``e @ v``) has its
+    own ancestors (``u``); their dims depend on the canonical axes the sibling's axes
+    map onto (``_get_same_launch_output_axis_map``). Nodes already mapped through the
+    canonical output keep their dependencies (single-output programs are unchanged).
+    """
+    canonical = _get_output_binding_node(output_node)
+    deps = output_axis_deps
+    for sibling in output_nodes:
+        bound = _get_output_binding_node(sibling)
+        if sibling is output_node or bound.name in inter_chains:
+            continue
+        sibling_deps = infer_output_axis_dependencies(sibling)
+        if all(name in deps for name in sibling_deps):
+            continue
+        try:
+            axis_map = _get_same_launch_output_axis_map(canonical, bound)
+        except NotImplementedError:  # not a same-launch sibling: left as it was
+            continue
+        if deps is output_axis_deps:
+            deps = dict(output_axis_deps)
+        for name, dim_deps in sibling_deps.items():
+            if name in deps:
+                continue
+            deps[name] = [
+                {axis_map[a] for a in axes if 0 <= a < len(axis_map)} for axes in dim_deps
+            ]
+    return deps
+
+
 def apply_tiling(cand: List) -> List[Graph]:
     # accumulation context per output-feeding node name (empty: every output intra)
     accumulation = {
@@ -1000,6 +1032,9 @@ def apply_tiling(cand: List) -> List[Graph]:
     # to correctly infer output axis dependencies for the
     # original output node
     output_axis_deps = infer_output_axis_dependencies(output_node)
+    output_axis_deps = _with_sibling_axis_deps(
+        output_axis_deps, output_nodes, output_node, inter_chains
+    )
     if inter_chains:
         # tensors only an inter output reads are not ancestors of the canonical output
         output_axis_deps = _with_token_axis_deps(
