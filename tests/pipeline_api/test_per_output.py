@@ -283,3 +283,35 @@ def test_toy_search_merges_per_output_graphs(monkeypatch, tmp_path):
             torch.testing.assert_close(got.reshape(ref.shape), ref, rtol=1e-4, atol=1e-4)
     again = P.superoptimize(p, P.SuperoptConfig(max_ops=8, threads=4))
     assert again.from_cache and [g.structure for g in again] == [g.structure for g in gs]
+
+
+def test_an_unread_declared_input_is_not_derived():
+    """The input graph of the backward reads no ``o``: validation still derives ``L`` (which the
+    graph reads), and leaves ``o`` (no placeholder) alone."""
+    p = attention_bwd()
+    g = superopt.SearchedGraph(0, _identity_parts(p), None, False, p)
+    ir = to_ir(g.structure, symbol_map=None)
+    names = bind_inputs(ir, g)
+    assert names[5] is None and None not in names[:5]
+    hook = rt.declared_inputs_hook(p, names, ir)
+    x = rt.make_inputs(ir, "float16", seed=0, device="cpu", derive=hook)
+    by_name = dict(zip([ph.name for ph in rt.placeholder_order(ir)], x))
+    q, k, L = (by_name[names[i]] for i in (0, 1, 4))
+    import tests.frontend.test_declared_inputs as t
+    want = torch.logsumexp(q.float() @ k.float().mT * t.C, -1, keepdim=True)
+    torch.testing.assert_close(L.reshape(want.shape), want, rtol=1e-5, atol=1e-5)
+
+
+def test_a_read_declared_input_needs_its_sources():
+    p = _strip_program()  # out0 reads y = a + b but not b
+    sub, kept = p.for_output("out0")
+    inputs = [op["output_tensors"][0] for op in p.to_graph_structure()
+              if op["op_type"] == "kn_input_op"]
+    # a merged graph of out0 alone over the parent's inputs: y is read, b (its source) is not
+    g = superopt.SearchedGraph(0, po.merge([sub.to_graph_structure()], [kept], [{}], inputs),
+                               None, False, p)
+    ir = to_ir(g.structure, symbol_map=None)
+    names = bind_inputs(ir, g)
+    assert names[1] is None and names[2] is not None
+    with pytest.raises(SpecError, match="does not read"):
+        rt.declared_inputs_hook(p, names, ir)

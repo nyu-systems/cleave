@@ -357,8 +357,7 @@ def declared_inputs_hook(program, input_names, graph):
     that recomputes every declared input with ``program.derive_inputs`` from the drawn values
     of the inputs it reads, so a kernel is validated (and timed) on, say, a real
     log-sum-exp rather than noise. ``input_names`` is the placeholder of each Program input
-    (``Plan.inputs``; ``None`` for an input the graph does not read); the inputs are matched
-    by that name, never by position.
+    (``Plan.inputs``); the inputs are matched by that name, never by position.
     """
     from ..core.errors import SpecError
 
@@ -372,27 +371,33 @@ def declared_inputs_hook(program, input_names, graph):
             "its declared inputs cannot be derived for validation"
         )
     order = [ph.name for ph in placeholder_order(graph)]
-    read = [n for n in input_names if n is not None]
-    if len(input_names) != len(specs) or len(set(read)) != len(read) \
-            or not set(read) <= set(order):
+    named = [n for n in input_names if n is not None]  # None: an input the graph does not read
+    if len(input_names) != len(specs) or len(set(named)) != len(named) \
+            or not set(named) <= set(order):
         raise SpecError(
             f"{name}: placeholders {tuple(input_names)} do not name one kernel input per "
             f"Program input ({len(specs)}) among {tuple(order)}"
         )
     positions = [None if n is None else order.index(n) for n in input_names]
-    for i, s in zip(positions, specs):
-        unread = [specs[j].name for j in (s.over if s.declaration is not None else ())
-                  if positions[j] is None]
-        if i is not None and unread:
-            raise SpecError(
-                f"{name}: declared input {s.name!r} is read by the kernel but derives from "
-                f"{tuple(unread)}, which the kernel does not read"
-            )
+    # A read declared input needs every input it is derived from, read or not; an unread one
+    # is not derived at all (its value would be dropped).
+    needs = {}
+    for k, s in enumerate(specs):
+        if s.declaration is not None:
+            needs[k] = set(s.over).union(*(needs.get(j, set()) for j in s.over))
+    missing = sorted({specs[j].name for k, srcs in needs.items() if positions[k] is not None
+                      for j in srcs if positions[j] is None and specs[j].declaration is None})
+    if missing:
+        raise SpecError(f"{name}: declared inputs the kernel reads are derived from inputs it "
+                        f"does not read ({missing}); they cannot be sampled")
 
     def derive(inputs):
+        import torch
+
         inputs = list(inputs)
-        values = [None if i is None else inputs[i].reshape(s.shape)
-                  for i, s in zip(positions, specs)]
+        ref = next(inputs[i] for i in positions if i is not None)
+        values = [torch.zeros(s.shape, dtype=s.dtype.torch, device=ref.device) if i is None
+                  else inputs[i].reshape(s.shape) for i, s in zip(positions, specs)]
         derived = program.derive_inputs(values)
         for i, s, x in zip(positions, specs, derived):
             if s.declaration is None or i is None:
