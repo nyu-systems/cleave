@@ -955,6 +955,14 @@ def _with_token_axis_deps(output_axis_deps, flat_graph, output_node, inter_chain
             if axes & tokens:
                 tokens |= axes
         axis_classes.append(tokens)
+    # A dim an inter output keeps and shares with one canonical axis (a batch dim) is
+    # launched with it: its tokens join that axis, so a tensor only the inter output
+    # reads (``exp(x2)`` of ``S^T @ exp(x2)``) gets that axis through its own tokens.
+    for chain in inter_chains.values():
+        for tokens in out_tokens.get((by_name[chain[0]], 0), []):
+            meets = [cls for cls in axis_classes if cls & tokens]
+            if len(meets) == 1:
+                meets[0] |= tokens
 
     deps = dict(output_axis_deps)
     for (node, out_id), dim_tokens in out_tokens.items():

@@ -39,6 +39,18 @@ def inter_pair(M=1024, N=1024, K=64):
     return p
 
 
+def inter_pair_batched(H=2, M=256, N=256, K=64):
+    """``inter_pair`` with a batch dim H on every tensor."""
+    p = Program("inter_pair_batched", dtype=cl.f16)
+    p.dims(H=H, M=M, N=N, K=K)
+    x, w = p.input("x", ("H", "M", "K")), p.input("w", ("H", "N", "K"))
+    u, x2 = p.input("u", ("H", "N", "K")), p.input("x2", ("H", "M", "K"))
+    S = x @ w.mT
+    p.output(S @ u)
+    p.output(S.mT @ cl.exp(x2))
+    return p
+
+
 def candidates(program, topk=1000):
     (graph,) = lower(GraphSet.identity(program)[0])
     return search_tiling(graph, topk=topk)
@@ -160,3 +172,16 @@ def test_refuses_inter_output_in_split_kernel(pair_cands):
     g = annotated(pair_cands[("intra", "inter")])
     with pytest.raises(CodegenError, match="split kernels"):
         TilelangCodeGen().gen([g, g])
+
+
+def test_batched_pair_builds_every_candidate():
+    # exp(x2) is read only by the inter output: its batch dim used to get no launch
+    # axis ("Expected exactly one launch-axis mapping for iter dim 0"), since the
+    # canonical output's batch axis did not include the inter output's own tokens.
+    cands = candidates(inter_pair_batched())
+    assert set(first_per_assignment(cands)) == {("intra", "inter"), ("inter", "intra")}
+    for cand in cands:
+        code = build_candidate_code(cand)
+        assert code.count("T.atomic_add(") == 1
+        # the inter block is the CTA's head: sliced on the batch launch index only
+        assert re.search(r"OutputNod\w+\[1 \* i0 : 1 \* i0 \+ 1, 0 : 0 \+ 256, 0 : 0 \+ 64\]", code)
