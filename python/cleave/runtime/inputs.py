@@ -268,12 +268,11 @@ def key_operand(graph, matmul) -> int:
         readers = [edge.dst_node for edge in node.outputs]
         # The explicit form, ``exp(s - max(s))``: the max reads the scores next to the
         # subtraction it feeds, which is one path, and the exp that reads the subtraction
-        # is a softmax by structure (``softmax_axis``), not by a record.
+        # is a softmax by structure (``softmax_axis``), not by a record. Whoever else reads
+        # the max (a split partial returns it) does not move the axis it was taken over.
         shifted = [r for r in readers if _explicit_max(r) is not None]
         if len(shifted) == 1 and all(
-            r is shifted[0]
-            or (r is _explicit_max(shifted[0]) and all(e.dst_node is shifted[0] for e in r.outputs))
-            for r in readers
+            r is shifted[0] or r is _explicit_max(shifted[0]) for r in readers
         ):
             exps = [edge.dst_node for edge in shifted[0].outputs]
             if len(exps) != 1 or type(exps[0]) is not Exp:

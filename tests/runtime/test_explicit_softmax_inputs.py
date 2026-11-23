@@ -168,6 +168,36 @@ def test_the_key_operand_follows_the_softmax_axis():
         assert adversarial_cases(ir) == ADVERSARIAL and not why_not_adversarial(ir)
 
 
+def query_softmax_and_its_max(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
+                              v: cl.Tensor["H", "SKV", "D"]):
+    s = (q @ k.mT) / q.shape[-1] ** 0.5
+    m = cl.max(s, -2, keepdim=True)
+    e = cl.exp(s - m)
+    return (e / cl.sum(e, -2, keepdim=True)) @ v, m
+
+
+def key_softmax_and_its_max(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
+                            v: cl.Tensor["H", "SKV", "D"]):
+    s = (q @ k.mT) / q.shape[-1] ** 0.5
+    m = cl.max(s, -1, keepdim=True)
+    e = cl.exp(s - m)
+    return (e @ v) / cl.sum(e, -1, keepdim=True), m
+
+
+def test_the_key_operand_of_a_softmax_that_also_returns_its_max():
+    """The max may be read by more than the subtraction (a split partial returns it): the
+    scores still have one path, and the softmax axis still decides. (It used to be taken
+    for the last axis as soon as the max had a second reader: the cases of a softmax over
+    the queries were then laid along the keys.)"""
+    for fn, key in ((key_softmax_and_its_max, 1), (query_softmax_and_its_max, 0)):
+        _, ir = _lowered(fn, SMALL)
+        (m,) = [n for n in ir.nodes if type(n) is ReduceMax]
+        assert len(m.outputs) == 2
+        (scores,) = score_matmuls(ir)
+        assert key_operand(ir, scores) == key, fn.__name__
+        assert adversarial_cases(ir) == ADVERSARIAL and not why_not_adversarial(ir)
+
+
 def test_the_key_operand_without_the_claim_is_the_last_axis():
     """With the switch off the same explicit graph makes no claim: the last axis, as for any
     graph that makes none."""
