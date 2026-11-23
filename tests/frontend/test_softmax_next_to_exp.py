@@ -10,7 +10,7 @@ Two softmaxes of ``x`` over different axes need a row and a column in one tile.
 
 (These programs once needed the merged exp computed again at lowering, because the softmax
 was a request on a plain exp; the claims about which sizes have plans are the ones README
-and the ``cl.softmax`` docstring make, re-measured on the explicit max.)
+makes, re-measured on the explicit max.)
 
 ``test_search_*`` run the superoptimizer (root conftest marks).
 """
@@ -119,7 +119,7 @@ def _reasons(plans):
 
 
 def test_search_where_a_softmax_next_to_an_exp_of_its_logits_has_plans():
-    """The sizes README and the ``cl.softmax`` docstring name. These programs return their
+    """The sizes README names (the ``cl.softmax`` docstring points there). These return their
     softmax, and a softmax that is returned is served while its row is in one tile: its
     exp is read by the division, which is not summed over the row, so the max is not
     carried across a loop and the reason says so."""
@@ -134,9 +134,16 @@ def test_search_where_a_softmax_next_to_an_exp_of_its_logits_has_plans():
     assert all(reason.startswith(f"{NO_TILING}; a max is not carried across a loop: ")
                and two_passes in reason and "a unit extent that is not a batch dim" in reason
                for reason in reasons), reasons
-    # ... where the softmax alone still has one
+    # ... where the softmax alone still has one; it has none at 16384, where the only
+    # tilings that hold a row in one block hold a single row (the README says so too)
     plans = _plans(softmax_alone, 64, 8192)
     assert len(plans) >= 1 and {tile[1] for tile in _output_tiles(plans)} == {8192}
+    plans = _plans(softmax_alone, 64, 16384)
+    assert len(plans) == 0
+    reasons = _reasons(plans)
+    assert all(reason.startswith(f"{NO_TILING}; a max is not carried across a loop: ")
+               and two_passes in reason and "a unit extent that is not a batch dim" in reason
+               for reason in reasons), reasons
     # two softmaxes, over the rows and over the columns: the tile is the whole tensor
     for rows, cols in ((16, 32), (64, 128)):
         plans = _plans(dual_softmax, rows, cols)

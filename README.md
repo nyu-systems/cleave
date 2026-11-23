@@ -87,16 +87,25 @@ needs two passes over the row) is reported with the reason.
 `demo/dynamic/` holds the paged-KV dynamic-shape demos.
 
 `cl.softmax` is the exact softmax, `exp(s - max(s)) / sum`, and records its max: the max is an
-ordinary reduction of the searched graph (`cl.exp(s - cl.max(s, -1, keepdim=True))` written
-by hand is the same program). Where a tile holds the row, the row max is computed in place.
-Where a tiling loops over the row (FlashAttention), the loop carries the max across its
-iterations and repairs every sum and matmul it accumulates with an update rule that is
-searched for on the program's own graph, proven with z3 and ranked (`cleave.pipeline.update`);
-the paged kernels carry a hand-placed running max. Where the softmax is contracted over its
-row (a sum or a matmul, as in attention's `softmax(...) @ V`) that holds at any row length. A
-program that returns the softmax itself (a standalone softmax, attention weights) is exact
-too, but is served only while its row fits one tile: its exp is read by the division, which
-is not summed over the row, so the max is not carried across a loop (the refusal says so).
+ordinary reduction of the flat graph the superoptimizer searches
+(`cl.exp(s - cl.max(s, -1, keepdim=True))` written by hand is the same program). Where a tile
+holds the row, the row max is computed in place. Where a tiling loops over the row
+(FlashAttention), the loop carries the max across its iterations, and every sum and matmul
+it accumulates under the max is repaired before it accumulates, `acc = acc * F(m, m') + tile`
+(`m` the max before the iteration, `m'` after it). No `F` is written anywhere: once per loop
+structure, `cleave.pipeline.update` evaluates the program's own flat graph on prefixes of the
+looped dim, enumerates small update expressions per accumulator, proves every one that
+matches over the reals with z3 (`exp` with its law `exp(a + b) = exp(a) exp(b)`), and ranks
+the proven ones by accuracy, stability and cost; for attention it finds `exp(m - m')` for
+the row sum and for the value matmul alike. The repair runs at every iteration. A loop whose
+accumulators get no proven rule keeps the row in one block, and the refusal gives the
+reason. The paged kernels carry a hand-placed running max. Where the softmax is contracted
+over its row (a sum or a matmul, as in attention's `softmax(...) @ V`) this holds at any row
+length. A program that returns the softmax itself (a standalone softmax, attention weights)
+is exact too, but is served only while its row fits one tile: its exp is read by the
+division, which is not summed over the row, so the max is not carried across a loop (the
+refusal says so). A float16 softmax of 64 rows that is returned has plans up to 8192 columns
+and none at 16384, where the only tilings that hold a row in one block hold one row.
 Shapes that have no kernel yet (each is refused with its reason, or fails in TileLang, never
 served wrongly):
 
@@ -292,8 +301,9 @@ Useful environment variables:
 
 - `python/cleave/`: the Python package: `frontend`/`lang` (tracing), `ir` (graph, ops),
   `lower` (superoptimizer graphs to IR), `schedule`, `codegen`, `runtime` (compile, validate,
-  time), `pipeline` (the staged API), `dynamic` (paged/ragged kernels) and `core` (settings,
-  target, `Session`).
+  time), `pipeline` (the staged API; `pipeline/update` searches and proves the update rules
+  of a carried max), `dynamic` (paged/ragged kernels) and `core` (settings, target,
+  `Session`).
 - `src/superoptimizer/`: C++ superoptimizer implementation.
 - `include/cleave/`: C++ public headers.
 - `demo/`: runnable search/codegen examples.
