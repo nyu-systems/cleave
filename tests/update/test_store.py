@@ -205,6 +205,19 @@ def test_the_key_moves_with_the_engine_sources_the_settings_and_the_build(tmp_pa
     assert store.path_of(key) != here
 
 
+def test_the_process_keeps_a_light_derivation(fresh):
+    """What ``derive`` keeps per loop structure has no small-shape instances, references or
+    blocks; the report reads none of them."""
+    ir, ob, recipe = setting()
+    d = update_package.derive(ir, ob, recipe)
+    assert d.flat is None and d.kernel is None and d.references == []
+    assert d.holes and all(h.leaves == {} and h.target is None for h in d.holes)
+    assert all(h.search is not None and h.verdicts for h in d.holes)
+    with use_searched_updates():
+        full = engine.run(ir, ob, recipe, key=d.key)
+    assert full.flat is not None and engine.report(full) == engine.report(d)
+
+
 def test_lowering_reads_the_store(fresh, monkeypatch):
     """``plans.lower`` under the switch: the first lowering derives, a later one in a
     fresh process (here: memo) reads the record back."""

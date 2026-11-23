@@ -216,6 +216,21 @@ def test_e13_a_bug_in_the_search_keeps_the_pin_and_names_itself(monkeypatch, tmp
     assert update_package._DERIVED == {}  # nor kept
 
 
+def test_e1_a_graph_made_without_a_program_keeps_its_pin(tmp_path, monkeypatch):
+    """A searched graph built by hand, with no program and no symbol map: there is nothing
+    to build it again from, and lowering says so instead of failing."""
+    from cleave.pipeline.superopt import SearchedGraph
+
+    graph = identity(flash_rows_explicit, SHAPES)
+    bare = SearchedGraph(0, graph.structure, None, False, None)
+    monkeypatch.setattr(update_package, "_DERIVED", {})
+    with use_searched_updates(), cleave.Session(cache_root=tmp_path):
+        (ir,) = plans.lower(bare)
+    ob = the_obstacle(ir)
+    assert ir.streaming_refusals == [f"{ob.full}: " + texts.E1.format(full=ob.full)]
+    assert not [n for n in ir.nodes if getattr(n, "streaming", None) is not None]
+
+
 def flash_rows_explicit(x: cl.Tensor["R", "C"], v: cl.Tensor["C", "D"]):
     e = cl.exp(x - _max(x))
     return (e @ v) / cl.sum(e, -1, keepdim=True)

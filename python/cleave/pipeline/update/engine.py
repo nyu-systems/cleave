@@ -64,6 +64,14 @@ class Derivation:
     def record(self) -> Streaming:
         return Streaming(self.loops, self.rules, self.key)
 
+    def light(self) -> "Derivation":
+        """The derivation without its small-shape instances, references and blocks: what
+        the process keeps per loop structure (the report needs none of them)."""
+        from dataclasses import replace
+
+        holes = [replace(h, leaves={}, target=None) for h in self.holes]
+        return replace(self, holes=holes, references=[], flat=None, kernel=None)
+
 
 def unary_ops(flat_graph, full: str, accs) -> tuple:
     """The unary functions the flat graph applies between the full-extent value and the

@@ -77,7 +77,7 @@ def probe_looped(recipe, full: str):
     """The symbol ``full`` reduces, found by one lowering with a distinct extent per symbol
     (unit symbols stay 1): None when no symbol has the extent its axis has."""
     free = [s for s in sorted(recipe.symbols, key=symbol_order) if recipe.symbols[s] != 1]
-    if len(free) > len(_PROBE):
+    if not free or len(free) > len(_PROBE):
         return None
     probe = {s: _PROBE[i] for i, s in enumerate(free)}
     sizes = {**{s: 1 for s in recipe.symbols if recipe.symbols[s] == 1}, **probe}

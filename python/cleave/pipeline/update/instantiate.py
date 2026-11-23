@@ -72,22 +72,22 @@ class Recipe:
     def identity(cls, g) -> "Recipe":
         from ...frontend.tensor import Dim
 
-        program = g.program
-        symbols = {name: int(extent) for name, extent in program.sizes.items()}
+        program = g.program  # (a graph made without one builds nothing: E1 / E2)
+        symbols = {name: int(extent) for name, extent in getattr(program, "sizes", {}).items()}
 
         def build(sizes, dtype):
             return _one_graph(program.to_graph_structure(sizes), None, dtype)
 
         def find(flat_graph, full):
             def symbol(index, axis):
-                if index is None or index >= len(program.inputs):
+                if program is None or index is None or index >= len(program.inputs):
                     return None
                 dims = program.inputs[index].dims
                 d = dims[axis] if axis < len(dims) else None
                 return d.name if isinstance(d, Dim) else None
 
             return _looped_from_tokens(flat_graph, full, symbol, set(symbols),
-                                       ranks=[len(s.dims) for s in program.inputs])
+                                       ranks=[len(s.dims) for s in getattr(program, "inputs", ())])
 
         return cls("identity", symbols, g.dtype, build, find, g)
 

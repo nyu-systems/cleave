@@ -47,6 +47,7 @@ def derive(flat_graph, obstacle, recipe):
         if found is None:
             found = run(flat_graph, obstacle, recipe, key=key)
             store.save(found)
+            found = found.light()
         else:
             found.seconds = time.perf_counter() - t0
     except Exception as e:  # noqa: BLE001 - never out of plans.lower: the pin stays

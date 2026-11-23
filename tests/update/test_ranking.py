@@ -16,7 +16,7 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("z3")
 
 from cleave.ir.update_rule import update_of, use_searched_updates
-from cleave.pipeline.update import engine, rank, search, store, texts
+from cleave.pipeline.update import rank, search, store, texts
 from cleave.pipeline.update.proof import prove
 from cleave.pipeline.update.rank import Ranked, Replay, order, replay
 
