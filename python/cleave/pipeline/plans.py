@@ -367,13 +367,20 @@ NO_STATE_SPLIT = "no partial/combine pair is built for a graph with a max over t
 
 def _refuse_state_split(g, graphs, config, refused) -> None:
     """The split plans of solo graph ``g`` of a ``GraphSet`` with ``state_split``: one
-    refusal per factor of ``config.split_k``."""
+    refusal per factor of ``config.split_k``, or one for the split when it names no factor.
+    A dim of the split that no max reduces is named as well: the search ran unsplit, so
+    that dim is not split either."""
+    from ..frontend.tensor import split_names
     from .superopt import max_split_dims
 
-    dims = ",".join(max_split_dims(graphs.program, graphs.state_split))
-    for f in config.split_k:
-        refused.append(Refusal(g.index, f"split-k={f}", "partial", LoweringRejected(
-            f"graph {g.index}: split over {dims}: {NO_STATE_SPLIT}")))
+    maxed = max_split_dims(graphs.program, graphs.state_split)
+    others = [d for d in split_names(graphs.state_split) if d not in maxed]
+    why = f"graph {g.index}: split over {','.join(maxed)}: "
+    why += NO_STATE_SPLIT if config.split_k else "ScheduleConfig.split_k is empty"
+    if others:
+        why += f"; the search ran unsplit, so {','.join(others)} is not split either"
+    for variant in [f"split-k={f}" for f in config.split_k] or ["split"]:
+        refused.append(Refusal(g.index, variant, "partial", LoweringRejected(why)))
 
 
 def schedule(graphs: GraphSet | Sequence[SearchedGraph], config: ScheduleConfig | None = None) -> PlanSet:

@@ -131,11 +131,13 @@ def superoptimize(program, config: SuperoptConfig | None = None) -> GraphSet:
     from ..lower.split import Rejected, _contains_split_ops, _renumber_graph, cut_split_graph
 
     config = config or SuperoptConfig()
+    program.can_split(config.split)  # SpecError on a bad split dim, whatever the search runs
     if config.resolve_per_output(program):
         return _superoptimize_per_output(program, config)
     # A split over the dim a max reduces: the search would return no valid split graph (the
     # max is opaque to it), so it runs unsplit, on the budget and with the cache entry of
-    # the unsplit search, and the result says which split was asked for.
+    # the unsplit search, and the result says which split was asked for (all of it: the
+    # refusals of ``schedule`` name every dim that is not split).
     state_split = config.split if max_split_dims(program, config.split) else ()
     searched = config.replace(split=()) if state_split else config
     max_ops = searched.resolve_max_ops(program)
