@@ -11,7 +11,7 @@ Every other graph has no orthogonal groups and is scheduled as before.
 import pytest
 
 import cleave.lang as cl
-from cleave.core.errors import CodegenError, ScheduleRejected
+from cleave.core.errors import ScheduleRejected
 from cleave.core.target import current_target
 from cleave.frontend import Program
 from cleave.ir.analysis import find_orthogonal_reduction_groups
@@ -294,11 +294,15 @@ def test_inter_output_follows_loop(name):
 
 
 @pytest.mark.parametrize("name", sorted(ORTHOGONAL))
-def test_codegen_refuses_inter_output(name):
+def test_codegen_emits_inter_output(name):
+    # Every assignment builds; its inter outputs are atomically added (P5b), and the
+    # module declares them for the runtime (tests/codegen/test_inter_codegen.py: where).
     graph = _lower(ORTHOGONAL[name]())
     for cand in _first_per_assignment(search_tiling(graph, topk=10000)):
-        with pytest.raises(CodegenError, match="inter accumulation"):
-            build_candidate_code(cand)
+        code = build_candidate_code(cand)
+        n_inter = list(_contexts(cand).values()).count("inter")
+        assert code.count("T.atomic_add(") == n_inter
+        assert "INTER_OUTPUTS = {" in code
 
 
 def test_schedule_labels_show_assignment():

@@ -102,7 +102,7 @@ GPU_TESTS = [
     "tests/schedule/end2end", "tests/graph/apply_tiling", "tests/graph/handwritten",
     "tests/reference", "tests/runtime/test_run_candidates.py", "tests/pipeline_api/test_e2e.py",
     "tests/frontend/test_exact_softmax.py", "tests/frontend_dynamic/test_paged_pipeline.py",
-    "tests/pipeline_api/test_declared_validation.py",
+    "tests/pipeline_api/test_declared_validation.py", "tests/runtime/test_inter_outputs.py",
 ]
 
 
@@ -261,6 +261,8 @@ def _test_operators():
             return "softmax" if "standalone" in test else "exact_attention"
         if path == "tests/pipeline_api/test_declared_validation.py":
             return "lse_attention"
+        if path == "tests/runtime/test_inter_outputs.py":
+            return "inter_pair"
         return node
 
     return operator

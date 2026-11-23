@@ -433,6 +433,24 @@
    "validated": 6
   }
  ],
+ "test:inter_pair": [
+  {
+   "abs": 1.0,
+   "absolute": false,
+   "dtype": "float16",
+   "rel": 0.0009756097570061684,
+   "seeds": 3,
+   "validated": 33
+  },
+  {
+   "abs": 2.0,
+   "absolute": false,
+   "dtype": "float16",
+   "rel": 0.0010362694738432765,
+   "seeds": 3,
+   "validated": 33
+  }
+ ],
  "test:lora_graph": [
   {
    "abs": 1.0,

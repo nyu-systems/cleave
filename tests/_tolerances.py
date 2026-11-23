@@ -68,6 +68,7 @@ TOLERANCES = {
     "softmax": Tolerance(rtol=2e-3),
     "exact_attention": Tolerance(rtol=5e-3),
     "lse_attention": Tolerance(rtol=5e-3),
+    "inter_pair": Tolerance(rtol=5e-3),
 }
 
 
