@@ -117,7 +117,14 @@ served wrongly):
 - a row that a tile has to hold whole and whose length is not a power of two (a standalone
   softmax or a row sum over 96 or 257 columns): the last tile of a reduction is not padded;
 - a matmul output with more than 64 rows that 64 does not divide, or more than 32 columns
-  that 32 does not divide (`M = 96`, `N = 48`).
+  that 32 does not divide (`M = 96`, `N = 48`);
+- a reduction over a dim of one element (`sum(x, -1)` of a `64 x 1` tensor): the search
+  builds no reduction over a single element, so `superoptimize` finds no graph and raises
+  `SuperoptError` with that reason (as it does for any search that finds none, such as a
+  `max_ops` below the program's own op count).
+
+A program with an input that no op reads is a `SpecError` in `superoptimize`: the search
+counts a tensor that nothing reads as an output, so none of its graphs could equal the program.
 
 `cl.softmax(x)` next to another `exp` of the same tensor is served under the limit of a
 softmax that is returned: the softmax's exp reads `x - max(x)`, a value of its own that the

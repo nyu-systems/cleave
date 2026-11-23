@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Sequence
 
-from ..core.errors import SuperoptError
+from ..core.errors import SpecError, SuperoptError
 from . import cache
 from .config import SuperoptConfig
 
@@ -126,12 +126,61 @@ def max_split_dims(program, split) -> tuple[str, ...]:
     return tuple(n for n in names if n in reduced)
 
 
+def _unread_inputs(program) -> list[str]:
+    """The names of the inputs of ``program`` that no op and no output reads. An ``equals=``
+    input is none of them: the search may read it through its definition (the forward
+    output ``o`` of an attention backward, which the program itself does not read)."""
+    records = getattr(program, "_records", ())
+    read = {a for r in records if r.kind != "input" for a in r.args if isinstance(a, int)}
+    ids = [r.out for r in records if r.kind == "input"]
+    return [spec.name for spec, i in zip(program.inputs, ids)
+            if i not in read and getattr(spec, "equals", None) is None]
+
+
+def _no_graph(program, max_ops: int) -> str:
+    """Why the search returned no graph, as far as the program shows it."""
+    from ..frontend.tensor import Dim, extent
+
+    causes = []
+    values = getattr(program, "_values", [])
+    for r in getattr(program, "_records", ()):
+        if r.kind in ("reduce_sum", "reduce_max"):
+            dim = values[r.args[0]].dims[r.attr("dim")]
+            if extent(dim) == 1:
+                label = f"dim {dim.name}" if isinstance(dim, Dim) else f"axis {r.attr('dim')}"
+                causes.append(f"its {r.kind.removeprefix('reduce_')} over {label} reduces one "
+                              "element, and the search builds no reduction over a dim of one "
+                              "element")
+    own = getattr(program, "op_count", 0)
+    if max_ops < own:
+        causes.append(f"max_ops={max_ops} is less than the program's own {own} ops (inputs "
+                      "and compute ops), so the search cannot reach its own graph")
+    return (f"{getattr(program, 'name', 'program')}: the search found no graph equal to the "
+            f"program within max_ops={max_ops}" + "".join(f"; {c}" for c in causes))
+
+
 def superoptimize(program, config: SuperoptConfig | None = None) -> GraphSet:
+    """Search the graphs equal to ``program``.
+
+    Raises ``SpecError`` for a program with an input that nothing reads (the search counts
+    every tensor that nothing reads as an output, so none of its graphs can equal the
+    program), and ``SuperoptError`` when the search fails or finds no graph (with the cause
+    where the program shows it: a reduction over a dim of one element, a ``max_ops`` below
+    the program's own size).
+    """
     import cleave.superoptimizer as csopt
     from ..lower.split import Rejected, _contains_split_ops, _renumber_graph, cut_split_graph
 
     config = config or SuperoptConfig()
     program.can_split(config.split)  # SpecError on a bad split dim, whatever the search runs
+    unread = _unread_inputs(program)
+    if unread:
+        what = (f"input {unread[0]!r} is" if len(unread) == 1
+                else f"inputs {', '.join(map(repr, unread))} are")
+        raise SpecError(
+            f"{getattr(program, 'name', 'program')}: {what} read by no op; the search counts "
+            "a tensor that nothing reads as an output, so none of its graphs can equal the "
+            "program (drop the input or read it)")
     if config.resolve_per_output(program):
         return _superoptimize_per_output(program, config)
     # A split over the dim a max reduces: the search would return no valid split graph (the
@@ -163,6 +212,8 @@ def superoptimize(program, config: SuperoptConfig | None = None) -> GraphSet:
         structures = [_renumber_graph(g.get_graph_structure()) for g in found]
     except Exception as e:  # noqa: BLE001
         raise SuperoptError(f"superoptimizer search failed: {type(e).__name__}: {e}") from e
+    if not structures:
+        raise SuperoptError(_no_graph(program, max_ops))
     graphs = []
     for i, s in enumerate(structures):
         cut = cut_split_graph(s) if _contains_split_ops(s) else None
