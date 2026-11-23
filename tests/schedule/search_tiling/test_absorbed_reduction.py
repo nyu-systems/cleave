@@ -132,8 +132,10 @@ def test_refuses_to_step_an_axis_that_an_absorbed_reduction_holds_whole():
     ``X``. No tile of ``X`` serves both, so the tiling is refused -- with a typed error, which
     ``python -O`` cannot strip -- rather than scheduled into a kernel that slices ``X`` wrong.
     """
-    # Rank 128: at the end2end case's rank of 16 the up projection never iterates.
-    candidates = _policy(g.lora_graph(16, 4096, 4096, 128), False).emit_config(1000)
+    # Rank 128: at the end2end case's rank of 16 the up projection never iterates. M = 64: at
+    # M = 16 only 32-thread candidates are emitted (16 rows per warp of the register operand of
+    # (X @ A) @ B, see test_register_operand_layout.py), and none of those steps all three.
+    candidates = _policy(g.lora_graph(64, 4096, 4096, 128), False).emit_config(1000)
 
     n_refused = 0
     for cand in candidates:

@@ -1,7 +1,8 @@
-"""sm_90, 256 threads: a gemm reading its A operand from another gemm's accumulator needs M = 128.
+"""sm_90: a gemm reading its A operand from another gemm's accumulator needs >= 16 rows per warp.
 
-TileLang 0.1.13 cannot lay out such a register A operand at two warpgroups unless the block's M
-is 128 (``Layout infer conflict``); the policy no longer emits those candidates. CPU only.
+TileLang 0.1.13 cannot lay out such a register A operand with fewer than 16 rows of M per warp,
+nor at two warpgroups unless M is exactly 128 (16 per warp) (``Layout infer conflict``); the
+policy no longer emits those candidates. CPU only.
 """
 import copy
 
@@ -12,7 +13,8 @@ from cleave.schedule import search_tiling
 from cleave.schedule.policy.default import TCPolicy
 
 from tests._graphs import (
-    ACCUM_DTYPE, DTYPE, OUT_DTYPE, _connect, _finalize, mha_bhsd_graph, mla_decode_bhsd_graph,
+    ACCUM_DTYPE, DTYPE, OUT_DTYPE, _connect, _finalize, lora_graph, mha_bhsd_graph,
+    mla_decode_bhsd_graph,
 )
 
 
@@ -42,7 +44,13 @@ def test_two_warpgroups_read_a_gemm_accumulator_only_at_block_m_128():
     m_256 = {int(c.get_tile(pv)[-2]) for c in cands if c.n_threads == 256}
     m_128 = {int(c.get_tile(pv)[-2]) for c in cands if c.n_threads == 128}
     assert m_256 == {128}
-    assert len(m_128) > 1  # one warpgroup: every M stays
+    assert m_128 == {m for m in m_128 if m >= 64} and len(m_128) > 1  # one warpgroup: M >= 64
+
+
+def test_lora_up_projection_needs_16_rows_per_warp():
+    # (X@A)@B with M = 16: only one warp (32 threads) gives it 16 rows.
+    graph = lora_graph(16, 4096, 4096, 16)
+    assert {c.n_threads for c in search_tiling(graph, topk=10000)} == {32}
 
 
 def test_a_operand_computed_from_loads_keeps_every_block_m():
@@ -66,10 +74,11 @@ def test_refusal_is_specific_to_sm_90_and_two_warpgroups():
     policy = _policy(graph)
     (pv,) = _register_a_matmuls(graph)
     cand = next(c for c in search_tiling(graph, topk=10000)
-                if c.n_threads == 128 and int(c.get_tile(pv)[-2]) != 128)
+                if c.n_threads == 128 and int(c.get_tile(pv)[-2]) == 64)
     cand = copy.copy(cand)
-    assert policy._register_operand_layout_conflict(cand, 256)
-    assert not policy._register_operand_layout_conflict(cand, 128)
+    assert policy._register_operand_layout_conflict(cand, 256)  # 8 rows per warp
+    assert not policy._register_operand_layout_conflict(cand, 128)  # 16 rows per warp
+    assert policy._register_operand_layout_conflict(cand, 64 * 32)  # 1 row per warp
     policy.arch = copy.copy(policy.arch)
     policy.arch.sm_version = 80
     assert not policy._register_operand_layout_conflict(cand, 256)

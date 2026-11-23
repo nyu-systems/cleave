@@ -1508,20 +1508,22 @@ class TCPolicy(DefaultPolicy):
     def _register_operand_layout_conflict(self, candidate, n_threads):
         """Would a gemm read its A operand from registers in a layout TileLang cannot match?
 
-        TileLang 0.1.13 limitation on sm_90 (the vendored TileLang cannot be patched):
-        with two warpgroups (256 threads) the accumulator layout of a gemm and the
-        register A-operand layout of a later gemm fed from it (directly or through
-        elementwise ops, e.g. FlashAttention's ``exp(q k^T) @ v``) differ unless the
-        block's M is 128 = 64 * warpgroups; lowering fails with ``Layout infer conflict
-        between <frag> and <frag>/A_ptr``. An A operand computed only from loaded tiles
-        lowers at every M. Repro (lowering only, no GPU): cleave-attn-bwd-evidence
-        scratch/p8-staging/repro_rs_gemm_layout.py, scratch/p8b-rsgemm/repro_variants.py.
+        TileLang 0.1.13 limitation on sm_90 (the vendored TileLang cannot be patched): the
+        accumulator layout of a gemm and the register A-operand layout of a later gemm fed
+        from it (directly or through elementwise ops, e.g. FlashAttention's
+        ``exp(q k^T) @ v``) differ unless the block's M gives every warp at least 16 rows,
+        and, with two warpgroups (256 threads), exactly 16 (M = 128); lowering fails with
+        ``Layout infer conflict between <frag> and <frag>/A_ptr``. An A operand computed
+        only from loaded tiles lowers at every M. Repros (lowering only, no GPU), in
+        cleave-attn-bwd-evidence/scratch: p8-staging/repro_rs_gemm_layout.py,
+        p8b-rsgemm/repro_variants.py (32..256 threads x M 16..256), p13-merged/repro_rs_m32.py.
         A transposed A, or a gemm whose operands are both computed, is staged through
         shared memory by codegen, so it is not read from registers; so is MLA decode's
         value gemm under ``mla_decode_pass``.
         """
-        if n_threads != 256 or getattr(self.arch, "sm_version", None) != 90:
+        if getattr(self.arch, "sm_version", None) != 90:
             return False
+        warps = n_threads // 32
         for node in self.ordered_nodes:
             if not isinstance(node, Matmul) or node.transpose_A:
                 continue
@@ -1534,7 +1536,8 @@ class TCPolicy(DefaultPolicy):
                 # CompilerPassOptions.mla_decode_pass stages this A operand through shared
                 # (codegen/passes.py), and the candidate then compiles.
                 continue
-            if int(candidate.get_tile(node)[-2]) != 128:
+            rows_per_warp = int(candidate.get_tile(node)[-2]) / warps
+            if rows_per_warp < 16 or (warps > 4 and rows_per_warp != 16):
                 return True
         return False
 

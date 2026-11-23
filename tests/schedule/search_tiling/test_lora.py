@@ -34,13 +34,13 @@ def test_lora_base_and_down_projections_step_together():
     # X@W and X@A share X, so apply_tiling runs them in one loop, which has one counter.
     # The policy used to step them independently: 616 of 720 candidates had different
     # K steps, sliced the shared X with one of them and all failed in TileLang with
-    # "T.gemm K shape check failed" (wasted candidates). Of the 104 left, 26
-    # (256 threads, (X@A)@B with M != 128) fail too and are refused: TileLang cannot lay out that
-    # register operand (test_register_operand_layout.py).
+    # "T.gemm K shape check failed" (wasted candidates). Of the 104 left, the 78 at 64, 128
+    # and 256 threads fail too and are refused: (X@A)@B with M = 16 gives a warp fewer than 16
+    # rows of its register operand, which TileLang cannot lay out (test_register_operand_layout.py).
     from cleave.schedule import apply_tiling
 
     candidates = search_tiling(lora_graph(16, 4096, 4096, 16), topk=1000)
-    assert len(candidates) == 78
+    assert len(candidates) == 26
     for cand in candidates:
         steps = {n.name: s for n, s in cand.rstep_map.items()}
         assert steps["mma_base"] == steps["mma_down"], steps
