@@ -227,6 +227,23 @@ class GraphValidator:
                 f"{where}: {node.name!r} is marked for stabilization but was not rewritten; "
                 "emitting it as a plain exp would silently drop the max."
             )
+            # The searched twin of the rule above: a full-extent value whose update rule
+            # (``node.streaming``) is still on it was not assembled. That is right where
+            # its dim is whole in the tile it is computed from, and wrong in a loop that
+            # carries it or steps its dim: without the lag copy and the repairs the sums
+            # next to it would be relative to the max of one slice.
+            if is_main or getattr(node, "streaming", None) is None:
+                continue
+            sliced = False
+            operand = node.inputs[0].src_node
+            it = None if isinstance(operand, GraphNode) else tmap.get(operand)
+            if isinstance(it, Iterator) and hasattr(node, "position_in"):
+                axis = node.position_in(it)
+                sliced = axis is not None and it.tile_size[axis] != it.shape[axis]
+            assert id(node) not in accum and not sliced, (
+                f"{where}: {node.name!r} has an update rule that was not assembled; "
+                "emitting it as a plain max would take the max of one slice."
+            )
 
         # --- lag snapshots and rescaled accumulators: state carried across iterations ---
         assert not ((graph.lag_nodes or graph.accum_scale) and is_main), (

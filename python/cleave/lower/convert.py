@@ -571,7 +571,7 @@ def _input(ctx: _Ctx, idx: int, op: KGOp) -> Built:
     # The k-th input op is input k of the graph. A graph is rebuilt in discovery order
     # from its outputs below, so this is the only place the declaration order is known.
     if op.outputs:
-        ctx.placeholder(op.outputs[0], ctx.input_position[idx])
+        ctx.placeholder(op.outputs[0], ctx.input_position[idx]).op_index = idx
     return None, ()
 
 
@@ -582,6 +582,7 @@ def _output(ctx: _Ctx, idx: int, op: KGOp) -> Built:
             raise ValueError(f"Output tensor guid {guid} has no producer.")
         node = OutputNode(ctx.producer(guid), dtype=ctx.dtypes.get(guid, ctx.out_dtype))
         node.boundary = Boundary(len(ctx.outputs))  # the k-th output op is output k
+        node.op_index = idx
         ctx.outputs.append(node)
     return None, ()
 
@@ -841,6 +842,10 @@ def to_ir(
             continue
         node, inputs = _rule(op, idx)(ctx, idx, op)
         if node is not None:
+            # Which op of the structure the node was lowered from (for a fused rsqrt, the
+            # div): what builds another structure from this graph's nodes reads it
+            # (``lower.state_split``) instead of parsing the node's name.
+            node.op_index = idx
             ctx.wire(node, inputs)
             ctx.register(node, op.outputs)
     if not ctx.outputs:

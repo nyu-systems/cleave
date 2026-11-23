@@ -51,7 +51,8 @@ from __future__ import annotations
 
 from ..core.errors import SpecError
 from ..ir.graph import PlaceHolderNode
-from ..ir.ops import Div, Exp, Matmul, Mul, PermuteView, SplitView
+from ..ir.ops import Div, Exp, Matmul, Mul, PermuteView, ReduceMax, SplitView, Sub
+from ..ir.update_rule import searched_updates
 from .reference import placeholder_order
 
 # What a dynamic operator can be validated on as well (``cleave.dynamic.reference`` adds two
@@ -153,8 +154,50 @@ def _cases(graph) -> tuple:
     return ADVERSARIAL, rest
 
 
+def softmax_axis(node):
+    """The axis, counted from the end, that ``node`` is the exp of an exact softmax over,
+    or None.
+
+    Either the record of the hand-derived pass (``Exp.stabilize``, with one axis), or --
+    where update rules are searched (``ir.update_rule.searched_updates``) -- a structural
+    fact: the exp reads ``x - max(x, axis)``, a ``Sub`` whose second operand is a
+    ``ReduceMax`` of its first. Its argument is then never positive, whatever the logits
+    are, which is the claim the adversarial cases test.
+    """
+    record = getattr(node, "stabilize", None)
+    if record is not None:
+        return record.axes[0] if len(record.axes) == 1 else None
+    if type(node) is not Exp or not searched_updates():
+        return None
+    shift = _explicit_max(node.inputs[0].src_node)
+    return None if shift is None else shift.flat_axis - len(node.get_shape(0))
+
+
+def _explicit_max(node):
+    """The ``ReduceMax`` of ``node`` = ``x - max(x)``: a ``Sub`` without a constant whose
+    second operand is a ``ReduceMax`` of its first (same node, same output); else None."""
+    if type(node) is not Sub or node.const is not None:
+        return None
+    x, m = sorted(node.inputs, key=lambda e: e.dst_id)
+    if type(m.src_node) is not ReduceMax:
+        return None
+    (reduced,) = m.src_node.inputs
+    if reduced.src_node is not x.src_node or reduced.src_id != x.src_id:
+        return None
+    return m.src_node
+
+
+def _logits_of(exp):
+    """The node an exact-softmax exp takes its logits from: what it reads, or the first
+    operand of the explicit ``x - max(x)``."""
+    src = exp.inputs[0].src_node
+    if getattr(exp, "stabilize", None) is None and softmax_axis(exp) is not None:
+        return next(e for e in src.inputs if e.dst_id == 0).src_node
+    return src
+
+
 def _stabilized(node) -> bool:
-    return getattr(node, "stabilize", None) is not None
+    return getattr(node, "stabilize", None) is not None or softmax_axis(node) is not None
 
 
 def _unshaped(graph, logits) -> list:
@@ -209,19 +252,38 @@ def key_operand(graph, matmul) -> int:
     place. Anywhere else -- no record, another op on the way, another shape -- it is
     taken to be the last axis, as for a graph that makes no claim.
     """
+    def by_axis(exp, recorded: bool):
+        """The operand the softmax axis of ``exp`` names; ``recorded``: whether the axis is
+        to come from the exp's record (it reads the scores) or from its structure."""
+        if recorded != (getattr(exp, "stabilize", None) is not None):
+            return 1
+        axis, rank = softmax_axis(exp), len(exp.get_shape(0))
+        if axis is None or tuple(exp.get_shape(0)) != tuple(matmul.get_shape(0)):
+            return 1
+        return 0 if axis % rank == rank - 2 else 1
+
     node, seen = matmul, set()
     while id(node) not in seen:
         seen.add(id(node))
         readers = [edge.dst_node for edge in node.outputs]
+        # The explicit form, ``exp(s - max(s))``: the max reads the scores next to the
+        # subtraction it feeds, which is one path, and the exp that reads the subtraction
+        # is a softmax by structure (``softmax_axis``), not by a record.
+        shifted = [r for r in readers if _explicit_max(r) is not None]
+        if len(shifted) == 1 and all(
+            r is shifted[0]
+            or (r is _explicit_max(shifted[0]) and all(e.dst_node is shifted[0] for e in r.outputs))
+            for r in readers
+        ):
+            exps = [edge.dst_node for edge in shifted[0].outputs]
+            if len(exps) != 1 or type(exps[0]) is not Exp:
+                return 1
+            return by_axis(exps[0], recorded=False)
         if len(readers) != 1:
             return 1
         (node,) = readers
         if type(node) is Exp:
-            record = getattr(node, "stabilize", None)
-            same = tuple(node.get_shape(0)) == tuple(matmul.get_shape(0))
-            if record is None or len(record.axes) != 1 or not same:
-                return 1
-            return 0 if record.axes[0] % len(node.get_shape(0)) == len(node.get_shape(0)) - 2 else 1
+            return by_axis(node, recorded=True)
         if not (type(node) in (Mul, Div) and node.const is not None
                 and not getattr(node, "const_on_left", False)):
             return 1
@@ -253,13 +315,13 @@ def logit_inputs(graph) -> list:
     """
     found = []
     for node in graph.nodes:
-        record = getattr(node, "stabilize", None)
-        if type(node) is not Exp or record is None or len(record.axes) != 1:
+        softmax = softmax_axis(node) if type(node) is Exp else None
+        if softmax is None:
             continue
         src, sign, views = _read(node)
         if not isinstance(src, PlaceHolderNode) or any(src is p for p, _, _ in found):
             continue
-        axis = _moved(_viewed(src, views[::-1]), record.axes[0], src)
+        axis = _moved(_viewed(src, views[::-1]), softmax, src)
         if axis is not None:
             found.append((src, axis, sign))
     return found
@@ -268,7 +330,7 @@ def logit_inputs(graph) -> list:
 def _read(exp):
     """``(node, sign, views)``: what ``exp`` reads behind the views that only reindex it and
     the constant scalings (``sign`` is theirs); ``views`` from the ``Exp`` inwards."""
-    src, sign, views = exp.inputs[0].src_node, 1.0, []
+    src, sign, views = _logits_of(exp), 1.0, []
     while True:
         if isinstance(src, (SplitView, PermuteView)):
             views.append(src)

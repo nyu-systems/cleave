@@ -480,6 +480,19 @@ def execute(graph, inputs):
     ``inputs`` are matched positionally to :func:`placeholder_order`. Returns a list
     with one tensor per output node, in :func:`output_order` (== kernel ``out_idx``).
     """
+    return values(graph, inputs)[1]
+
+
+def values(graph, inputs, given=None):
+    """``({node name: value}, outputs)``: the value of every placeholder and compute node
+    of ``graph`` for ``inputs``, and its reference outputs as :func:`execute` returns them.
+
+    ``given`` (``{node name: tensor}``) supplies the value of the named compute nodes
+    instead of evaluating them: the graph re-wired to read a value from outside (a tile
+    computed with the row max of a longer prefix, ``cleave.pipeline.update``). What only a
+    given node reads is still evaluated, and unused.
+    """
+    given = given or {}
     order = find_topo_sort(graph.nodes)
     placeholders = [n for n in order if isinstance(n, PlaceHolderNode)]
     if len(inputs) != len(placeholders):
@@ -500,12 +513,15 @@ def execute(graph, inputs):
             value = env[(edge.src_node, edge.src_id)]
             outputs.append(value.to(torch_dtype(node.get_dtype(0))))
             continue
+        if node.name in given:
+            env[(node, 0)] = given[node.name]
+            continue
         args = [
             env[(edge.src_node, edge.src_id)]
             for edge in sorted(node.inputs, key=lambda e: e.dst_id)
         ]
         env[(node, 0)] = _eval_node(node, args)
-    return outputs
+    return {node.name: value for (node, _), value in env.items()}, outputs
 
 
 def _check_layout(layout, rank):

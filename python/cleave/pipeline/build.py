@@ -192,9 +192,18 @@ def _reference_fn(distributions, program, publish):
     exact = bool(getattr(program, "stabilize_requests", ()))
     held = {}
 
+    def explicit(graph) -> bool:
+        # Where update rules are searched, a graph whose exp reads ``x - max(x)`` is exact
+        # by structure, whoever wrote it (``runtime.inputs.softmax_axis``; never true for
+        # an exp without a record while the switch is off).
+        from ..runtime.inputs import softmax_axis
+
+        return any(getattr(n, "stabilize", None) is None and softmax_axis(n) is not None
+                   for n in graph.nodes)
+
     def reference(reference_cache_dir, graph, dtype):
         cases, note = distributions, ""
-        if exact:
+        if exact or explicit(graph):
             from ..runtime.inputs import adversarial_cases, why_not_adversarial
 
             cases += tuple(d for d in adversarial_cases(graph) if d not in distributions)

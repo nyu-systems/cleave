@@ -29,6 +29,7 @@ _MARKERS = {
         "tests/runtime/test_thread_stacks.py::test_gpu_",
         "tests/frontend/test_exact_softmax.py::test_gpu_",
         "tests/lower/test_attention_bwd_gpu.py",
+        "tests/update/test_foundation.py::test_gpu_",
     ),
     "expected": (
         "tests/graph/handwritten/",
@@ -53,6 +54,9 @@ _MARKERS = {
         "tests/pipeline_api/test_exact_split_attention.py::test_gpu_",
         "tests/pipeline_api/test_exact_split_rows.py::test_search_",
         "tests/pipeline_api/test_exact_split_rows.py::test_gpu_",
+        "tests/update/test_foundation.py::test_search_",
+        "tests/update/test_foundation.py::test_gpu_",
+        "tests/update/test_state_split.py::test_search_",
     ),
     "slow": (
         "tests/schedule/end2end/",
@@ -135,6 +139,17 @@ def pytest_collection_modifyitems(config, items):
                 continue
             if key.startswith(prefixes):
                 item.add_marker(getattr(pytest.mark, name))
+
+
+@pytest.fixture
+def searched_updates():
+    """The searched update rules switched on for one test (``CLEAVE_SEARCHED_UPDATES``;
+    dormant by default until the switch-over): ``cl.softmax`` records the explicit max and
+    lowering derives an update rule for every streaming obstacle."""
+    from cleave.ir.update_rule import use_searched_updates
+
+    with use_searched_updates():
+        yield
 
 
 @pytest.fixture(autouse=True)

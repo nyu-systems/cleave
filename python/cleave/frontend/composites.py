@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from ..ir.update_rule import searched_updates
 from .program import grouped_matmul
 from .tensor import Tensor
 
@@ -77,5 +78,12 @@ def softmax(x, dim: int = -1):
     at 8192 (where a softmax alone still has one). A second softmax of ``x`` over another
     axis needs a row and a column in one block, which is the whole tensor: 16x32 and 64x128
     have plans, 64x256 has none."""
-    e = x.program._stable_exp(x, dim) if _traced(x) else exp(x - max(x, dim, keepdim=True))
+    if _traced(x) and not searched_updates():
+        e = x.program._stable_exp(x, dim)
+    else:
+        # Dormant until the switch-over (``CLEAVE_SEARCHED_UPDATES``): the max is recorded,
+        # an ordinary reduction of the searched flat graph, and a loop over the softmax
+        # dim carries it with an update rule that is searched and proven
+        # (``cleave.pipeline.update``, ``cleave.schedule.streaming``).
+        e = exp(x - max(x, dim, keepdim=True))
     return e / sum(e, dim, keepdim=True)

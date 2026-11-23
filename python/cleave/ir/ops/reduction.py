@@ -4,7 +4,7 @@ import tvm
 from tvm import te
 
 from ..graph import ComputeOpNode, PlaceHolderNode
-from .base import MacroOp
+from .base import NEG_FLT_MAX, MacroOp
 
 
 class Matmul(ComputeOpNode):
@@ -385,6 +385,12 @@ class ReduceMax(ReduceSum):
     _tl_reduce = "T.reduce_max"
     accum_init = -float("inf")
     running_max = True
+    # As a full-extent value carried across a loop (``cleave.schedule.streaming``): how its
+    # value over a prefix and over the next tile combine to its value over both, and where
+    # the carried value starts (a float32 number: the first repair is ``exp(start - m)``,
+    # which has to be 0 and not NaN).
+    combine = "max"
+    carry_init = NEG_FLT_MAX
 
     def __init__(self, dims, axis=-1, name=kind, dtype="float32", out_dtype="float32",
                  accum_init=None):

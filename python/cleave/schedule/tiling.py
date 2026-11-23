@@ -772,8 +772,14 @@ def reduction_ancestors(nodes):
     return {n: frozenset(get_op_ancestors(n)) for n in nodes if len(n.raxis) > 0}
 
 
-def absorbed_reductions(nodes, rstep_map, ancestors=None):
+def absorbed_reductions(nodes, rstep_map, ancestors=None, carried=None):
     """The reductions of ``nodes`` that ``apply_tiling`` schedules inside another's loop.
+
+    ``carried`` (``streaming.streamed``: ``{full-extent node: its looped descendants}``)
+    names the ancestors that are NOT absorbed although they iterate inside a descendant's
+    loop: a running max over the very dim the loop steps is advanced by the loop's own
+    counter and carried across iterations, where every descendant that iterates steps as
+    it does (anything else is refused by ``_refuse_carried_out_of_step``).
 
     A reduction that iterates (step < extent) while one of its descendant reductions
     also iterates is absorbed into that descendant's loop (see the merge in
@@ -789,10 +795,14 @@ def absorbed_reductions(nodes, rstep_map, ancestors=None):
         return []
     if ancestors is None:
         ancestors = reduction_ancestors(active)
+    carried = carried or {}
     return [
         a
         for a in active
-        if any(r is not a and a in ancestors[r] for r in active)
+        if any(
+            r is not a and a in ancestors[r] and r not in carried.get(a, ())
+            for r in active
+        )
     ]
 
 
@@ -804,6 +814,7 @@ class _ScheduledAxes(NamedTuple):
     out_tokens: dict  # ``build_output_axis_provenance`` of ``nodes``
     red_tokens: dict  # ``build_reduction_axis_provenance`` of ``nodes``
     ancestors: dict  # ``reduction_ancestors`` of ``nodes``
+    carried: dict = {}  # ``streaming.streamed`` of ``nodes``: full-extent node -> its loops
 
 
 # id(flat graph) -> (weak reference to it, its _ScheduledAxes). A ``Graph`` is a mutable
@@ -812,9 +823,14 @@ _SCHEDULED_AXES: dict = {}
 
 
 def _structure(flat_graph) -> tuple:
-    """The nodes of ``flat_graph`` and how they are wired, by name."""
+    """The nodes of ``flat_graph`` and how they are wired, by name, with the streaming
+    record of each (what ``_ScheduledAxes.carried`` is read from)."""
     return tuple(
-        (n.name, tuple((e.src_node.name, e.src_id) for e in n.inputs))
+        (
+            n.name,
+            tuple((e.src_node.name, e.src_id) for e in n.inputs),
+            getattr(n, "streaming", None),
+        )
         for n in flat_graph.nodes
     )
 
@@ -839,12 +855,19 @@ def _scheduled_axes(flat_graph) -> _ScheduledAxes:
         n for n in pruned.nodes if not n.is_placeholder() and not n.is_output()
     ]
     out_tokens = build_output_axis_provenance(ordered_nodes)
+    red_tokens = build_reduction_axis_provenance(ordered_nodes, out_tokens)
+    ancestors = reduction_ancestors(ordered_nodes)
+    from .streaming import streamed
+
     axes = _ScheduledAxes(
         structure,
         ordered_nodes,
         out_tokens,
-        build_reduction_axis_provenance(ordered_nodes, out_tokens),
-        reduction_ancestors(ordered_nodes),
+        red_tokens,
+        ancestors,
+        # The records are read off the clone; whether each is honoured is asked of the
+        # graph itself (its key), as the policy asks it.
+        streamed(ordered_nodes, red_tokens, ancestors, flat_graph),
     )
 
     key = id(flat_graph)
@@ -870,7 +893,13 @@ def scheduled_reductions(flat_graph):
     return axes.nodes, axes.red_tokens
 
 
-def _held_axis_tokens(ordered_nodes, rstep_map, red_tokens, ancestors=None):
+def carried_reductions(flat_graph) -> dict:
+    """``streaming.streamed`` of ``flat_graph`` as ``apply_tiling`` sees it (split views
+    removed): what the policy has to agree with."""
+    return _scheduled_axes(flat_graph).carried
+
+
+def _held_axis_tokens(ordered_nodes, rstep_map, red_tokens, ancestors=None, carried=None):
     """Provenance tokens of the axes that absorbed reductions hold whole.
 
     Raises ``ScheduleRejected`` for a tiling no loop can serve: one in which another
@@ -881,7 +910,8 @@ def _held_axis_tokens(ordered_nodes, rstep_map, red_tokens, ancestors=None):
         tokens = red_tokens.get(node)
         return tokens[0] if tokens else set()
 
-    absorbed = absorbed_reductions(ordered_nodes, rstep_map, ancestors)
+    absorbed = absorbed_reductions(ordered_nodes, rstep_map, ancestors, carried)
+    _refuse_carried_out_of_step(ordered_nodes, rstep_map, carried)
     # These are refusals, not asserts: without them the tiling would be scheduled into
     # a kernel that reads the wrong slices, and ``python -O`` drops an assert.
     held = set()
@@ -903,14 +933,47 @@ def _held_axis_tokens(ordered_nodes, rstep_map, red_tokens, ancestors=None):
     return held
 
 
-def absorbed_axis_conflict(ordered_nodes, rstep_map, red_tokens, ancestors=None) -> Optional[str]:
+def _refuse_carried_out_of_step(ordered_nodes, rstep_map, carried):
+    """A carried full-extent value steps with the loop that carries it, or not at all.
+
+    The loop of its descendants has one counter. A max that is stepped differently from
+    a descendant that iterates would be taken over the wrong slices; a max that is not
+    stepped while a descendant iterates would be the max of one slice, used as if it
+    were the max of the row.
+    """
+    for full, loops in (carried or {}).items():
+        full = next((n for n in ordered_nodes if n == full), None)
+        if full is None or full not in rstep_map:
+            continue
+        own = _get_rstep_for_axis(full, rstep_map[full])
+        for node in ordered_nodes:
+            if node not in loops or node not in rstep_map:
+                continue
+            step = _get_rstep_for_axis(node, rstep_map[node])
+            if step < node.raxis[0].dom.extent and step != own:
+                raise ScheduleRejected(
+                    f"{full.name} is carried by the loop of {node.name}, which steps "
+                    f"{int(step)}, but is itself stepped {int(own)}: one loop counter "
+                    "advances both"
+                )
+            if step >= node.raxis[0].dom.extent and own < full.raxis[0].dom.extent:
+                raise ScheduleRejected(
+                    f"{full.name} is stepped {int(own)} but {node.name}, which reads its "
+                    "finished value, is not: the value would be needed whole and "
+                    "per iteration at once"
+                )
+
+
+def absorbed_axis_conflict(
+    ordered_nodes, rstep_map, red_tokens, ancestors=None, carried=None
+) -> Optional[str]:
     """Why ``apply_tiling`` refuses ``rstep_map`` over its absorbed reductions, or ``None``.
 
     ``ordered_nodes`` and ``red_tokens`` are those of ``scheduled_reductions``;
     ``ancestors`` is ``reduction_ancestors(ordered_nodes)`` when the caller has it.
     """
     try:
-        _held_axis_tokens(ordered_nodes, rstep_map, red_tokens, ancestors)
+        _held_axis_tokens(ordered_nodes, rstep_map, red_tokens, ancestors, carried)
     except ScheduleRejected as refusal:
         return str(refusal)
     return None
@@ -929,10 +992,13 @@ def _pin_absorbed_reduction_axes(flat_graph, rstep_map, tile_map, itile_map):
     axis: its loop would have to advance an axis that has to stay whole.
     """
     axes = _scheduled_axes(flat_graph)
-    if not absorbed_reductions(axes.nodes, rstep_map, axes.ancestors):
+    _refuse_carried_out_of_step(axes.nodes, rstep_map, axes.carried)
+    if not absorbed_reductions(axes.nodes, rstep_map, axes.ancestors, axes.carried):
         return itile_map
 
-    pinned = _held_axis_tokens(axes.nodes, rstep_map, axes.red_tokens, axes.ancestors)
+    pinned = _held_axis_tokens(
+        axes.nodes, rstep_map, axes.red_tokens, axes.ancestors, axes.carried
+    )
 
     itile_map = dict(itile_map)
     for (node, out_id), dim_tokens in axes.out_tokens.items():
@@ -1850,6 +1916,13 @@ def apply_tiling(cand: List) -> List[Graph]:
         for gnode in graphs["main"].nodes:
             if isinstance(gnode, GraphNode) and gnode.graph.accumulation:
                 gnode.graph.invariant_nodes = loop_invariant_nodes(gnode.graph)
+    if any(getattr(n, "streaming", None) is not None for n in ordered_nodes):
+        # A carried full-extent value leaves its loop as an accumulator (it may be read
+        # outside: the max a split partial returns), so it is registered before the
+        # checks and the walk below look at what leaves a loop.
+        from .streaming import carry_early
+
+        carry_early(graphs["main"], cand.rstep_map)
     # Every merge is done, the inter outputs' included: a loop's readers are all in it.
     _refuse_per_iteration_values_read_outside(graphs["main"])
     _refuse_loops_that_miscount_their_tiles(graphs["main"])
@@ -1980,4 +2053,11 @@ def apply_tiling(cand: List) -> List[Graph]:
         from .stabilize import stabilize
 
         return stabilize(graphs["main"])
+    if any(getattr(n, "streaming", None) is not None for n in ordered_nodes):
+        # A full-extent value with a proven update rule (``schedule.streaming``): where its
+        # dim ended up looped, it becomes carried state and each accumulator under it gets
+        # its repair -- if the rule was derived for this candidate's flat graph.
+        from .streaming import assemble
+
+        return assemble(graphs["main"], cand.flat_graph)
     return graphs["main"]

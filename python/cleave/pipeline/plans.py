@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Sequence
 
 from ..core.errors import LoweringRejected, ScheduleRejected
+from ..ir.update_rule import searched_updates
 from .config import ScheduleConfig
 from .superopt import GraphSet, SearchedGraph
 
@@ -98,7 +99,70 @@ def lower(graph: SearchedGraph, split_factor: int | None = None) -> list:
     bundle = _lower_structure(graph, graph.structure, split_factor)
     if getattr(graph.program, "stabilize_requests", ()):
         bundle = _annotate_softmax(graph, bundle)
+    elif searched_updates() and not graph.is_split:
+        _derive_updates(graph, bundle[0])
     return bundle
+
+
+def _looped_symbol(graph: SearchedGraph, nodes, red_tokens, full: str):
+    """The symbolic dim of ``graph.structure`` that the reduction ``full`` runs over: read
+    off the reduction-axis provenance the scheduler pins by. Its tokens name the input
+    axes the dim comes from; lowering recorded which input of the structure each
+    placeholder is (``input_index``). None when the tokens do not name one symbol."""
+    node = next(n for n in nodes if n.name == full)
+    tokens = red_tokens[node][0]
+    placeholders = {id(e.src_node): e.src_node
+                    for n in nodes for e in n.inputs if e.src_node.is_placeholder()}
+    inputs = [op for op in graph.structure if op["op_type"] == "kn_input_op"]
+    symbols = set()
+    for node_id, _, dim in tokens:
+        index = getattr(placeholders.get(node_id), "input_index", None)
+        if index is None or index >= len(inputs):
+            return None
+        symbols.add(inputs[index]["output_tensors"][0]["dim"][dim])
+    return symbols.pop() if len(symbols) == 1 else None
+
+
+def _derive_updates(graph: SearchedGraph, ir) -> None:
+    """Give every streaming obstacle of a freshly lowered flat graph its proven update
+    rule, or the reason it has none.
+
+    The obstacles are the scheduler's own (``schedule.streaming.obstacles``, from the
+    reduction-axis provenance the policy pins by). For each one that can be streamed, the
+    rules are derived once per loop structure (``pipeline.update.derive``: references from
+    this very graph at small shapes, search, z3 proof, ranking) and written on the
+    full-extent node as a ``Streaming`` record. The policy lets a loop step under a max
+    only where it finds that record; without one the pin and the refusal stay.
+
+    ``ir.streaming_refusals`` (``["{full}: {reason}", ...]``) exists exactly when the graph
+    has an obstacle; ``ir.derivations`` holds the derivations that gave a record.
+    """
+    from ..schedule.streaming import obstacles
+    from ..schedule.tiling import reduction_ancestors, scheduled_reductions
+
+    try:
+        nodes, red = scheduled_reductions(ir)
+    except NotImplementedError:
+        return
+    found = obstacles(nodes, red, reduction_ancestors(nodes))
+    if not found:
+        return
+    from .update import derive, rebuilder
+
+    ir.streaming_refusals = []
+    for ob in found:
+        why = ob.refused
+        if not why and graph.symbol_map is None:
+            why = "this graph has no symbolic dims to re-instantiate it at small shapes"
+        if not why:
+            derivation = derive(ir, ob, rebuilder(graph), graph.symbol_map,
+                                looped=_looped_symbol(graph, nodes, red, ob.full))
+            why = derivation.refused
+            if not why:
+                next(n for n in ir.nodes if n.name == ob.full).streaming = derivation.record()
+                ir.derivations = getattr(ir, "derivations", []) + [derivation]
+        if why:
+            ir.streaming_refusals.append(f"{ob.full}: {why}")
 
 
 def _lower_structure(graph: SearchedGraph, structure, split_factor: int | None = None) -> list:
@@ -247,10 +311,12 @@ def _search(ir_graph, topk: int, force: bool, hints: dict | None,
 
     A graph with a marked softmax exp keeps only the tilings ``apply_tiling`` builds,
     stabilization included, decided before the top-k cut; the reasons of the others are
-    added to ``refused``. For any other graph nothing changes.
+    added to ``refused``. The same holds for a graph with a streaming obstacle, served or
+    not (``schedule.streaming.streaming_accept``). For any other graph nothing changes.
     """
     from ..schedule import search_tiling
     from ..schedule.stabilize import stabilize_accept
+    from ..schedule.streaming import streaming_accept
 
     kw = dict(hints or {})
     if kw:
@@ -259,6 +325,8 @@ def _search(ir_graph, topk: int, force: bool, hints: dict | None,
         if unknown:
             raise ScheduleRejected(f"search_tiling does not accept hints {unknown}")
     stable = stabilize_accept(ir_graph)
+    if stable is None:
+        stable = streaming_accept(ir_graph)
     if stable is not None:
         user = kw.get("accept")
         kw["accept"] = stable if user is None else (lambda cand: user(cand) and stable(cand))
@@ -289,6 +357,10 @@ def _schedule_once(graphs: GraphSet, config: ScheduleConfig, force: bool):
             return
         if not tiles:
             why = MAX_ROW_LIMIT if "max" in g.ops else "no tiling candidates"
+            unstreamed = getattr(ir, "streaming_refusals", None)
+            if unstreamed:  # why the max is not carried across a loop instead
+                why = ("a max needs its whole row in one block, and this row is longer; "
+                       "it is not carried across a loop: " + "; ".join(unstreamed))
             if reasons:  # every tiling was refused by the softmax filter: say why
                 why += f" ({sum(reasons.values())} refused: " + "; ".join(
                     f"{n}x {reason}" for reason, n in reasons.most_common()) + ")"

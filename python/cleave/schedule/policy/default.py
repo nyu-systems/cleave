@@ -20,9 +20,11 @@ from ...ir.ops.elementwise import BinaryElementwise
 from ..tiling import (
     absorbed_axis_conflict,
     absorbed_reductions,
+    carried_reductions,
     reduction_ancestors,
     scheduled_reductions,
 )
+from ..streaming import streamed
 
 import copy
 import numpy as np
@@ -79,14 +81,29 @@ class DefaultPolicy:
         # over the same HD. Tiling such a contraction axis below full extent makes
         # the fused RMSNorm see only a partial-HD slice per step -> numerically
         # wrong. Pin these axes to full extent so only correct schedules generate.
-        self._full_extent_reduction_axis_ids = {}
-        for (_anc, desc), axis_pairs in self.reduction_axis_overlap_pairs.items():
-            self._full_extent_reduction_axis_ids.setdefault(desc, set()).update(
-                desc_ax for (_anc_ax, desc_ax) in axis_pairs
-            )
+        #
         # Asked for every pair of reductions of every step map the search rates (see
         # _kernel_rstep_map); it does not depend on the steps, so it is built once.
         self._reduction_ancestors = reduction_ancestors(self.ordered_nodes)
+        # The exception to the pin is a *streaming obstacle* that is served
+        # (``schedule.streaming``): the ancestor is a running max over the very dim its
+        # descendants reduce, and it carries an update rule proven for each of them on
+        # this graph. The loop then advances the max with the sums and carries it; nothing
+        # is pinned, and the max steps with its descendants (one group). Empty for a
+        # graph without such a record, and for a policy built without its flat graph.
+        self.streamed = streamed(
+            self.ordered_nodes,
+            self.reduction_axis_provenance,
+            self._reduction_ancestors,
+            flat_graph,
+        )
+        self._full_extent_reduction_axis_ids = {}
+        for (_anc, desc), axis_pairs in self.reduction_axis_overlap_pairs.items():
+            if desc in self.streamed.get(_anc, ()):
+                continue
+            self._full_extent_reduction_axis_ids.setdefault(desc, set()).update(
+                desc_ax for (_anc_ax, desc_ax) in axis_pairs
+            )
         self.compatible_reduction_groups = self._get_compatible_reduction_groups()
         self.force_fusion = force_fusion
         self.flat_graph = flat_graph
@@ -669,6 +686,8 @@ class DefaultPolicy:
                     for desc_node in self.reduction_axis_overlap_descendants.get(
                         node, set()
                     ):
+                        if desc_node in self.streamed.get(node, ()):
+                            continue  # carried across the loop, not fused irregularly
                         desc_active_axes = active_desc_reduction_axes.get(desc_node)
                         if not desc_active_axes:
                             continue
@@ -943,7 +962,7 @@ class DefaultPolicy:
         ``rstep_map`` itself when nothing is absorbed.
         """
         absorbed = absorbed_reductions(
-            self.ordered_nodes, rstep_map, self._reduction_ancestors
+            self.ordered_nodes, rstep_map, self._reduction_ancestors, self.streamed
         )
         if not absorbed:
             return rstep_map
@@ -958,17 +977,23 @@ class DefaultPolicy:
         """Why ``apply_tiling`` would refuse ``rstep_map`` over an absorbed axis, or None."""
         if self._scheduled_reductions is None:
             scheduled = (self.ordered_nodes, self.reduction_axis_provenance)
+            carried = self.streamed
             if self.flat_graph is not None:
                 try:
                     # The provenance apply_tiling itself decides on (split views removed).
                     scheduled = scheduled_reductions(self.flat_graph)
+                    carried = carried_reductions(self.flat_graph)
                 except NotImplementedError:
                     # A split apply_tiling cannot take apart: it refuses every candidate
                     # of this graph for that reason, whatever is answered here.
                     pass
-            self._scheduled_reductions = (*scheduled, reduction_ancestors(scheduled[0]))
-        ordered_nodes, red_tokens, ancestors = self._scheduled_reductions
-        return absorbed_axis_conflict(ordered_nodes, rstep_map, red_tokens, ancestors)
+            self._scheduled_reductions = (
+                *scheduled, reduction_ancestors(scheduled[0]), carried
+            )
+        ordered_nodes, red_tokens, ancestors, carried = self._scheduled_reductions
+        return absorbed_axis_conflict(
+            ordered_nodes, rstep_map, red_tokens, ancestors, carried
+        )
 
     def _rate_kernel(self, output_tile, kernel_rstep_map):
         """``_rate_steps`` of a kernel's own steps, rated once per search.
@@ -1560,6 +1585,12 @@ class DefaultPolicy:
         }
 
         def are_compatible(node1, node2):
+            # 0. a carried full-extent value steps with the reductions that loop under it
+            if node2 in self.streamed.get(node1, ()) or node1 in self.streamed.get(
+                node2, ()
+            ):
+                return True
+
             # 1. intersecting ancestor path
             if not memo_ancestors[node1].intersection(memo_ancestors[node2]):
                 return False
