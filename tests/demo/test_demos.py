@@ -16,7 +16,7 @@ import pytest
 import cleave.examples as examples
 from cleave.runtime.validate import Tolerance
 
-from .._measure_tolerances import MEASURED, expected_tolerance
+from .._measure_tolerances import MEASURED, expected_declaration
 from .._tolerances import CEILING
 from ..frontend.test_trace_equivalence import normalized, spy
 from ._snapshot import SNAPSHOT, record, updating
@@ -92,12 +92,16 @@ def test_every_demo_has_a_case():
 
 
 def _assert_declared(config, name):
-    """One measured bound for the operator, within the ceiling; normal inputs only."""
+    """One measured bound for the operator (or one per output), within the ceiling; normal
+    inputs only."""
     tolerance = config.tolerance
-    assert isinstance(tolerance, Tolerance), "the demo declares no tolerance"
-    assert 0 < tolerance.rtol <= CEILING and tolerance.atol == 0
-    # ... and exactly the one the rule gives for the pinned measurement of this demo
-    assert tolerance == expected_tolerance(json.loads(MEASURED.read_text())[f"demo:{name}"])
+    per_output = (tolerance,) if isinstance(tolerance, Tolerance) else tolerance
+    assert isinstance(per_output, tuple) and per_output, "the demo declares no tolerance"
+    for t in per_output:
+        assert isinstance(t, Tolerance) and 0 < t.rtol <= CEILING and t.atol == 0
+    # ... and exactly the one(s) the rule gives for the pinned measurement of this demo
+    outputs = json.loads(MEASURED.read_text())[f"demo:{name}"]
+    assert tolerance == expected_declaration(tolerance, outputs)
     # the adversarial input distributions exist but are not switched on for any operator yet
     assert config.distributions == ("normal",)
 

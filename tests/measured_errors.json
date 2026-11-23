@@ -443,6 +443,16 @@
    "validated": 57
   }
  ],
+ "test:lse_attention": [
+  {
+   "abs": 0.001953125,
+   "absolute": false,
+   "dtype": "float16",
+   "rel": 0.0009708738070912659,
+   "seeds": 3,
+   "validated": 15
+  }
+ ],
  "test:matmul": [
   {
    "abs": 0.03125,

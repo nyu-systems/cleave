@@ -20,6 +20,7 @@ from cleave.runtime.validate import Tolerance, compare_outputs
 from tests._measure_tolerances import (
     ATOL_FLOOR,
     MEASURED,
+    expected_declaration,
     expected_tolerance,
     expected_tolerances,
     recommend,
@@ -32,10 +33,14 @@ PINNED = json.loads(MEASURED.read_text())
 
 def test_declared_tolerances_are_row_relative_bounds_within_the_ceiling():
     assert (CEILING, FP32_CEILING) == (5e-2, 2e-5)
-    for name, tolerance in TOLERANCES.items():
-        assert isinstance(tolerance, Tolerance), name
-        # fp16 outputs: relative to the row, no absolute slack, never the old 0.5
-        assert 1e-3 <= tolerance.rtol <= CEILING and tolerance.atol == 0, name
+    for name, declared in TOLERANCES.items():
+        # one bound for every output, or a tuple of one per output
+        per_output = (declared,) if isinstance(declared, Tolerance) else declared
+        assert isinstance(per_output, tuple) and per_output, name
+        for tolerance in per_output:
+            assert isinstance(tolerance, Tolerance), name
+            # fp16 outputs: relative to the row, no absolute slack, never the old 0.5
+            assert 1e-3 <= tolerance.rtol <= CEILING and tolerance.atol == 0, name
     for name, operator in OPERATORS.items():
         out, lse = operator.tolerance
         assert 0 < out.rtol <= CEILING and out.atol == 0, name
@@ -56,7 +61,7 @@ def test_every_declared_tolerance_follows_from_the_pinned_measurement():
         if outputs is None:
             unmeasured.add(name)
         else:
-            assert tolerance == expected_tolerance(outputs), name
+            assert tolerance == expected_declaration(tolerance, outputs), name
     # No kernel of this operator validates (its tests are deselected), so there is nothing
     # to measure: it declares the floor, one fp16 ulp of the row max.
     assert unmeasured == {"rmsnorm_matmul_split_combine_graph"}
@@ -150,3 +155,14 @@ def test_the_rule_that_turns_a_measured_error_into_a_tolerance():
     # An output with an absolute part gets the fixed floor; its measured part is the rtol.
     lse = [dict(dtype="float32", rel=5.7e-7, absolute=True)]
     assert expected_tolerances(lse) == [Tolerance(rtol=5e-6, atol=1e-6)]
+
+
+def test_an_operator_may_declare_one_bound_per_output():
+    """A tuple declaration is held output by output; a single one to the loosest output."""
+    dq_dk_dv = [dict(dtype="float16", rel=r, absolute=False) for r in (1.3e-3, 9e-4, 3e-4)]
+    loose = Tolerance(rtol=5e-3)
+    assert expected_declaration(Tolerance(rtol=1e-2), dq_dk_dv) == Tolerance(rtol=1e-2)
+    assert expected_declaration((loose,) * 3, dq_dk_dv) == (
+        Tolerance(rtol=1e-2), Tolerance(rtol=5e-3), Tolerance(rtol=2e-3))
+    with pytest.raises(AssertionError):  # an output no valid kernel was measured on
+        expected_declaration((loose,) * 3, dq_dk_dv[:2] + [dict(dq_dk_dv[2], rel=None)])

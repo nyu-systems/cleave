@@ -102,6 +102,7 @@ GPU_TESTS = [
     "tests/schedule/end2end", "tests/graph/apply_tiling", "tests/graph/handwritten",
     "tests/reference", "tests/runtime/test_run_candidates.py", "tests/pipeline_api/test_e2e.py",
     "tests/frontend/test_exact_softmax.py", "tests/frontend_dynamic/test_paged_pipeline.py",
+    "tests/pipeline_api/test_declared_validation.py",
 ]
 
 
@@ -152,6 +153,17 @@ def expected_tolerance(outputs) -> Tolerance:
     rtols = [t.rtol for t in expected_tolerances(outputs) if t is not None]
     assert rtols and not any(o["absolute"] for o in outputs), outputs
     return Tolerance(rtol=max(rtols))
+
+
+def expected_declaration(declared, outputs):
+    """What ``declared`` must equal for an operator measured as ``outputs``: one
+    ``Tolerance`` for every output (``expected_tolerance``), or, when it declares a sequence,
+    one per output (``expected_tolerances``; every output must have been measured)."""
+    if isinstance(declared, Tolerance):
+        return expected_tolerance(outputs)
+    per_output = expected_tolerances(outputs)
+    assert None not in per_output, outputs
+    return tuple(per_output)
 
 
 # ----------------------------------------------------------------------------- running
@@ -247,6 +259,8 @@ def _test_operators():
             return "matmul"
         if path == "tests/frontend/test_exact_softmax.py":
             return "softmax" if "standalone" in test else "exact_attention"
+        if path == "tests/pipeline_api/test_declared_validation.py":
+            return "lse_attention"
         return node
 
     return operator
@@ -265,7 +279,8 @@ def load(out: Path) -> dict:
                 node = context.rpartition(" (")[0]
                 if not node.startswith("tests/") or "test_compare_outputs" in node \
                         or node.startswith("tests/test_runtime_tolerance.py") \
-                        or "threaded_into_workers" in node:
+                        or "threaded_into_workers" in node \
+                        or "test_noise_where_an_input_is_declared" in node:
                     continue  # comparator unit tests and deliberate failures
                 context = "test:" + operator_of(node)
                 context = context.replace("test:dynamic:", "dynamic:")
