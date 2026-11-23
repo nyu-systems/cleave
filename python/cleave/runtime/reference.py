@@ -357,7 +357,8 @@ def declared_inputs_hook(program, input_names, graph):
     that recomputes every declared input with ``program.derive_inputs`` from the drawn values
     of the inputs it reads, so a kernel is validated (and timed) on, say, a real
     log-sum-exp rather than noise. ``input_names`` is the placeholder of each Program input
-    (``Plan.inputs``); the inputs are matched by that name, never by position.
+    (``Plan.inputs``; ``None`` for an input the graph does not read); the inputs are matched
+    by that name, never by position.
     """
     from ..core.errors import SpecError
 
@@ -371,20 +372,30 @@ def declared_inputs_hook(program, input_names, graph):
             "its declared inputs cannot be derived for validation"
         )
     order = [ph.name for ph in placeholder_order(graph)]
-    if len(input_names) != len(specs) or len(set(input_names)) != len(specs) \
-            or not set(input_names) <= set(order):
+    read = [n for n in input_names if n is not None]
+    if len(input_names) != len(specs) or len(set(read)) != len(read) \
+            or not set(read) <= set(order):
         raise SpecError(
             f"{name}: placeholders {tuple(input_names)} do not name one kernel input per "
             f"Program input ({len(specs)}) among {tuple(order)}"
         )
-    positions = [order.index(n) for n in input_names]
+    positions = [None if n is None else order.index(n) for n in input_names]
+    for i, s in zip(positions, specs):
+        unread = [specs[j].name for j in (s.over if s.declaration is not None else ())
+                  if positions[j] is None]
+        if i is not None and unread:
+            raise SpecError(
+                f"{name}: declared input {s.name!r} is read by the kernel but derives from "
+                f"{tuple(unread)}, which the kernel does not read"
+            )
 
     def derive(inputs):
         inputs = list(inputs)
-        values = [inputs[i].reshape(s.shape) for i, s in zip(positions, specs)]
+        values = [None if i is None else inputs[i].reshape(s.shape)
+                  for i, s in zip(positions, specs)]
         derived = program.derive_inputs(values)
         for i, s, x in zip(positions, specs, derived):
-            if s.declaration is None:
+            if s.declaration is None or i is None:
                 continue
             drawn = inputs[i]
             if x.dtype != drawn.dtype:

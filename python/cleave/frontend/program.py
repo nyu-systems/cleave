@@ -431,13 +431,17 @@ class Program:
     def derive_inputs(self, values) -> list:
         """``values`` (one per input; declared positions may be ``None``) with every declared
         input (re)computed, in order, from the inputs it reads: fp32 compute, cast straight to
-        the declared dtype, on the device of its first source."""
+        the declared dtype, on the device of its first source. A declared input that reads a
+        ``None`` value (an input a kernel does not read) stays ``None``."""
         values = list(values)
         if len(values) != len(self.inputs):
             raise TypeError(f"{self.name}: expected {len(self.inputs)} inputs, got {len(values)}")
         for i, s in enumerate(self.inputs):
             if s.declaration is not None:
                 srcs = [values[j] for j in s.over]
+                if any(x is None for x in srcs):
+                    values[i] = None
+                    continue
                 (x,) = s.declaration._evaluate(s.declaration._bind(srcs, {}))
                 values[i] = x.to(dtype=s.dtype.torch, device=srcs[0].device)
         return values

@@ -170,3 +170,38 @@ def test_build_publishes_the_reference_with_the_plans_derivation(plans):
         ((args, kwargs),) = calls
         assert args == ("dir", graph, DTYPE) and kwargs["distributions"] == ("normal",)
         assert (kwargs["derive"] is not None) == declared
+
+
+def test_inputs_the_kernel_does_not_read_are_not_derived(tmp_path, monkeypatch):
+    """dV of attention reads neither v nor o (o declared ``equals=``; its binding is None):
+    the hook still derives the log-sum-exp L, whose kernel placeholder is [H, SQ] while the
+    Program input is [H, SQ, 1]."""
+    monkeypatch.setenv("CLEAVE_CACHE_ROOT", str(tmp_path))
+    c = 64 ** -0.5
+
+    def lse(q, k):
+        s = q @ k.mT * c
+        m = cl.max(s, -1, keepdim=True)
+        return m + cl.log(cl.sum(cl.exp(s - m), -1, keepdim=True))
+
+    p = Program("dv_unread_o")
+    H, SQ, SKV, D = p.dims(H=2, SQ=128, SKV=128, D=64)
+    q, k, dO = p.input("q", (H, SQ, D)), p.input("k", (H, SKV, D)), p.input("dO", (H, SQ, D))
+    L = p.input("L", (H, SQ, 1), cl.f32, sample=lse)
+    p.input("o", (H, SQ, D), equals=lambda q, k, dO, L: cl.exp(q @ k.mT * c - L) @ dO)
+    p.output((cl.exp(q @ k.mT * c - L)).mT @ dO, "dv")
+    plan = P.schedule(P.GraphSet.identity(p), P.ScheduleConfig(topk=1))[0]
+    assert plan.inputs[-1] is None
+    graph = plan.tile.flat_graph
+    derive = derive_for(plan, graph)
+    got = _by_name_read(plan, rt.make_inputs(graph, DTYPE, device="cpu", derive=derive))
+    assert got["L"].shape == (2, 128)
+    want = torch.logsumexp(got["q"].float() @ got["k"].float().mT * c, -1)
+    torch.testing.assert_close(got["L"], want, rtol=1e-5, atol=1e-5)
+
+
+def _by_name_read(plan, tensors):
+    graph = plan.tile.flat_graph
+    position = {ph.name: i for i, ph in enumerate(rt.placeholder_order(graph))}
+    return {s.name: tensors[position[ph]] for s, ph in zip(plan.program.inputs, plan.inputs)
+            if ph is not None}
