@@ -31,9 +31,11 @@ def _infer_broadcast_index(dims: Tuple[int, ...], other_shape: Tuple[int, ...]) 
         return -1
     batch_dims = dims[:-2]
     m_dim, n_dim = dims[-2], dims[-1]
-    if tuple(other_shape) == tuple(batch_dims + (m_dim,)):
+    # B is a row vector ``[..., M]`` / ``[..., M, 1]`` or a column vector ``[..., N]`` /
+    # ``[..., 1, N]`` (a keepdim input such as a log-sum-exp keeps its unit axis).
+    if tuple(other_shape) in (batch_dims + (m_dim,), batch_dims + (m_dim, 1)):
         return 0
-    if tuple(other_shape) == tuple(batch_dims + (n_dim,)):
+    if tuple(other_shape) in (batch_dims + (n_dim,), batch_dims + (1, n_dim)):
         return 1
     return -1
 
