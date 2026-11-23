@@ -4,6 +4,8 @@
 
 #include <cassert>
 #include <numeric>
+#include <stdexcept>
+#include <string>
 
 namespace cleave_superoptimizer {
 namespace symbolic {
@@ -36,6 +38,19 @@ DimensionGrouper::DimensionGrouper(
 
 void DimensionGrouper::touch(DimensionID d) {
   (void)find(d);
+}
+
+void DimensionGrouper::group_alone(DimensionID d, int extent) {
+  // Nothing is inserted for a dimension that already has a group, so a graph
+  // whose input dims all have one is grouped, and numbered, as without this.
+  if (parent.count(d) != 0) {
+    return;
+  }
+  if (extent == 1) {
+    mark_broadcast(d);
+  } else {
+    touch(d);
+  }
 }
 
 void DimensionGrouper::merge(DimensionID d1, DimensionID d2) {
@@ -244,9 +259,15 @@ DimensionSymbolizer::DimensionSymbolizer(
 }
 
 int DimensionSymbolizer::get_symbol(DimensionID dim) const {
-  // First check if dimension is directly in the symbol map
   auto it = symbol_map.find(dim);
-  assert(it != symbol_map.end() && "Dimension not found in symbol map");
+  if (it == symbol_map.end()) {
+    // A dimension the grouping never saw. Thrown, not asserted: the Python
+    // binding turns it into an exception instead of the process aborting.
+    throw std::logic_error("symbolic graph: dim " +
+                           std::to_string(dim.dim_idx) + " of tensor " +
+                           std::to_string(dim.tensor_guid) +
+                           " has no symbol (no grouping rule saw it)");
+  }
   return it->second;
 }
 
