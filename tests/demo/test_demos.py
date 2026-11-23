@@ -336,6 +336,39 @@ def test_qknorm_says_which_inputs_its_kernels_are_validated_on():
     assert tuple(cases) == ("normal",) and "not read from an input" in note
 
 
+def test_search_qknorm_builds_no_split_and_its_docstring_quotes_why(monkeypatch, tmp_path):
+    """demo/qknorm.py parses ``--split SKV`` and runs unsplit; its docstring quotes the
+    reason no pair is built from the loop state. That is the refusal its graphs get: the
+    flash form normalizes the queries on the way to the loop state from no split input
+    (P2), the traced order carries no update over the keys (P1, with its two-pass reason).
+    (Small shapes; the real search, no GPU.)"""
+    from cleave import pipeline as P
+    from cleave.core.errors import LoweringRejected
+    from cleave.pipeline.plans import NO_PROVEN_UPDATE, lower
+
+    p2 = "kn_mul_op on the way to the loop state reads no split input"
+    doc = " ".join((DEMO / "qknorm.py").read_text().split('"""')[1].split())
+    assert f'no pair is built ("{p2}")' in doc
+    monkeypatch.setenv("CLEAVE_CACHE_ROOT", str(tmp_path))
+    monkeypatch.syspath_prepend(str(DEMO))
+    qknorm = runpy.run_path(str(DEMO / "qknorm.py"), run_name="_demo")["qknorm"]
+    program = qknorm.trace(HQ=4, HKV=2, SQ=16, SKV=64, D=32)
+    graphs = P.superoptimize(program, P.SuperoptConfig(split=("SKV",)))
+    assert graphs.state_split == ("SKV",) and len(graphs) == 2
+    why = {}
+    for graph in graphs:
+        assert not graph.is_split
+        with pytest.raises(LoweringRejected) as info:
+            lower(graph, 4)
+        why[graph.summary().rpartition(">exp>sum>")[2]] = (graph.index, str(info.value))
+    assert sorted(why) == ["div>matmul", "matmul>div"]
+    flash, text = why["matmul>div"]
+    assert text == f"graph {flash}: split over SKV: {p2}"
+    traced, text = why["div>matmul"]
+    assert text.startswith(f"graph {traced}: split over SKV: {NO_PROVEN_UPDATE}: reduce_max_")
+    assert "a finished reduction over the dim" in text and "two passes over the row" in text
+
+
 def test_demo_cli_overrides(monkeypatch):
     seen = run_demo(monkeypatch, "mha_decode", ["--SKV", "2048", "--preset", "fast", "--topk", "20",
                                                 "--split", "SKV:8", "--max-ops", "15"])
