@@ -32,6 +32,10 @@ E11 = ("no proven update of {acc} of the form 'accumulator * factor + tile' with
        "ops ({matched} matched the references, {proved} proved)")
 E12 = "every proven update of {loops} is non-finite on an input case ({case})"
 E13 = "{type}: {message} (a bug in the update search)"
+# Not in DESIGN 4.3's list: what the proof takes as one free real per element must be the
+# same on every prefix of the loop.
+E14 = ("{node}, which {acc} reads, is computed from {other}, another reduction over the dim "
+       "{full} reduces: it changes from one prefix of the loop to the next")
 # The structural rule S5 of ``schedule.streaming.obstacles`` (its text T5), checked again
 # here: the contribution of one element is only read off a plain sum or matmul.
 T5 = ("{d} is a {cls}: the reductions that loop under {full} must be sums or matmuls that "

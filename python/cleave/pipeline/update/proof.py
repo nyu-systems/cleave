@@ -44,7 +44,7 @@ import time
 from dataclasses import dataclass, field
 from fractions import Fraction
 
-from .texts import E7, E8, E9, T5, Refused
+from .texts import E7, E8, E9, E14, T5, Refused
 
 TIMEOUT_MS = 5000
 OBLIGATIONS = ("(D) defined", "(0) accumulate form", "(i) one element",
@@ -146,6 +146,39 @@ def check_contribution(flat_graph, full: str, acc: str) -> None:
         both = sum(name in computed for name in operands) > 1
         if both and (node is acc_node or getattr(node, "broadcast", -1) != -1):
             raise Refused(E9.format(node=node.name, full=full))
+
+
+def check_leaves(flat_graph, full: str, acc: str) -> None:
+    """E14 unless every value the contribution of one element to ``acc`` reads as a free
+    real is the same on every prefix of the loop: computed from no other reduction over the
+    looped dim (a second softmax's max, in ``sum(pa * pb)``). The proof's free reals are
+    per-element constants; such a value is not, and the references then say so too, by
+    chance of the data. Read off the provenance the scheduler pins by."""
+    from ...schedule.tiling import scheduled_reductions
+
+    nodes, red = scheduled_reductions(flat_graph)
+    scheduled = {n.name: n for n in nodes}
+    tokens = set()  # the looped dim, as every input that carries it into the loop names it
+    for name in (full, acc):
+        node = scheduled.get(name)
+        if node in red and red[node]:
+            tokens |= set(red[node][0])
+    looping = {n.name for n in nodes if n in red and n.name not in (full, acc)
+               and any(set(t) & tokens for t in red[n] if t)}
+    if not looping:
+        return
+    _, leaves = contribution(flat_graph, full, acc)
+    by_name = {n.name: n for n in flat_graph.nodes}
+    for leaf in sorted(leaves):
+        stack, seen = [by_name[leaf]], set()
+        while stack:
+            n = stack.pop()
+            if n.name in looping:
+                raise Refused(E14.format(node=leaf, acc=acc, other=n.name, full=full))
+            for e in n.inputs:
+                if e.src_node.name not in seen:
+                    seen.add(e.src_node.name)
+                    stack.append(e.src_node)
 
 
 def contribution(flat_graph, full: str, acc: str):

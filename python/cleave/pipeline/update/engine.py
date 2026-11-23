@@ -121,9 +121,11 @@ def run(flat_graph, obstacle, recipe, *, key: str = "", budgets=BUDGETS, rank_ca
 def _run(d, flat_graph, recipe, budgets, rank_cases, combine):
     full, loops = d.full, d.loops
     t0 = time.perf_counter()
-    # ---- what the proof can read, before anything is built (E7, E8, E9, T5)
+    # ---- what the proof can read, before anything is built (T5, E7, E8, E9, E14)
     for acc in loops:
         proof_module.check_contribution(flat_graph, full, acc)
+    for acc in loops:
+        proof_module.check_leaves(flat_graph, full, acc)
     d.unary = unary_ops(flat_graph, full, loops)
 
     # ---- references (E1-E6, E10)
