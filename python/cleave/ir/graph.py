@@ -608,12 +608,9 @@ class PrimFuncNode(Node):
         targets = [t.name for t in self.args[read_idx_offset:]]
         shapes, _ = self.propagate(tile, rstep, targets)
         results = []
-        for i, arg in enumerate(self.args[read_idx_offset:]):
-            # should not exceed original shape
-            trimmed_shape = list(
-                map(min, zip(shapes[arg.name], self.input_buffers[i].shape))
-            )
-            results.append(trimmed_shape)
+        for arg in self.args[read_idx_offset:]:
+            # should not exceed the output's own shape
+            results.append(list(map(min, zip(shapes[arg.name], arg.shape))))
         return results
 
     def propagate_reduction_inputs(

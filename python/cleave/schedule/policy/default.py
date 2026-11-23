@@ -359,7 +359,9 @@ class DefaultPolicy:
 
         return normalized_shapes
 
-    def _propagate_inputs_from_output_rank_collapse(self, node, tile, rstep):
+    def _compress_tile_to_stage_rank(self, node, tile):
+        """``tile`` (in the node's output space) in its stage's spatial space, when the stage
+        fuses output dims (e.g. a batched matmul reindexed to one batch dim); else ``None``."""
         if len(node.output_buffers) == 0:
             return None
 
@@ -400,6 +402,12 @@ class DefaultPolicy:
             compressed_tile.append(grouped_tile)
 
         if logical_idx != len(output_shape):
+            return None
+        return compressed_tile
+
+    def _propagate_inputs_from_output_rank_collapse(self, node, tile, rstep):
+        compressed_tile = self._compress_tile_to_stage_rank(node, tile)
+        if compressed_tile is None:
             return None
 
         compensated = []
@@ -653,7 +661,11 @@ class DefaultPolicy:
             input_iter_shapes = self._propagate_inputs_full_rank(
                 node, itile, rstep=rstep_map[node]
             )
-            output_shapes = node.propagate_outputs(tile)
+            # the tile is in the node's output space; a stage that fuses output dims reads
+            # it in its own (fewer) dims
+            output_shapes = node.propagate_outputs(
+                self._compress_tile_to_stage_rank(node, tile) or tile
+            )
             for i, edge in enumerate(node.inputs):
                 op_tile_map[edge.src_node], op_itile_map[edge.src_node] = (
                     input_shapes[i],
