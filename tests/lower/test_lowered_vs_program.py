@@ -151,3 +151,105 @@ def test_validation_reference_of_the_plain_twin_is_finite_on_constant_rows():
     _, ir = _lowered(flash_twin, dict(HQ=32, HKV=32, SQ=64, SKV=256, D=64), cl.f16)
     _, reference, _ = build_inputs_and_reference(ir, "float16", device="cpu", distribution="constant")
     assert all(torch.isfinite(r).all() for r in reference)
+
+
+# ------------------------------------------- programs 1119's scale analysis refused, served
+#
+# With a request on a plain exp, 1119 proved at lowering that the shift of every exp
+# cancels, and refused a program where it did not (the square of the numerator, a Gram
+# matrix of the weights, a nonlinear op of them, ...). With the max in the graph there is
+# nothing to prove: such a program is an ordinary graph whose exp reads ``x - max(x)``, and
+# it is served where its rows fit one tile, like a softmax that is returned.
+
+
+def _weights_of(op):
+    def fn(x: cl.Tensor["R", "C"]):
+        e = stable_exp(x, -1)
+        return op(e) / cl.sum(e, -1, keepdim=True)
+    return fn
+
+
+def cube(x: cl.Tensor["R", "C"]):
+    e = stable_exp(x, -1)
+    return (e * e) / cl.sum(e, -1, keepdim=True)
+
+
+def squares(x: cl.Tensor["R", "C"]):
+    e = stable_exp(x, -1)
+    return (e * e) / cl.sum(e * e, -1, keepdim=True)
+
+
+def squares_first_axis(x: cl.Tensor["R", "C"]):
+    e = stable_exp(x, 0)
+    return (e * e) / cl.sum(e * e, 0, keepdim=True)
+
+
+def softmax_times_its_exp(x: cl.Tensor["R", "C"]):
+    e = stable_exp(x, -1)
+    return (e / cl.sum(e, -1, keepdim=True)) * e
+
+
+def gram(x: cl.Tensor["R", "C"]):
+    e = stable_exp(x, -1)
+    return e @ e.mT
+
+
+def different_axes(x: cl.Tensor["R", "C"], v: cl.Tensor["C", "R"], u: cl.Tensor["R", "C"]):
+    e = stable_exp(x, -1)
+    return (e @ v) * (u @ e.mT)
+
+
+def kv_side(q: cl.Tensor["HQ", "S", "D"], k: cl.Tensor["HKV", "S", "D"]):
+    return q @ stable_exp(k, -1).mT
+
+
+def add_tensor(x: cl.Tensor["R", "C"]):
+    e = stable_exp(x, -1)
+    return (e + x) / cl.sum(e, -1, keepdim=True)
+
+
+def sub_tensor(x: cl.Tensor["R", "C"]):
+    e = stable_exp(x, -1)
+    return (x - e) / cl.sum(e, -1, keepdim=True)
+
+
+RC, RC_TILE = dict(R=16, C=24), dict(R=64, C=256)
+# name: (fn, sizes, sizes at which a tile holds the rows (float16), inputs that hold logits)
+FORMERLY_REFUSED = {
+    "cube": (cube, RC, RC_TILE, {"x"}),
+    "squares": (squares, RC, RC_TILE, {"x"}),
+    "squares_first_axis": (squares_first_axis, RC, RC_TILE, {"x"}),
+    "softmax_times_its_exp": (softmax_times_its_exp, RC, RC_TILE, {"x"}),
+    "gram": (gram, RC, RC_TILE, {"x"}),
+    "different_axes": (different_axes, RC, RC_TILE, {"x"}),
+    "kv_side": (kv_side, dict(HQ=4, HKV=2, S=8, D=16), dict(HQ=4, HKV=2, S=64, D=64), {"k"}),
+    "add_constant": (_weights_of(lambda e: e + 1.0), RC, RC_TILE, {"x"}),
+    "add_tensor": (add_tensor, RC, RC_TILE, {"x"}),
+    "sub_tensor": (sub_tensor, RC, RC_TILE, {"x"}),
+    "silu": (_weights_of(cl.silu), RC, RC_TILE, {"x"}),
+    "sqrt": (_weights_of(cl.sqrt), RC, RC_TILE, {"x"}),
+    "exp": (_weights_of(cl.exp), RC, RC_TILE, {"x"}),
+}
+
+
+@pytest.mark.parametrize("scale", [1.0, 100.0], ids=["x1", "x100"])
+@pytest.mark.parametrize("name", FORMERLY_REFUSED)
+def test_a_program_the_scale_analysis_refused_is_the_program(name, scale):
+    fn, sizes, _, logits = FORMERLY_REFUSED[name]
+    prog, ir = _lowered(fn, sizes)
+    (exp,) = [n for n in ir.nodes if type(n) is Exp and softmax_axis(n) is not None]
+    inputs = _inputs(prog, logits, scale)
+    (got,) = run_lowered(ir, prog, inputs)
+    (want,) = prog.reference(*inputs)
+    assert torch.isfinite(want).all() and torch.isfinite(got).all()
+    torch.testing.assert_close(got.reshape(want.shape), want, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("name", FORMERLY_REFUSED)
+def test_a_program_the_scale_analysis_refused_has_plans_where_a_tile_holds_its_rows(name):
+    """At 64x256 in float16 (1119 refused each: "softmax cannot be stabilized: ...")."""
+    from cleave import pipeline as P
+
+    fn, _, sizes, _ = FORMERLY_REFUSED[name]
+    plans = P.schedule(GraphSet.identity(trace(fn, sizes, cl.f16)), P.ScheduleConfig(topk=4))
+    assert len(plans) >= 1, plans.summary()
