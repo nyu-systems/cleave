@@ -44,7 +44,15 @@ def dkdv_o(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"], v: cl.Te
     return (p * (dO @ v.mT - d) * C).mT @ q, p.mT @ dO
 
 
-PROGRAMS = {"dv": dv, "dq": dq, "dk": dk, "dkdv": dkdv, "dkdv_o": dkdv_o}
+def dq_o(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"], v: cl.Tensor["H", "SKV", "D"],
+         dO: cl.Tensor["H", "SQ", "D"], L: cl.Tensor["H", "SQ", 1, cl.f32],
+         o: cl.Tensor["H", "SQ", "D"]):
+    """dQ with D = sum_D(dO * o) computed in the loop body."""
+    d = (dO * o).sum(dim=-1, keepdim=True)
+    return (_p(q, k, L) * (dO @ v.mT - d) * C) @ k
+
+
+PROGRAMS = {"dv": dv, "dq": dq, "dk": dk, "dkdv": dkdv, "dkdv_o": dkdv_o, "dq_o": dq_o}
 
 
 def program(name, shapes=SMALL):

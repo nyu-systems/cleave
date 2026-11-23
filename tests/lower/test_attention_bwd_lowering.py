@@ -96,3 +96,21 @@ def test_shared_memory_estimate_counts_staging_buffers():
     plans = list(schedule(GraphSet.identity(program), ScheduleConfig(topk=40)))
     assert plans
     assert all(p.output_tile[1] < 512 for p in plans)
+
+
+def test_register_gemm_operand_feeding_a_row_sum_is_kept_shared():
+    # dQ with D = sum_D(dO * o): dO (loaded once per Q block) feeds dO @ v^T and the row sum.
+    # Held in registers it takes the gemm's A layout, which TileLang's ReduceOp cannot
+    # reduce over ("source index depends on a thread-owned reduce segment").
+    import tilelang
+    from tvm.target import Target
+
+    from cleave.runtime.compile import _load_main_kernel_from_code
+
+    plan = next(p for p in _plans("dq_o", topk=40)
+                if p.output_tile[1] == 128 and p.n_threads == 128)
+    code = build_candidate_code(plan.tile)
+    assert re.search(r"ukernel_mma_ssr_transB_clear\(PlaceHolder_input_\d+, ", code)
+    target = Target({"kind": "cuda", "arch": "sm_90"})
+    with target:
+        tilelang.lower(_load_main_kernel_from_code(code), target=target)

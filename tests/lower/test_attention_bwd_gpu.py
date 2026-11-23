@@ -18,7 +18,8 @@ from cleave.runtime.validate import Tolerance, compare_outputs  # noqa: E402
 from tests.lower import _attention_bwd as A  # noqa: E402
 
 TOL = Tolerance(rtol=1.5e-3)
-OUTPUTS = {"dv": ("dv",), "dq": ("dq",), "dk": ("dk",), "dkdv": ("dk", "dv"), "dkdv_o": ("dk", "dv")}
+OUTPUTS = {"dv": ("dv",), "dq": ("dq",), "dk": ("dk",), "dkdv": ("dk", "dv"), "dkdv_o": ("dk", "dv"),
+           "dq_o": ("dq",)}
 
 
 def _inputs(program):
@@ -38,11 +39,7 @@ def _inputs(program):
     return [env[spec.name] for spec in program.inputs], ref
 
 
-@pytest.mark.parametrize("name", sorted(OUTPUTS))
-def test_matches_autograd(name):
-    program = A.program(name)
-    plan = list(schedule(GraphSet.identity(program), ScheduleConfig(topk=1)))[0]
-    assert plan.n_threads == 128
+def _check(name, program, plan):
     built = BuiltKernel.from_plan(plan, build_candidate_code(plan.tile))
     stages, problem = stages_for([(plan, None, built)], program)
     assert problem is None
@@ -53,3 +50,20 @@ def test_matches_autograd(name):
     out = out if isinstance(out, tuple) else (out,)
     want = [ref[o] for o in OUTPUTS[name]]
     compare_outputs([a.reshape(w.shape) for a, w in zip(out, want)], want, TOL, what=name)
+
+
+@pytest.mark.parametrize("name", sorted(OUTPUTS))
+def test_matches_autograd(name):
+    program = A.program(name)
+    plan = list(schedule(GraphSet.identity(program), ScheduleConfig(topk=1)))[0]
+    assert plan.n_threads == 128
+    _check(name, program, plan)
+
+
+def test_in_graph_d_dq_with_register_do_matches_autograd():
+    # [1, 128, 64] x 128 threads: dO is loaded once per Q block and read by a gemm and the
+    # row sum (failed TileLang's ReduceOp lowering while dO was held in registers)
+    program = A.program("dq_o")
+    plan = next(p for p in schedule(GraphSet.identity(program), ScheduleConfig(topk=40))
+                if p.output_tile[1] == 128 and p.n_threads == 128)
+    _check("dq_o", program, plan)

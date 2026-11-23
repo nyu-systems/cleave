@@ -45,6 +45,24 @@ def _read_transposed_by_gemm(node) -> bool:
     return False
 
 
+def _feeds_reduction_outside(src, matmul, graph: Graph) -> bool:
+    """Does ``src`` reach a whole (not loop-accumulated) ReduceSum of ``graph`` through a
+    consumer other than ``matmul``, without passing through a gemm?"""
+    stack = [e.dst_node for e in src.outputs if e.dst_node is not matmul]
+    seen = set()
+    while stack:
+        n = stack.pop()
+        if id(n) in seen or n not in graph.nodes or isinstance(n, Matmul):
+            continue
+        seen.add(id(n))
+        if isinstance(n, ReduceSum):
+            if n not in graph.accum_nodes:
+                return True
+            continue
+        stack.extend(e.dst_node for e in n.outputs)
+    return False
+
+
 def annotate_tinfo(graph: Graph, is_main: bool = False) -> Graph:
     all_names = set([node.name for node in graph.nodes])
     assert len(all_names) == len(graph.nodes), "node names should be unique"
@@ -138,6 +156,18 @@ def annotate_tinfo(graph: Graph, is_main: bool = False) -> Graph:
                     node.stage_fragment_operands_in_shared = tuple(
                         sorted(set(node.stage_fragment_operands_in_shared) | transposed)
                     )
+                # An input held in registers for this gemm takes the gemm's operand layout;
+                # a row sum of it (``sum_D(dO * o)`` next to ``dO @ v^T``) must then reduce
+                # over that layout, which TileLang's ReduceOp cannot always lower
+                # ("source index depends on a thread-owned reduce segment"). Keep it shared.
+                for edge in node.inputs:
+                    src = edge.src_node
+                    if (
+                        isinstance(src, PlaceHolderNode)
+                        and graph.tinfo_map[src][1] == "r"
+                        and _feeds_reduction_outside(src, node, graph)
+                    ):
+                        graph.tinfo_map[src] = (graph.tinfo_map[src][0], "s")
         elif isinstance(node, ViewOpNode):
             src_tinfo = graph.tinfo_map[node.inputs[0].src_node]
             graph.tinfo_map[node] = (getname("v_" + node.name), src_tinfo[1])
