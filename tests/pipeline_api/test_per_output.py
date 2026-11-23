@@ -225,7 +225,8 @@ def test_an_unread_input_stays_an_input():
 
 
 def evaluate(graph, inputs):
-    """A merged structure, lowered and run by the runtime reference (fp32), on ``inputs``."""
+    """A merged structure, lowered and run by the runtime reference (fp32), on ``inputs``
+    (the Program's, in its order); one tensor per output (the kernel's shape)."""
     ir = to_ir(graph.structure, symbol_map=graph.symbol_map, dtype="float32",
                out_dtype="float32")
     names = bind_inputs(ir, graph)
@@ -242,3 +243,43 @@ def test_identity_merge_evaluates_to_the_reference():
     want = [y.float() for y in p._evaluate([t.float() for t in x])]
     for got, ref in zip(evaluate(g, x), want, strict=True):
         torch.testing.assert_close(got, ref, rtol=1e-4, atol=1e-5)
+
+
+# ------------------------------------------------------------------ a search, end to end (toy)
+
+
+def toy():
+    """P2's toy (P an input, o = P @ v declared). x = dP - delta, delta = sum_SKV(P dP),
+    dV = P^T dO. dV reads neither v nor o."""
+    p = Program("toy", cl.f16)
+    h, sq, skv, d = p.dims(H=4, SQ=128, SKV=256, D=64)
+    pm, v, dO = p.input("P", (h, sq, skv)), p.input("v", (h, skv, d)), p.input("dO", (h, sq, d))
+    p.input("o", (h, sq, d), equals=lambda P, v: P @ v)
+    dp = dO @ v.mT
+    delta = cl.sum(pm * dp, -1, keepdim=True)
+    p.output(dp - delta, "x")
+    p.output(delta, "delta")
+    p.output(pm.mT @ dO, "dV")
+    return p
+
+
+def test_toy_search_merges_per_output_graphs(monkeypatch, tmp_path):
+    monkeypatch.setenv("CLEAVE_CACHE_ROOT", str(tmp_path))
+    p = toy()
+    gs = P.superoptimize(p, P.SuperoptConfig(max_ops=8, threads=4))
+    assert [len(part) for part in gs.parts] == [1, 2, 1]
+    assert all(len(part.program.outputs) == 1 for part in gs.parts)
+    assert [g.parts for g in gs] == [(0, 0, 0), (0, 1, 0)]
+    # (0, 1, 0): delta's second graph is the one x computes: everything is shared
+    assert [g.ops for g in gs] == [["matmul", "mul", "sum", "sub", "matmul", "mul", "sum", "matmul"],
+                                   ["matmul", "mul", "sum", "sub", "matmul"]]
+    for g in gs:
+        assert sum(op["op_type"] == "kn_input_op" for op in g.structure) == len(p.inputs)
+        assert g.program is p and not g.is_split and g.symbol_map
+    x = p.random_inputs(seed=3, device="cpu")
+    want = [y.float() for y in p._evaluate([t.float() for t in x])]
+    for g in gs:
+        for got, ref in zip(evaluate(g, x), want, strict=True):
+            torch.testing.assert_close(got.reshape(ref.shape), ref, rtol=1e-4, atol=1e-4)
+    again = P.superoptimize(p, P.SuperoptConfig(max_ops=8, threads=4))
+    assert again.from_cache and [g.structure for g in again] == [g.structure for g in gs]
