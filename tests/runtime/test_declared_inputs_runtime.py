@@ -149,3 +149,24 @@ def test_a_combine_stage_draws_all_its_inputs(plans):
         role, program, inputs = "combine", plan.program, None
 
     assert derive_for(Combine, plan.tile.flat_graph) is None
+
+
+def test_build_publishes_the_reference_with_the_plans_derivation(plans):
+    """``build``'s reference_fn: ``publish_reference`` exactly as before (``derive=None``)
+    for a program without declarations, with the plan's hook for one with them."""
+    from cleave.pipeline.build import _publish_reference
+
+    for declared in (False, True):
+        _, plan = plans[declared]
+        graph = plan.tile.flat_graph
+        calls = []
+
+        def publish(*args, **kwargs):
+            calls.append((args, kwargs))
+            return 0, 0
+
+        assert _publish_reference(publish, ("normal",), {id(graph): plan}, "dir", graph,
+                                  DTYPE) == (0, 0)
+        ((args, kwargs),) = calls
+        assert args == ("dir", graph, DTYPE) and kwargs["distributions"] == ("normal",)
+        assert (kwargs["derive"] is not None) == declared
