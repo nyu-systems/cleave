@@ -1,9 +1,9 @@
-"""What the codegen refuses about stabilized exps and rolling state (CPU).
+"""What the codegen refuses about unassembled update rules and rolling state (CPU).
 
 One hand-built rolling tier (``tests/graph/_rolling_tier.py``) that passes, and one mutation
 of it per rule. Each mutation would otherwise emit a kernel that compiles and computes
-something else: a plain exp where a max was asked for, a snapshot taken after the update,
-a max that restarts every tile.
+something else: the max of one slice where a carried max was asked for, a snapshot taken
+after the update, a max that restarts every tile.
 """
 
 import pytest
@@ -14,10 +14,13 @@ pytest.importorskip("tvm")
 from cleave.codegen import TilelangCodeGen
 from cleave.ir.graph import Iterator
 from cleave.ir.graph_utils import edit_graph
-from cleave.ir.ops import Copy, Exp, Stabilize, wire_input
+from cleave.ir.ops import Copy, wire_input
+from cleave.ir.update_rule import Streaming
 from cleave.schedule.tiling import rebase_reduction_axis
 
 from tests.graph._rolling_tier import KV, ROWS, STEP, build_rolling_tier, schedule_rolling_tier
+
+FACTOR = ("exp", ("sub", "m", "m'"))
 
 
 def _tier(**kw):
@@ -39,23 +42,19 @@ def test_the_unmodified_tier_is_accepted():
     assert "ukernel_rescale_1dims_rr" in TilelangCodeGen().gen(_tier().main)
 
 
-# V1 ------------------------------------------------------------------------------------
-@pytest.mark.parametrize("where", ["loop", "main"])
-def test_an_exp_still_marked_for_stabilization_is_refused(where):
+# V1' -----------------------------------------------------------------------------------
+def test_a_carried_max_whose_update_rule_is_still_on_it_is_refused():
+    """The loop carries the max (an accumulator of its tier): a ``Streaming`` record still
+    on it means the assembly did not run, and the sums next to it would be relative to the
+    max of one slice. (Where the max's dim is whole in its tile the flat graph's max is
+    right as it stands: ``tests/update/test_foundation.py``.)"""
     t = _tier()
-    record = Stabilize(axes=(-1,), scaled=(("rowsum_0", 1),))
-    if where == "loop":
-        t.p.stabilize = record
-    else:  # an in-tile softmax that nothing rewrote
-        marked = Exp((64, STEP), name="exp_1", n_batch_dims=0)
-        marked.stabilize = record
-        with edit_graph(t.main):
-            wire_input(t.div, marked, 0)
-            wire_input(marked, t.out, 0)
-            t.main.nodes.insert(t.main.nodes.index(t.out), marked)
-            t.main.tmap[marked] = t.main.tmap[t.div]
-            t.main.tinfo_map[marked] = ("t_exp_1", "r")
-    _refused(t, "marked for stabilization but was not rewritten")
+    t.m.streaming = Streaming(("rowsum_0", "psum_0"),
+                              (("rowsum_0", FACTOR), ("psum_0", FACTOR)), "a key")
+    _refused(t, "'exp_0_max' has an update rule that was not assembled; emitting it as a "
+                "plain max would take the max of one slice")
+    t.m.streaming = None  # consumed, as ``streaming.assemble`` leaves it
+    assert "ukernel_rescale_1dims_rr" in TilelangCodeGen().gen(t.main)
 
 
 # V2 ------------------------------------------------------------------------------------

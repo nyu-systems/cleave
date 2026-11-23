@@ -299,19 +299,6 @@ def _unary(fn):
     return _compute(lambda node, args, out_dtype: fn(args[0].to(out_dtype)))
 
 
-def _eval_exp(node, x):
-    """``exp(x)``, or for an annotated softmax exp ``exp(x - max over its softmax axis)``.
-
-    The annotation says that a positive factor constant along that axis cancels in every
-    output of a solo graph, so this is the same function with a representable
-    intermediate. Per node: an Exp without the record is the plain ``exp``.
-    """
-    stabilize = getattr(node, "stabilize", None)
-    if stabilize is not None:
-        x = x - x.amax(dim=tuple(stabilize.axes), keepdim=True)
-    return x.exp()
-
-
 def _eval_permute(node, args):
     return args[0].to(torch_dtype(node.get_dtype(0))).permute(*node.perm).contiguous()
 
@@ -328,7 +315,8 @@ REFERENCES = {
     Sub: _compute(_eval_binary),
     Mul: _compute(_eval_binary),
     Div: _compute(_eval_binary),
-    Exp: _compute(lambda node, args, out_dtype: _eval_exp(node, args[0].to(out_dtype))),
+    # The plain exp: a softmax's stable value comes from the graph (ReduceMax, Sub, Exp).
+    Exp: _unary(lambda x: x.exp()),
     Silu: _unary(lambda x: x * x.sigmoid()),
     Sqrt: _unary(lambda x: x.sqrt()),
     RSqrt: _unary(lambda x: x.rsqrt()),

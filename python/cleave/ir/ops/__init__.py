@@ -22,7 +22,6 @@ from .elementwise import (
     RSqrt,
     Silu,
     Sqrt,
-    Stabilize,
     Sub,
 )
 from .gather import IndexGather, PagedGather, RangeGather, RowGather
@@ -41,7 +40,6 @@ __all__ = [
     "Accumulate",
     "AccumulateMax",
     "Rescale",
-    "Stabilize",
     "NEG_FLT_MAX",
     "Add",
     "Mul",

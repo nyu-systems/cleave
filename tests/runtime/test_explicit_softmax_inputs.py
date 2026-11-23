@@ -92,7 +92,6 @@ def key_softmax(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
 def test_softmax_axis_is_read_off_the_explicit_max(fn, sizes, axis):
     _, ir = _lowered(fn, sizes)
     (exp,) = _exps(ir)
-    assert getattr(exp, "stabilize", None) is None  # no record: the structure says it
     assert softmax_axis(exp) == axis
     (m,) = [n for n in ir.nodes if type(n) is ReduceMax]
     assert m.flat_axis - len(exp.get_shape(0)) == axis

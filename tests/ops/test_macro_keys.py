@@ -42,9 +42,9 @@ from cleave.ir.ops import (
     RSqrt,
     Silu,
     Sqrt,
-    Stabilize,
     Sub,
 )
+from cleave.ir.update_rule import Streaming
 from tests.graph.handwritten._cases import CASES
 
 
@@ -99,8 +99,8 @@ def _variants():
         yield cls((2, 16, 32), broadcast=0, n_batch_dims=0)
         yield cls((2, 16, 32), broadcast=0, n_batch_dims=0, name="other")
         yield cls((2, 16), broadcast=1, n_batch_dims=0)
-    marked = Exp((16, 32), name="marked")
-    marked.stabilize = Stabilize(axes=(-1,), scaled=(("rowsum", 1),))
+    marked = ReduceMax((16, 32), axis=-1, name="marked")
+    marked.streaming = Streaming(("rowsum",), (("rowsum", ("exp", ("sub", "m", "m'"))),), "k")
     yield marked
     for rank, lead in ((1, 1), (2, 1), (2, 1), (2, 2), (3, 1)):
         yield Rescale(rank, lead)
@@ -187,13 +187,14 @@ def test_rescale_is_emitted_for_register_operands():
 
 
 def test_annotations_are_not_part_of_the_macro_key():
-    """A `Stabilize` record and a per-instance `accum_init` change what is built around the
-    op, never the op's own macro: marked and plain share one name and one body."""
-    plain, marked = Exp((16, 32)), Exp((16, 32), name="marked")
-    marked.stabilize = Stabilize(axes=(-1,), scaled=(("rowsum", 1),), rolling="", export=None)
+    """A `Streaming` record (the update rule of a max) and a per-instance `accum_init` change
+    what is built around the op, never the op's own macro: marked and plain share one name
+    and one body."""
+    plain, marked = ReduceMax((16, 32)), ReduceMax((16, 32), name="marked")
+    marked.streaming = Streaming(("rowsum",), (("rowsum", ("exp", ("sub", "m", "m'"))),), "k")
     assert marked.macro_key() == plain.macro_key()
     assert _emit(marked, "rr", True) == _emit(plain, "rr", True) is not None
-    assert "stabilize" not in Exp._macro_attrs
+    assert "streaming" not in ReduceMax._macro_attrs
 
     carried = ReduceMax((16, 32), accum_init=NEG_FLT_MAX)
     assert carried.macro_key() == ReduceMax((16, 32)).macro_key()

@@ -212,7 +212,7 @@ class GraphValidator:
                 self._validate_graph(node.graph, is_main=False, seen=seen)
 
     def _validate_rolling_state(self, graph, where, is_main):
-        """Stabilized exps, lag snapshots, rescaled accumulators and carried maxima."""
+        """Unassembled update rules, lag snapshots, rescaled accumulators and carried maxima."""
         tmap = graph.tmap if isinstance(graph.tmap, dict) else {}
         in_graph = {id(n) for n in graph.nodes}
         accum = {id(n) for n in graph.accum_nodes}
@@ -223,15 +223,11 @@ class GraphValidator:
             return None if not isinstance(it, Iterator) else [t for t in it.tile_size if t != 1]
 
         for node in graph.nodes:
-            assert getattr(node, "stabilize", None) is None, (
-                f"{where}: {node.name!r} is marked for stabilization but was not rewritten; "
-                "emitting it as a plain exp would silently drop the max."
-            )
-            # The searched twin of the rule above: a full-extent value whose update rule
-            # (``node.streaming``) is still on it was not assembled. That is right where
-            # its dim is whole in the tile it is computed from, and wrong in a loop that
-            # carries it or steps its dim: without the lag copy and the repairs the sums
-            # next to it would be relative to the max of one slice.
+            # A full-extent value whose update rule (``node.streaming``) is still on it was
+            # not assembled. That is right where its dim is whole in the tile it is computed
+            # from, and wrong in a loop that carries it or steps its dim: without the lag
+            # copy and the repairs the sums next to it would be relative to the max of one
+            # slice.
             if is_main or getattr(node, "streaming", None) is None:
                 continue
             sliced = False

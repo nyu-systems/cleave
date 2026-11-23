@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import operator
-from dataclasses import dataclass
 
 import tvm
 from tvm import te
@@ -293,39 +292,8 @@ class Silu(UnaryElementwise):
     _te = lambda x: x * te.sigmoid(x)  # noqa: E731
 
 
-@dataclass(frozen=True)
-class Stabilize:
-    """Annotation of an ``Exp`` whose unknown positive scale provably cancels (a softmax).
-
-    The exp may then be evaluated as ``exp(x - max(x))`` without changing the graph's
-    outputs. Plain data only: it lives on the node, and ``Graph.clone`` copies node
-    attributes shallowly, so the record reaches the tiled clone as it is.
-
-    ``axes``     the softmax axis of the Exp -- exactly one -- counted from the END
-                 (``-1`` = last): a loop tier drops leading unit dims, so a front-relative
-                 index would not survive tiling. The shift is the max over it.
-    ``scaled``   ``(node name, degree)`` of every reduction / contraction that sums a
-                 scaled value over the softmax axis: the nodes whose accumulators carry
-                 the scale across loop iterations and are rescaled when the max moves.
-                 The degree is always 1.
-    ``rolling``  ``""`` when the softmax axis may be tiled by a loop (a rolling max);
-                 otherwise the reason it may not, and only tilings that hold the whole
-                 axis in one tile are served.
-    ``export``   name of the ``ReduceMax`` sibling that already computes the shift (a
-                 split partial exports it), to be reused instead of adding another.
-    """
-
-    axes: tuple
-    scaled: tuple = ()
-    rolling: str = ""
-    export: str | None = None
-
-
 class Exp(UnaryElementwise):
     kind, _te, _tl = "exp", te.exp, "T.exp({a})"
-    # None: a plain exp. Not a macro attribute: the macro body is `T.exp` either way, the
-    # shift is a separate node in front of it.
-    stabilize: Stabilize | None = None
 
 
 class RSqrt(UnaryElementwise):

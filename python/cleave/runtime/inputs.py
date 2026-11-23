@@ -39,10 +39,10 @@ validated on all of them (``ADVERSARIAL``, see ``cleave.pipeline.build``). A gra
 score matmul and no logit input has no logits to shape, and asking for an adversarial
 distribution on it is an error.
 
-In a graph whose softmax is exact (an ``Exp`` carries a ``Stabilize`` record) only the
-logits of the stabilized ``Exp`` nodes are shaped: a plain ``exp`` written next to a softmax
-makes no claim about large arguments, and its own matmul is left alone. Where a shaped input
-also feeds such a plain ``exp``, the graph has no adversarial case at all
+In a graph whose softmax is exact (an ``Exp`` reads ``x - max(x)``: :func:`softmax_axis`)
+only the logits of those stabilized ``Exp`` nodes are shaped: a plain ``exp`` written next
+to a softmax makes no claim about large arguments, and its own matmul is left alone. Where a
+shaped input also feeds such a plain ``exp``, the graph has no adversarial case at all
 (``why_not_adversarial`` says so): its reference would overflow, by the program's own
 definition.
 """
@@ -126,8 +126,8 @@ def _cases(graph) -> tuple:
     if not operands and not logits:
         return (), "its logits are neither the result of a score matmul nor an input"
     shaped = [p for pair in operands for p in pair] + logits
-    # Only where the softmax is exact: a graph without a record makes no claim at all, and
-    # the cases are simply what its inputs can be shaped into.
+    # Only where the softmax is exact: a graph without an exp behind its max makes no claim
+    # at all, and the cases are simply what its inputs can be shaped into.
     exact = any(_stabilized(n) for n in graph.nodes)
     plain = _plain_exp_fed_by(graph, shaped) if exact else None
     if plain is not None:
@@ -157,14 +157,11 @@ def softmax_axis(node):
     """The axis, counted from the end, that ``node`` is the exp of an exact softmax over,
     or None.
 
-    Either the record of the hand-derived pass (``Exp.stabilize``, with one axis), or a
-    structural fact: the exp reads ``x - max(x, axis)``, a ``Sub`` whose second operand is a
-    ``ReduceMax`` of its first. Its argument is then never positive, whatever the logits
-    are, which is the claim the adversarial cases test.
+    A structural fact: the exp reads ``x - max(x, axis)``, a ``Sub`` whose second operand is
+    a ``ReduceMax`` of its first (what ``cl.softmax`` records, and the same graph written by
+    hand). Its argument is then never positive, whatever the logits are, which is the claim
+    the adversarial cases test.
     """
-    record = getattr(node, "stabilize", None)
-    if record is not None:
-        return record.axes[0] if len(record.axes) == 1 else None
     if type(node) is not Exp:
         return None
     shift = _explicit_max(node.inputs[0].src_node)
@@ -186,16 +183,16 @@ def _explicit_max(node):
 
 
 def _logits_of(exp):
-    """The node an exact-softmax exp takes its logits from: what it reads, or the first
-    operand of the explicit ``x - max(x)``."""
+    """The node an exp takes its logits from: the first operand of its ``x - max(x)`` where
+    it is an exact softmax, else what it reads."""
     src = exp.inputs[0].src_node
-    if getattr(exp, "stabilize", None) is None and softmax_axis(exp) is not None:
+    if softmax_axis(exp) is not None:
         return next(e for e in src.inputs if e.dst_id == 0).src_node
     return src
 
 
 def _stabilized(node) -> bool:
-    return getattr(node, "stabilize", None) is not None or softmax_axis(node) is not None
+    return softmax_axis(node) is not None
 
 
 def _unshaped(graph, logits) -> list:
@@ -207,7 +204,7 @@ def _unshaped(graph, logits) -> list:
 
 
 def _plain_exp_fed_by(graph, placeholders):
-    """``(exp, placeholder)`` for an ``Exp`` without a record that is computed from one of
+    """``(exp, placeholder)`` for an ``Exp`` that is no exact softmax computed from one of
     ``placeholders``, else None. A stabilized ``Exp`` on the way is not crossed: what it
     returns is at most 1, whatever its logits are."""
     wanted = {id(p) for p in placeholders}
@@ -230,7 +227,7 @@ def _plain_exp_fed_by(graph, placeholders):
 def score_matmuls(graph) -> list:
     """The matmuls whose result reaches an ``Exp`` without crossing another matmul.
 
-    In a graph whose softmax is exact (some ``Exp`` carries a ``Stabilize`` record) only the
+    In a graph whose softmax is exact (some ``Exp`` reads ``x - max(x)``) only those
     stabilized ones count: the logits of a plain ``exp`` are not softmax logits.
     """
     stack = [n for n in graph.nodes if isinstance(n, Exp)]
@@ -241,20 +238,17 @@ def score_matmuls(graph) -> list:
 
 def key_operand(graph, matmul) -> int:
     """Which operand of a score matmul has the softmax axis for its rows: 1, the second
-    (attention over the keys), unless the stabilized ``Exp`` the scores feed says the
+    (attention over the keys), unless the exact-softmax ``Exp`` the scores feed says the
     softmax runs over the first operand's rows.
 
     The scores are ``(batch.., M, N)`` with ``M`` the rows of the first operand and ``N``
-    those of the second. The softmax axis is read off the ``Exp``'s record where the
-    ``Exp`` reads the scores through constant scalings only, which keep the axes in
-    place. Anywhere else -- no record, another op on the way, another shape -- it is
-    taken to be the last axis, as for a graph that makes no claim.
+    those of the second. The softmax axis is that of the max in ``exp(s - max(s))`` where
+    ``s`` is the scores through constant scalings only, which keep the axes in place.
+    Anywhere else -- a plain exp, another op on the way, another shape -- it is taken to be
+    the last axis, as for a graph that makes no claim.
     """
-    def by_axis(exp, recorded: bool):
-        """The operand the softmax axis of ``exp`` names; ``recorded``: whether the axis is
-        to come from the exp's record (it reads the scores) or from its structure."""
-        if recorded != (getattr(exp, "stabilize", None) is not None):
-            return 1
+    def by_axis(exp):
+        """The operand the softmax axis of ``exp`` names."""
         axis, rank = softmax_axis(exp), len(exp.get_shape(0))
         if axis is None or tuple(exp.get_shape(0)) != tuple(matmul.get_shape(0)):
             return 1
@@ -264,10 +258,10 @@ def key_operand(graph, matmul) -> int:
     while id(node) not in seen:
         seen.add(id(node))
         readers = [edge.dst_node for edge in node.outputs]
-        # The explicit form, ``exp(s - max(s))``: the max reads the scores next to the
-        # subtraction it feeds, which is one path, and the exp that reads the subtraction
-        # is a softmax by structure (``softmax_axis``), not by a record. Whoever else reads
-        # the max (a split partial returns it) does not move the axis it was taken over.
+        # ``exp(s - max(s))``: the max reads the scores next to the subtraction it feeds,
+        # which is one path, and the exp that reads the subtraction is a softmax by
+        # structure (``softmax_axis``). Whoever else reads the max (a split partial returns
+        # it) does not move the axis it was taken over.
         shifted = [r for r in readers if _explicit_max(r) is not None]
         if len(shifted) == 1 and all(
             r is shifted[0] or r is _explicit_max(shifted[0]) for r in readers
@@ -275,12 +269,12 @@ def key_operand(graph, matmul) -> int:
             exps = [edge.dst_node for edge in shifted[0].outputs]
             if len(exps) != 1 or type(exps[0]) is not Exp:
                 return 1
-            return by_axis(exps[0], recorded=False)
+            return by_axis(exps[0])
         if len(readers) != 1:
             return 1
         (node,) = readers
-        if type(node) is Exp:
-            return by_axis(node, recorded=True)
+        if type(node) is Exp:  # a plain exp of the scores makes no claim
+            return 1
         if not (type(node) in (Mul, Div) and node.const is not None
                 and not getattr(node, "const_on_left", False)):
             return 1
@@ -306,9 +300,9 @@ def logit_inputs(graph) -> list:
     """``(placeholder, softmax axis, sign)`` for every stabilized ``Exp`` whose logits are an
     input: it reads a placeholder, directly or through constant scalings (``sign`` is
     theirs) and views that only reindex it -- the partial of a program split over its
-    softmax axis reads its logits through the split. The softmax axis is the record's,
-    which only a stabilized ``Exp`` has (a plain ``exp(x)`` does not say what it is summed
-    over), given as the axis of the placeholder one step along it moves along.
+    softmax axis reads its logits through the split. The softmax axis is its max's, which
+    only a stabilized ``Exp`` has (a plain ``exp(x)`` does not say what it is summed over),
+    given as the axis of the placeholder one step along it moves along.
     """
     found = []
     for node in graph.nodes:

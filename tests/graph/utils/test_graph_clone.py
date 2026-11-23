@@ -7,8 +7,9 @@ import pytest
 pytest.importorskip("tilelang")
 
 from cleave.ir.graph import Graph, GraphNode, OutputNode, PlaceHolderNode
-from cleave.ir.ops import Exp, Matmul, Mul, ReduceSum, Stabilize, wire_input
+from cleave.ir.ops import Exp, Matmul, Mul, ReduceMax, ReduceSum, wire_input
 from cleave.ir.graph_utils import clone_graph, find_topo_sort, gather_all_nodes
+from cleave.ir.update_rule import Streaming
 from tests.graph._rolling_tier import build_rolling_tier, schedule_rolling_tier
 from tests.graph.handwritten._cases import CASES
 from tests.graph.handwritten._test_utils import gen_handwritten_code
@@ -100,25 +101,25 @@ def test_clone_remaps_lag_nodes_and_accum_scale():
     assert inner.accum_scale == {t.rowsum: t.alpha, t.psum: t.alpha}
 
 
-def test_clone_keeps_the_stabilize_record():
-    """The annotation is written on the flat graph and read on its tiled clone."""
-    exp = Exp((16, 32), name="exp_0")
-    rowsum = ReduceSum((16, 32), name="rowsum_0")
+def test_clone_keeps_the_streaming_record():
+    """The update rule of a max is written on the flat graph and read on its tiled clone."""
+    full = ReduceMax((16, 32), axis=-1, name="max_0")
+    other = ReduceMax((16,), axis=-1, name="max_1")
     plain = Exp((16,), name="exp_1", n_batch_dims=0)
-    wire_input(exp, rowsum, 0)
-    wire_input(rowsum, plain, 0)
-    graph = Graph(nodes=find_topo_sort(gather_all_nodes(OutputNode(plain, dtype="float32"))))
-    record = Stabilize(axes=(-1,), scaled=(("rowsum_0", 1),), rolling="why not", export="max_0")
-    exp.stabilize = record
+    wire_input(full, plain, 0)
+    wire_input(plain, other, 0)
+    graph = Graph(nodes=find_topo_sort(gather_all_nodes(OutputNode(other, dtype="float32"))))
+    record = Streaming(("rowsum_0",), (("rowsum_0", ("exp", ("sub", "m", "m'"))),), "a key")
+    full.streaming = record
 
     clone = graph.clone()
     by_name = {n.name: n for n in clone.nodes}
-    assert by_name["exp_0"] is not exp
-    assert by_name["exp_0"].stabilize == record
-    assert by_name["exp_1"].stabilize is None and Exp.stabilize is None
-    # Consuming the record on the clone (what the rewrite does) leaves the flat graph's.
-    by_name["exp_0"].stabilize = None
-    assert exp.stabilize == record
+    assert by_name["max_0"] is not full
+    assert by_name["max_0"].streaming == record
+    assert getattr(by_name["max_1"], "streaming", None) is None
+    # Consuming the record on the clone (what the assembly does) leaves the flat graph's.
+    by_name["max_0"].streaming = None
+    assert full.streaming == record
 
 
 @pytest.mark.parametrize("name", sorted(CASES))
