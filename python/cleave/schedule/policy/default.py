@@ -1263,18 +1263,25 @@ class DefaultPolicy:
                     ), "Node with no reduction axis in compatible reduction group"
                     dim_id = rdim_ids[node]
 
+                    def can_step(member, i):
+                        return (
+                            member in rdim_ids
+                            and i < len(rdim_ids[member])
+                            and rdim_ids[member][i] + 1 < len(steps[member])
+                        )
+
                     for i in reversed(range(len(dim_id))):
-                        if dim_id[i] + 1 < len(steps[node]):
+                        # The group steps while any member still can, each member that can
+                        # taking its next step: a group whose first member is already at
+                        # its extent still walks the others (the row max of
+                        # ``softmax(x, -1) * softmax(x, 0)``, grouped with the column max
+                        # because both read ``x``, held the column max at its first step).
+                        if any(can_step(member, i) for member in group):
                             new_rstep_map = rstep_map.copy()
 
                             for member in group:
-                                if member not in rdim_ids:
-                                    continue
-                                member_dim_id = rdim_ids[member]
-                                if (
-                                    i < len(member_dim_id)
-                                    and member_dim_id[i] + 1 < len(steps[member])
-                                ):
+                                if can_step(member, i):
+                                    member_dim_id = rdim_ids[member]
                                     new_rstep = new_rstep_map[member].copy()
                                     new_rstep[member.raxis[i].var.name] = steps[member][
                                         member_dim_id[i] + 1

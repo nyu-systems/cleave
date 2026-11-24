@@ -154,6 +154,28 @@ def test_search_where_a_softmax_next_to_an_exp_of_its_logits_has_plans():
     assert all(MAX_ROW_LIMIT in reason and two_passes in reason for reason in reasons), reasons
 
 
+def test_search_every_graph_of_two_softmaxes_has_its_whole_tile_plan():
+    """The row max (over C) and the column max (over R) both read ``x`` and feed neither
+    other, so the policy puts them, and both sums, into one group that steps in lockstep
+    (``DefaultPolicy._get_compatible_reduction_groups``, rule 2). The walk used to step a
+    group only while its first member could: where that was the row max, already at its
+    extent, the column max never left its first step, its loop was refused (a max is not
+    carried across a loop here), and 5 of the 12 searched graphs had no plan at all. Every
+    graph has the tiling that holds the whole tensor, with every reduction at its extent."""
+    prog = trace(dual_softmax, dict(R=16, C=32), cl.f16)
+    graphs = P.superoptimize(prog, SEARCH)
+    plans = P.schedule(graphs, P.ScheduleConfig(topk=100000))
+    assert (len(graphs), len(plans), len(plans.refused)) == (12, 33, 0), plans.summary()
+
+    def whole(plan):
+        return list(plan.tile.output_tile) == [16, 32] and all(
+            int(step) == int(ax.dom.extent)
+            for node, steps in plan.tile.rstep_map.items() for ax in node.raxis
+            for name, step in steps.items() if name == ax.var.name)
+
+    assert {p.graph_index for p in plans if whole(p)} == set(range(len(graphs)))
+
+
 def test_search_two_softmaxes_of_one_input_are_exact_at_large_logits():
     """Both softmaxes of the dual softmax carry their own max, each over its own axis: at
     x100 logits every lowered graph is finite and is the program, and its kernels are held

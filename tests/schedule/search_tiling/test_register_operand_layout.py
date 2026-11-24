@@ -56,8 +56,9 @@ def test_an_inter_output_gemm_is_judged_by_the_rows_of_one_iteration():
     every such tiling passed at 128 threads (1024 rows a warp: the steps of 32 rows, 8 a
     warp, failed to lower with ``Layout infer conflict``) and was let through at 256 threads
     as staged (codegen stages by the rows of the step, so none was, and all failed the same
-    way): 16 of the 36 tilings of demo/mha_backward. By the iteration's rows only steps of 64
-    rows at 128 threads remain, and every tiling that is proposed lowers."""
+    way): 16 of the 36 tilings of demo/mha_backward. By the iteration's rows, steps of 64
+    rows at 128 threads and of 128 rows (16 a warp at 256 threads) remain, and every tiling
+    that is proposed lowers."""
     from tests._lowering import lower_to_cuda
     from cleave.runtime.compile import build_candidate_code
     from tests.schedule.search_tiling import test_accumulation_contexts as AC
@@ -73,7 +74,9 @@ def test_an_inter_output_gemm_is_judged_by_the_rows_of_one_iteration():
          int(c.get_itile(dq)[-2]))
         for c in cands
     }
-    assert {r for r in rows if r[0].startswith("inter")} == {("inter,intra,intra", 128, 4096, 64)}
+    assert {r for r in rows if r[0].startswith("inter")} == {
+        ("inter,intra,intra", 128, 4096, 64), ("inter,intra,intra", 128, 4096, 128),
+        ("inter,intra,intra", 256, 4096, 128)}
     assert {(t, m) for acc, t, m, _ in rows if acc.startswith("intra")} == {
         (128, 64), (128, 128), (128, 256), (256, 128), (256, 256)}
     for acc in ("inter,intra,intra", "intra,inter,inter"):
