@@ -108,12 +108,14 @@ BY_ROLE = set(ATTENTION) - {"mla_decode", "mla_prefill", "qknorm"}
 def test_the_readme_says_which_attention_demos_have_no_split_run():
     """Every demo parses ``--split``, and the README lists it among the flags the demos
     share. Three attention demos have no split run; the README names them where it lists
-    the flag."""
+    the flag, next to the attention backward, which runs unsplit."""
     readme = (DEMO.parent / "README.md").read_text()
     (paragraph,) = [p for p in readme.split("\n\n") if p.startswith("`--split` is parsed by")]
     assert sorted(set(ATTENTION) - BY_ROLE) == ["mla_decode", "mla_prefill", "qknorm"]
     for name in ATTENTION:
         assert (f"`{name}.py`" in paragraph) == (name not in BY_ROLE), name
+    assert "`mha_backward.py` runs unsplit" in " ".join(paragraph.split())
+    assert "split=False," in (DEMO / "mha_backward.py").read_text()
 
 
 def _assert_declared(config, name):

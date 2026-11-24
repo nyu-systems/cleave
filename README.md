@@ -76,8 +76,9 @@ All demos share the same flags (`python demo/<name>.py --help`):
 | `staged.py` | the pipeline one stage at a time (research view) |
 
 `--split` is parsed by every demo, but not every demo has a split run: `mla_prefill.py` and
-`qknorm.py` declare a single tolerance and offer none (their docstrings say why), and
-`mla_decode.py` asks for none. The search does not split a graph whose max reduces the split
+`qknorm.py` declare a single tolerance and offer none (their docstrings say why),
+`mla_decode.py` asks for none, and `mha_backward.py` runs unsplit (a program searched one
+output at a time takes no split). The search does not split a graph whose max reduces the split
 dim (`--split SKV` of an attention demo); the split is built from the loop state of each solo
 graph instead: each partial returns the accumulators of its split and the max they are
 relative to, and the combine takes the max over the splits, repairs every partial by the
@@ -142,8 +143,9 @@ served wrongly):
   `SuperoptError` with that reason (as it does for any search that finds none, such as a
   `max_ops` below the program's own op count).
 
-A program with an input that no op reads is a `SpecError` in `superoptimize`: the search
-counts a tensor that nothing reads as an output, so none of its graphs could equal the program.
+A program with an input that no op reads is a `SpecError` in `superoptimize` (an `Equals`
+input aside: the search reads it through its definition): the search counts a tensor that
+nothing reads as an output, so none of its graphs could equal the program.
 So is a program that returns one of its inputs as it is: no op writes that output.
 
 `cl.softmax(x)` next to another `exp` of the same tensor is served under the limit of a
