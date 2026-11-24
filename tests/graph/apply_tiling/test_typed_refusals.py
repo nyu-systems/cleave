@@ -226,6 +226,18 @@ def test_grid_dim_without_one_launch_axis_is_a_typed_refusal():
     assert reasons == {
         "Expected exactly one launch-axis mapping for iter dim 0, got [0, 1].": {(64, 64)},
     }
+    # The dim held whole is still refused where such a tiling is built by hand: the policy's
+    # own rating of the (64, 128) block, with the steps of each candidate it proposes.
+    policy = _policy_of(ir)
+    for cand in cands:
+        rstep_map = {node: dict(steps) for node, steps in cand.rstep_map.items()}
+        by_hand = policy.compute_tile_dict([64, 128], rstep_map)
+        with pytest.raises(ScheduleRejected) as refusal:
+            apply_tiling(by_hand)
+        assert str(refusal.value) == (
+            "Dim 0 is held whole but launch axes [0, 1] index it and the grid walks [0]: one "
+            "tile cannot be a slice and the whole."
+        )
 
 
 def _raw_statistics_graph(BH, S_Q, S_KV, D):

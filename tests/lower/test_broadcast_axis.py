@@ -503,6 +503,15 @@ def row_input(x: cl.Tensor["R", "C"], y: cl.Tensor["ONE", "C"]):
     return x + y
 
 
+def column_computed(x: cl.Tensor["R", "C"], y: cl.Tensor["R", "ONE"]):
+    # column_input with a computed operand: only an input is read the way the op reads it
+    return x * (y * 2.0)
+
+
+def row_computed(x: cl.Tensor["R", "C"], y: cl.Tensor["ONE", "C"]):
+    return x + (y * 2.0)
+
+
 def total(x: cl.Tensor["R", "C"]):
     return x / cl.sum(cl.sum(x, -1, keepdim=True), 0, keepdim=True)
 
@@ -552,6 +561,16 @@ REFUSED = {
                       r"kn_div_op at index 3: the operand \(16, 24\) is broadcast along axis 0 of "
                       r"the first operand \(3, 16, 24\) \(dims \(3, 16, 24\) and \(1, 16, 24\)\)"
                       + RULE),
+    # A computed operand that keeps its unit axis, broadcast along it: an input of that shape
+    # is accepted (UNIT_AXES: column_input, row_input), a computed one is not.
+    "column_computed": (column_computed, SMALL,
+                        r"kn_mul_op at index 3: the operand \(4, 1\) is broadcast along axis 1 of "
+                        r"the first operand \(4, 6\), which reads an operand of shape \(4,\) there "
+                        r"\(dims \(4, 6\) and \(4, 1\)\)"),
+    "row_computed": (row_computed, SMALL,
+                     r"kn_add_op at index 3: the operand \(1, 6\) is broadcast along axis 0 of the "
+                     r"first operand \(4, 6\), which reads an operand of shape \(6,\) there "
+                     r"\(dims \(4, 6\) and \(1, 6\)\)"),
     "total": (total, dict(R=4, C=6),
               r"kn_div_op at index 3: the operand \(\) is broadcast along axes 0, 1 of the first "
               r"operand \(4, 6\) \(dims \(4, 6\) and \(1, 1\)\)" + RULE),

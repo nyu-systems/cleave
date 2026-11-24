@@ -153,3 +153,25 @@ def test_search_the_native_search_is_not_handed_a_program_with_an_unread_input(t
     native search is never handed it."""
     assert _run(NATIVE_CHILD, tmp_path) == dict(
         error="SpecError", message="f: input 'y' is not read by any output")
+
+
+NATIVE_UNREAD_CHILD = PRELUDE + """
+from cleave.frontend.program import Program
+
+
+def f(x: cl.Tensor["R", "C"], y: cl.Tensor["R", "C"]):
+    return cl.exp(x)
+
+
+Program._unread_inputs = lambda self: []  # past the frontend's refusal, on purpose
+symbolic, _ = csopt.create_symbolic_tile_graph(trace(f, dict(R=64, C=1024), cl.f16).to_tile_graph())
+config = symbolic.setup_search_config()
+config.max_num_kernel_graph_op = 13
+print("RESULT " + json.dumps(dict(graphs=len(symbolic.search_tile_graph("", False, False, config)))))
+"""
+
+
+def test_search_the_native_search_of_a_program_with_an_unread_input_finds_no_graph(tmp_path):
+    """Under both refusals: handed such a tile graph anyway, the native search itself does
+    not abort (the input's dims get symbols of their own) and finds no graph."""
+    assert _run(NATIVE_UNREAD_CHILD, tmp_path) == dict(graphs=0)

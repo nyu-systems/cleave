@@ -81,7 +81,9 @@ CASES = {
     "column_weighted": (X.column_weighted, dict(M=128, K=4096, N=256), (None,), 0,
                         [(NOT_LEADING, 34), (NOT_ITS_DIMS, 12)]),
     # (the tilings that read ``x`` with one tile per reader are not proposed:
-    # DefaultPolicy._reads_placeholder_unevenly; 26 and the 6 SLICE_AND_WHOLE ones were)
+    # DefaultPolicy._reads_placeholder_unevenly; 26 and the 6 SLICE_AND_WHOLE ones were,
+    # and such a block built by hand is still refused:
+    # test_a_block_that_holds_a_dim_whole_and_slices_it_is_refused)
     "self_weighted": (X.self_weighted, dict(K=4096, N=128), (None,), 0,
                       [(ONE_DIM_TWO_AXES, 8), (ALSO_ITS_TRAILING_DIM, 4)]),
     "max_normalized": (X.max_normalized, dict(R=256, C=4096, D=64),
@@ -269,6 +271,34 @@ def test_a_dim_that_is_both_the_rows_and_the_trailing_axis_is_refused(monkeypatc
             refusal.value
         looped += 1
     assert looped == 4
+
+
+def test_a_block_that_holds_a_dim_whole_and_slices_it_is_refused():
+    """``self_weighted`` reads ``x`` on both axes of its output, so a block of 64 rows and
+    128 columns would read ``x`` with one tile of 64 columns for one operand and the whole
+    128 for the other. The policy does not propose such a block
+    (``DefaultPolicy._reads_placeholder_unevenly``); built by hand from the policy's own
+    rating, with the steps of every candidate it does propose, the build refuses it, as it
+    did when the policy proposed it (6 of them), and never builds it."""
+    from cleave.arch import get_arch
+    from cleave.ir.graph import OutputNode
+    from cleave.schedule.policy.default import TCPolicy
+
+    ir = X.streamed_ir(X.self_weighted, dict(K=4096, N=128))
+    cands = search_tiling(ir, topk=1000)
+    assert {tuple(c.output_tile) for c in cands} == {(64, 64), (128, 128)}
+    policy = TCPolicy([n for n in ir.nodes if isinstance(n, OutputNode)], get_arch("cuda"),
+                      flat_graph=ir)
+    reasons = Counter()
+    for cand in cands:
+        by_hand = policy.compute_tile_dict(
+            [64, 128], {node: dict(steps) for node, steps in cand.rstep_map.items()})
+        by_hand.n_threads = cand.n_threads
+        tiled, refusal = _try(by_hand)
+        assert tiled is None
+        reasons[refusal] += 1
+    assert _histogram(reasons, [(SLICE_AND_WHOLE, len(cands))]) == Counter(
+        {SLICE_AND_WHOLE: len(cands)})
 
 
 SERVED = {  # every family the assembly serves: its accumulators lead with the max's dims

@@ -372,8 +372,10 @@ class Program:
         self._lowerable("to_tile_graph")
         flags = self.can_split(split)
         for s in self._unread_inputs():
-            # The C++ symbolizer aborts on a free input no op touches; an unread equals= input
-            # is fine (its definition gives it its dims, and it is no output).
+            # The native search finds no graph for a free input no op touches (it counts a
+            # tensor nothing reads as an output), so the program is refused here, with its
+            # reason; an unread equals= input is fine (its definition gives it its dims, and
+            # it is no output).
             if s.equals is None:
                 raise SpecError(f"{self.name}: input {s.name!r} is not read by any output")
         declared = [s.equals is not None for s in self.inputs]
