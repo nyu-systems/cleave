@@ -1769,9 +1769,9 @@ class TCPolicy(DefaultPolicy):
     def get_base_tile(self):
         """The output tile the walk starts from: per non-batch axis the largest of the
         axis's steps (the powers of two that divide its extent, and the extent) at or below
-        the tensor-core tile (64 rows, 32 columns). It used to be the tensor-core tile
-        itself, which is none of the steps of 96 or 80 rows or 48 columns, and the walk
-        refused every such matmul. A start below the smallest tile a tensor-core matmul has
+        the tensor-core tile (64 rows, 32 columns). The tensor-core tile itself is none of
+        the steps of 96 or 80 rows or 48 columns, and the walk would refuse every such
+        matmul from it. A start below the smallest tile a tensor-core matmul has
         (``TC_MIN_TILE``: 100 rows, whose steps are 1, 2, 4 and 100) is refused with that
         reason: an output tile is not padded."""
         out_node = self.canonical_output_node

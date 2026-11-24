@@ -39,10 +39,13 @@ def _hold(out, ref, what="returned kernel"):
     return measured
 
 
-def test_the_returned_kernel_check_has_the_declared_bound():
+def test_the_returned_kernel_check_has_the_declared_bound(monkeypatch):
     """What ``_hold`` accepts: the reference itself; not the reference 1.5% off, which the
     elementwise check it replaces accepted."""
     from cleave.core.errors import OutputMismatch
+
+    # (References and made-up tensors, no kernel: nothing here belongs in a measurement.)
+    monkeypatch.delenv("CLEAVE_VALIDATION_LOG", raising=False)
 
     prog = trace(programs.matmul, SHAPES, cl.f16)
     x, w = prog.random_inputs(seed=1)

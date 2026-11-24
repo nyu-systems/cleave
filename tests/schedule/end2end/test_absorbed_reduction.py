@@ -109,11 +109,14 @@ def test_absorbed_reduction_matches_reference(name):
     assert 0 <= worst <= TOLERANCE.rtol
 
 
-def test_the_bound_holds_a_right_kernel_and_fails_a_mis_tiled_one():
+def test_the_bound_holds_a_right_kernel_and_fails_a_mis_tiled_one(monkeypatch):
     """The comparison a case is held to, on made-up outputs: the reference itself passes;
     a kernel 0.32 of the row max off (the smallest mis-tiled error measured) and one with a
     NaN fail, in the program's dtype (no float64)."""
     import torch
+
+    # (Made-up tensors, no kernel: nothing here belongs in a measurement.)
+    monkeypatch.delenv("CLEAVE_VALIDATION_LOG", raising=False)
 
     reference = (torch.randn(64, 128, generator=torch.Generator().manual_seed(0))
                  .to(torch.float16))
