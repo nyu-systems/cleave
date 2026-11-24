@@ -114,7 +114,7 @@
    "dtype": "float16",
    "rel": 0.001123595517128706,
    "seeds": 3,
-   "validated": 48
+   "validated": 72
   },
   {
    "abs": 0.0001220703125,
@@ -122,7 +122,7 @@
    "dtype": "float16",
    "rel": 0.001145475427620113,
    "seeds": 3,
-   "validated": 48
+   "validated": 72
   },
   {
    "abs": 0.0001220703125,
@@ -130,7 +130,7 @@
    "dtype": "float16",
    "rel": 0.0009765625,
    "seeds": 3,
-   "validated": 48
+   "validated": 72
   }
  ],
  "demo:mha_decode": [
@@ -567,12 +567,12 @@
  ],
  "test:dual_softmax": [
   {
-   "abs": 6.103515625e-05,
+   "abs": 0.0001220703125,
    "absolute": false,
    "dtype": "float16",
    "rel": 0.000965250947047025,
    "seeds": 3,
-   "validated": 1179
+   "validated": 1389
   }
  ],
  "test:exact_attention": [
