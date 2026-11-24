@@ -86,6 +86,19 @@ needs two passes over the row) is reported with the reason.
 
 `demo/dynamic/` holds the paged-KV dynamic-shape demos.
 
+An input can say what it is. `cl.Tensor[..., cl.Equals(fn)]` declares an input that equals `fn`
+of earlier inputs: the program need not read it, and the search may read it through its
+definition (the forward output `o` of `mha_backward.py`, which lets it replace
+`sum_SKV(P * dP)` by `D = sum_D(dO * o)`). `cl.Tensor[..., cl.Sample(fn)]` only says how
+validation draws the input (the forward's log-sum-exp `L`, from the drawn `q` and `k`); the
+search treats it as free. A program with an `Equals` input and several outputs is searched
+one output at a time (`SuperoptConfig(per_output="auto")`, the default) and one graph per
+output is merged into one, equal ops shared. Where the outputs reduce over orthogonal axes (the backward's `dQ`
+over `S_KV`, `dK` and `dV` over `S_Q`), a thread block owns a tile of one axis and loops over
+the other: the outputs of that loop accumulate in registers, the others across thread blocks
+with atomic adds into a float32 buffer, and both assignments are searched and ranked. A value
+the loop does not change (`D`) is computed on its first iteration and read by the others.
+
 `cl.softmax` is the exact softmax, `exp(s - max(s)) / sum`, and records its max: the max is an
 ordinary reduction of the flat graph the superoptimizer searches
 (`cl.exp(s - cl.max(s, -1, keepdim=True))` written by hand is the same program). Where a tile
@@ -109,7 +122,12 @@ and none at 16384, where the only tilings that hold a row in one block hold one 
 Shapes that have no kernel yet (each is refused with its reason, or fails in TileLang, never
 served wrongly):
 
-- attention with a single query row (`S_Q = 1`): a unit dim that is not a batch dim has no tile;
+- attention with a single query row (`S_Q = 1`): a unit dim that is not a batch dim has no tile
+  (and the value matmul would read its operand from the exp's registers with one row a warp,
+  which TileLang cannot lay out: the refusal names that, since no thread count is proposed);
+- a matmul that reads its first operand from another matmul's accumulator (attention's
+  `P @ V`) with fewer than 16 rows a warp, or over two warp groups at another M than 128
+  unless the operand is staged through shared memory: 64 query rows have no 256-thread tiling;
 - an output that reduces every dim to one element (`sum(x, 0)` of a vector, the total of a
   matrix): its tile has no dim, for the same reason;
 - for 16-bit dtypes, a matmul that contracts a length no multiple of 16 divides (float16
