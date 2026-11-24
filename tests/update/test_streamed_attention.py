@@ -304,7 +304,7 @@ def test_a_policy_without_its_flat_graph_serves_nothing():
 
 @pytest.mark.parametrize("foreign", ["key", "loops", "edited graph"])
 def test_a_record_of_another_graph_is_not_served(foreign):
-    """R1: the record says which graph its rules were proven for. On any other graph --
+    """The record says which graph its rules were proven for. On any other graph --
     another key, another loop membership, the graph itself after an edit -- the pin stays,
     and the graph says why."""
     ir = lowered(flash_by_hand, SHORT)
@@ -616,7 +616,7 @@ def tier_owner(tiled) -> str:
 
 
 def test_codegen_refuses_an_update_rule_that_was_not_assembled(monkeypatch):
-    """V1': a max that its loop carries (or steps) with its record still on it has no lag
+    """A max that its loop carries (or steps) with its record still on it has no lag
     copy and no repairs. Emitting it would rescale nothing: the sums would be relative to
     the max of one slice."""
     from cleave.codegen import TilelangCodeGen
@@ -641,7 +641,7 @@ def test_codegen_refuses_an_update_rule_that_was_not_assembled(monkeypatch):
 
 
 def test_codegen_refuses_a_recorded_max_that_only_steps(monkeypatch):
-    """V1', second half: not registered as carried either, but its operand tile is a slice
+    """A recorded max not registered as carried either, but whose operand tile is a slice
     of its block along the reduced dim."""
     from cleave.codegen import TilelangCodeGen
 

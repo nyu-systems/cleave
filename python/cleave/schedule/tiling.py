@@ -1189,13 +1189,14 @@ def _refuse_tile_that_misses_dims(node, shape, tile, expanded_tile):
     when it is a batch dim. A unit dim that is not a batch dim stays missing: the output
     of ``x @ column`` (a ``Matmul`` with N = 1) is ``(M, 1)`` with the tile ``[m]``. The
     grid extent would then be taken from the dims the tile happens to cover, and the
-    launch-axis plan and the offsets built for a tensor of lower rank (it used to end in
-    ``KeyError: 1`` or an assert on ``iter_repeat_factors``, depending on the loop).
+    launch-axis plan and the offsets built for a tensor of lower rank; without this
+    refusal the build ends in ``KeyError: 1`` or an assert on ``iter_repeat_factors``,
+    depending on the loop.
 
     Next to batch dims the tile has the tensor's rank after all, with its extents on the
     wrong dims: for ``(B, M, 1)`` the policy tiles ``(B, M)`` as ``[b, m]`` and the
     expansion reads that as ``[1, b, m]``, ``m`` rows of the unit dim. Same defect, same
-    refusal (it used to end in whichever guard the nonsense tripped first).
+    refusal (without it the build ends in whichever guard the nonsense trips first).
     """
     misplaced = len(tile) != len(shape) and any(
         int(extent) == 1 and int(step) > 1 for extent, step in zip(shape, expanded_tile)
@@ -1239,8 +1240,9 @@ def refuse_unit_extents(main: Graph) -> None:
     * a matmul, whose operands and result must be stored 2-D (a single row or column:
       "Swizzle layout expects rank >= 2", the gemm 2-D assert).
 
-    Such a candidate used to be built and handed to TileLang, where it died at parse or in
-    layout inference, each with whatever message the missing dim produced first. This is
+    Without this check such a candidate is built and handed to TileLang, where it dies at
+    parse or in layout inference, each with whatever message the missing dim produces
+    first. This is
     the default build's check (``schedule_kernel``), not ``apply_tiling``'s: the paged path
     schedules step-1 tilings only to read them (``read_dense_combine``) and emits its own
     kernels for them.

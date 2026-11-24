@@ -20,6 +20,14 @@ The pair is a *streaming obstacle* when all of this holds (:func:`obstacles`):
      zero: the repair multiplies what such an accumulator holds, and nothing else is
      modelled by the proof (a max of the scaled value starts at ``-inf``).
 
+An overlap that fails condition k is refused with its text (``Obstacle.refused``); the tests
+call those texts T1 to T5 (T3: two passes over the row, T4: a value of the max read
+elsewhere, T5: ``pipeline.update.texts.T5``). A step map in which the carried max does not
+step with the loop that carries it is refused as well
+(``tiling._refuse_carried_out_of_step``): stepped by another step than a descendant that
+iterates (C1 in the tests), or stepped while a descendant that reads its finished value is
+not (C2).
+
 It is *served* where, in addition, an update rule was found and PROVEN for every
 overlapped descendant (``cleave.pipeline.update``): the full-extent node carries a
 ``Streaming`` record (``cleave.ir.update_rule``) whose key is the key of the very graph it
@@ -314,7 +322,7 @@ def _other_lead(flat_graph, full, acc):
     unit dim comes from nowhere (one head, MLA decode's batch of one), and so does a dim
     the analysis does not follow through a view (the heads of a split partial)."""
     if flat_graph is None:
-        return None  # nothing is served without its flat graph anyway (R1)
+        return None  # a record is served only for the graph its key was derived from
     from .tiling import _scheduled_axes
 
     tokens = {(n.name, out): t for (n, out), t in _scheduled_axes(flat_graph).out_tokens.items()}

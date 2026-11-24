@@ -41,8 +41,10 @@ E14 = ("{node}, which {acc} reads, is computed from {other}, another reduction o
 # cut the queries too).
 E15 = ("{node} is {a} at {n} elements of the looped dim of {full} and {b} at {m}: its symbol "
        "{symbol} also sizes a dim the loop does not step")
-# The structural rule S5 of ``schedule.streaming.obstacles`` (its text T5), checked again
-# here: the contribution of one element is only read off a plain sum or matmul.
+# The structural check of ``schedule.streaming.obstacles`` that refuses with T5 (every
+# reduction looped under the full-extent value is a ReduceSum or Matmul with no
+# accum_init), checked again here: the contribution of one element is only read off a
+# plain sum or matmul.
 T5 = ("{d} is a {cls}: the reductions that loop under {full} must be sums or matmuls that "
       "start at zero")
 

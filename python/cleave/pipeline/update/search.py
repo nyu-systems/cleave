@@ -21,7 +21,7 @@ and every one within the loose filter is collected: the search never stops at a 
 Intermediates are merged BY VALUE: equal float32 bits on every reference row. A 64-bit
 fingerprint of the bits selects a bucket, and equality is then confirmed on the stored bits
 (a fingerprint collision never drops a distinct value); the first expression wins. A value
-with a non-finite entry on any reference row is neither kept nor a match (D3).
+with a non-finite entry on any reference row is neither kept nor a match.
 
 Deterministic: fixed leaf order (``a, m, m', r``), op order, level order; numpy float32
 elementwise on the CPU. Everything is float32.

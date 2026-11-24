@@ -4,7 +4,7 @@ refusal text of the classification and of the step maps (CPU).
 ``schedule.streaming.obstacles`` classifies a flat graph once, from what the policy already
 has: for a running max over a dim, the reductions that loop under it over that dim (the
 state proposal) and, where it cannot be streamed, why (T1-T5). A classified obstacle is
-served only with a record derived for the very graph (R1). Given a record, a step map in
+served only with a record derived for the very graph. Given a record, a step map in
 which the carried max does not step with its loop is a typed refusal (C1, C2), both in
 ``apply_tiling`` and in the twin the policy rates its step maps with; without a record the
 same maps get what the tiler always said. A graph left without tilings says why its max is
@@ -164,7 +164,7 @@ def test_a_refused_obstacle_keeps_its_pin_whatever_record_it_has():
     assert carried_reductions(ir) == {}
 
 
-# ------------------------------------------------------------------------------------- R1
+# ------------------------------------------- a record derived for another graph is not served
 
 
 def test_r1_a_record_of_another_graph_keeps_the_pin():

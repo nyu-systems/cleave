@@ -360,9 +360,9 @@ def test_e14_one_sum_scaled_by_two_softmaxes():
 
 
 def test_t5_a_max_under_the_max_is_not_a_sum():
-    """S5 is a structural rule: ``streaming.obstacles`` refuses the obstacle with T5, so
-    lowering never asks the engine. The engine checks it again for an obstacle handed to it
-    as it is, with the same text."""
+    """A max under the max is refused by a structural check: ``streaming.obstacles``
+    refuses the obstacle with T5, so lowering never asks the engine. The engine checks it
+    again for an obstacle handed to it as it is, with the same text."""
     import dataclasses
 
     from cleave.schedule.streaming import obstacles

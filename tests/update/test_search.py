@@ -68,7 +68,7 @@ def test_every_match_is_collected_and_sorted():
 
 def test_a_value_that_is_not_finite_is_neither_kept_nor_a_match():
     """At the first iteration the old max is the reducer's start value: ``exp(m' - m)``
-    overflows there, so ``r + a / exp(m' - m)`` is never formed (D3)."""
+    overflows there, so ``r + a / exp(m' - m)`` is never formed."""
     leaves, wide, target = blocks()
     leaves = dict(leaves)
     leaves["m"] = leaves["m"].copy()

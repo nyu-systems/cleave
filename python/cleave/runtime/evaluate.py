@@ -309,9 +309,10 @@ def run_candidates(
         the program's output, and its combine reads that), so the cap has to hold for the
         largest. A graph without a reference sends nothing to a worker and has no say:
         one whose reference could not be built (its candidates report why), one no bound
-        covers. The first candidate's graph used to speak for all of them: with no bound
-        its footprint was 0 and the cap was off for the whole run, and with a reference
-        that failed the run itself ended on that error, every candidate unreported.
+        covers. The first candidate's graph does not speak for all of them: with no
+        bound its footprint would be 0 and the cap off for the whole run, and with a
+        reference that failed the run itself would end on that error, every candidate
+        unreported.
         """
         return max((ref[2] for ref in graph_refs.values() if not isinstance(ref, Exception)),
                    default=0)

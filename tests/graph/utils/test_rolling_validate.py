@@ -42,7 +42,7 @@ def test_the_unmodified_tier_is_accepted():
     assert "ukernel_rescale_1dims_rr" in TilelangCodeGen().gen(_tier().main)
 
 
-# V1' -----------------------------------------------------------------------------------
+# a recorded max that was not assembled --------------------------------------------------
 def test_a_carried_max_whose_update_rule_is_still_on_it_is_refused():
     """The loop carries the max (an accumulator of its tier): a ``Streaming`` record still
     on it means the assembly did not run, and the sums next to it would be relative to the

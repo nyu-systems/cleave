@@ -1254,10 +1254,9 @@ class DefaultPolicy:
                 if base not in step:
                     # The walk only knows the steps that divide the extent: nothing pads
                     # the last tile of a reduction. `_assign_reduce_step` starts every
-                    # reduction at one of them today (the tensor-core policy used to start
-                    # at its own step whatever the extent, "for the case of padding", and
-                    # the lookup below died on it); a start from anywhere else is refused
-                    # here, with the reason.
+                    # reduction at one of them (a start outside them, "for the case of
+                    # padding", would end the lookup below in a ValueError); a start from
+                    # anywhere else is refused here, with the reason.
                     raise ScheduleRejected(
                         f"{n.name}: its reduction over {int(n.raxis[0].dom.extent)} elements "
                         f"starts at step {base}, which does not divide it; "
