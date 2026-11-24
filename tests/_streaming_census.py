@@ -165,11 +165,19 @@ def first_axis(x: cl.Tensor["H", "K", "N"], y: cl.Tensor["H", "K", "N"]):
 
 # job -> the plans ``pipeline.schedule`` kept for the program with the hand-derived pass
 # (no top-k cut), recorded by this census at the integration of the searched path
-# (a60f5ed, where both paths were in the tree), before that pass was deleted.
+# (a60f5ed, where both paths were in the tree), before that pass was deleted; less the
+# tilings the policy has proposed to neither path since (the attention backward merge): a
+# gemm that reads its first operand from another gemm's accumulator with fewer than 16
+# rows a warp, or two warp groups at another M than 128, unless codegen stages that operand
+# (``TCPolicy._register_operand_layout_conflict``; the 16 CompileErrors of MHA prefill), and
+# an input two readers would need with two tiles (``DefaultPolicy._reads_placeholder_
+# unevenly``; MLA decode's latent cache under tiles narrower than 512). At a60f5ed: 68 for
+# the prefill and the GQA / MQA decode jobs, 138 for MLA prefill, 600 for MLA decode, 32 for
+# MHA decode and 40 for MHA decode at 256 keys.
 HAND_DERIVED_PLANS = {
-    "demo:mha_prefill": 68, "demo:gqa_prefill": 68, "demo:mqa_prefill": 68,
-    "demo:mla_prefill": 138, "demo:mla_decode": 600, "demo:mha_decode": 32,
-    "demo:gqa_decode": 68, "demo:mqa_decode": 68, "demo:mha_decode@256": 40,
+    "demo:mha_prefill": 52, "demo:gqa_prefill": 52, "demo:mqa_prefill": 52,
+    "demo:mla_prefill": 102, "demo:mla_decode": 60, "demo:mha_decode": 16,
+    "demo:gqa_decode": 52, "demo:mqa_decode": 52, "demo:mha_decode@256": 20,
     "program:rows_v": 16, "program:first_axis": 62,
 }
 # job -> (plans of the searched program, plans of the hand-derived pass, why they differ):

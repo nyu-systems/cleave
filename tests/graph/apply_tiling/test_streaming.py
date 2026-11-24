@@ -378,7 +378,9 @@ def test_one_tile_reads_a_loop_accumulator_through_an_accum_edge():
             built.append((cand, apply_tiling(cand)))
         except ScheduleRejected:
             pass
-    assert len(built) == 8 and len(cands) == 32
+    # (64 query rows have no 256-thread tiling: the value matmul would read 8 rows a warp
+    # of the exp's registers, TCPolicy._register_operand_layout_conflict)
+    assert len(built) == 4 and len(cands) == 16
     through_loop = 0
     for cand, tiled in built:
         m = _find(tiled, a.max.name)[2]
@@ -391,7 +393,7 @@ def test_one_tile_reads_a_loop_accumulator_through_an_accum_edge():
                 assert isinstance(edge, AccumEdge) and edge.accum_node.name == a.score.name
                 assert any(edge is e for e in edge.src_node.outputs)
         assert "ukernel_reduce_max_axis2_rr_clear(" in build_candidate_code(cand)
-    assert through_loop == 4
+    assert through_loop == 2
 
 
 def test_one_tile_over_the_first_axis():

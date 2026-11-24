@@ -80,14 +80,17 @@ CASES = {
                       [(TWO_REPAIRS, 27), (SINGLE_ROW_LOOP, 6), (UNIT_ROW, 1)]),
     "column_weighted": (X.column_weighted, dict(M=128, K=4096, N=256), (None,), 0,
                         [(NOT_LEADING, 34), (NOT_ITS_DIMS, 12)]),
+    # (the tilings that read ``x`` with one tile per reader are not proposed:
+    # DefaultPolicy._reads_placeholder_unevenly; 26 and the 6 SLICE_AND_WHOLE ones were)
     "self_weighted": (X.self_weighted, dict(K=4096, N=128), (None,), 0,
-                      [(ONE_DIM_TWO_AXES, 34), (SLICE_AND_WHOLE, 6), (ALSO_ITS_TRAILING_DIM, 4)]),
+                      [(ONE_DIM_TWO_AXES, 8), (ALSO_ITS_TRAILING_DIM, 4)]),
     "max_normalized": (X.max_normalized, dict(R=256, C=4096, D=64),
                        ("must be sums or matmuls that start at zero",), 0, []),
     "sum_next_to_exp": (X.sum_next_to_exp, dict(R=256, C=4096), ("two passes",), 14,
                         [(UNIT_ROW, 7)]),
+    # (64 query rows: no 256-thread tiling, TCPolicy._register_operand_layout_conflict)
     "unscaled_attention": (X.unscaled_attention, dict(H=32, SQ=64, SKV=256, D=64),
-                           ("two passes",), 8, [(OUTSIDE, 24)]),
+                           ("two passes",), 4, [(OUTSIDE, 12)]),
 }
 
 

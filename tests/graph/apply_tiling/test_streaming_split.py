@@ -103,7 +103,9 @@ def test_search_every_partial_tiling_serves_the_max_it_returns(pair):
     (m,) = [n for n in partial.nodes if type(n) is ReduceMax]
     record = m.streaming
     tilings = _tilings(partial)
-    assert len(tilings) == 16 and not [t for _, t in tilings if isinstance(t, ScheduleRejected)]
+    # (64 query rows have no 256-thread tiling: the value matmul would read 8 rows a warp
+    # of the exp's registers, TCPolicy._register_operand_layout_conflict)
+    assert len(tilings) == 8 and not [t for _, t in tilings if isinstance(t, ScheduleRejected)]
     accept = streaming_accept(partial)
     cases = Counter()
     for cand, tiled in tilings:
@@ -142,7 +144,7 @@ def test_search_every_partial_tiling_serves_the_max_it_returns(pair):
         outs = re.findall(r"(OutputNod\w): T\.Tensor\(\(.*?\), \"(\w+)\"\)", signature)
         assert outs == [("OutputNodf", "float32"), ("OutputNode", "float32"),
                         ("OutputNodg", "float32")]
-    assert cases == {"looped": 8, "one tile": 8}
+    assert cases == {"looped": 4, "one tile": 4}
 
 
 def test_search_the_looped_partial_emits_the_loop_of_an_attention_kernel(pair):

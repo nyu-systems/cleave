@@ -76,8 +76,10 @@ def test_search_mha_prefill_is_streamed_in_the_flash_form():
         "solo matmul>div>max>sub>exp>sum>div>matmul", "solo matmul>div>max>sub>exp>sum>matmul>div"]
     flash_graph, traced_graph = flash(graphs), traced_order(graphs)
 
-    # ---- the flash form: a record on its max, derived for this very graph
-    assert len(plans) == 68 and {p.graph_index for p in plans} == {flash_graph.index}
+    # ---- the flash form: a record on its max, derived for this very graph (52 plans: the
+    # 16 that read the exp's registers with 8 rows a warp, 64 query rows over 256 threads,
+    # are no candidates, TCPolicy._register_operand_layout_conflict)
+    assert len(plans) == 52 and {p.graph_index for p in plans} == {flash_graph.index}
     (flat,) = {id(p.tile.flat_graph): p.tile.flat_graph for p in plans}.values()
     full = recorded_node(flat)
     record = full.streaming
@@ -92,7 +94,7 @@ def test_search_mha_prefill_is_streamed_in_the_flash_form():
     assert {acc: show(update) for acc, update in derivation.chosen.items()} == {
         acc: "(r + (a * exp((m - m'))))" for acc in record.loops}
 
-    # ---- every one of the 68 candidates is built, with the max carried by the loop
+    # ---- every one of the 52 candidates is built, with the max carried by the loop
     for plan in plans:
         tiled = schedule_kernel(plan.tile)
         (site,) = sites(tiled)
@@ -129,7 +131,9 @@ def test_search_a_short_row_has_one_tile_plans_as_well():
     and nothing is assembled; the traced order is served by those alone."""
     graphs, plans = scheduled(64, 256)
     flash_graph, traced_graph = flash(graphs), traced_order(graphs)
-    assert len(plans) == 40 and not plans.refused
+    # (64 query rows have no 256-thread tiling: the value matmul would read 8 rows a warp
+    # of the exp's registers, TCPolicy._register_operand_layout_conflict)
+    assert len(plans) == 20 and not plans.refused
     kinds = Counter()
     for plan in plans:
         tiled = schedule_kernel(plan.tile)
@@ -140,8 +144,8 @@ def test_search_a_short_row_has_one_tile_plans_as_well():
             (full,) = [n for n in tiled.nodes if getattr(n, "streaming", None) is not None]
             assert not tiled.lag_nodes and not tiled.accum_scale
             assert full.accum_init == -float("inf")
-    assert kinds == {(flash_graph.index, "looped"): 24, (flash_graph.index, "one tile"): 8,
-                     (traced_graph.index, "one tile"): 8}
+    assert kinds == {(flash_graph.index, "looped"): 12, (flash_graph.index, "one tile"): 4,
+                     (traced_graph.index, "one tile"): 4}
     # a one-tile kernel of either graph is generated (the validator has nothing to object to)
     for graph in (flash_graph, traced_graph):
         plan = next(p for p in plans if p.graph_index == graph.index
@@ -261,13 +265,15 @@ def test_an_obstacle_that_is_not_served_keeps_only_the_tilings_that_build():
         except ScheduleRejected:
             continue
         built.append(cand)
-    assert (len(unfiltered), len(built)) == (32, 8)
+    # (64 query rows have no 256-thread tiling: the value matmul would read 8 rows a warp
+    # of the exp's registers, TCPolicy._register_operand_layout_conflict)
+    assert (len(unfiltered), len(built)) == (16, 4)
     ir.streaming_refusals = [f"{node_of(ir, ReduceMax).name}: it has no update rule"]
     assert streaming.streaming_accept(ir) is not None
     kept, reasons = tilings(ir)
-    assert len(kept) == 8
+    assert len(kept) == 4
     assert {tuple(steps(c)) for c in kept} == {tuple(steps(c)) for c in built}
-    assert sum(reasons.values()) == 24 and len(reasons) == 1
+    assert sum(reasons.values()) == 12 and len(reasons) == 1
     (reason,) = reasons
     assert "is computed per iteration of" in reason and "outside it" in reason
 
@@ -280,7 +286,7 @@ def test_a_record_lets_the_loop_step_under_its_max():
     assert not hasattr(ir, "streaming_refusals")
     kept, reasons = tilings(ir)
     kinds = Counter("looped" if sites(schedule_kernel(cand)) else "one tile" for cand in kept)
-    assert kinds == {"looped": 24, "one tile": 8} and not reasons
+    assert kinds == {"looped": 12, "one tile": 4} and not reasons
     # the max steps with the sums it is carried for, one loop counter for the three
     for cand in kept:
         own = {n.name: [int(x) for x in v.values()] for n, v in cand.rstep_map.items()}
@@ -317,7 +323,7 @@ def test_a_record_of_another_graph_is_not_served(foreign):
     # the pipeline: only the tilings that hold the row whole are left, and every tiling in
     # which the policy stepped the max on its own is dropped before the top-k cut
     kept, reasons = tilings(ir)
-    assert len(kept) == 8 and all(not sites(schedule_kernel(cand)) for cand in kept)
+    assert len(kept) == 4 and all(not sites(schedule_kernel(cand)) for cand in kept)
     assert ir.streaming_refusals == [why]
     row = {node_of(ir, ReduceSum).name, node_of(ir, Matmul, 1).name}
     for cand in kept:
@@ -341,7 +347,7 @@ def test_an_edit_after_the_record_was_served_is_seen_by_apply_tiling():
     full, record = record_by_hand(ir)
     assert {n.name for n in carried_reductions(ir)} == {full.name}  # the memo, served
     kept, reasons = tilings(ir)
-    assert len(kept) == 32 and not reasons
+    assert len(kept) == 16 and not reasons
     looped = next(cand for cand in kept if sites(schedule_kernel(cand)))
     node_of(ir, Div).const = 2.0
     assert served(ir) == {} and carried_reductions(ir) == {}
@@ -352,12 +358,12 @@ def test_an_edit_after_the_record_was_served_is_seen_by_apply_tiling():
         schedule_kernel(looped)
     assert not isinstance(no.value, StreamingRefused)
     kept, reasons = tilings(ir)
-    assert len(kept) == len(plain_kept) == 8
+    assert len(kept) == len(plain_kept) == 4
     assert all(not sites(schedule_kernel(cand)) for cand in kept)
     # the same tilings are kept, and the others dropped for the same reason, as on the
     # graph without a record
     assert {tuple(steps(c)) for c in kept} == {tuple(steps(c)) for c in plain_kept}
-    assert reasons == plain_reasons and sum(reasons.values()) == 24
+    assert reasons == plain_reasons and sum(reasons.values()) == 12
     (reason,) = reasons
     assert "is computed per iteration of" in reason and "outside it" in reason
     node_of(ir, Div).const = 8.0  # undone: the record is served again, to both
@@ -584,7 +590,7 @@ def test_a_returned_max_leaves_its_loop_as_carried_state(monkeypatch):
     assert sorted(type(e.dst_node).__name__ for e in full.outputs) == ["OutputNode", "Sub"]
     kept, reasons = tilings(ir)
     kinds = Counter("looped" if sites(schedule_kernel(cand)) else "one tile" for cand in kept)
-    assert kinds == {"looped": 24, "one tile": 8} and not reasons
+    assert kinds == {"looped": 12, "one tile": 4} and not reasons
     cand = looped_candidate(ir)
     tier = loop_tier(schedule_kernel(cand))
     assert [n.name for n in tier.accum_nodes][-1] == full.name  # after the loop's own

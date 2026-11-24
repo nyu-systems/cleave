@@ -39,7 +39,7 @@ def test_a_job_whose_checks_ran_is_ok(monkeypatch, tmp_path, capsys):
     _job(monkeypatch, lambda: [X.streamed_ir(*FLASH)])
     status, lines, report = _run(tmp_path, capsys, "job")
     assert status == 0 and lines[-1] == "job: ok"
-    assert lines[0].startswith("job: 32 raw candidates, 32 accepted, 32 build")
+    assert lines[0].startswith("job: 16 raw candidates, 16 accepted, 16 build")
     assert not report["problems"] and not report["unchecked"]
     assert sorted({r["tiling"] for r in report["rows"]}) == ["looped", "one tile"]
 
@@ -212,13 +212,14 @@ def test_a_count_that_differs_by_design_says_why(monkeypatch, tmp_path, capsys):
 def test_search_a_demo_job_censuses_the_searched_graphs(monkeypatch, tmp_path, capsys):
     """The real thing, on the smallest demo: its own program (``cl.softmax`` records the
     explicit max), searched, lowered with the engine's records, and every tiling of both
-    searched graphs censused. Flash form: every tiling is served, 24 of them looped; traced
-    order: only the ones that hold the row whole. The plans are the hand-derived pass's 40."""
+    searched graphs censused. Flash form: every tiling is served, 12 of them looped; traced
+    order: only the ones that hold the row whole. The plans are the hand-derived pass's 20
+    (40 then, the 256-thread tilings of 64 query rows included: ``HAND_DERIVED_PLANS``)."""
     monkeypatch.setenv("CLEAVE_CACHE_ROOT", str(tmp_path / "cache"))
     status, lines, report = _run(tmp_path, capsys, "demo:mha_decode@256")
     assert status == 0 and lines[-1] == "demo:mha_decode@256: ok", lines[-6:]
     assert not report["unchecked"] and not report["problems"]
-    assert report["counts"] == [40, 40]
+    assert report["counts"] == [20, 20]
 
     by_graph = {}
     for row in report["rows"]:
@@ -228,7 +229,7 @@ def test_search_a_demo_job_censuses_the_searched_graphs(monkeypatch, tmp_path, c
         (len(rows), sum(r["accepted"] for r in rows), sum(r["tiling"] == "looped" for r in rows))
         for rows in by_graph.values()
     )
-    assert counts == [(32, 8, 0), (32, 32, 24)]
+    assert counts == [(16, 4, 0), (16, 16, 12)]
     heads = [line for line in lines if line.startswith("demo:mha_decode@256[")]
     assert len(heads) == 2 and sum(line.endswith("[records: engine]") for line in heads) == 1
 
@@ -240,9 +241,9 @@ def test_search_the_demo_at_its_own_shape_is_all_looped(monkeypatch, tmp_path, c
     status, lines, report = _run(tmp_path, capsys, "demo:mha_decode")
     assert status == 0 and lines[-1] == "demo:mha_decode: ok", lines[-6:]
     assert not report["unchecked"] and not report["problems"]
-    assert report["counts"] == [32, 32]
+    assert report["counts"] == [16, 16]
     rows = [r for r in report["rows"] if r["accepted"]]
-    assert len(rows) == 32 and all(r["tiling"] == "looped" for r in rows)
+    assert len(rows) == 16 and all(r["tiling"] == "looped" for r in rows)
     heads = [line for line in lines if line.startswith("demo:mha_decode[")]
     assert len(heads) == 2 and sum(" 0 raw candidates" in line for line in heads) == 1
 
@@ -266,11 +267,11 @@ def test_search_a_split_job_censuses_the_partial_and_the_combine(monkeypatch, tm
         by_graph.setdefault(row["graph"], []).append(row)
     (partial,) = [rows for g, rows in by_graph.items() if g.endswith(".partial")]
     (combine,) = [rows for g, rows in by_graph.items() if g.endswith(".combine")]
-    assert Counter(r["tiling"] for r in partial if r["accepted"]) == {"looped": 16, "one tile": 8}
+    assert Counter(r["tiling"] for r in partial if r["accepted"]) == {"looped": 8, "one tile": 4}
     assert Counter(r["tiling"] for r in combine if r["accepted"]) == {"looped": 21, "one tile": 3}
     # (raw candidates, accepted, looped, one tile): the hand-derived pass's counts. The
     # 12 combines that are not accepted step one partial at a time or hold a single row
-    assert _split_counts(partial) == (24, 24, 16, 8)
+    assert _split_counts(partial) == (12, 12, 8, 4)
     assert _split_counts(combine) == (36, 24, 21, 3)
     assert tool.SPLITS["mha_decode@32"] == ("mha_decode", 32)
     assert any("no pair: LoweringRejected" in line

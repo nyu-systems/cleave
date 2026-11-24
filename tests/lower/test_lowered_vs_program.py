@@ -221,7 +221,9 @@ FORMERLY_REFUSED = {
     "squares_first_axis": (squares_first_axis, RC, RC_TILE, {"x"}),
     "softmax_times_its_exp": (softmax_times_its_exp, RC, RC_TILE, {"x"}),
     "gram": (gram, RC, RC_TILE, {"x"}),
-    "different_axes": (different_axes, RC, RC_TILE, {"x"}),
+    # at C = 256 a block that holds the rows needs 180 KB of shared memory, over the cap:
+    # the exp, read transposed by ``u @ e.mT``, is staged through shared as well
+    "different_axes": (different_axes, RC, dict(R=64, C=128), {"x"}),
     "kv_side": (kv_side, dict(HQ=4, HKV=2, S=8, D=16), dict(HQ=4, HKV=2, S=64, D=64), {"k"}),
     "add_constant": (_weights_of(lambda e: e + 1.0), RC, RC_TILE, {"x"}),
     "add_tensor": (add_tensor, RC, RC_TILE, {"x"}),
