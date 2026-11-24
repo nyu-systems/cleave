@@ -75,6 +75,6 @@ def softmax(x, dim: int = -1):
     (attention's ``softmax(...) @ v``). A softmax that is returned itself -- a standalone
     softmax, attention weights, a softmax next to another ``exp`` of its logits -- is served
     while its row fits one block, and so is a second softmax of ``x`` over another axis, which
-    needs a row and a column in one block (README names the sizes that have plans)."""
+    needs a row and a column in one block."""
     e = exp(x - max(x, dim, keepdim=True))
     return e / sum(e, dim, keepdim=True)

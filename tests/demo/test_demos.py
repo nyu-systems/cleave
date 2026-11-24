@@ -105,19 +105,6 @@ ATTENTION = ["mha_decode", "gqa_decode", "mqa_decode", "mha_prefill", "gqa_prefi
 BY_ROLE = set(ATTENTION) - {"mla_decode", "mla_prefill", "qknorm"}
 
 
-def test_the_readme_says_which_attention_demos_have_no_split_run():
-    """Every demo parses ``--split``, and the README lists it among the flags the demos
-    share. Three attention demos have no split run; the README names them where it lists
-    the flag, next to the attention backward, which runs unsplit."""
-    readme = (DEMO.parent / "README.md").read_text()
-    (paragraph,) = [p for p in readme.split("\n\n") if p.startswith("`--split` is parsed by")]
-    assert sorted(set(ATTENTION) - BY_ROLE) == ["mla_decode", "mla_prefill", "qknorm"]
-    for name in ATTENTION:
-        assert (f"`{name}.py`" in paragraph) == (name not in BY_ROLE), name
-    assert "`mha_backward.py` runs unsplit" in " ".join(paragraph.split())
-    assert "split=False," in (DEMO / "mha_backward.py").read_text()
-
-
 def _assert_declared(config, name):
     """One measured bound for the operator (or one per output), within the ceiling (one per
     boundary role for a demo of ``BY_ROLE``); it asks for normal inputs."""
@@ -310,16 +297,13 @@ def test_search_split_of_a_demo_that_declares_one_tolerance_stops_before_it_buil
 def test_qknorm_says_which_inputs_its_kernels_are_validated_on():
     """The adversarial softmax cases shape inputs. qknorm's logits are computed from the
     normalized q and k, so its kernels are held to the normal inputs only (the build's
-    report gives that reason): the demo and the README say so and do not claim the
-    adversarial cases for it."""
+    report gives that reason): the demo says so and does not claim the adversarial cases
+    for it."""
     from cleave.lower import to_ir
     from cleave.pipeline.build import _reference_fn
 
     doc = " ".join((DEMO / "qknorm.py").read_text().split('"""')[1].split())
     assert "this demo's kernels are validated on normal inputs" in doc
-    readme = " ".join((DEMO.parent / "README.md").read_text().split())
-    assert ("wherever the logits can be shaped through an input: every attention demo but "
-            "`qknorm.py`") in readme
     # ... which is what the build does with the demo's program
     sys.path.insert(0, str(DEMO))
     try:
