@@ -187,6 +187,32 @@ def test_search_every_factor_of_the_flash_graph_has_partial_and_combine_plans():
     assert "LoweringRejected: graph" in plans.summary()
 
 
+def test_search_a_list_or_a_slice_of_the_graphs_keeps_the_split():
+    """``schedule`` takes a ``GraphSet`` or a sequence of its graphs. The split built from
+    the loop state is the set's (``state_split``), and every graph carries it: a list, a
+    slice, a comprehension or a set rebuilt from them gives the same split plans and the
+    same refusals as the set itself, never the solo plans alone."""
+    graphs = _graphs()
+    config = P.ScheduleConfig(topk=2, split_k=(4,))
+
+    def outcome(plans):
+        return (sorted((p.graph_index, p.variant, p.role) for p in plans),
+                sorted((r.graph_index, r.variant, r.role, str(r.error)) for r in plans.refused))
+
+    whole = outcome(P.schedule(graphs, config))
+    assert {v for _, v, _ in whole[0]} == {"solo", "split-k=4"}
+    sliced = graphs[0:len(graphs)]
+    assert isinstance(sliced, GraphSet) and sliced.state_split == ("SKV",)
+    for part in (list(graphs), sliced, [g for g in graphs],
+                 GraphSet(list(graphs), graphs.program)):
+        assert outcome(P.schedule(part, config)) == whole
+    assert GraphSet(list(graphs), graphs.program).state_split == ("SKV",)
+    assert GraphSet(list(graphs), graphs.program, state_split=()).state_split == ()
+    # a set of graphs the search split itself has no state split
+    assert GraphSet.identity(graphs.program).state_split == ()
+    assert graphs[0] is list(graphs)[0]  # one graph is a graph
+
+
 def test_a_split_dim_that_is_no_input_dim_is_refused_with_the_rest_of_the_split():
     """The whole split is checked, not only the part the search would run: a dim that is
     no input dim is a SpecError next to the softmax dim as well as alone."""

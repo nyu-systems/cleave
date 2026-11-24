@@ -68,30 +68,37 @@ class GraphSet(Sequence):
     of the program reduces one of its dims. The search returns no valid split graph for a
     flat graph with such a max in it, so it runs unsplit; a split of such a program is built
     from the loop state of its solo graphs (``pipeline.plans._schedule_once``). ``()`` for
-    every other program, whose split graphs come from the search as they always did.
+    every other program, whose split graphs come from the search as they always did. Not
+    given, it is read off the graphs (``state_split_of``), so a set rebuilt from some of the
+    graphs of another -- a list, a slice, a comprehension -- keeps the split they carry.
     """
 
     def __init__(self, graphs, program=None, config: SuperoptConfig | None = None, *,
                  max_ops: int | None = None, checkpoint: str | None = None,
                  from_cache: bool = False, seconds: float = 0.0, parts: tuple = (),
-                 state_split: tuple = ()):
+                 state_split: tuple | None = None):
         self.graphs = list(graphs)
         self.parts = tuple(parts)  # per-output search: one GraphSet per output, in output order
         self.program, self.config, self.max_ops = program, config, max_ops
         self.checkpoint, self.from_cache, self.seconds = checkpoint, from_cache, seconds
-        self.state_split = tuple(state_split)
+        self.state_split = tuple(state_split_of(self.graphs, program) if state_split is None
+                                 else state_split)
 
     def __len__(self):
         return len(self.graphs)
 
     def __getitem__(self, i):
+        if isinstance(i, slice):  # a part of the set is a set: it keeps what the set says
+            return self._with(self.graphs[i])
         return self.graphs[i]
 
     def filter(self, fn: Callable[[SearchedGraph], bool]) -> "GraphSet":
-        return GraphSet([g for g in self.graphs if fn(g)], self.program, self.config,
-                        max_ops=self.max_ops, checkpoint=self.checkpoint,
-                        from_cache=self.from_cache, seconds=self.seconds, parts=self.parts,
-                        state_split=self.state_split)
+        return self._with([g for g in self.graphs if fn(g)])
+
+    def _with(self, graphs) -> "GraphSet":
+        return GraphSet(graphs, self.program, self.config, max_ops=self.max_ops,
+                        checkpoint=self.checkpoint, from_cache=self.from_cache,
+                        seconds=self.seconds, parts=self.parts, state_split=self.state_split)
 
     @property
     def dtype(self) -> str:
@@ -107,6 +114,17 @@ class GraphSet(Sequence):
         head = (f"GraphSet: {len(self)} graph(s) max_ops={self.max_ops} "
                 f"{'cache hit' if self.from_cache else 'searched'} {self.seconds:.2f}s")
         return "\n".join([head] + [f"  {g.index}: {g.summary()}" for g in self])
+
+
+def state_split_of(graphs, program) -> tuple:
+    """The split to build from the loop state of ``graphs``: the split their search was
+    asked for, where every one is solo and a max of ``program`` reduces a dim of it (what
+    ``superoptimize`` records as ``GraphSet.state_split``); ``()`` otherwise."""
+    splits = {tuple(g.split) for g in graphs}
+    if program is None or len(splits) != 1 or any(g.is_split or g.invalid_split for g in graphs):
+        return ()
+    (split,) = splits
+    return split if split and max_split_dims(program, split) else ()
 
 
 def max_split_dims(program, split) -> tuple[str, ...]:
