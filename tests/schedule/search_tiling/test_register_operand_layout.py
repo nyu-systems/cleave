@@ -59,8 +59,7 @@ def test_an_inter_output_gemm_is_judged_by_the_rows_of_one_iteration():
     warp, failed to lower with ``Layout infer conflict``) and was let through at 256 threads
     as staged (codegen stages by the rows of the step, so none was, and all failed the same
     way): 16 of the 36 tilings of demo/mha_backward. By the iteration's rows, steps of 64
-    rows at 128 threads and of 128 rows (16 a warp at 256 threads) remain, and every tiling
-    that is proposed lowers."""
+    and 128 rows at 128 threads remain, and every tiling that is proposed lowers."""
     from tests._lowering import lower_to_cuda
     from cleave.runtime.compile import build_candidate_code
     from tests.schedule.search_tiling import test_accumulation_contexts as AC
@@ -76,9 +75,10 @@ def test_an_inter_output_gemm_is_judged_by_the_rows_of_one_iteration():
          int(c.get_itile(dq)[-2]))
         for c in cands
     }
+    # (the steps of 128 rows on 256 threads, 16 a warp, pass this rule; their dK and dV are
+    # two staged accumulators of 64 rows, test_two_staged_accumulators_of_64_rows_...)
     assert {r for r in rows if r[0].startswith("inter")} == {
-        ("inter,intra,intra", 128, 4096, 64), ("inter,intra,intra", 128, 4096, 128),
-        ("inter,intra,intra", 256, 4096, 128)}
+        ("inter,intra,intra", 128, 4096, 64), ("inter,intra,intra", 128, 4096, 128)}
     assert {(t, m) for acc, t, m, _ in rows if acc.startswith("intra")} == {
         (128, 64), (128, 128), (128, 256), (256, 128), (256, 256)}
     for acc in ("inter,intra,intra", "intra,inter,inter"):
@@ -170,6 +170,32 @@ def test_a_softmax_over_256_queries_has_no_tiling_and_says_why():
     assert len(refused) == 0
     ((reason),) = {str(r.error) for r in refused.refused}
     assert f"x {ROW_REDUCTION_CONFLICT}" in reason
+
+
+def test_two_staged_accumulators_of_64_rows_get_no_two_warp_groups():
+    """``dV += P^T dO`` and ``dK += dS^T q`` in one loop over a block of 64 keys came out
+    wrong on 256 threads (10 of the 14 such tilings of dkdv, dkdv_o and fused_o validated
+    wrong on an H100, almost every element of the first accumulator off): no such tiling
+    is proposed. One such gemm alone (dk, dv) keeps its 256-thread tilings of 64 rows,
+    which all validate, and so does fused_o's assignment that sums dK and dV across
+    thread blocks."""
+    from cleave.pipeline import GraphSet, ScheduleConfig, schedule
+    from tests.lower import _attention_bwd as A
+
+    ref = dict(H=32, SQ=4096, SKV=4096, D=64)
+
+    def plans(name):
+        return list(schedule(GraphSet.identity(A.program(name, ref)), ScheduleConfig(topk=1000)))
+
+    def wide(p):
+        return p.n_threads == 256 and list(p.output_tile) == [1, 64, 64]
+
+    for name, count in (("dkdv", 18), ("dkdv_o", 18), ("fused_o", 24)):
+        found = plans(name)
+        assert len(found) == count, name
+        assert not [p.label for p in found if wide(p) and "acc=[intra" not in p.label], name
+    for name, count in (("dk", 16), ("dv", 8)):
+        assert sum(wide(p) for p in plans(name)) == count, name
 
 
 def test_lora_up_projection_needs_16_rows_per_warp():
