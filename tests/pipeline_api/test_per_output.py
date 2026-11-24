@@ -125,9 +125,11 @@ def test_undeclared_programs_take_the_whole_program_path(monkeypatch, tmp_path):
     m, k, n = p.dims(M=64, K=64, N=64)
     x, w = p.input("x", (m, k)), p.input("w", (k, n))
     p.output(x @ w, "y")
-    p.output(x @ w, "y2")
+    # (a second output the search finds a graph with: for ``x @ w`` returned twice it finds
+    # none, and ``superoptimize`` says so with a SuperoptError instead of an empty set)
+    p.output(x * 2.0, "y2")
     gs = P.superoptimize(p, P.SuperoptConfig(threads=2, cache=False))
-    assert gs.parts == () and all(g.parts == () for g in gs)
+    assert len(gs) and gs.parts == () and all(g.parts == () for g in gs)
 
 
 def test_per_output_refuses_split():

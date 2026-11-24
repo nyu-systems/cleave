@@ -9,8 +9,9 @@ group of its own; a program whose input dims all have a group is grouped and num
 before (``test_search_reproducible.py`` and the pipeline snapshots hold the rest).
 
 An input that no op reads aborted the same way (no rule mentions any of its dims). The native
-search now runs on it and finds no graph: it counts every tensor that nothing reads as an
-output, so no graph has the program's outputs. ``superoptimize`` refuses such a program, and
+search would find no graph for it: it counts every tensor that nothing reads as an output, so
+no graph has the program's outputs; ``Program.to_tile_graph`` does not build the symbolic graph
+of such an input (one declared ``equals=`` aside). ``superoptimize`` refuses such a program, and
 one that returns an input, with a ``SpecError`` before the search, and any search that finds
 no graph (a reduction over a dim of one element, a ``max_ops`` below the program's own size)
 with a ``SuperoptError`` that says so. Before, an empty ``GraphSet`` came back, which
@@ -139,13 +140,16 @@ def f(x: cl.Tensor["R", "C"], y: cl.Tensor["R", "C"]):
     return cl.exp(x)
 
 
-symbolic, _ = csopt.create_symbolic_tile_graph(trace(f, dict(R=64, C=1024), cl.f16).to_tile_graph())
-config = symbolic.setup_search_config()
-config.max_num_kernel_graph_op = 13
-print("RESULT " + json.dumps(dict(graphs=len(symbolic.search_tile_graph("", False, False, config)))))
+try:
+    trace(f, dict(R=64, C=1024), cl.f16).to_tile_graph()
+    print("RESULT " + json.dumps(dict(error=None)))
+except CleaveError as e:
+    print("RESULT " + json.dumps(dict(error=type(e).__name__, message=str(e))))
 """
 
 
-def test_search_the_native_search_of_a_program_with_an_unread_input_finds_no_graph(tmp_path):
-    """Under the refusal of ``superoptimize``: the native search itself no longer aborts."""
-    assert _run(NATIVE_CHILD, tmp_path) == dict(graphs=0)
+def test_search_the_native_search_is_not_handed_a_program_with_an_unread_input(tmp_path):
+    """Under the refusal of ``superoptimize``: the tile graph is not built either, so the
+    native search is never handed it."""
+    assert _run(NATIVE_CHILD, tmp_path) == dict(
+        error="SpecError", message="f: input 'y' is not read by any output")
