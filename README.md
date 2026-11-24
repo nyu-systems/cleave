@@ -93,11 +93,12 @@ definition (the forward output `o` of `mha_backward.py`, which lets it replace
 validation draws the input (the forward's log-sum-exp `L`, from the drawn `q` and `k`); the
 search treats it as free. A program with an `Equals` input and several outputs is searched
 one output at a time (`SuperoptConfig(per_output="auto")`, the default) and one graph per
-output is merged into one, equal ops shared. Where the outputs reduce over orthogonal axes (the backward's `dQ`
-over `S_KV`, `dK` and `dV` over `S_Q`), a thread block owns a tile of one axis and loops over
-the other: the outputs of that loop accumulate in registers, the others across thread blocks
-with atomic adds into a float32 buffer, and both assignments are searched and ranked. A value
-the loop does not change (`D`) is computed on its first iteration and read by the others.
+output is merged into one, equal ops shared. Where the outputs reduce over orthogonal axes
+(the backward's `dQ` over `S_KV`, `dK` and `dV` over `S_Q`), a thread block owns a tile of one
+axis and loops over the other: the outputs of that loop accumulate in registers, the others
+across thread blocks with atomic adds into a float32 buffer, and both assignments are searched
+and ranked. A value the loop does not change (`D`) is computed on its first iteration and read
+by the others.
 
 `cl.softmax` is the exact softmax, `exp(s - max(s)) / sum`, and records its max: the max is an
 ordinary reduction of the flat graph the superoptimizer searches
@@ -125,11 +126,11 @@ served wrongly):
 - attention with a single query row (`S_Q = 1`): a unit dim that is not a batch dim has no tile
   (and the value matmul would read its operand from the exp's registers with one row a warp,
   which TileLang cannot lay out: the refusal names that, since no thread count is proposed);
+- an output that reduces every dim to one element (`sum(x, 0)` of a vector, the total of a
+  matrix): its tile has no dim, for the same reason;
 - a matmul that reads its first operand from another matmul's accumulator (attention's
   `P @ V`) with fewer than 16 rows a warp, or over two warp groups at another M than 128
   unless the operand is staged through shared memory: 64 query rows have no 256-thread tiling;
-- an output that reduces every dim to one element (`sum(x, 0)` of a vector, the total of a
-  matrix): its tile has no dim, for the same reason;
 - for 16-bit dtypes, a matmul that contracts a length no multiple of 16 divides (float16
   attention at `S_KV = 1000`), and for float32 one no multiple of 8 divides;
 - a row that a tile has to hold whole and whose length is not a power of two (a standalone
@@ -215,8 +216,8 @@ There is no default tolerance. Each operator declares its own `cl.Tolerance(rtol
 (one, or one per output when every plan has that many: a program with split plans declares
 one, because a split partial has more outputs than its combine; a split partial that also
 returns a float32 max gets a bound of its own by boundary role,
-`{"": cl.Tolerance(...), "shift": cl.Tolerance(...)}`, which the decode demos declare for the
-split of their softmax), set from its measured error
+`{"": cl.Tolerance(...), "shift": cl.Tolerance(...)}`, which the MHA, GQA and MQA decode and
+prefill demos declare for the split of their softmax), set from its measured error
 (the next 1-2-5 step at or above 4x the largest error of its valid kernels, 2x for a bf16
 output, whose single ulp is already 0.8% of the row max; valid kernels sit within a few ulp of
 the reference, wrong kernels above 10% of the row max): `cleave.compile(..., tolerance=...)`,
