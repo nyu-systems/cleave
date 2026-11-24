@@ -28,8 +28,30 @@ def cache_root(tmp_path, monkeypatch):
     return tmp_path
 
 
-def _close(out, ref):
-    torch.testing.assert_close(out.float(), ref.float(), rtol=2e-2, atol=5e-2)
+def _hold(out, ref, what="returned kernel"):
+    """The kernel ``compile`` returned (or loaded, or chained), on inputs it was not
+    validated on, against the program's own reference at the bound the matmul declares.
+    (This compared elementwise at 2e-2 + 5e-2: a kernel 1.5% off everywhere passed.)"""
+    from cleave.runtime.validate import compare_outputs
+
+    (measured,) = compare_outputs([out], [ref.to(out.device)], TOLERANCE, what=what)
+    assert 0 <= measured.rel <= TOLERANCE.rtol
+    return measured
+
+
+def test_the_returned_kernel_check_has_the_declared_bound():
+    """What ``_hold`` accepts: the reference itself; not the reference 1.5% off, which the
+    elementwise check it replaces accepted."""
+    from cleave.core.errors import OutputMismatch
+
+    prog = trace(programs.matmul, SHAPES, cl.f16)
+    x, w = prog.random_inputs(seed=1)
+    ref = prog.reference(x, w)[0]
+    assert _hold(ref.clone(), ref).rel == 0
+    off = (ref.float() * 1.015).to(torch.float16)
+    torch.testing.assert_close(off.float(), ref.float(), rtol=2e-2, atol=5e-2)  # what passed
+    with pytest.raises(OutputMismatch, match="entries out of tolerance"):
+        _hold(off, ref)
 
 
 def test_compile_matmul_end_to_end(cache_root, tmp_path):
@@ -52,19 +74,19 @@ def test_compile_matmul_end_to_end(cache_root, tmp_path):
     prog = trace(programs.matmul, SHAPES, cl.f16)
     x, w = prog.random_inputs(seed=1)
     ref = prog.reference(x, w)[0]
-    _close(kernel(x, w), ref)
-    _close(kernel(w=w, x=x), ref)
+    _hold(kernel(x, w), ref)
+    _hold(kernel(w=w, x=x), ref, "returned kernel, by name")
     with pytest.raises(ValueError):
         kernel(w, x)  # wrong shapes are rejected, not silently transposed
 
     loaded = P.load(kernel.save(tmp_path / "saved"))
     assert loaded.latency_us == kernel.latency_us and loaded.input_names == ["x", "w"]
-    _close(loaded(x, w), ref)
+    _hold(loaded(x, w), ref, "loaded kernel")
 
     t0 = time.perf_counter()
     again = P.compile(programs.matmul, shapes=SHAPES, dtype=cl.f16, split=False, **FAST)
     assert again.meta["cache"] == "hit" and time.perf_counter() - t0 < 30
-    _close(again(x, w), ref)
+    _hold(again(x, w), ref, "cached kernel")
 
 
 def test_split_k_schedule_and_chained_kernel(cache_root):
@@ -91,7 +113,7 @@ def test_split_k_schedule_and_chained_kernel(cache_root):
     parts = report.variants()["split-k=4"].members
     assert kernel.latency_us == pytest.approx(sum(m.latency_us for m in parts))
     x, w = prog.random_inputs(seed=2)
-    _close(kernel(x, w), prog.reference(x, w)[0])
+    _hold(kernel(x, w), prog.reference(x, w)[0], "chained split-k=4 kernel")
 
 
 def test_session_scopes_compile(tmp_path, monkeypatch):
@@ -108,5 +130,6 @@ def test_session_scopes_compile(tmp_path, monkeypatch):
     assert [p.role for p in built.params][-1] == "output" and built.plan is kernel.plan
     best = min(kernel.report.timed, key=lambda r: r.latency_ms)
     assert best.kernel is built and best.source == built.source
-    x, w = trace(programs.matmul, SHAPES, cl.f16).random_inputs(seed=3)
-    _close(kernel(x, w), x.float() @ w.float())
+    prog = trace(programs.matmul, SHAPES, cl.f16)
+    x, w = prog.random_inputs(seed=3)
+    _hold(kernel(x, w), prog.reference(x, w)[0], "session kernel")
