@@ -48,6 +48,10 @@ HELD = {
     # float16 ulp of the row max). Three seeds measure 9.71e-4 / 9.66e-4 / 9.51e-4 for the
     # first, second and third output of the kernels, for which the rule gives 5e-3.
     "attention_bwd": "the rule would loosen 1.5e-3 to 5e-3 on the three-seed measurement",
+    # 2e-3 is the bound tests/schedule/end2end/test_absorbed_reduction.py came with (on main
+    # and on 1119, computed in that file), above every kernel it measured (8.1e-4 to 9.8e-4,
+    # one float16 ulp of the row max). Declared here, measured with the other test operators.
+    "absorbed_reduction": "the rule would loosen 2e-3 to 5e-3 on the three-seed measurement",
 }
 
 

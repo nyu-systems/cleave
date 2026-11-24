@@ -536,6 +536,8 @@ def _test_operators():
             return "per_output_pair"
         if path == "tests/lower/test_attention_bwd_gpu.py":
             return "attention_bwd"
+        if path == "tests/schedule/end2end/test_absorbed_reduction.py":
+            return "absorbed_reduction"
         return node
 
     return operator

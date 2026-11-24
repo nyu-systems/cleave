@@ -167,3 +167,27 @@ def test_the_engine_never_names_float64():
     for path in store.engine_sources():
         text = path.read_text()
         assert "float64" not in text and ".double(" not in text, path.name
+
+
+# The files that make a float64 array on purpose: the guards above, which hand one in.
+_FLOAT64_ON_PURPOSE = {"tests/update/test_ranking.py"}
+_FLOAT64 = re.compile(r"\.double\(|\b(?:torch|np|numpy)\.(?:float64|double)\b")
+
+
+def test_no_test_reference_or_library_computes_in_float64():
+    """No float64 anywhere: references, search evaluation, ranking and tests use the
+    program's own dtypes / float32. A test that widened its error arithmetic to float64
+    (tests/schedule/end2end/test_absorbed_reduction.py did) is caught here."""
+    root = store.engine_sources()[0].parents[3]
+    offenders = []
+    for top in ("python", "tests", "demo"):
+        for path in sorted((root / top).rglob("*.py")):
+            name = path.relative_to(root).as_posix()
+            if name in _FLOAT64_ON_PURPOSE:
+                continue
+            for n, line in enumerate(path.read_text().splitlines(), 1):
+                if _FLOAT64.search(line):
+                    offenders.append(f"{name}:{n}: {line.strip()}")
+    assert offenders == []
+    assert _FLOAT64.search("ref.double()") and _FLOAT64.search("x.to(torch.float64)")
+    assert not _FLOAT64.search("csopt.float64") and not _FLOAT64.search('"float64": "f"')

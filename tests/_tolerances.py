@@ -122,6 +122,11 @@ TOLERANCES = {
     # against torch autograd of the forward: main's bound, held below the rule
     # (tests/test_tolerance_declarations.py, HELD)
     "attention_bwd": Tolerance(rtol=1.5e-3),
+    # The kernels of tests/schedule/end2end/test_absorbed_reduction.py, whose score
+    # contraction is absorbed into the S_KV loop (flash_attention_sd, mha_bhsd and
+    # mla_decode_bhsd at one tiling each): that test's bound, held below the rule
+    # (tests/test_tolerance_declarations.py, HELD)
+    "absorbed_reduction": Tolerance(rtol=2e-3),
 }
 
 
