@@ -134,6 +134,9 @@ served wrongly):
   unless the operand is staged through shared memory: 64 query rows have no 256-thread tiling
   (M is the rows of one iteration: for the backward's `dQ` summed across thread blocks, one
   step of the `S_Q` loop);
+- a sum or max over the rows of a matmul's accumulator (a softmax over the queries,
+  `dim=-2`) that would give a warp more than 16 of those rows, which TileLang's reduction
+  cannot lower: attention normalized over 64 queries has plans, over 256 none;
 - for 16-bit dtypes, a matmul that contracts a length no multiple of 16 divides (float16
   attention at `S_KV = 1000`), and for float32 one no multiple of 8 divides;
 - a row that a tile has to hold whole and whose length is not a power of two (a standalone

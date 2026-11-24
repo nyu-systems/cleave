@@ -6,6 +6,8 @@ policy no longer emits those candidates. CPU only.
 """
 import copy
 
+import pytest
+
 from cleave.core.target import current_target
 from cleave.ir.graph import ComputeOpNode, OutputNode
 from cleave.ir.ops import Exp, Matmul
@@ -85,6 +87,89 @@ def test_an_inter_output_gemm_is_judged_by_the_rows_of_one_iteration():
                     and ",".join(AC._contexts(c).values()) == acc]
             if some:
                 lower_to_cuda(build_candidate_code(some[0]))
+
+
+def _column_sum(x, w):
+    """sum_N(exp(w x^T / 8)): a sum over the rows of a gemm's accumulator, as the per-output
+    search writes ``rowsum(exp(x w))`` (tests/pipeline_api/test_per_output_gpu.py)."""
+    import cleave.lang as cl
+
+    return cl.sum(cl.exp(w @ x.mT * 0.125), 0, keepdim=True)
+
+
+def test_a_reduction_over_gemm_rows_holds_at_most_16_of_them_a_warp():
+    """TileLang's ReduceOp cannot lower a sum (or max) over dim -2 of a gemm accumulator
+    fragment whose warps hold more than 16 of the reduced rows ("source index depends on a
+    thread-owned reduce segment"). Such tilings are no longer proposed: steps of 128 and 256
+    rows at 128 threads, and of 256 at 256 threads (22 of the 144 tilings of
+    per_output_pair, none of which lowered, 4 of them in the top 8 of one of its graphs)."""
+    import cleave.lang as cl
+    from cleave.codegen.passes import wgmma_row_warps
+    from cleave.frontend import trace
+    from cleave.ir.ops import ReduceSum
+    from cleave.pipeline import GraphSet
+    from cleave.pipeline.plans import lower
+    from cleave.runtime.compile import build_candidate_code
+    from tests._lowering import lower_to_cuda
+
+    def column_sum(x: cl.Tensor["M", "K"], w: cl.Tensor["N", "K"]):
+        return _column_sum(x, w)
+
+    (graph,) = lower(GraphSet.identity(trace(column_sum, dict(M=128, K=64, N=1024), cl.f16))[0])
+    policy = _policy(graph)
+    (rowsum,) = [n for n in graph.nodes if isinstance(n, ReduceSum)]
+    (gemm,) = [n for n in graph.nodes if isinstance(n, Matmul)]
+    cands = search_tiling(graph, topk=10000)
+
+    def rows_a_warp(c):
+        (rows,) = [int(s) for s in c.get_rstep(rowsum).values()]
+        warps = wgmma_row_warps(gemm.warp_policy, rows, int(c.get_itile(gemm)[-1]), c.n_threads)
+        return rows, min(rows // w for w in warps or (c.n_threads // 32,))
+
+    seen = {(c.n_threads, rows_a_warp(c)) for c in cands}
+    assert all(rpw <= 16 for _, (_, rpw) in seen)
+    assert {(t, rows) for t, (rows, _) in seen if rows >= 64} == {(128, 64), (256, 64), (256, 128)}
+    # the limit itself lowers: 16 rows a warp at 128 and at 256 threads
+    for threads, rows in ((128, 64), (256, 128)):
+        c = next(c for c in cands if c.n_threads == threads and rows_a_warp(c)[0] == rows)
+        lower_to_cuda(build_candidate_code(c))
+    # ... and one step more does not: the same tiling with 128 rows a step at 128 threads,
+    # built by hand, is refused, and fails to lower with the error the rule stands for
+    c = next(c for c in cands if c.n_threads == 128 and rows_a_warp(c)[0] == 64)
+    assert not policy._row_reduction_layout_conflict(c, 128)
+    rstep_map = {n: dict(s) for n, s in c.rstep_map.items()}
+    (name,) = rstep_map[rowsum]
+    rstep_map[rowsum][name] = 128
+    over = policy.compute_tile_dict(list(c.output_tile), rstep_map)
+    over.n_threads = 128
+    assert policy._row_reduction_layout_conflict(over, 128)
+    with pytest.raises(Exception, match="thread-owned reduce segment"):
+        lower_to_cuda(build_candidate_code(over))
+
+
+def test_a_softmax_over_256_queries_has_no_tiling_and_says_why():
+    """The max and the sum of a softmax over the queries (``dim=-2``) reduce the rows of the
+    scores' accumulator. At 64 queries a block holds 16 of them a warp; at 256 every tiling
+    holds 32 or 64 (none of the 144 of the searched graph lowered), so there is no plan,
+    and the refusal names the limit."""
+    import cleave.lang as cl
+    from cleave.frontend import trace
+    from cleave.pipeline import GraphSet, ScheduleConfig, schedule
+    from cleave.schedule.policy.default import ROW_REDUCTION_CONFLICT
+
+    def over_queries(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
+                     v: cl.Tensor["H", "SKV", "D"]):
+        return cl.softmax((q @ k.mT) / q.shape[-1] ** 0.5, dim=-2) @ v
+
+    def plans(sq):
+        return schedule(GraphSet.identity(trace(over_queries, dict(H=4, SQ=sq, SKV=256, D=64),
+                                                cl.f16)), ScheduleConfig(topk=100000))
+
+    assert len(plans(64)) > 0
+    refused = plans(256)
+    assert len(refused) == 0
+    ((reason),) = {str(r.error) for r in refused.refused}
+    assert f"x {ROW_REDUCTION_CONFLICT}" in reason
 
 
 def test_lora_up_projection_needs_16_rows_per_warp():

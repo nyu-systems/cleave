@@ -15,7 +15,7 @@ from ...ir.analysis import (
     get_output_axis_tokens,
 )
 from ...ir.analysis import is_mla_value_gemm
-from ...ir.ops import Copy, Div, Matmul, Mul, ReduceSum
+from ...ir.ops import Copy, Div, Matmul, Mul, ReduceMax, ReduceSum
 from ...ir.ops.elementwise import BinaryElementwise
 from ..tiling import (
     absorbed_axis_conflict,
@@ -44,6 +44,12 @@ REGISTER_OPERAND_CONFLICT = (
     "a matmul would read its first operand from another matmul's accumulator in registers "
     "with fewer than 16 rows a warp, or over two warp groups at another M than 128, which "
     "TileLang cannot lay out"
+)
+# ... and for a tiling whose reduction over a matmul's rows TileLang cannot lower
+# (``_row_reduction_layout_conflict``).
+ROW_REDUCTION_CONFLICT = (
+    "a reduction over the rows of a matmul's accumulator would hold more than 16 of those "
+    "rows a warp, which TileLang's reduction cannot lower"
 )
 # Ops an inter output may apply between its reduction and the output: linear in the
 # reduction's result (one input; a scalar operand is folded into the op), so the sum of
@@ -1864,8 +1870,67 @@ class TCPolicy(DefaultPolicy):
             return False
         return register_operand_is_misplaced(node.warp_policy, rows, cols, n_threads)
 
+    @staticmethod
+    def _gemm_under(node):
+        """The matmul whose accumulator fragment ``node`` is computed from through
+        elementwise and view ops (no reduction between them), or None."""
+        stack, seen = [node], set()
+        while stack:
+            current = stack.pop()
+            if isinstance(current, Matmul):
+                return current
+            if (
+                id(current) in seen
+                or not isinstance(current, (ComputeOpNode, ViewOpNode))
+                or getattr(current, "raxis", None)
+            ):
+                continue
+            seen.add(id(current))
+            stack.extend(edge.src_node for edge in current.inputs)
+        return None
+
+    def _row_reduction_layout_conflict(self, candidate, n_threads):
+        """Would a reduction over the rows of a gemm accumulator get more than 16 of them a
+        warp?
+
+        TileLang 0.1.13 limitation on sm_90 (the vendored TileLang cannot be patched): a sum
+        or max over dim -2 of a fragment laid out as a gemm's accumulator (directly or
+        through elementwise ops: the row sum of ``exp(w^T x^T)`` that a per-output search
+        writes for ``rowsum(exp(x w))``, the max of a softmax over the queries) lowers only
+        while every warp holds at most 16 of the reduced rows; with more, lowering fails
+        with ``ReduceOp cannot lower a layout where a source index depends on a
+        thread-owned reduce segment``. The rows a warp are the reduction's step over the
+        warps TileLang lays along the gemm's rows (``codegen.passes.wgmma_row_warps``; all
+        the warps for a gemm below 64 rows). Measured on CPU lowering for sm_90: every one of
+        30 such tilings with 32 or 64 rows a warp failed, and every one with 16 or fewer
+        but two lowered (2 at 256 threads with 16 rows a warp fail as well, and stay).
+        """
+        from ...codegen.passes import wgmma_row_warps
+
+        if getattr(self.arch, "sm_version", None) != 90:
+            return False
+        warps = n_threads // 32
+        for node in self.ordered_nodes:
+            if not isinstance(node, (ReduceSum, ReduceMax)) or not node.raxis:
+                continue
+            src = node.inputs[0].src_node
+            if node.axis != len(src.get_shape()) - 2:
+                continue
+            gemm = self._gemm_under(src)
+            if gemm is None:
+                continue
+            try:
+                (rows,) = [int(step) for step in candidate.get_rstep(node).values()]
+                cols = int(candidate.get_itile(gemm)[-1])
+            except (TypeError, ValueError):
+                continue
+            row_warps = wgmma_row_warps(gemm.warp_policy, rows, cols, n_threads) or (warps,)
+            if min(rows // w for w in row_warps) > 16:
+                return True
+        return False
+
     def get_num_threads(self, candidates):
-        expanded_candidates, conflicts = [], 0
+        expanded_candidates, conflicts, row_conflicts = [], 0, 0
         for candidate in candidates:
             n_threads_options = list(self.PRIMARY_N_THREADS)
             if self._requires_low_thread_counts(candidate):
@@ -1874,14 +1939,20 @@ class TCPolicy(DefaultPolicy):
                 if self._register_operand_layout_conflict(candidate, n_threads):
                     conflicts += 1
                     continue
+                if self._row_reduction_layout_conflict(candidate, n_threads):
+                    row_conflicts += 1
+                    continue
                 expanded = copy.copy(candidate)
                 expanded.n_threads = n_threads
                 expanded_candidates.append(expanded)
         if self.flat_graph is not None:
             # Where this leaves the graph no tiling at all, that is why, and nothing else
             # says so: the schedule's report reads it off the graph (``REGISTER_OPERAND_
-            # CONFLICT``; ``pipeline.plans._no_tiling``).
+            # CONFLICT``, ``ROW_REDUCTION_CONFLICT``; ``pipeline.plans._no_tiling``).
             self.flat_graph.register_operand_conflicts = (
                 0 if expanded_candidates else conflicts
+            )
+            self.flat_graph.row_reduction_conflicts = (
+                0 if expanded_candidates else row_conflicts
             )
         return expanded_candidates
