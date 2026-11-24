@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from ....ir.graph import Graph, GraphNode, Iterator
-from ....ir.ops import MaskedDiv, MaskedLog2
+from ....ir.ops import MaskedDiv, MaskedLse2
 from ....ir.graph_utils import gather_all_nodes, lock_graph
 from ..stages import (
     LOG2E,
-    _exp,
+    _accumulators,
+    _declare_rolling,
     _gqa_body,
     _index_input,
     _name_inputs,
@@ -17,7 +18,7 @@ from ..stages import (
     _worklist,
     _worklist_scan,
 )
-from ..tensor_maps import _accum_tiles, _output_maps, _output_tinfo, _whole
+from ..tensor_maps import _accum_tiles, _output_maps, _output_tinfo, _rolling_maps, _whole
 
 
 def _build_ragged_prefill_causal(spec, dense) -> Graph:
@@ -34,8 +35,8 @@ def _build_ragged_prefill_causal(spec, dense) -> Graph:
     # P stays in its fragment rather than being staged through shared (REGISTER_P_KINDS):
     # tilelang then feeds it to the second matmul in place (wgmma_rs) instead of a stmatrix
     # round trip.
-    score_mma, exp, rowsum, value_mma = _gqa_body(
-        spec, dense, bm, lambda: _exp(dense, bm, causal=True)
+    score_mma, exp, rowsum, value_mma, rolling = _gqa_body(
+        spec, dense, bm, causal=True
     )
     ph_q = score_mma.inputs[0].src_node
     ph_k = score_mma.inputs[1].src_node
@@ -43,6 +44,7 @@ def _build_ragged_prefill_causal(spec, dense) -> Graph:
     _name_inputs(spec, ph_q, ph_k, ph_v)
 
     inner = Graph(nodes=gather_all_nodes(rowsum, value_mma))
+    _declare_rolling(inner, rolling, rowsum, value_mma)
     inner.extent = 1
     inner.loop_kind = "pipelined"
     inner.loop_stages = 2
@@ -74,22 +76,20 @@ def _build_ragged_prefill_causal(spec, dense) -> Graph:
     lock_graph(inner)
 
     loop_node = GraphNode(name="GraphNode_0", graph=inner)
-    rowsum_id = inner.accum_nodes.index(rowsum)
-    value_id = inner.accum_nodes.index(value_mma)
+    accumulators = _accumulators(loop_node, rowsum, value_mma, rolling)
     inner_q = inner.binding[ph_q.name]
     inner_k = inner.binding[ph_k.name]
     inner_v = inner.binding[ph_v.name]
 
-    div, log2, outputs = _normalise(
+    div, lse, outputs = _normalise(
         loop_node,
-        (value_mma, value_id),
-        (rowsum, rowsum_id),
+        *accumulators,
         (bm, head_dim),
         dense.accum_dtype,
         dense.out_dtype,
         spec.emit_lse,
         div_cls=MaskedDiv,
-        log2_cls=MaskedLog2,
+        lse_cls=MaskedLse2,
         scalar_args=("n_rows",),
     )
     ph_qo = _index_input(spec.query_indptr_input)
@@ -145,7 +145,7 @@ def _build_ragged_prefill_causal(spec, dense) -> Graph:
     _output_maps(
         main,
         div,
-        log2,
+        lse,
         outputs,
         Iterator(
             lambda i, h: (q_abs, f"{h}", "0"), shape=q_shape, tile_size=(bm, 1, head_dim)
@@ -178,7 +178,7 @@ def _build_ragged_prefill_causal(spec, dense) -> Graph:
 
     main.tinfo_map = {node: (node.name, "g") for node in (ph_q, ph_k, ph_v, ph_qo, ph_kv)}
     main.tinfo_map[loop_node] = ("t_GraphNode_0", "r")
-    _output_tinfo(main, div, log2, outputs)
+    _output_tinfo(main, div, lse, outputs)
     inner.tinfo_map = {
         **{node: (node.name, "g") for node in (ph_q, ph_k, ph_v)},
         **{node: (node.name, "s") for node in (inner_q, inner_k, inner_v)},
@@ -187,4 +187,5 @@ def _build_ragged_prefill_causal(spec, dense) -> Graph:
         rowsum: ("t_rowsum_0", "r"),
         value_mma: ("t_mma_1", "r"),
     }
+    _rolling_maps(inner, score_mma, rolling, bm)
     return _run_passes(main)

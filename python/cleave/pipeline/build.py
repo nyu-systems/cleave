@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ast
-import functools
 import time
 from dataclasses import dataclass, field
 from typing import Any, Sequence
@@ -45,8 +44,12 @@ class BuiltKernel:
         return [p for p in self.params if p.role == "output"]
 
     @classmethod
-    def from_plan(cls, plan, source: str, signature=None) -> "BuiltKernel":
+    def from_plan(cls, plan, source: str, signature=None, stored_layouts=None) -> "BuiltKernel":
+        """``stored_layouts`` (``CandidateResult.stored_layouts``) gives the outputs the dims
+        the kernel declares; without it they keep the lowered graph's logical dims."""
         params, out_idx, dyn = signature or _signature(plan.tile.flat_graph)
+        if stored_layouts is not None:
+            params = _stored_output_dims(params, stored_layouts)
         return cls(source, ENTRY, params, out_idx, pass_configs_of(source), dyn, plan)
 
     def to_dict(self) -> dict:
@@ -109,8 +112,25 @@ def _signature(graph):
     return params, tuple(graph_out_indices(graph)), dyn
 
 
+def _stored_output_dims(params, stored_layouts):
+    """``params`` with each output's dims as the kernel stores them (one layout per output,
+    in order): the signature of a lowered graph has them in the graph's logical layout."""
+    layouts = list(stored_layouts)
+    if len(layouts) != sum(p.role == "output" for p in params):
+        raise ValueError(f"{len(layouts)} stored layouts for the outputs of "
+                         f"{[p.name for p in params if p.role == 'output']}")
+    out = []
+    for p in params:
+        if p.role == "output":
+            axes, pad = layouts.pop(0)
+            p = KernelParam(p.name, p.dtype, tuple(p.dims[a] for a in axes) + (1,) * pad, p.role)
+        out.append(p)
+    return tuple(out)
+
+
 def built_kernels(plans: Sequence[Plan], runs) -> list[BuiltKernel | None]:
-    """A ``BuiltKernel`` per run that produced source (signatures shared per lowered graph)."""
+    """A ``BuiltKernel`` per run that produced source (signatures shared per lowered graph;
+    the output dims are each candidate's own, since tilings store outputs differently)."""
     sigs: dict[int, tuple] = {}
     out = []
     for plan, run in zip(plans, runs):
@@ -120,7 +140,8 @@ def built_kernels(plans: Sequence[Plan], runs) -> list[BuiltKernel | None]:
         graph = plan.tile.flat_graph
         if id(graph) not in sigs:
             sigs[id(graph)] = _signature(graph)
-        out.append(BuiltKernel.from_plan(plan, run.code, sigs[id(graph)]))
+        out.append(BuiltKernel.from_plan(plan, run.code, sigs[id(graph)],
+                                         getattr(run, "stored_layouts", None)))
     return out
 
 
@@ -142,26 +163,80 @@ class BuildSet(_Results):
         return f"BuildSet: {len(self)} candidates, {len(self.correct)} ok, failures: {self.failures}"
 
 
-def _program_dtype(plans) -> str:
+def _program(plans):
     program = getattr(plans, "program", None)
     if program is None and len(plans):
         program = plans[0].program
-    return str(getattr(program, "dtype", None) or "float16")
+    return program
+
+
+def _program_dtype(plans) -> str:
+    return str(getattr(_program(plans), "dtype", None) or "float16")
+
+
+def _reference_fn(distributions, program, publish):
+    """``publish(cache_dir, graph, dtype)`` over the input cases the kernels are held to.
+
+    ``distributions`` is what the caller asked for. A program whose softmax is exact
+    (``cl.softmax`` recorded the stabilize request) is right at any logit scale, so its
+    kernels are also held to every adversarial softmax case its inputs can be shaped into
+    (``cleave.runtime.inputs.adversarial_cases``), whether asked or not; they are timed on
+    the first case, as always. An ``exp / sum`` written out by hand makes no such
+    claim (its reference overflows on those inputs) and is validated on what was asked.
+
+    The returned function remembers what each graph was held to: ``held`` maps
+    ``id(flat graph)`` to ``(cases, note)``, ``note`` saying why a graph of an exact program
+    got fewer than every adversarial case (``""`` when it got them all, and for a program
+    that makes no claim).
+    """
+    exact = bool(getattr(program, "stabilize_requests", ()))
+    held = {}
+
+    def reference(reference_cache_dir, graph, dtype):
+        cases, note = distributions, ""
+        if exact:
+            from ..runtime.inputs import adversarial_cases, why_not_adversarial
+
+            cases += tuple(d for d in adversarial_cases(graph) if d not in distributions)
+            note = why_not_adversarial(graph)
+        held[id(graph)] = (cases, note)
+        return publish(reference_cache_dir, graph, dtype, distributions=cases)
+
+    reference.held = held
+    return reference
 
 
 def _check_tolerance_fits(plan_list, tolerance) -> None:
-    """Refuse a per-output ``tolerance`` that does not fit every plan, before any runs.
+    """Refuse a ``tolerance`` that leaves an output of some plan without a bound, or that
+    does not fit every plan, before any runs.
 
-    One ``Tolerance`` covers every output of every plan. A sequence is one per output, and
-    the plans of one program need not have the same outputs: a split partial has more than
-    its combine and than the solo plans. All candidates share the declaration, so a sequence
-    is only valid when every plan has exactly that many outputs.
+    One ``Tolerance`` covers every output the program or its cut defines. An output that a
+    rewrite added to the cut carries a boundary role (the float32 shift a split partial of
+    an exact softmax returns), and is only covered by a declaration keyed by role: a mapping
+    from role to ``Tolerance``, which fits every plan. A sequence is one per output, by
+    position, and the plans of one program need not have the same outputs: a split partial
+    has more than its combine and than the solo plans. All candidates share the
+    declaration, so a sequence is only valid when every plan has exactly that many outputs.
     """
-    from ..runtime import reference
-    from ..runtime.validate import Tolerance, tolerances_for
+    from collections.abc import Mapping
 
-    if not plan_list or isinstance(tolerance, Tolerance):
-        return  # nothing to validate, or one bound for every output
+    from ..runtime import reference
+    from ..runtime.validate import Tolerance, tolerances_for, tolerances_of
+
+    if not plan_list:
+        return  # nothing to validate
+    if isinstance(tolerance, (Tolerance, Mapping)):
+        checked = set()
+        for plan in plan_list:
+            graph = plan.tile.flat_graph
+            if id(graph) in checked:
+                continue
+            checked.add(id(graph))
+            try:
+                tolerances_of(tolerance, reference.output_roles(graph))
+            except SpecError as error:
+                raise SpecError(f"build(): plan {plan.label!r} ({plan.role}): {error}") from None
+        return
     try:
         declared = len(tuple(tolerance))
     except TypeError:
@@ -177,7 +252,8 @@ def _check_tolerance_fits(plan_list, tolerance) -> None:
                 f"build(): {declared} tolerances were declared, but plan {plan.label!r} "
                 f"({plan.role}) has {counted[id(graph)]} output(s). A per-output tolerance "
                 "must fit every plan, and a split partial has more outputs than its combine "
-                "and the solo plans; declare one Tolerance for all outputs")
+                "and the solo plans; declare one Tolerance for all outputs, or one per "
+                "boundary role")
 
 
 def _plans_by_graph(plan_list) -> dict:
@@ -210,7 +286,8 @@ def build(plans: PlanSet | Sequence[Plan], workers: int | None = None, *,
 
     Parallelism: ``workers``, else the active ``Session.max_parallel``, else ``config``.
     ``config.tolerance`` is required as soon as there is a plan to validate: one
-    ``Tolerance`` for every output, or one per output when every plan has that many.
+    ``Tolerance`` for every output, one per boundary role, or one per output when every
+    plan has that many (``_check_tolerance_fits``).
     """
     from ..core.session import current_session
     from ..runtime.inputs import check_distributions
@@ -226,9 +303,14 @@ def build(plans: PlanSet | Sequence[Plan], workers: int | None = None, *,
     if plan_list and config.tolerance is None:
         raise SpecError("build(): no validation tolerance declared; there is no default bound. "
                         "Pass config=EvalConfig(tolerance=cl.Tolerance(rtol=...))")
-    reference_fn = functools.partial(_publish_reference, publish_reference,
-                                     check_distributions(config.distributions),
-                                     _plans_by_graph(plan_list))
+    distributions = check_distributions(config.distributions)
+    plans_by_graph = _plans_by_graph(plan_list)
+
+    def publish(reference_cache_dir, graph, dtype, distributions):
+        return _publish_reference(publish_reference, distributions, plans_by_graph,
+                                  reference_cache_dir, graph, dtype)
+
+    reference_fn = _reference_fn(distributions, _program(plans), publish)
     _check_tolerance_fits(plan_list, config.tolerance)
     t0 = time.perf_counter()
     runs = run_candidates([p.tile for p in plan_list], _program_dtype(plans),
@@ -238,7 +320,9 @@ def build(plans: PlanSet | Sequence[Plan], workers: int | None = None, *,
                           benchmark=BenchOptions(config.warmup, config.iters),
                           reference_fn=reference_fn)
     kernels = built_kernels(plan_list, runs)
-    results = [Result(p, r, k) for p, r, k in zip(plan_list, runs, kernels)]
+    held = [reference_fn.held.get(id(p.tile.flat_graph), (None, "")) for p in plan_list]
+    results = [Result(p, r, k, cases, note)
+               for p, r, k, (cases, note) in zip(plan_list, runs, kernels, held)]
     return BuildSet(results, plans if isinstance(plans, PlanSet) else None,
                     time.perf_counter() - t0, config.tolerance)
 

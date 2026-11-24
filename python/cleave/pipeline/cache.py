@@ -8,12 +8,15 @@ import json
 from pathlib import Path
 
 # In every key. Bump it when the layout changes, or when the same program and configs would
-# now build a different kernel: a kernel-cache hit returns the saved one as it is.
-# 2: a reduction absorbed into another's loop is scheduled over its whole axis.
-SCHEMA = 2
+# now build a different kernel: a kernel-cache hit returns the saved one as it is. (What
+# changed belongs in the commit message. tests/pipeline_api/test_schema_guard.py fails when
+# the generated text of a softmax kernel moves without a bump.)
+SCHEMA = 41
 # What "validated" means for a saved kernel. A kernel-cache hit returns without validating,
 # so bump this whenever the comparison or its inputs change: saved kernels are then rebuilt.
-VALIDATION = 2
+# (The inputs include the adversarial cases a program with an exact softmax is held to,
+# cleave.runtime.inputs.ADVERSARIAL, which are not in the key by name.)
+VALIDATION = 6
 
 
 @functools.lru_cache(maxsize=None)

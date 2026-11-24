@@ -199,6 +199,89 @@ def test_a_paged_candidate_keeps_the_measurement_that_failed_it(monkeypatch):
     assert report.measured_error()[0]["rel"] == pytest.approx(0.005)
 
 
+def test_a_paged_validation_is_logged_under_its_workload(monkeypatch, tmp_path):
+    """Every comparison of ``compile_and_validate_over_workloads`` carries its workload's
+    key: in the validation log, where the key is what tells an adversarial workload
+    (``<workload>@<distribution>``) from a captured one when tolerances are measured, and
+    once in a failure."""
+    import torch
+
+    log = tmp_path / "validation.jsonl"
+    monkeypatch.setenv("CLEAVE_VALIDATION_LOG", str(log))
+    monkeypatch.setenv("CLEAVE_VALIDATION_CONTEXT", "dynamic:op")
+    out = torch.tensor([[1.0, -4.0, 2.0]])
+
+    def kernel(wrong_from):
+        calls = []
+
+        def run(scale, got):
+            calls.append(None)
+            got.copy_(scale * out + (1.2 if len(calls) > wrong_from else 0.0))
+
+        return run
+
+    kernels = {"good": kernel(9), "late": kernel(1)}  # "late": 30% off on its second workload
+    monkeypatch.setattr(autotune, "_compiled", lambda source: kernels[source])
+    monkeypatch.setattr(autotune, "_assert_context_survived", lambda label, cause: None)
+    candidates = [WorkloadCandidate(label=name, source=name) for name in kernels]
+    hard = "wl_1_2_3@large_logits"
+
+    def workloads():
+        for i, key in enumerate(("wl_1_2_3", hard)):
+            yield key, (torch.tensor(i + 1.0),), [(i + 1.0) * out]
+
+    success, errors = [], []
+    autotune.compile_and_validate_over_workloads(candidates, workloads, success, errors,
+                                                 tolerance=(Tolerance(rtol=2e-2),))
+    records = [json.loads(line) for line in log.read_text().splitlines()]
+    assert [(r["context"], r["what"], r["kind"]) for r in records] == [
+        ("dynamic:op", "wl_1_2_3", None), ("dynamic:op", "wl_1_2_3", None),
+        ("dynamic:op", hard, None), ("dynamic:op", hard, "mismatch")]
+    good, late = candidates
+    assert success == [good] and (good.checked, late.checked) == (2, 1)
+    # the error names the workload, and the candidate's failure leads with it once
+    ((label, error),) = errors
+    assert label == "late" and str(error).startswith(f"{hard}: output 0: ")
+    assert late.failure.startswith(f"{hard}: OutputMismatch: output 0: ")
+    assert late.failure.count(hard) == 1
+
+
+def test_a_keyed_workload_of_a_prim_func_names_its_comparison(monkeypatch):
+    """``compile_and_run_prim_func(workloads_fn=...)``: a workload that leads with its key
+    is validated under it; a plain ``(inputs, reference)`` pair is validated unnamed."""
+    import contextlib
+
+    from cleave.runtime import compile as runtime_compile
+
+    seen = []
+
+    class Kernel:
+        def get_kernel_source(self):
+            return "source"
+
+    def validated(kernel, inputs, reference, *, tolerance, what=""):
+        seen.append((what, inputs, reference, tolerance))
+
+    monkeypatch.setattr(runtime_compile, "_create_parallel_env", lambda: None)
+    monkeypatch.setattr(runtime_compile, "_compile", lambda prim_func, out_idx: Kernel())
+    monkeypatch.setattr(runtime_compile, "_gpu_exec_guard", contextlib.nullcontext)
+    monkeypatch.setattr(runtime_compile, "_validate_kernel_outputs", validated)
+    tolerance = Tolerance(rtol=1e-2)
+
+    def workloads():
+        yield "wl_1_2_3", ["q", "k"], "out"
+        yield "wl_1_2_3@increasing", ["q", "k"], ("out", "lse")
+        yield ["q"], "out"
+
+    assert runtime_compile.compile_and_run_prim_func(
+        None, out_idx=[2], workloads_fn=workloads, tolerance=tolerance) == "source"
+    assert seen == [
+        ("wl_1_2_3", ("q", "k"), ["out"], tolerance),
+        ("wl_1_2_3@increasing", ("q", "k"), ["out", "lse"], tolerance),
+        ("", ("q",), ["out"], tolerance),
+    ]
+
+
 def test_worst_measured_keeps_every_output_when_plans_differ_in_output_count():
     # a solo plan has one output, a split partial two: neither order may drop the second
     solo = (MeasuredError(9e-4, 0.01),)

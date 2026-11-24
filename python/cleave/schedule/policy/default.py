@@ -17,6 +17,12 @@ from ...ir.analysis import (
 from ...ir.analysis import is_mla_value_gemm
 from ...ir.ops import Copy, Div, Matmul, Mul, ReduceSum
 from ...ir.ops.elementwise import BinaryElementwise
+from ..tiling import (
+    absorbed_axis_conflict,
+    absorbed_reductions,
+    reduction_ancestors,
+    scheduled_reductions,
+)
 
 import copy
 import numpy as np
@@ -78,6 +84,9 @@ class DefaultPolicy:
             self._full_extent_reduction_axis_ids.setdefault(desc, set()).update(
                 desc_ax for (_anc_ax, desc_ax) in axis_pairs
             )
+        # Asked for every pair of reductions of every step map the search rates (see
+        # _kernel_rstep_map); it does not depend on the steps, so it is built once.
+        self._reduction_ancestors = reduction_ancestors(self.ordered_nodes)
         self.compatible_reduction_groups = self._get_compatible_reduction_groups()
         self.force_fusion = force_fusion
         self.flat_graph = flat_graph
@@ -92,6 +101,11 @@ class DefaultPolicy:
         )
         # Set only on the per-assignment copies made by ``_for_assignment``.
         self.accumulation = {}
+        self._scheduled_reductions = None  # built on first use, see _absorbed_conflict
+        self._kernel_ratings = {}  # (output tile, kernel steps) -> its rating, see _rate_kernel
+        # Why candidates were invalid for an absorbed axis (``_as_candidate``); a list only
+        # on the per-assignment copies, which report it when no tiling is left.
+        self._absorbed_refusals = None
 
     def _select_canonical_output_node(self):
         if not self.output_nodes:
@@ -161,18 +175,39 @@ class DefaultPolicy:
         return expanded_tile
 
     def _project_canonical_tile_to_output(self, canonical_tile, node):
+        """The tile of output ``node`` under the tile of the canonical output.
+
+        One launch grid serves every output of a kernel, and it is the canonical
+        output's: another output is tiled, launched and stored on the axes of the
+        canonical one that its own axes are paired with -- the batch axes in order, then
+        its other axes onto the leading non-batch axes of the canonical output. An
+        output whose axes do not pair that way has no tile for any candidate: the graph
+        is refused here, with the reason, instead of ending the search with an
+        exception that names no output (``NotImplementedError``, for ``x @ w`` next to
+        ``sum(w, 0)`` whenever ``M != N``, and for ``exp(x) @ b`` next to ``exp(x) * 2``).
+        The pairing is by position and extent; ``apply_tiling`` checks it against the
+        graph for each tiling (``_refuse_siblings_on_another_axis``).
+        """
         canonical_node = self.canonical_output_node
         if canonical_node is None or node == canonical_node:
             return list(canonical_tile)
 
         canonical_shape = list(canonical_node.get_space_dim())
         node_shape = list(node.get_space_dim())
+
+        def refuse(why):
+            return ScheduleRejected(
+                f"{node.name} {tuple(int(e) for e in node_shape)} is an output next to "
+                f"{canonical_node.name} {tuple(int(e) for e in canonical_shape)}, whose "
+                f"launch grid serves every output of the kernel: {why}"
+            )
+
         canonical_batch_flags = self._get_visible_batch_dim_flags(canonical_node)
         node_batch_flags = self._get_visible_batch_dim_flags(node)
         if len(canonical_batch_flags) != len(canonical_shape) or len(node_batch_flags) != len(
             node_shape
         ):
-            raise NotImplementedError("Output batch flags do not match node rank.")
+            raise refuse("its batch axes are not known")
 
         canonical_batch_axes = [
             i for i, is_batch_dim in enumerate(canonical_batch_flags) if is_batch_dim
@@ -181,8 +216,9 @@ class DefaultPolicy:
             i for i, is_batch_dim in enumerate(node_batch_flags) if is_batch_dim
         ]
         if len(node_batch_axes) != len(canonical_batch_axes):
-            raise NotImplementedError(
-                "Same-launch multi-output currently requires matching batch-axis rank."
+            raise refuse(
+                f"it has {len(node_batch_axes)} batch axes and the grid "
+                f"{len(canonical_batch_axes)}"
             )
 
         canonical_non_batch_axes = [
@@ -192,16 +228,19 @@ class DefaultPolicy:
             i for i, is_batch_dim in enumerate(node_batch_flags) if not is_batch_dim
         ]
         if len(node_non_batch_axes) > len(canonical_non_batch_axes):
-            raise NotImplementedError(
-                "Sibling outputs cannot have more non-batch axes than the canonical output."
+            raise refuse(
+                f"it has {len(node_non_batch_axes)} axes behind the batch axes and the "
+                f"grid {len(canonical_non_batch_axes)}"
             )
 
         projected_tile = [int(canonical_tile[axis]) for axis in canonical_batch_axes]
         for idx, axis in enumerate(node_non_batch_axes):
             canonical_axis = canonical_non_batch_axes[idx]
             if int(node_shape[axis]) != int(canonical_shape[canonical_axis]):
-                raise NotImplementedError(
-                    "Same-launch multi-output currently requires sibling outputs to drop only trailing non-batch axes."
+                raise refuse(
+                    f"its axis {axis} would be launched on axis {canonical_axis} of the "
+                    f"grid, which has {int(canonical_shape[canonical_axis])} elements "
+                    f"where it has {int(node_shape[axis])}"
                 )
             projected_tile.append(int(canonical_tile[canonical_axis]))
         return projected_tile
@@ -492,8 +531,10 @@ class DefaultPolicy:
         return base_tile
 
     def get_node_reduce_step_candidates(self, node):
-        # general idea : use factor first, since it does not require extra boundary check
-        #                for large prime number, which is rare case, use power of 2.
+        # The steps of a reduction axis divide its extent: nothing pads the last tile of a
+        # reduction. For an odd extent that leaves 1 and the extent itself (the whole axis
+        # in one step); a power of two below it divides nothing, and ``apply_tiling``
+        # refuses a step that does not divide.
         full_extent_axes = self._full_extent_reduction_axis_ids.get(node, set())
         results = {}
         for ax_id, k_iter in enumerate(node.raxis):
@@ -502,12 +543,7 @@ class DefaultPolicy:
                 # the fused reduction is computed over the whole axis.
                 results[k_iter.var.name] = [int(k_iter.dom.extent)]
                 continue
-            all_factors = get_all_round_factors(int(k_iter.dom.extent))
-            if len(all_factors) == 2 and int(k_iter.dom.extent) > 64:
-                all_factors = [1]
-                while all_factors[-1] * 2 < int(k_iter.dom.extent):
-                    all_factors.append(all_factors[-1] * 2)
-            results[k_iter.var.name] = all_factors
+            results[k_iter.var.name] = get_all_round_factors(int(k_iter.dom.extent))
         return results
 
     def _assign_reduce_step(self, node):
@@ -749,8 +785,9 @@ class DefaultPolicy:
         row sum of plain loads broadcast into a gemm-derived fragment of the same loop body
         (``annotate_fragment_layout_conflicts``: ``dP - sum_D(dO * o)``). ``own_loops``: the
         reductions that get a loop of their own; their consumers read them through the loop
-        node, which that pass does not look through. The older two-fragment gemm staging is
-        not counted.
+        node, which that pass does not look through on the gemm side (it does for the row
+        sum's operand: a gemm in its own loop makes it gemm-derived too). The older
+        two-fragment gemm staging is not counted.
         """
         if isinstance(node, Matmul):
             return tuple(
@@ -768,11 +805,11 @@ class DefaultPolicy:
         ):
             return ()
 
-        def has_matmul_ancestor(start):
+        def has_matmul_ancestor(start, through_loops=False):
             stack, seen = [start], set()
             while stack:
                 n = stack.pop()
-                if id(n) in seen or n in own_loops:
+                if id(n) in seen or (n in own_loops and not through_loops):
                     continue
                 seen.add(id(n))
                 if isinstance(n, Matmul):
@@ -785,7 +822,7 @@ class DefaultPolicy:
             isinstance(rhs, ReduceSum)
             and rhs not in own_loops
             and has_matmul_ancestor(lhs)
-            and not has_matmul_ancestor(rhs)
+            and not has_matmul_ancestor(rhs, through_loops=True)
         ):
             return (1,)
         return ()
@@ -848,6 +885,10 @@ class DefaultPolicy:
                         if has_unprocessed_consumer(dst, view_out_id):
                             return True
                     continue
+                if dst.is_output():
+                    # a returned value is stored, not held: its output node is not
+                    # one of ordered_nodes and so is never processed
+                    continue
                 if dst not in processed:
                     return True
             return False
@@ -888,10 +929,106 @@ class DefaultPolicy:
                         output_elem * dtype_bytes
                     )
 
-        assert len(block_map) == 0
+        assert not block_map, (
+            "the shared-memory model never gave back the blocks of "
+            f"{sorted(f'{node.name}:{out_id}' for node, out_id in block_map)}"
+        )
         return allocator.limit, cached_tensors_map
 
+    def _kernel_rstep_map(self, rstep_map):
+        """The steps of the kernel ``apply_tiling`` generates for ``rstep_map``.
+
+        A reduction absorbed into a descendant's loop is scheduled over its whole axis,
+        whatever step the map gives it (``schedule.tiling.absorbed_reductions``). Returns
+        ``rstep_map`` itself when nothing is absorbed.
+        """
+        absorbed = absorbed_reductions(
+            self.ordered_nodes, rstep_map, self._reduction_ancestors
+        )
+        if not absorbed:
+            return rstep_map
+        kernel_rstep_map = dict(rstep_map)
+        for node in absorbed:
+            steps = dict(rstep_map[node])
+            steps[node.raxis[0].var.name] = int(node.raxis[0].dom.extent)
+            kernel_rstep_map[node] = steps
+        return kernel_rstep_map
+
+    def _absorbed_conflict(self, rstep_map):
+        """Why ``apply_tiling`` would refuse ``rstep_map`` over an absorbed axis, or None."""
+        if self._scheduled_reductions is None:
+            scheduled = (self.ordered_nodes, self.reduction_axis_provenance)
+            if self.flat_graph is not None:
+                try:
+                    # The provenance apply_tiling itself decides on (split views removed).
+                    scheduled = scheduled_reductions(self.flat_graph)
+                except NotImplementedError:
+                    # A split apply_tiling cannot take apart: it refuses every candidate
+                    # of this graph for that reason, whatever is answered here.
+                    pass
+            self._scheduled_reductions = (*scheduled, reduction_ancestors(scheduled[0]))
+        ordered_nodes, red_tokens, ancestors = self._scheduled_reductions
+        return absorbed_axis_conflict(ordered_nodes, rstep_map, red_tokens, ancestors)
+
+    def _rate_kernel(self, output_tile, kernel_rstep_map):
+        """``_rate_steps`` of a kernel's own steps, rated once per search.
+
+        Every state of the walk that differs only in the steps of its absorbed
+        reductions has the same kernel, and a walk visits many of them.
+        """
+        key = (
+            tuple(output_tile),
+            tuple((k, tuple(v.items())) for k, v in kernel_rstep_map.items()),
+        )
+        kernel = self._kernel_ratings.get(key)
+        if kernel is None:
+            kernel = self._kernel_ratings[key] = self._rate_steps(
+                output_tile, kernel_rstep_map
+            )
+        return kernel
+
+    def _as_candidate(self, state: TileDict) -> TileDict:
+        """``state`` with the verdict of the kernel it generates.
+
+        ``_rate_steps`` rates a step map at face value. That is the kernel's rating
+        unless a reduction is absorbed: the kernel then holds that reduction's whole axis
+        in every iteration, so it needs more shared memory than the steps suggest, and
+        may not fit at all. Validity, shared memory and waves (hence rank) are taken from
+        the kernel's own steps; a step map ``apply_tiling`` refuses has no kernel and is
+        invalid. The tile maps stay those of the given steps: ``apply_tiling`` derives
+        the kernel's from them, pinning the absorbed axes itself.
+        """
+        kernel_rstep_map = self._kernel_rstep_map(state.rstep_map)
+        if kernel_rstep_map is state.rstep_map:
+            return state
+        if self._absorbed_refusals is not None:
+            # An accumulation assignment (``_for_assignment``) is rated at face value: its
+            # loop step is the one step of its intra reductions, which a kernel step map
+            # holding one of them whole does not have. A step map ``apply_tiling`` refuses
+            # is invalid, and why is kept for the report (``_propose_assignment_tiles``).
+            conflict = self._absorbed_conflict(state.rstep_map)
+            if conflict is None:
+                return state
+            self._absorbed_refusals.append(conflict)
+            cand = copy.copy(state)
+            cand.valid = False
+            return cand
+        kernel = self._rate_kernel(state.output_tile, kernel_rstep_map)
+        cand = copy.copy(state)
+        cand.traffic, cand.smem_cost = kernel.traffic, kernel.smem_cost
+        cand.cached_tensors_map = kernel.cached_tensors_map
+        cand.grid_size, cand.block_per_SM = kernel.grid_size, kernel.block_per_SM
+        cand.num_wave = kernel.num_wave
+        cand.valid = kernel.valid and self._absorbed_conflict(state.rstep_map) is None
+        return cand
+
     def compute_tile_dict(self, output_tile: list[int], rstep_map):
+        """The candidate for ``(output_tile, rstep_map)``, rated as the kernel it generates."""
+        return self._as_candidate(self._rate_steps(output_tile, rstep_map))
+
+    def _rate_steps(self, output_tile: list[int], rstep_map):
+        """Tiles and cost of ``rstep_map`` at face value: every reduction at its own step
+        (an inter reduction of an accumulation assignment at its launch tile)."""
         if self.accumulation:
             rstep_map = self._assignment_rstep_map(output_tile, rstep_map)
             if rstep_map is None:
@@ -940,6 +1077,17 @@ class DefaultPolicy:
     def dfs_smem_tile(self, init_tile, rstep_map):
         visible_shape = self._get_visible_output_shape(self.canonical_output_node)
         _steps = [get_all_round_factors(n) for n in visible_shape]
+        for axis, (step, t, n) in enumerate(zip(_steps, init_tile, visible_shape)):
+            if t not in step:
+                # The walk grows the tile through the steps of each axis (the powers of two
+                # that divide its extent, and the extent), from the base tile. The
+                # tensor-core policy starts at its own tile whatever the extent is: 64 rows
+                # for 96 or 100, 32 columns for 48. The lookup below would die on it.
+                raise ScheduleRejected(
+                    f"{self.canonical_output_node.name}: axis {axis} of the output has "
+                    f"{int(n)} elements and its tile starts at {int(t)}, which is none of "
+                    f"that axis's steps {[int(s) for s in step]}; an output tile is not padded"
+                )
         steps = [step[step.index(t) :] for step, t in zip(_steps, init_tile)]
         visible_batch_flags = self._get_visible_output_batch_dim_flags(
             self.canonical_output_node
@@ -971,7 +1119,8 @@ class DefaultPolicy:
         def add_to_queue(tile):
             if tuple(tile) in visited_tiles:
                 return
-            td = self.compute_tile_dict(tile, rstep_map)
+            # Face value, as in expand_iterative_tiles: these tiles only seed that walk.
+            td = self._rate_steps(tile, rstep_map)
             visited_tiles[tuple(tile)] = td
             if td.valid:
                 queue.put(tile)
@@ -1002,15 +1151,20 @@ class DefaultPolicy:
                 tuple((k, tuple(v.items())) for k, v in rstep_map.items()),
             ) in visited_tiles:
                 return
-            td = self.compute_tile_dict(tile, rstep_map)
+            # The walk prunes on the steps at face value, as it always did: a state whose
+            # kernel does not fit is still the way to the states behind it (an absorbed
+            # reduction stops being one once its descendant reaches its extent), so
+            # pruning on the kernel would lose those. What is emitted is rated as the
+            # kernel.
+            state = self._rate_steps(tile, rstep_map)
             visited_tiles[
                 (
                     tuple(tile),
                     tuple((k, tuple(v.items())) for k, v in rstep_map.items()),
                 )
-            ] = td
-            if td.valid:
-                queue.put((prio(td), tile_counter, (tile, rstep_map)))
+            ] = self._as_candidate(state)
+            if state.valid:
+                queue.put((prio(state), tile_counter, (tile, rstep_map)))
                 tile_counter += 1
 
         visited_tiles = {}
@@ -1021,10 +1175,22 @@ class DefaultPolicy:
                 for n in base_rstep_map
                 if n.raxis
             }
-            steps = {
-                n: step[step.index(base_rstep_map[n][n.raxis[0].var.name]) :]
-                for n, step in _steps.items()
-            }
+            steps = {}
+            for n, step in _steps.items():
+                base = base_rstep_map[n][n.raxis[0].var.name]
+                if base not in step:
+                    # The walk only knows the steps that divide the extent: nothing pads
+                    # the last tile of a reduction. `_assign_reduce_step` starts every
+                    # reduction at one of them today (the tensor-core policy used to start
+                    # at its own step whatever the extent, "for the case of padding", and
+                    # the lookup below died on it); a start from anywhere else is refused
+                    # here, with the reason.
+                    raise ScheduleRejected(
+                        f"{n.name}: its reduction over {int(n.raxis[0].dom.extent)} elements "
+                        f"starts at step {base}, which does not divide it; "
+                        "the last tile of a reduction is not padded"
+                    )
+                steps[n] = step[step.index(base) :]
 
             add_to_queue(base_td.output_tile, base_rstep_map)
             while not queue.empty():
@@ -1066,11 +1232,62 @@ class DefaultPolicy:
         sorted_tiles = sorted(visited_tiles, key=lambda td: prio(td))
         return sorted_tiles
 
+    def _start_siblings_together(self, base_iter_map):
+        """``base_iter_map`` with the reductions that share an axis started at one step.
+
+        ``_assign_reduce_step`` picks the smallest step of each reduction on its own (a
+        tensor-core matmul by the byte width of its operand, any other reduction by its
+        read pattern), and ``expand_iterative_tiles`` then enlarges the steps of a
+        compatible group in lockstep: members that start apart stay apart. Two members
+        that reduce the same axis of the same tensor -- the row sum and the value matmul
+        of a flash-form softmax -- end up in one loop, which has one trip count; with
+        different steps it miscounts the tiles of one of them, so ``apply_tiling``
+        refuses every such candidate (float32 operands: the matmul starts at 16, the
+        row sum at 32, and the softmax had no tiling at all).
+
+        Such members start at the largest of their own smallest steps: none goes below
+        what it asked for, and from there the lockstep keeps them equal. A member whose
+        axis is pinned to its full extent, or that cannot take that step, is left as it
+        is; so is any reduction that shares no axis with a member of its group.
+        """
+        aligned = dict(base_iter_map)
+        for group in self.compatible_reduction_groups:
+            members = [
+                n
+                for n in group
+                if len(n.raxis) == 1
+                and 0 not in self._full_extent_reduction_axis_ids.get(n, set())
+                and self.reduction_axis_provenance.get(n, [set()])[0]
+            ]
+            # members that reduce one tensor dim: connected through shared axis tokens
+            clusters = []
+            for node in members:
+                tokens = set(self.reduction_axis_provenance[node][0])
+                joined = [c for c in clusters if c[1] & tokens]
+                for c in joined:
+                    clusters.remove(c)
+                clusters.append(
+                    (
+                        [m for c in joined for m in c[0]] + [node],
+                        set().union(tokens, *(c[1] for c in joined)),
+                    )
+                )
+            for nodes, _ in clusters:
+                if len(nodes) < 2:
+                    continue
+                names = [n.raxis[0].var.name for n in nodes]
+                start = max(int(base_iter_map[n][name]) for n, name in zip(nodes, names))
+                for node, name in zip(nodes, names):
+                    if start in self.get_node_reduce_step_candidates(node)[name]:
+                        aligned[node] = {**base_iter_map[node], name: start}
+        return aligned
+
     def propose_iterative_tiles(self, base_tile):
-        # 1. find minimum reduction step for each reduction node
-        base_iter_map = {
-            node: self._assign_reduce_step(node) for node in self.ordered_nodes
-        }
+        # 1. find minimum reduction step for each reduction node; reductions that will
+        #    share a loop axis start together
+        base_iter_map = self._start_siblings_together(
+            {node: self._assign_reduce_step(node) for node in self.ordered_nodes}
+        )
 
         # 2. find all possible output tiles that work with the minumum reduction step
         base_iter_tiles = self.dfs_smem_tile(base_tile, base_iter_map)
@@ -1123,11 +1340,13 @@ class DefaultPolicy:
             for c in policy.propose_iterative_tiles(base_tile):
                 if policy._reads_placeholder_unevenly(c):
                     continue
-                conflict = self._absorbed_axis_conflict(c)
-                if conflict is not None:
-                    absorbed_conflicts.append(conflict)
-                    continue
                 candidates.append(c)
+            # A tiling that needs a second loop -- a reduction feeding a loop's reductions
+            # over its own axis (``delta = rowsum(P*dP)`` over SKV of the naive
+            # attention-backward dS, inside the loop over SKV) must be complete before the
+            # loop's first iteration -- is invalid as the kernel it generates
+            # (``_as_candidate``); ``apply_tiling`` does not build that second loop.
+            absorbed_conflicts += policy._absorbed_refusals
         if not candidates and absorbed_conflicts:
             raise ScheduleRejected(
                 "every tiling needs a second loop: " + absorbed_conflicts[0]
@@ -1135,24 +1354,6 @@ class DefaultPolicy:
         # each assignment's list is sorted by this key already (expand_iterative_tiles);
         # the stable sort keeps assignment order on ties
         return sorted(candidates, key=lambda td: (td.traffic + 1) * td.num_wave)
-
-    def _absorbed_axis_conflict(self, td):
-        """``apply_tiling``'s refusal of ``td`` for an absorbed reduction, or ``None``.
-
-        A reduction feeding a loop's reductions over its own axis (``delta = rowsum(P*dP)``
-        over SKV of the naive attention-backward dS, inside the loop over SKV) must be
-        complete before the loop's first iteration: a second loop over that axis, which
-        ``apply_tiling`` does not build (repro: notes/p13-merged.md, issue 2). Only
-        accumulation-context tilings are checked here; every other graph keeps its
-        candidate list (the refusal happens in ``apply_tiling`` as before).
-        """
-        from ..tiling import _absorbed_axis_tokens
-
-        try:
-            _absorbed_axis_tokens(self.ordered_nodes, td.rstep_map)
-        except ScheduleRejected as e:
-            return str(e)
-        return None
 
     def _for_assignment(self, intra_id):
         """This policy with group ``intra_id`` intra and the others inter, or ``None``.
@@ -1217,6 +1418,7 @@ class DefaultPolicy:
                 inter_loop_dims[out] = loop_dims[0]
 
         policy = copy.copy(self)
+        policy._absorbed_refusals = []
         policy.canonical_output_node = canonical
         policy.accumulation = {o: INTRA for o in intra.outputs}
         policy.accumulation.update({o: INTER for g in inter for o in g.outputs})
@@ -1341,11 +1543,9 @@ class DefaultPolicy:
         return candidates
 
     def _get_compatible_reduction_groups(self):
-        from ...ir.graph_utils import get_op_ancestors
-
         reduction_nodes = [n for n in self.ordered_nodes if n.raxis]
 
-        memo_ancestors = {n: set(get_op_ancestors(n)) for n in reduction_nodes}
+        memo_ancestors = self._reduction_ancestors
 
         def get_descendant_reduction_nodes(node):
             from ...ir.graph_utils import gather_all_nodes
@@ -1434,9 +1634,30 @@ class TCPolicy(DefaultPolicy):
                 # the fused reduction is correct (never a partial-axis slice).
                 result[iter_name] = int(iter_dom)
             elif iter_dom % 16 > 0:
-                result[iter_name] = (
-                    16 if iter_dom < basic else basic
-                )  # for the case of padding
+                # No multiple of 16 divides this extent. 16 (or ``basic``) was given here
+                # "for the case of padding": a step that is none of the axis's candidates,
+                # and the walk over the candidates then died on it (``ValueError: 16 is not
+                # in list``; K = 8, 24, 40: the graph had no tiling, and no reason).
+                if reduce_input_dtype.bits <= 16:
+                    # TileLang's gemm takes 16-bit operands in K blocks of a multiple of
+                    # 16. Every step of this axis is something else: it asserts on 24 or
+                    # 40, and for 8 it emits a kernel that computes something else.
+                    raise ScheduleRejected(
+                        f"{node.name} contracts {int(iter_dom)} {reduce_input_dtype} "
+                        "elements: a tensor-core matmul of 16-bit operands steps its "
+                        "reduction axis in multiples of 16, and none divides that extent"
+                    )
+                # A wider operand (float32, multiplied as tf32) is contracted in K blocks
+                # of 8. Over a multiple of 8 it is stepped like any reduction; the steps of
+                # any other extent (4 and the extent itself, for 12 or 100) are none of
+                # them a multiple of 8, and TileLang refuses every kernel built on one.
+                if int(iter_dom) % 8:
+                    raise ScheduleRejected(
+                        f"{node.name} contracts {int(iter_dom)} {reduce_input_dtype} "
+                        "elements: a tensor-core matmul of float32 operands steps its "
+                        "reduction axis in multiples of 8, and none divides that extent"
+                    )
+                return super()._assign_reduce_step(node)
             elif iter_dom % basic == 0:
                 result[iter_name] = basic
             else:
@@ -1542,10 +1763,34 @@ class TCPolicy(DefaultPolicy):
                 # CompilerPassOptions.mla_decode_pass stages this A operand through shared
                 # (codegen/passes.py), and the candidate then compiles.
                 continue
-            rows_per_warp = int(candidate.get_tile(node)[-2]) / warps
+            tile = candidate.get_tile(node)
+            rows_per_warp = int(tile[-2]) / warps
             if rows_per_warp < 16 or (warps > 4 and rows_per_warp != 16):
+                if self._staged_as_misplaced(node, tile, n_threads):
+                    continue
                 return True
         return False
+
+    @staticmethod
+    def _staged_as_misplaced(node, tile, n_threads):
+        """Does codegen stage ``node``'s A operand through shared memory for its rows?
+
+        A block two warp groups tall that takes more than one instruction per group gets
+        its first operand from shared memory whatever it is computed from
+        (``codegen.passes.stage_misplaced_register_operands``: TileLang would multiply the
+        fragment on the wrong rows): such a gemm reads no register A operand either, and
+        its kernels compile and validate (``tile=[1, 256, 64]`` of the MHA prefill at 256
+        threads).
+        """
+        from ...codegen.passes import register_operand_is_misplaced
+
+        if node.dtype not in ("float16", "bfloat16"):
+            return False
+        try:
+            rows, cols = int(tile[-2]), int(tile[-1])
+        except (TypeError, ValueError):
+            return False
+        return register_operand_is_misplaced(node.warp_policy, rows, cols, n_threads)
 
     def get_num_threads(self, candidates):
         expanded_candidates = []

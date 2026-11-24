@@ -2,7 +2,17 @@
 S_Q=S_KV=4096, D=128, fp16). Forced schedule fusion by default: the unforced tile policy
 prunes every candidate of the fused RMSNorm + attention kernel.
 
-``--split SKV`` splits k/v along S_KV.
+The softmax is exact (see demo/mha_decode.py). Its logits are computed here (from the
+normalized q and k), not read from an input, so the adversarial input cases, which shape
+inputs, cannot reach them: this demo's kernels are validated on normal inputs, and the
+report says so.
+
+The demo is unsplit and declares one tolerance, for the outputs of its solo kernels.
+Splitting k/v along S_KV (``--split SKV``) is not offered: the split search of this 25-op
+program runs for more than an hour, and a split partial of an exact softmax also returns
+its shift, which needs a tolerance declared by boundary role (see demo/mha_prefill.py). The
+flag is still parsed, as for every demo; a run that got through that search would stop
+before it builds a kernel, with one line that says which plan the tolerance does not cover.
 """
 import cleave
 import cleave.lang as cl

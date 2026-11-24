@@ -83,13 +83,51 @@ def ukernel_mma_ssr_transB_clear(A, B, C):
 
 
 @T.macro
-def ukernel_causal_maskedexp_scale_rt2_2dims_rr(A, tile_base, valid_len, diag, scale2, B):
+def ukernel_causal_maskedscore_scale_rt2_2dims_rr(A, tile_base, valid_len, diag, scale2, B):
     for m0, m1 in T.Parallel(*B.shape):
         B[m0, m1] = T.if_then_else(
             (tile_base + m1 < valid_len) & (tile_base + m1 <= diag + m0),
-            T.exp2(A[m0, m1] * scale2),
+            A[m0, m1] * scale2,
+            -3.4028234663852886e38,
+        )
+
+
+@T.macro
+def ukernel_copy_1dims_rr(A, B):
+    for i0 in T.Parallel(*B.shape):
+        B[i0] = T.cast(A[i0], B.dtype)
+
+
+@T.macro
+def ukernel_reduce_max_axis1_rr(A, B):
+
+    A_ptr = A
+
+    B_ptr = B
+
+    T.reduce_max(A_ptr, B_ptr, dim=-1, clear=False)
+
+
+@T.macro
+def ukernel_causal_maskedexp_shift2_2dims_rrr(A, M, tile_base, valid_len, diag, B):
+    for m0, m1 in T.Parallel(*B.shape):
+        B[m0, m1] = T.if_then_else(
+            (tile_base + m1 < valid_len) & (tile_base + m1 <= diag + m0),
+            T.exp2(A[m0, m1] - M[m0]),
             0.0,
         )
+
+
+@T.macro
+def ukernel_sub_1dims_rrr(A, B, C):
+    for i0 in T.Parallel(*C.shape):
+        C[i0] = A[i0] - B[i0]
+
+
+@T.macro
+def ukernel_exp2_1dims_rr(A, B):
+    for i0 in T.Parallel(*B.shape):
+        B[i0] = T.exp2(A[i0])
 
 
 @T.macro
@@ -100,6 +138,12 @@ def ukernel_reduction_axis1_rr(A, B):
     B_ptr = B
 
     T.reduce_sum(A_ptr, B_ptr, dim=-1, clear=False)
+
+
+@T.macro
+def ukernel_rescale_1dims_rr(S, ACC):
+    for i0 in T.Parallel(*ACC.shape):
+        ACC[i0] *= S[i0]
 
 
 @T.macro
@@ -122,6 +166,12 @@ def ukernel_mma_rsr(A, B, C):
 
 
 @T.macro
+def ukernel_rescale_lead1_2dims_rr(S, ACC):
+    for i0, i1 in T.Parallel(*ACC.shape):
+        ACC[i0, i1] *= S[i0]
+
+
+@T.macro
 def ukernel_masked_div_broadcast_0_dfloor_1eminus_30_2dims_rrg(A, B, n_rows, C):
     for i0, i1 in T.Parallel(*C.shape):
         if i0 < n_rows:
@@ -129,10 +179,10 @@ def ukernel_masked_div_broadcast_0_dfloor_1eminus_30_2dims_rrg(A, B, n_rows, C):
 
 
 @T.macro
-def ukernel_masked_log2_1dims_rg(A, n_rows, B):
+def ukernel_masked_lse2_1dims_rrg(A, M, n_rows, B):
     for i0 in T.Parallel(*B.shape):
         if i0 < n_rows:
-            B[i0] = T.log2(A[i0])
+            B[i0] = T.log2(A[i0]) + M[i0]
 
 
 @T.macro
@@ -162,6 +212,7 @@ def GraphNode_0_iter(
     kv_head: T.int32,
     t_rowsum_0: T.Tensor((64), "float32"),
     t_mma_1: T.Tensor((64, 128), "float32"),
+    t_exp_0_max: T.Tensor((64), "float32"),
 ):
     PlaceHolder_KK = T.alloc_shared(
         (
@@ -180,6 +231,19 @@ def GraphNode_0_iter(
         "float32",
     )
     ukernel_mma_ssr_transB_clear(PlaceHolder_QQ, PlaceHolder_KK, t_mma_0)
+    t_score_0 = T.alloc_fragment(
+        (
+            64,
+            64,
+        ),
+        "float32",
+    )
+    ukernel_causal_maskedscore_scale_rt2_2dims_rr(
+        t_mma_0, tile_base, valid_len, diag, scale2, t_score_0
+    )
+    t_exp_0_max_prev = T.alloc_fragment((64,), "float32")
+    ukernel_copy_1dims_rr(t_exp_0_max, t_exp_0_max_prev)
+    ukernel_reduce_max_axis1_rr(t_score_0, t_exp_0_max)
     t_exp_0 = T.alloc_fragment(
         (
             64,
@@ -187,9 +251,14 @@ def GraphNode_0_iter(
         ),
         "float32",
     )
-    ukernel_causal_maskedexp_scale_rt2_2dims_rr(
-        t_mma_0, tile_base, valid_len, diag, scale2, t_exp_0
+    ukernel_causal_maskedexp_shift2_2dims_rrr(
+        t_score_0, t_exp_0_max, tile_base, valid_len, diag, t_exp_0
     )
+    t_exp_0_max_step = T.alloc_fragment((64,), "float32")
+    ukernel_sub_1dims_rrr(t_exp_0_max_prev, t_exp_0_max, t_exp_0_max_step)
+    t_exp_0_alpha = T.alloc_fragment((64,), "float32")
+    ukernel_exp2_1dims_rr(t_exp_0_max_step, t_exp_0_alpha)
+    ukernel_rescale_1dims_rr(t_exp_0_alpha, t_rowsum_0)
     ukernel_reduction_axis1_rr(t_exp_0, t_rowsum_0)
     PlaceHolder_VV = T.alloc_shared(
         (
@@ -208,6 +277,7 @@ def GraphNode_0_iter(
         "bfloat16",
     )
     T.copy(t_exp_0, t_exp_0_cast)
+    ukernel_rescale_lead1_2dims_rr(t_exp_0_alpha, t_mma_1)
     ukernel_mma_rsr(t_exp_0_cast, PlaceHolder_VV, t_mma_1)
 
 
@@ -227,6 +297,7 @@ def GraphNode_0(
     scale2: T.float32,
     t_rowsum_0: T.Tensor((64), "float32"),
     t_mma_1: T.Tensor((64, 128), "float32"),
+    t_exp_0_max: T.Tensor((64), "float32"),
 ):
     PlaceHolder_QQ = T.alloc_shared(
         (
@@ -254,6 +325,7 @@ def GraphNode_0(
             kv_head=kv_head,
             t_rowsum_0=t_rowsum_0,
             t_mma_1=t_mma_1,
+            t_exp_0_max=t_exp_0_max,
         )
 
 
@@ -285,6 +357,8 @@ def main_kernel_iter(
         "float32",
     )
     T.clear(t_mma_1)
+    t_exp_0_max = T.alloc_fragment((64,), "float32")
+    T.fill(t_exp_0_max, -3.4028234663852886e38)
     GraphNode_0(
         PlaceHolder_Q,
         PlaceHolder_K,
@@ -300,11 +374,12 @@ def main_kernel_iter(
         scale2,
         t_rowsum_0,
         t_mma_1,
+        t_exp_0_max,
     )
     ukernel_masked_div_broadcast_0_dfloor_1eminus_30_2dims_rrg(
         t_mma_1, t_rowsum_0, n_rows, OutputNode_0
     )
-    ukernel_masked_log2_1dims_rg(t_rowsum_0, n_rows, OutputNode_1)
+    ukernel_masked_lse2_1dims_rrg(t_rowsum_0, t_exp_0_max, n_rows, OutputNode_1)
 
 
 @T.prim_func

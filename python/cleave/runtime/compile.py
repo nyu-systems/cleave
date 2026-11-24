@@ -203,7 +203,9 @@ def compile_and_run_prim_func(
     A kernel whose tensor extents are symbolic serves many shapes from one compile.
     ``workloads_fn`` validates such a kernel over a sequence of them: it yields
     ``(inputs, reference)`` pairs, one built and freed at a time, because a single
-    workload's tensors can run to several GiB.
+    workload's tensors can run to several GiB. A workload may lead with its key,
+    ``(key, inputs, reference)``: it then names the comparison in a failure and in the
+    validation log.
 
     ``tolerance`` is the operator's declared bound (a ``Tolerance``, or one per output);
     there is no default, so leaving it out is an error.
@@ -221,12 +223,13 @@ def compile_and_run_prim_func(
             raise ValueError("workloads_fn requires an explicit out_idx.")
         kernel = _compile(prim_func, out_idx)
         n = 0
-        for inputs, reference in workloads_fn():
+        for *key, inputs, reference in workloads_fn():
             # Per workload, not around the loop: the guard is a cross-process lock, so
             # holding it for the whole sequence would stall every other test worker.
             with _gpu_exec_guard():
                 _validate_kernel_outputs(
-                    kernel, tuple(inputs), _as_list(reference), tolerance=tolerance
+                    kernel, tuple(inputs), _as_list(reference), tolerance=tolerance,
+                    what=key[0] if key else "",
                 )
             del inputs, reference
             n += 1
@@ -257,14 +260,21 @@ def compile_and_run_prim_func(
     )
 
 
-def build_candidate_code(cand, options: CompilerPassOptions | None = None):
-    """Tilelang source for one tiling candidate: the default ``build_fn``."""
+def build_candidate(cand, options: CompilerPassOptions | None = None):
+    """``(source, stored layouts)`` for one tiling candidate: the default ``build_fn``.
+
+    The stored layouts are what ``apply_tiling`` recorded for the candidate's outputs
+    (``Graph.stored_layouts``), one ``(axes, pad)`` per output in the order the kernel
+    returns them. They are not in the source; whoever compares or forwards the kernel's
+    outputs is handed them next to it.
+    """
     from ..codegen import TilelangCodeGen
-    from ..schedule import apply_tiling
+    from ..ir.graph import OutputNode
+    from ..schedule.tiling import schedule_kernel
     from ..codegen import passes
 
     options = options or CompilerPassOptions()
-    sch_graph = apply_tiling(cand)
+    sch_graph = schedule_kernel(cand)  # typed refusals, not kernels TileLang cannot take
     sch_graph = passes.annotate_args(sch_graph, is_main=True)
     sch_graph = passes.annotate_tinfo(sch_graph, is_main=True)
     if options.tc_awareness_pass:
@@ -272,12 +282,23 @@ def build_candidate_code(cand, options: CompilerPassOptions | None = None):
     sch_graph = passes.annotate_fragment_layout_conflicts(sch_graph)
     if options.mla_decode_pass:
         sch_graph = passes.annotate_mla_accumulation_layout_conflict(sch_graph)
-    return TilelangCodeGen().gen(sch_graph)
+    code = TilelangCodeGen().gen(sch_graph)
+    # `args` is the kernel's parameter list, so this is the order of its outputs.
+    layouts = tuple(
+        sch_graph.stored_layouts[arg.name] for arg in sch_graph.args if isinstance(arg, OutputNode)
+    )
+    return code, layouts
+
+
+def build_candidate_code(cand, options: CompilerPassOptions | None = None):
+    """Tilelang source for one tiling candidate."""
+    return build_candidate(cand, options)[0]
 
 
 def check_code(
     code_str, *, graph=None, dtype=None, out_idx=None, reference_cache_dir=None,
-    tolerance=None, benchmark: BenchOptions | None = None, derive=None,
+    tolerance=None, benchmark: BenchOptions | None = None, derive=None, stored_layouts=None,
+    roles=None,
 ):
     """``(cuda_src, latency_ms | None, measured)``: compile, validate and optionally time
     one kernel; ``measured`` is the error per output the comparison found.
@@ -287,6 +308,9 @@ def check_code(
     ``derive`` of ``cleave.runtime.reference.declared_inputs_hook`` for declared inputs).
     ``tolerance`` is the operator's declared bound and has no default: a kernel nobody
     declared a tolerance for fails here, before it is compiled.
+    ``stored_layouts`` is the second half of :func:`build_candidate`'s result: how the
+    kernel stores each output. Without it the reference is laid out by matching extents.
+    ``roles``: the boundary role of each output, for the validation log.
     """
     with _stage("validate"):
         require_tolerance(tolerance)
@@ -301,6 +325,7 @@ def check_code(
 
     measured, latency_ms = _check_kernel(
         kernel, graph=graph, dtype=dtype, reference_cache_dir=reference_cache_dir,
-        tolerance=tolerance, benchmark=benchmark, derive=derive,
+        tolerance=tolerance, benchmark=benchmark, derive=derive, stored_layouts=stored_layouts,
+        roles=roles,
     )
     return kernel.get_kernel_source(), latency_ms, measured

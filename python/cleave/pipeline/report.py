@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
@@ -14,17 +15,56 @@ VALIDATION_KINDS = {OutputMismatch: "mismatch", NonFiniteOutput: "non_finite",
                     LaunchCrash: "launch_crash"}
 
 
+def matmul_operands(graph) -> tuple:
+    """``(format, significant bits)`` of every format the matmuls of a lowered graph
+    multiply their operands in that is not the operands' own dtype, sorted.
+
+    Today that is ``("tf32", 11)`` for a float32 matmul (``Matmul.tensor_core_format``):
+    the one case in which a kernel computes with fewer bits than its program's dtype has.
+    """
+    from ..ir.ops import Matmul
+
+    found = set()
+    for node in getattr(graph, "nodes", ()):
+        if isinstance(node, Matmul) and node.tensor_core_format != node.dtype:
+            fmt = node.tensor_core_format
+            found.add((fmt, Matmul.SIGNIFICANT_BITS[fmt]))
+    return tuple(sorted(found))
+
+
 def validation_kind(error) -> str:
     return next((kind for cls, kind in VALIDATION_KINDS.items() if isinstance(error, cls)),
                 "other")
 
 
-def tolerance_dicts(tolerance) -> list | None:
-    """``[{"rtol", "atol"}, ...]`` for a Tolerance or a sequence of them (None stays None)."""
+def tolerance_dicts(tolerance) -> list | dict | None:
+    """``[{"rtol", "atol"}, ...]`` for a Tolerance or a sequence of them, ``{role: {"rtol",
+    "atol"}}`` for a declaration keyed by boundary role (None stays None, also as an entry
+    of a sequence: an output no single bound governs)."""
+    def entry(t):
+        return None if t is None else {"rtol": t.rtol, "atol": t.atol}
+
     if tolerance is None:
         return None
+    if isinstance(tolerance, Mapping):
+        return {role: entry(t) for role, t in tolerance.items()}
     items = tolerance if isinstance(tolerance, (tuple, list)) else (tolerance,)
-    return [{"rtol": t.rtol, "atol": t.atol} for t in items]
+    return [entry(t) for t in items]
+
+
+def bounds_by_output(tolerance, roles_of_results):
+    """What governs each output index of a report: ``tolerance`` itself, or for a
+    declaration keyed by role one entry per output index -- the bound of the role that
+    output has in the plans measured (``roles_of_results``: the output roles of each), None
+    where plans disagree on it."""
+    if not isinstance(tolerance, Mapping):
+        return tolerance
+    at = {}
+    for roles in roles_of_results:
+        for i, role in enumerate(roles):
+            at.setdefault(i, set()).add(role)
+    return [tolerance.get(next(iter(roles))) if len(roles) == 1 else None
+            for _, roles in sorted(at.items())]
 
 
 def worst_measured(measurements) -> list | None:
@@ -49,6 +89,8 @@ def format_measured(worst, tolerance=None) -> str:
     it has both terms: neither error alone is then a fraction of its term."""
     if not worst:
         return ""
+    if isinstance(tolerance, Mapping):  # by role: which output has which is not known here
+        tolerance = None
     bounds = tolerance_dicts(tolerance) or [None] * len(worst)
     if len(bounds) == 1:
         bounds = bounds * len(worst)
@@ -74,6 +116,12 @@ class Result:
     plan: Any  # pipeline.plans.Plan
     run: Any  # cleave.runtime.evaluate.CandidateResult
     kernel: Any = None  # pipeline.build.BuiltKernel, when codegen produced source
+    # The input cases the reference of its graph was built for (cleave.runtime.inputs): what
+    # a kernel had to pass to be ok. ``cases_note`` says why a program whose softmax is exact
+    # was held to fewer than every adversarial case, or which of its softmaxes the cases do
+    # not shape ("" when it was held to all of them and they reach every softmax).
+    cases: tuple | None = None
+    cases_note: str = ""
 
     @property
     def ok(self) -> bool:
@@ -172,8 +220,36 @@ class _Results(Sequence):
     def failures(self) -> Failures:
         return Failures(r for r in self.results if not r.ok)
 
+    def input_cases(self) -> list[tuple]:
+        """``(cases, kernels, note)`` for each distinct set of input cases the candidates
+        were held to (``Result.cases``), in first-seen order; empty when none is recorded."""
+        groups = {}
+        for r in self.results:
+            if r.cases is not None:
+                groups[(r.cases, r.cases_note)] = groups.get((r.cases, r.cases_note), 0) + 1
+        return [(cases, n, note) for (cases, note), n in groups.items()]
+
     def histogram(self) -> dict[str, int]:
         return self.failures.histogram()
+
+    def matmul_operands(self) -> tuple:
+        """``(format, significant bits)`` of the reduced formats the candidates' matmuls
+        multiply in (``matmul_operands``), over every lowered graph; empty when every
+        matmul multiplies its operands as they are."""
+        found, seen = set(), set()
+        for r in self.results:
+            graph = getattr(getattr(r.plan, "tile", None), "flat_graph", None)
+            if graph is not None and id(graph) not in seen:
+                seen.add(id(graph))
+                found.update(matmul_operands(graph))
+        return tuple(sorted(found))
+
+    def _matmul_text(self) -> str:
+        """What the validate line and a failed compile say about reduced matmul operands."""
+        return "".join(
+            f"  matmul operands multiplied as {fmt} ({bits} significant bits): the result "
+            "is not the product at the program's dtype"
+            for fmt, bits in self.matmul_operands())
 
 
 class Report(_Results):
@@ -192,20 +268,37 @@ class Report(_Results):
     def timed(self) -> list[Result]:
         return [r for r in self.results if r.ok and r.latency_ms is not None]
 
-    def variants(self) -> dict[str, VariantResult]:
-        """Best latency per variant: solo = best main; split-k=N = best partial + best combine."""
-        best: dict[tuple[str, str], Result] = {}
+    def _resolve(self) -> tuple[dict[str, VariantResult], dict[str, str]]:
+        timed: dict[str, dict[str, list[Result]]] = {}
         for r in self.timed:
-            key = (r.variant, r.role)
-            if key not in best or r.latency_ms < best[key].latency_ms:
-                best[key] = r
-        out = {}
-        for variant in dict.fromkeys(v for v, _ in best):
-            roles = ("main",) if (variant, "main") in best else ("partial", "combine")
-            if all((variant, role) in best for role in roles):
-                members = [best[(variant, role)] for role in roles]
+            timed.setdefault(r.variant, {}).setdefault(r.role, []).append(r)
+        out, unpaired = {}, {}
+        for variant, roles in timed.items():
+            if "main" in roles:
+                members = [_fastest(roles["main"])]
+            else:
+                members, why = _fastest_pair(roles.get("partial", ()), roles.get("combine", ()))
+                if why is not None:
+                    unpaired[variant] = why
+            if members:
                 out[variant] = VariantResult(variant, sum(m.latency_us for m in members), members)
-        return out
+        return out, unpaired
+
+    def variants(self) -> dict[str, VariantResult]:
+        """Best latency per variant: solo = best main; split-k=N = the fastest partial +
+        combine pair that pass the same tensors across the cut (see ``unpaired``).
+
+        A split variant's latency is the sum of its two stage timings. The copy that hands
+        a partial's transposed outputs to the combine is in the partial's timing
+        (``runtime.reference.with_hand_off``), so the sum covers the stages and the
+        hand-off of a chained call; it is not a timing of the chained Kernel itself."""
+        return self._resolve()[0]
+
+    def unpaired(self) -> dict[str, str]:
+        """Split variants that have timed partial and combine kernels but no pair that fits
+        together, with the reason. Such a variant is not in ``variants()``; the stage
+        report, ``to_dict()`` and ``best(variant)`` say why instead of dropping it."""
+        return self._resolve()[1]
 
     def best(self, variant: str | None = None):
         """The fastest Kernel overall, or of one ``variant`` (``"solo"``, ``"split-k=8"``)."""
@@ -216,6 +309,13 @@ class Report(_Results):
             if not variants:
                 refused = getattr(self.plans, "refused", None) if not len(self) else None
                 why = f"; refused: {refused[0].reason}" if refused else ""
+                unpaired = self.unpaired()
+                for name in [variant] if variant is not None else unpaired:
+                    if name in unpaired:
+                        why += f"; {name} unpaired: {unpaired[name]}"
+                if any(isinstance(r.error, OutputMismatch) for r in self.failures):
+                    # a bound set for the program's dtype is one no such kernel can meet
+                    why += self._matmul_text().replace("  matmul", "; matmul", 1)
                 raise CleaveError(f"no {variant or 'kernel'} compiled, validated and timed "
                                   f"({len(self)} candidates; failures: {self.failures}{why})")
             win = min(variants.values(), key=lambda v: v.latency_us)
@@ -237,6 +337,13 @@ class Report(_Results):
         """Per output, the largest error measured over the candidates that passed."""
         return worst_measured(r.measured for r in self.correct)
 
+    def _bounds(self):
+        """The bound beside each entry of ``measured_error()``."""
+        from ..runtime.reference import output_roles
+
+        return bounds_by_output(self.tolerance, (
+            output_roles(r.plan.tile.flat_graph) for r in self.correct if r.measured is not None))
+
     def to_dict(self) -> dict:
         variants = self.variants()
         return {
@@ -251,12 +358,49 @@ class Report(_Results):
                               "rel": [m.rel for m in r.measured],
                               "abs": [m.abs for m in r.measured]}
                              for r in self.results if r.measured is not None],
+                **self._inputs_entry(),
+                **self._matmul_entry(),
             },
             "timings_s": self.timings,
             "variants": {k: {"latency_us": v.latency_us, "kernels": [m.label for m in v.members]}
                          for k, v in variants.items()},
+            # split variants whose timed partial and combine kernels do not fit together
+            "unpaired": self.unpaired(),
             "best": None if not variants else min(variants.values(), key=lambda v: v.latency_us).variant,
         }
+
+    def _inputs_entry(self) -> dict:
+        """``{"inputs": [...]}`` for ``to_dict()["validation"]``: the input cases the
+        candidates were validated on, when the build recorded them."""
+        held = self.input_cases()
+        if not held:
+            return {}
+        return {"inputs": [{"cases": list(cases), "kernels": n, "note": note}
+                           for cases, n, note in held]}
+
+    def _matmul_entry(self) -> dict:
+        """``{"matmul_operands": [...]}`` for ``to_dict()["validation"]``: the formats the
+        matmuls multiply in that keep fewer bits than the program's dtype, when there are
+        any."""
+        reduced = self.matmul_operands()
+        if not reduced:
+            return {}
+        return {"matmul_operands": [{"format": fmt, "significant_bits": bits}
+                                    for fmt, bits in reduced]}
+
+    def _inputs_text(self) -> str:
+        """What the validate line says about the input cases: nothing while every candidate
+        was held to the normal inputs alone and none of them claims more."""
+        held = self.input_cases()
+        if all(cases == ("normal",) and not note for cases, _, note in held):
+            return ""
+        parts = []
+        for cases, n, note in held:
+            text = ", ".join(cases) + (f" ({n} kernels)" if len(held) > 1 else "")
+            if note:
+                text += f" [exact softmax not held to every adversarial case: {note}]"
+            parts.append(text)
+        return "  inputs: " + "; ".join(parts)
 
     def stage_lines(self) -> list[tuple[str, str, float | None]]:
         """``(stage, text, seconds)`` rows: superoptimize / schedule / build / validate / benchmark."""
@@ -276,12 +420,13 @@ class Report(_Results):
         rows.append(("build", text + (f"  [{build_fail}]" if build_fail else ""), self.timings.get("build")))
         val_fail = Failures(r for r in self.results if not r.ok and r.stage == "validate")
         n_val = len(self) - len(build_fail)
-        worst = format_measured(self.measured_error(), self.tolerance)
+        worst = format_measured(self.measured_error(), self._bounds())
         rows.append(("validate", f"{n_val - len(val_fail)} ok / {len(val_fail)} failed"
                      + (f"  [{val_fail}]" if val_fail else "")
-                     + (f"  max error {worst}" if worst else ""), None))
+                     + (f"  max error {worst}" if worst else "") + self._inputs_text()
+                     + self._matmul_text(), None))
         bench_fail = Failures(r for r in self.results if not r.ok and r.stage == "bench")
-        variants = self.variants()
+        variants, unpaired = self._resolve()
         if variants:
             win = min(variants.values(), key=lambda v: v.latency_us)
             others = ", ".join(f"{v.variant} {v.latency_us:.2f}" for v in
@@ -291,6 +436,8 @@ class Report(_Results):
                 text += f"  (others: {others} us)"
         else:
             text = "no complete variant"
+        for name, why in unpaired.items():
+            text += f"  [{name} unpaired: {why}]"
         if bench_fail:
             text += f"  [{bench_fail}]"
         rows.append(("benchmark", text, self.timings.get("benchmark")))
@@ -310,6 +457,69 @@ class Report(_Results):
                 f"failures: {self.failures}")
 
 
+def _fastest(results) -> Result:
+    return min(results, key=lambda r: r.latency_ms)
+
+
+def _fastest_pair(partials, combines) -> tuple[list[Result] | None, str | None]:
+    """``([partial, combine], None)``: the pair with the lowest total latency among those
+    whose boundary signatures are equal. ``(None, why)`` when there are partials and
+    combines but none fit together, ``(None, None)`` when one of the two is missing.
+
+    The combine of a factor is searched once and shared by every split graph of the program,
+    so the fastest partial and the fastest combine need not come from the same cut. Each is
+    validated alone, on its own random inputs, so no validation sees whether a partial
+    writes what a combine reads; the boundary records are the check there is. They compare
+    index, role, shape and dtype of every tensor crossing the cut -- not what the tensors
+    hold: two cuts that pass equally shaped tensors with different contents would be
+    paired. (Every cut of the programs searched today has one boundary and one combine.)
+
+    This is the pairing ``kernel.stages_for`` accepts. Plans without records (hand-built
+    graphs) all compare equal, which is the pairing there was before the records. A side
+    with records never pairs with one without, and a plan whose records cannot be read
+    (set on some of its tensors only, or one index twice) pairs with nothing: either is a
+    graph built without saying which tensor is which, and the reason is returned so that
+    the variant is reported as unpaired instead of vanishing.
+    """
+    from .kernel import _describe, boundary_of
+
+    read: dict[int, tuple] = {}  # plans of one lowered graph share the answer
+
+    def signature(result):
+        graph = getattr(getattr(result.plan, "tile", None), "flat_graph", None)
+        if id(graph) not in read:
+            try:
+                read[id(graph)] = (boundary_of(result.plan), None)
+            except ValueError as error:
+                read[id(graph)] = (None, f"{result.label}: {error}")
+        return read[id(graph)]
+
+    sides: dict[object, dict[str, list[Result]]] = {}
+    unreadable = []
+    for role, results in (("partial", partials), ("combine", combines)):
+        for r in results:
+            found, error = signature(r)
+            if error is None:
+                sides.setdefault(found, {}).setdefault(role, []).append(r)
+            elif error not in unreadable:
+                unreadable.append(error)
+    pairs = [[_fastest(side["partial"]), _fastest(side["combine"])]
+             for side in sides.values() if len(side) == 2]
+    if pairs:
+        return min(pairs, key=lambda pair: sum(m.latency_ms for m in pair)), None
+    if not partials or not combines:
+        return None, None
+    if unreadable:
+        return None, "; ".join(unreadable)
+
+    def tensors(role):
+        return " or ".join("tensors without boundary records" if found is None
+                           else _describe(found) for found, side in sides.items() if role in side)
+
+    return None, (f"no partial writes what a combine reads: the partials write "
+                  f"{tensors('partial')}, the combines read {tensors('combine')}")
+
+
 def _hist(counter) -> str:
     return ", ".join(f"{n} {k}" for k, n in counter.most_common())
 
@@ -324,11 +534,13 @@ def _fmt(rows, header) -> str:
 
 
 def _make_kernel(win: VariantResult, report: Report):
-    from .kernel import Kernel, stages_for
+    from .kernel import Kernel, declared_output_order, stages_for
 
     plans = [m.plan for m in win.members]
     program = plans[0].program
     stages, problem = stages_for([(m.plan, m.run, m.kernel) for m in win.members], program)
+    order, misordered = declared_output_order(plans[-1], program)
+    problem = problem or misordered
     inputs = list(getattr(program, "inputs", []) or [])
     outputs = getattr(program, "outputs", None)
     out_shapes = None
@@ -338,6 +550,10 @@ def _make_kernel(win: VariantResult, report: Report):
         problem = "split kernel without Program output shapes"
     meta = {"fingerprint": program.fingerprint() if hasattr(program, "fingerprint") else None,
             "graph_index": plans[0].graph_index, "dtype": str(getattr(program, "dtype", ""))}
+    reduced = sorted({found for plan in plans
+                      for found in matmul_operands(getattr(plan.tile, "flat_graph", None))})
+    if reduced:  # what this kernel's matmuls multiply in, where that is not its dtype
+        meta["matmul_operands"] = [fmt for fmt, _ in reduced]
     from . import cache
 
     meta["build_id"] = cache.build_id()
@@ -345,4 +561,4 @@ def _make_kernel(win: VariantResult, report: Report):
     return Kernel(stages, name=getattr(program, "name", "kernel"), input_names=[s.name for s in inputs],
                   input_shapes=[tuple(int(x) for x in s.shape) for s in inputs], output_shapes=out_shapes,
                   variant=win.variant, label=label, latency_us=win.latency_us, report=report,
-                  plans=plans, unrunnable=problem, meta=meta)
+                  plans=plans, unrunnable=problem, meta=meta, output_order=order)

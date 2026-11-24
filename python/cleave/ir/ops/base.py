@@ -35,6 +35,14 @@ class MacroOp:
         raise NotImplementedError
 
 
+# Where a carried softmax max starts, and the value a masked score takes before the max:
+# the most negative finite float32. Finite on purpose: with `-inf` the first
+# `alpha = exp(m_prev - m)` and a fully masked row form `(-inf) - (-inf)` = NaN, while with
+# this value the max is finite at every program point and nothing needs a guard. It is a
+# float32 value (it rounds to -inf in float16 / bfloat16), so a buffer holding it is float32.
+NEG_FLT_MAX = -3.4028234663852886e38
+
+
 def const_token(value) -> str:
     """A macro-name fragment for a numeric literal, safe inside a Python identifier."""
     return str(value).replace(".", "_").replace("-", "minus_").replace("+", "plus_")

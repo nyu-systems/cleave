@@ -36,18 +36,51 @@ def _tolerance(out_rtol, lse_rtol):
     Both are relative to the row. For the bf16 output the row is the head_dim vector of one
     query row and head, and there is no absolute part: an empty causal row is exactly 0.
     For the fp32 lse the row is the heads of one query row. Its error grows with its
-    magnitude (measured per operator over |lse| of 2 .. 25: the largest absolute error rises
-    with the row max, the largest relative one stays level, between 2e-7 and 1.6e-6), so an
+    magnitude (measured per operator over |lse| of 2 .. 25 on the captured workloads and up
+    to 3000 on the adversarial ones: the largest absolute error rises with the row max, from
+    2e-6 to 4e-3, the largest relative one stays level, between 2e-7 and 5e-6), so an
     absolute bound sized on one logit scale is wrong on every other: at |lse| = 450 (logits
     x100) one fp32 ulp is already 3e-5. ``LSE_ATOL`` only keeps a row whose lse is 0 from
     demanding a bit-exact answer; an empty row's -inf is matched exactly either way.
 
     ``lse_rtol`` is the next 1-2-5 step at or above 4x the largest row-relative error the
-    operator's valid kernels measured over its captured workloads and three seeds. ``out``
-    follows the same rule at 2x: bf16 has 8 significand bits, so one ulp is 7.8e-3 of the
-    row max, every kernel measures 1 to 1.2 ulps (7.8e-3 .. 9.4e-3), and 4x would be the
-    5e-2 ceiling, looser than the elementwise 0.01 + 0.01|ref| these operators were held to
-    before for any row whose max is above 0.25. 2e-2 is 2.56 ulps.
+    operator's valid kernels measured over three seeds on its normal inputs: its captured
+    workloads and the hand-made requests of its tests that leave the inputs as generated,
+    single kernels and split-KV pairs alike. Two kinds of comparison are counted and are no
+    input to it.
+
+    One is an lse output whose every entry is within ``LSE_ATOL``. It is inside the bound
+    whatever the rtol, and its row-relative error is the floor's share of a row near 0, not
+    an error that grows with the row.
+
+    The other is a comparison on adversarial inputs: the operator's adversarial workloads
+    and the hand-made requests that transform the inputs (logits x100 through the queries
+    or the scale, a ramp or one dominant key along the keys, a mirrored scale). The softmax
+    of every layer is exact, so every kernel is validated on them too, at this same bound:
+    it is declared from the normal inputs and never loosened for an adversarial case, and a
+    kernel that needs more than it there fails. What they measure, next to the normal
+    inputs: 4.1e-7 .. 6.9e-7 against 2.3e-7 .. 5.7e-7 for the GQA layers, 1.1e-6 against
+    1.1e-6 for MLA decode and 5.0e-6 against 1.5e-6 for MLA prefill, each inside its bound
+    by a factor of 2 to 7.
+
+    The MLA prefill figure is not all the kernel's. The reference is float32 as well, and
+    where an adversarial workload makes the queries and a key row constant -- every product
+    of a 576-term MLA score of one sign -- it is the reference that is off: against the
+    value those inputs allow to be formed with two roundings, the kernel is within 1.1e-7
+    and the reference 3.2e-6 away.
+
+    ``out`` follows the same rule at 2x: bf16 has 8 significand bits, so one ulp is 7.8e-3
+    of the row max, every kernel measures 1 ulp (7.8e-3), and 4x would be the 5e-2 ceiling
+    itself. 2e-2 is 2.56 ulps.
+
+    Against an elementwise ``0.01 + 0.01 |ref|`` (the bound these operators had before they
+    declared one of the row): ``2e-2 * rowmax`` with no absolute part is tighter for a row
+    whose max is below 0.5 and exact for an empty row, which must be zeros; it is looser
+    from a row max of 0.5 on the near-zero entries of the row and from 1.0 on at its
+    largest entry (0.04 against 0.03 at a max of 2, 0.08 against 0.05 at 4). The rows of
+    the captured workloads with few keys have maxima of 1 to 4, so for them it is the
+    looser of the two; 2x was chosen because every kernel measures one ulp and 4x is the
+    ceiling, not because 2x is nowhere looser.
     (``python -m tests._measure_tolerances`` re-measures; ``tests/measured_errors.json``
     is the measurement these values are pinned to.)
     """
@@ -73,7 +106,10 @@ class DynamicOperator:
     reference: Callable = field(repr=False)
     # The declared (out, lse) validation bounds; every operator states its own.
     tolerance: tuple
-    # (distribution, axes) adversarial workloads; validated on only when asked for.
+    # (distribution, axes) adversarial softmax workloads. The softmax of every layer is
+    # exact (a running max), so it holds at any logit scale, and every validation of the
+    # operator -- single kernel or split-KV pair -- runs these after the captured ones.
+    # They are never timed.
     adversarial: tuple = ()
     page_size: int = 1
     scale: float | None = None
@@ -127,7 +163,7 @@ OPERATORS: dict[str, DynamicOperator] = {
             PagingSpec(num_qo_heads=32, num_kv_heads=8),
             _GQA,
             (32, 8, 128),
-            _tolerance(out_rtol=2e-2, lse_rtol=2e-6),
+            _tolerance(out_rtol=2e-2, lse_rtol=1e-6),
         ),
         _operator(
             "gqa_paged_decode_h32_kv4_d128_ps1",
@@ -162,14 +198,14 @@ OPERATORS: dict[str, DynamicOperator] = {
             # measured -- the captured requests' causal windows are a handful of tokens.
             _GQA_PREFILL,
             (32, 8, 128),
-            _tolerance(out_rtol=2e-2, lse_rtol=5e-6),
+            _tolerance(out_rtol=2e-2, lse_rtol=2e-6),
         ),
         _operator(
             "gqa_paged_prefill_causal_h32_kv4_d128_ps1",
             PagingSpec(num_qo_heads=32, num_kv_heads=4, kind=PAGED_PREFILL_CAUSAL, causal=True),
             _GQA_PREFILL,
             (32, 4, 128),
-            _tolerance(out_rtol=2e-2, lse_rtol=5e-6),
+            _tolerance(out_rtol=2e-2, lse_rtol=2e-6),
         ),
         _operator(
             "gqa_ragged_prefill_causal_h32_kv8_d128",

@@ -43,7 +43,9 @@ def test_two_warpgroups_read_a_gemm_accumulator_only_at_block_m_128():
     cands = search_tiling(graph, topk=10000)
     m_256 = {int(c.get_tile(pv)[-2]) for c in cands if c.n_threads == 256}
     m_128 = {int(c.get_tile(pv)[-2]) for c in cands if c.n_threads == 128}
-    assert m_256 == {128}
+    # M = 256: two instructions a warp group, so codegen stages the A operand through shared
+    # (codegen.passes.stage_misplaced_register_operands) and no register operand is read
+    assert m_256 == {128, 256}
     assert m_128 == {m for m in m_128 if m >= 64} and len(m_128) > 1  # one warpgroup: M >= 64
 
 

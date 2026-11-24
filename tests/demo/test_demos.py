@@ -14,10 +14,11 @@ from pathlib import Path
 import pytest
 
 import cleave.examples as examples
+from cleave.core.errors import SpecError
 from cleave.runtime.validate import Tolerance
 
-from .._measure_tolerances import MEASURED, expected_declaration
-from .._tolerances import CEILING
+from .._measure_tolerances import MEASURED, expected_declaration, expected_tolerances_by_role
+from .._tolerances import CEILING, FP32_CEILING
 from ..frontend.test_trace_equivalence import normalized, spy
 from ._snapshot import SNAPSHOT, record, updating
 
@@ -88,22 +89,55 @@ def test_demo_emits_recorded_search(monkeypatch, request, case):
 
 def test_every_demo_has_a_case():
     covered = {c[1] for c in CASES}
-    assert set(DEMOS) - covered == {"staged", "mha_decode_exact"}
+    assert set(DEMOS) - covered == {"staged"}
     assert {c[0] for c in CASES} == set(SNAPSHOT["demos"])
 
 
+# The demos whose softmax is ``cl.softmax``, the exact one: every attention demo.
+ATTENTION = ["mha_decode", "gqa_decode", "mqa_decode", "mha_prefill", "gqa_prefill",
+             "mqa_prefill", "mla_prefill", "mla_decode", "qknorm"]
+# The demos whose kernels can return an output with a boundary role: an exact softmax,
+# split over the keys (by default for the decode demos, with the ``--split SKV`` their
+# docstrings name for the MHA / GQA / MQA prefill demos). Its partials return their float32
+# shift, so the demo declares one bound per role. mla_decode, mla_prefill and qknorm offer
+# no split: no split graph of mla_decode has a partial / combine cut, the split graphs of
+# mla_prefill need about 190 GB of references, and qknorm's split search is no demo run.
+BY_ROLE = set(ATTENTION) - {"mla_decode", "mla_prefill", "qknorm"}
+
+
+def test_the_readme_says_which_attention_demos_have_no_split_run():
+    """Every demo parses ``--split``, and the README lists it among the flags the demos
+    share. Three attention demos have no split run; the README names them where it lists
+    the flag."""
+    readme = (DEMO.parent / "README.md").read_text()
+    (paragraph,) = [p for p in readme.split("\n\n") if p.startswith("`--split` is parsed by")]
+    assert sorted(set(ATTENTION) - BY_ROLE) == ["mla_decode", "mla_prefill", "qknorm"]
+    for name in ATTENTION:
+        assert (f"`{name}.py`" in paragraph) == (name not in BY_ROLE), name
+
+
 def _assert_declared(config, name):
-    """One measured bound for the operator (or one per output), within the ceiling; normal
-    inputs only."""
+    """One measured bound for the operator (or one per output), within the ceiling (one per
+    boundary role for a demo of ``BY_ROLE``); it asks for normal inputs."""
     tolerance = config.tolerance
+    measured = json.loads(MEASURED.read_text())[f"demo:{name}"]
+    if name in BY_ROLE:
+        assert isinstance(tolerance, dict) and set(tolerance) == {"", "shift"}
+        expected = expected_tolerances_by_role(measured)
+        shift, tolerance = tolerance["shift"], tolerance[""]
+        assert isinstance(shift, Tolerance) and 0 < shift.rtol <= FP32_CEILING
+        assert shift.atol == 0 and shift == expected["shift"]
+        expected = expected[""]
+    else:
+        expected = expected_declaration(tolerance, measured)
     per_output = (tolerance,) if isinstance(tolerance, Tolerance) else tolerance
     assert isinstance(per_output, tuple) and per_output, "the demo declares no tolerance"
     for t in per_output:
         assert isinstance(t, Tolerance) and 0 < t.rtol <= CEILING and t.atol == 0
     # ... and exactly the one(s) the rule gives for the pinned measurement of this demo
-    outputs = json.loads(MEASURED.read_text())[f"demo:{name}"]
-    assert tolerance == expected_declaration(tolerance, outputs)
-    # the adversarial input distributions exist but are not switched on for any operator yet
+    assert tolerance == expected
+    # No demo asks for more than the normal inputs. (The build holds a program whose softmax
+    # is exact to the adversarial cases as well, whatever is asked: pipeline.build.)
     assert config.distributions == ("normal",)
 
 
@@ -134,13 +168,48 @@ def test_staged_demo_declares_its_own_tolerance(monkeypatch):
     assert (seen["config"].warmup, seen["config"].iters) == (16, 1000)
 
 
-def test_mha_decode_exact_config(monkeypatch):
-    seen = run_demo(monkeypatch, "mha_decode_exact", [])
-    program, so = seen["program"], seen["so"]
+def test_mha_decode_config(monkeypatch):
+    """The decode demo: no max in the program (the request stands for it), the split over
+    the keys, and the search budget the auto rule gives."""
+    seen = run_demo(monkeypatch, "mha_decode", [])
+    program, so, sc = seen["program"], seen["so"], seen["sc"]
     assert [r.kind for r in program.ops if r.kind != "input"] == [
-        "matmul", "div", "reduce_max", "sub", "exp", "reduce_sum", "div", "matmul"]
-    assert not so.split and so.resolve_max_ops(program) == 14
-    assert program.sizes == {"H": 32, "SQ": 64, "D": 64, "SKV": 256}
+        "matmul", "div", "exp", "reduce_sum", "div", "matmul"]
+    assert len(program.stabilize_requests) == 1
+    assert so.split == ("SKV",) and sc.split_k == (16, 32)
+    assert so.max_ops == "auto" and so.resolve_max_ops(program) == 13
+    assert program.sizes == {"H": 32, "SQ": 64, "D": 64, "SKV": 4096}
+    # --split none: the solo kernels only, on the same budget
+    solo = run_demo(monkeypatch, "mha_decode", ["--split", "none"])
+    assert not solo["so"].split and not solo["sc"].split_k
+    assert solo["so"].resolve_max_ops(solo["program"]) == 13
+
+
+@pytest.mark.parametrize("name", ATTENTION)
+def test_attention_demo_softmax_is_exact(monkeypatch, name):
+    """No attention demo shifts its scores by a constant: each records the one request of
+    ``cl.softmax`` on an exp that reads the scaled scores themselves, and no max."""
+    program = run_demo(monkeypatch, name, [])["program"]
+    assert len(program.stabilize_requests) == 1
+    ops = {r.out: r for r in program.ops}
+    (exp,) = [r for r in program.ops if r.kind == "exp"]
+    assert exp.attr("stabilize") == 2  # the keys: the last of three axes
+    scores = ops[exp.args[0]]
+    # the exp's operand is the division by sqrt(d), not an add of a constant behind it
+    assert scores.kind == "div" and isinstance(scores.args[1], float)
+    assert not [r for r in program.ops if r.kind in ("reduce_max", "sub")]
+    # an add in the program adds two tensors (MLA's two score terms) or qknorm's eps to
+    # a mean of squares; none of them feeds the exp
+    for add in (r for r in program.ops if r.kind == "add"):
+        assert add.out != exp.args[0]
+        assert all(isinstance(a, int) for a in add.args) or name == "qknorm"
+
+
+def test_no_demo_passes_a_shift():
+    """The parameter is gone, and so is every mention of it in a demo's source."""
+    for path in sorted(DEMO.glob("*.py")) + sorted((DEMO / "dynamic").glob("*.py")):
+        assert "shift=" not in path.read_text(), path.name
+    assert not (DEMO / "mha_decode_exact.py").exists()  # merged into mha_decode.py
 
 
 @pytest.mark.parametrize("name", DEMOS)
@@ -166,6 +235,102 @@ def test_demo_cli_help(monkeypatch, capsys, name):
         runpy.run_path(str(DEMO / f"{name}.py"), run_name="__main__")
     assert e.value.code == 0
     assert "usage:" in capsys.readouterr().out
+
+
+def _run_to_exit(monkeypatch, name, argv):
+    """Run the demo as ``__main__`` to the ``SystemExit`` it ends on; its message."""
+    monkeypatch.setattr(examples, "_target", lambda: "cpu")
+    monkeypatch.setattr(sys, "argv", [str(DEMO / f"{name}.py"), *argv])
+    monkeypatch.syspath_prepend(str(DEMO))
+    with pytest.raises(SystemExit) as e:
+        runpy.run_path(str(DEMO / f"{name}.py"), run_name="__main__")
+    return str(e.value.code)
+
+
+def test_a_declaration_that_does_not_fit_ends_a_demo_in_one_line(monkeypatch):
+    """A flag can ask for plans the demo's declaration does not cover: ``--split`` on a
+    demo that declares one ``Tolerance``, whose split partials return a shift. That is a
+    ``SpecError`` of the pipeline, and the demo ends on its message, behind the demo's name:
+    it says what to declare, and a traceback through the pipeline says nothing more.
+    ``-v`` keeps the traceback."""
+    reason = ("build(): plan 'g4 split-k=4 partial #0' (partial): one Tolerance covers the "
+              "outputs a program or its cut defines, and this kernel also returns outputs of "
+              "role ['shift']")
+
+    def refuse(program, **kw):
+        raise SpecError(reason)
+
+    monkeypatch.setattr(examples, "_compile", refuse)
+    args = ["--split", "SKV", "--max-ops", "13"]
+    assert _run_to_exit(monkeypatch, "mla_prefill", args) == f"mla_prefill: {reason}"
+    monkeypatch.setattr(sys, "argv", [str(DEMO / "mla_prefill.py"), *args, "-v"])
+    with pytest.raises(SpecError, match="one Tolerance covers"):
+        runpy.run_path(str(DEMO / "mla_prefill.py"), run_name="__main__")
+
+    # any other error without a report is not the demo's to reword
+    def broken(program, **kw):
+        raise examples.CleaveError("something else")
+
+    monkeypatch.setattr(examples, "_compile", broken)
+    monkeypatch.setattr(sys, "argv", [str(DEMO / "mla_prefill.py")])
+    with pytest.raises(examples.CleaveError, match="something else"):
+        runpy.run_path(str(DEMO / "mla_prefill.py"), run_name="__main__")
+
+
+def test_search_split_of_a_demo_that_declares_one_tolerance_stops_before_it_builds(
+        monkeypatch, tmp_path):
+    """demo/mla_prefill.py declares one ``Tolerance`` and offers no split (its docstring
+    says why). Asked for one anyway, with the budget the split graphs need, the run
+    searches and schedules them and then ends on one line that names the plan the
+    declaration does not cover -- before a kernel or a reference is built: the pipeline
+    refuses the declaration first, so ``run_candidates`` is never reached. (Small shapes;
+    the real search and scheduler, no GPU.)"""
+    import cleave.runtime.evaluate as evaluate_mod
+
+    monkeypatch.setenv("CLEAVE_CACHE_ROOT", str(tmp_path))
+    reached = []
+    monkeypatch.setattr(evaluate_mod, "run_candidates",
+                        lambda *a, **kw: reached.append(1) or [])
+    message = _run_to_exit(monkeypatch, "mla_prefill", [
+        "--H", "4", "--SQ", "64", "--SKV", "1024", "--D", "32", "--DV", "16",
+        "--split", "SKV:4", "--max-ops", "13", "--preset", "fast", "--topk", "4",
+        "--no-cache"])
+    assert message.startswith("mla_prefill: build(): plan 'g") and "\n" not in message
+    assert "split-k=4 partial #0" in message and "(partial): one Tolerance covers" in message
+    assert message.endswith("declare the tolerance by role, "
+                            "tolerance={'': Tolerance(...), 'shift': Tolerance(...)}")
+    assert not reached
+
+
+def test_qknorm_says_which_inputs_its_kernels_are_validated_on():
+    """The adversarial softmax cases shape inputs. qknorm's logits are computed from the
+    normalized q and k, so its kernels are held to the normal inputs only (the build's
+    report gives that reason): the demo and the README say so and do not claim the
+    adversarial cases for it."""
+    from cleave.lower import to_ir
+    from cleave.pipeline.build import _reference_fn
+
+    doc = " ".join((DEMO / "qknorm.py").read_text().split('"""')[1].split())
+    assert "this demo's kernels are validated on normal inputs" in doc
+    readme = " ".join((DEMO.parent / "README.md").read_text().split())
+    assert ("wherever the logits can be shaped through an input: every attention demo but "
+            "`qknorm.py`") in readme
+    # ... which is what the build does with the demo's program
+    sys.path.insert(0, str(DEMO))
+    try:
+        qknorm = runpy.run_path(str(DEMO / "qknorm.py"), run_name="_demo")["qknorm"]
+    finally:
+        sys.path.remove(str(DEMO))
+    program = qknorm.trace(HQ=4, HKV=2, SQ=16, SKV=64, D=32)
+    held = []
+    reference = _reference_fn(("normal",), program,
+                              lambda cache_dir, graph, dtype, distributions:
+                              held.append(distributions) or "published")
+    graph = to_ir(program.to_graph_structure(), dtype="float16", out_dtype="float16")
+    assert reference("dir", graph, "float16") == "published"
+    assert held == [("normal",)]
+    cases, note = reference.held[id(graph)]
+    assert tuple(cases) == ("normal",) and "not read from an input" in note
 
 
 def test_demo_cli_overrides(monkeypatch):

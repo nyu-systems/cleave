@@ -20,11 +20,15 @@ from ..core.settings import Settings
 from ..ir.graph import OutputNode, PlaceHolderNode
 from ..ir.ops import (
     Accumulate,
+    AccumulateMax,
     Add,
     Copy,
+    GridFloor,
     Div,
     Exp,
+    Exp2,
     Log2,
+    Lse2,
     Matmul,
     ReduceMax,
     Mul,
@@ -73,6 +77,30 @@ def placeholder_order(graph):
 def output_order(graph):
     """Output nodes in the order the kernel returns them (matches ``out_idx``)."""
     return [n for n in find_topo_sort(graph.nodes) if isinstance(n, OutputNode)]
+
+
+def output_roles(graph):
+    """The boundary role of each output, in :func:`output_order`: ``""`` for an output the
+    program or its cut defines (and for one without a record), else what a rewrite named
+    the tensor it added to the cut (``"shift"``)."""
+    return tuple(getattr(getattr(node, "boundary", None), "role", "") or ""
+                 for node in output_order(graph))
+
+
+def declared_output_places(graph):
+    """Per output in :func:`output_order`, which output of the program it is, or None.
+
+    A kernel returns its outputs in the order its graph lists them (``to_ir`` lists them in
+    the structure's order; a graph a rewrite builds need not); the declared place of each is
+    the record its ``OutputNode`` carries (``Boundary.index``). None when the outputs do not carry
+    exactly the places ``0 .. n-1`` once each, without a role: a hand-built graph, or a
+    split partial (which returns the tensors of its cut, not the program's outputs).
+    """
+    records = [getattr(node, "boundary", None) for node in output_order(graph)]
+    if any(r is None or r.role for r in records):
+        return None
+    places = [int(r.index) for r in records]
+    return places if sorted(places) == list(range(len(places))) else None
 
 
 def graph_out_indices(graph):
@@ -271,6 +299,19 @@ def _unary(fn):
     return _compute(lambda node, args, out_dtype: fn(args[0].to(out_dtype)))
 
 
+def _eval_exp(node, x):
+    """``exp(x)``, or for an annotated softmax exp ``exp(x - max over its softmax axis)``.
+
+    The annotation says that a positive factor constant along that axis cancels in every
+    output of a solo graph, so this is the same function with a representable
+    intermediate. Per node: an Exp without the record is the plain ``exp``.
+    """
+    stabilize = getattr(node, "stabilize", None)
+    if stabilize is not None:
+        x = x - x.amax(dim=tuple(stabilize.axes), keepdim=True)
+    return x.exp()
+
+
 def _eval_permute(node, args):
     return args[0].to(torch_dtype(node.get_dtype(0))).permute(*node.perm).contiguous()
 
@@ -287,13 +328,18 @@ REFERENCES = {
     Sub: _compute(_eval_binary),
     Mul: _compute(_eval_binary),
     Div: _compute(_eval_binary),
-    Exp: _unary(lambda x: x.exp()),
+    Exp: _compute(lambda node, args, out_dtype: _eval_exp(node, args[0].to(out_dtype))),
     Silu: _unary(lambda x: x * x.sigmoid()),
     Sqrt: _unary(lambda x: x.sqrt()),
     RSqrt: _unary(lambda x: x.rsqrt()),
     Log2: _unary(lambda x: x.log2()),
     Accumulate: _unary(lambda x: x),
+    # One iteration of it, like Accumulate: the max over a single slice is the slice.
+    AccumulateMax: _unary(lambda x: x),
     Copy: _unary(lambda x: x),
+    GridFloor: _unary(lambda x: (x / GridFloor.GRID).floor() * GridFloor.GRID),
+    Exp2: _unary(lambda x: x.exp2()),
+    Lse2: _compute(lambda node, args, out_dtype: args[0].to(out_dtype).log2() + args[1].to(out_dtype)),
 }
 
 
@@ -462,25 +508,119 @@ def execute(graph, inputs):
     return outputs
 
 
-def reconcile_output_layout(reference, actual_shape):
+def _check_layout(layout, rank):
+    """``(axes, pad)`` of a stored layout (``Graph.stored_layouts``) for a rank-``rank`` output."""
+    axes, pad = layout
+    axes, pad = tuple(int(a) for a in axes), int(pad)
+    if sorted(axes) != list(range(rank)) or pad < 0:
+        raise ValueError(
+            f"stored layout (axes={axes}, pad={pad}) is not a permutation of the {rank} "
+            "axes of the output it describes plus a number of unit dims"
+        )
+    return axes, pad
+
+
+def stored_shape(logical_shape, layout):
+    """The shape a kernel stores an output of ``logical_shape`` in under ``layout``."""
+    logical_shape = tuple(int(s) for s in logical_shape)
+    axes, pad = _check_layout(layout, len(logical_shape))
+    return tuple(logical_shape[a] for a in axes) + (1,) * pad
+
+
+def to_stored(logical, layout):
+    """``logical`` (an output as the graph defines it) in the layout a kernel stores it in.
+
+    ``layout`` is the ``(axes, pad)`` ``apply_tiling`` recorded for that output:
+    ``axes[p]`` is the logical axis at stored position ``p``, followed by ``pad`` unit dims.
+    """
+    axes, _ = _check_layout(layout, logical.dim())
+    return logical.permute(*axes).reshape(stored_shape(logical.shape, layout))
+
+
+def to_logical(stored, layout, logical_shape):
+    """The inverse of :func:`to_stored`: a kernel's stored output as a contiguous tensor of
+    ``logical_shape``. Raises if ``stored`` is not that output in that layout."""
+    logical_shape = tuple(int(s) for s in logical_shape)
+    axes, pad = _check_layout(layout, len(logical_shape))
+    expected = stored_shape(logical_shape, layout)
+    if tuple(stored.shape) != expected:
+        raise ValueError(
+            f"a tensor of shape {tuple(stored.shape)} is not an output of logical shape "
+            f"{logical_shape} stored as (axes={axes}, pad={pad}), which is {expected}"
+        )
+    inverse = sorted(range(len(axes)), key=axes.__getitem__)
+    return stored.reshape(expected[: len(axes)]).permute(*inverse).contiguous()
+
+
+def is_transposed(layout) -> bool:
+    """Whether ``layout`` permutes the axes of the output it describes. Such an output has
+    to be copied to reach the logical layout (:func:`to_logical`); any other layout only
+    appends unit dims, which is a view."""
+    axes = tuple(int(a) for a in layout[0])
+    return axes != tuple(range(len(axes)))
+
+
+def with_hand_off(kernel, stored_layouts, logical_shapes):
+    """What a launch of ``kernel`` costs its caller: ``kernel`` itself, or -- when it stores
+    an output transposed -- a callable that launches it and brings every output to its
+    logical layout.
+
+    Only a split partial stores outputs transposed, and its outputs are only ever read
+    through that copy (``Kernel.__call__`` hands them to the combine with ``to_logical``).
+    The copy belongs to the tiling that chose the layout, so it is timed with the kernel:
+    a split variant's latency is the sum of its stage timings, and would otherwise leave
+    out part of every call. A kernel without transposed outputs is returned as it is.
+    """
+    layouts = list(stored_layouts or ())
+    if not any(is_transposed(layout) for layout in layouts):
+        return kernel
+    shapes = [tuple(int(s) for s in shape) for shape in logical_shapes]
+    if len(shapes) != len(layouts):
+        raise ValueError(f"{len(layouts)} stored layouts for {len(shapes)} outputs")
+
+    def launch_and_hand_off(*inputs):
+        outputs = kernel(*inputs)
+        outputs = list(outputs) if isinstance(outputs, (tuple, list)) else [outputs]
+        return [to_logical(out, layout, shape)
+                for out, layout, shape in zip(outputs, layouts, shapes)]
+
+    return launch_and_hand_off
+
+
+def reconcile_output_layout(reference, actual_shape, layout=None):
     """Return ``reference`` reshaped/permuted to the kernel's physical output shape.
 
     The executor emits an output in its *logical* axis order, but a scheduled kernel
     may store it differently: it can keep or drop size-1 axes (e.g. a split-partial
     rowsum stored ``(split_k, M, 1)``) and, for split-partial outputs, move the split
     axis to the front (``(split_k, B*H, S_Q, ...)`` vs logical ``(B*H, split_k, ...)``).
-    Both are pure reindexings recovered by matching non-unit axis extents.
 
-    The extent-matching is only well defined when the non-unit extents are distinct.
-    If two non-unit axes share an extent AND a non-identity permutation is required
-    to line up with ``actual_shape`` (e.g. a split-partial output where ``split_k ==
-    B*H``), the layout is ambiguous and we raise rather than silently risk a wrong
-    permutation masking a real mismatch.
+    ``layout`` is the stored layout ``apply_tiling`` recorded for this output
+    (``Graph.stored_layouts``). With it the reindexing is applied as recorded and must
+    produce exactly ``actual_shape``; every kernel the pipeline builds comes with one.
+
+    Without it (a hand-written kernel has no schedule to record anything) the reindexing
+    is recovered by matching non-unit axis extents, which is only well defined when those
+    extents are distinct. If two non-unit axes share an extent AND a non-identity
+    permutation is required to line up with ``actual_shape`` (e.g. a split-partial
+    output where ``split_k == B*H``), the layout is ambiguous and we raise rather than
+    silently risk a wrong permutation masking a real mismatch. Equal shapes are returned
+    as they are, so a kernel that stores a permutation between equal extents is compared
+    transposed: such a kernel needs the record.
     """
     import torch
 
     ref_shape = tuple(int(s) for s in reference.shape)
     actual_shape = tuple(int(s) for s in actual_shape)
+    if layout is not None:
+        stored = to_stored(reference, layout)
+        if tuple(stored.shape) != actual_shape:
+            raise ValueError(
+                f"the recorded stored layout (axes={tuple(layout[0])}, pad={int(layout[1])}) "
+                f"lays the reference of shape {ref_shape} out as {tuple(stored.shape)}, but "
+                f"the kernel returned {actual_shape}"
+            )
+        return stored
     if ref_shape == actual_shape:
         return reference
     if reference.numel() != int(torch.tensor(actual_shape).prod().item()):

@@ -164,7 +164,7 @@ def test_program_metadata():
     assert [i.name for i in prog.inputs] == ["q", "k", "v"]
     assert prog.inputs[1].dims[1] == cl.Dim("SKV", 32)
     assert prog.sizes == dict(HQ=4, SQ=8, D=16, HKV=4, SKV=32)
-    assert prog.op_count == 10 and len(prog.outputs) == 1  # 3 inputs + 7 compute ops
+    assert prog.op_count == 9 and len(prog.outputs) == 1  # 3 inputs + 6 compute ops
     assert "matmul" in repr(prog)
 
 
@@ -241,7 +241,7 @@ def test_unsupported_ops_raise():
 def test_eager_dispatch_on_torch():
     x = torch.rand(4, 8) + 0.5
     _close(cl.rsqrt(x), torch.rsqrt(x), tol=1e-5)
-    _close(cl.softmax(x, -1, shift=-3.0), torch.softmax(x, -1), tol=1e-5)
+    _close(cl.softmax(x, -1), torch.softmax(x, -1), tol=1e-5)
     _close(cl.rms_norm(x, eps=1e-6), x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6), tol=1e-5)
     _close(cl.silu(x), torch.nn.functional.silu(x), tol=1e-5)
 

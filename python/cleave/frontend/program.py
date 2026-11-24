@@ -323,6 +323,32 @@ class Program:
         self._check(a, op)
         return self._emit(op, (a.id,), a.dims, a.dtype)
 
+    def _stable_exp(self, a, dim) -> Tensor:
+        """``exp`` of a softmax over ``dim``, recorded with the stabilize request.
+
+        The search still sees a plain ``exp`` (``to_tile_graph`` replays unary ops by
+        their args alone); the attribute tells the pipeline that this program asked for
+        the exact, shift-invariant softmax. It is part of the fingerprint, so the program
+        never shares a search or kernel cache entry with a hand-written
+        ``exp(x) / sum(exp(x))``. It is ``cl.softmax``'s record and nobody else's: it
+        must sit next to the sum and the divide over the same ``dim``, because
+        ``reference`` trusts ``dim`` while lowering derives the axis from the graph.
+        """
+        self._check(a, "softmax")
+        if not -a.ndim <= dim < a.ndim:
+            raise SpecError(f"softmax: dim {dim} out of range for rank {a.ndim}")
+        return self._emit("exp", (a.id,), a.dims, a.dtype, stabilize=dim % a.ndim)
+
+    @property
+    def stabilize_requests(self) -> tuple:
+        """``(input value id, dim)`` of every exp ``cl.softmax`` recorded, deduplicated."""
+        seen = []
+        for r in self._records:
+            dim = r.attr("stabilize") if r.kind == "exp" else None
+            if dim is not None and (r.args[0], dim) not in seen:
+                seen.append((r.args[0], dim))
+        return tuple(seen)
+
     def _reduction(self, a, dim, kind="reduce_sum") -> Tensor:
         what = kind.removeprefix("reduce_")
         self._check(a, what)
@@ -474,6 +500,11 @@ class Program:
                 env[r.out] = env[r.args[0]].amax(r.attr("dim"), keepdim=True)
             elif r.kind == "silu":
                 env[r.out] = torch.nn.functional.silu(env[r.args[0]])
+            elif r.kind == "exp" and r.attr("stabilize") is not None:
+                # The exact softmax: a shift that is constant along `dim` cancels in the
+                # program's outputs, and the row max is the one that cannot overflow.
+                x = env[r.args[0]]
+                env[r.out] = torch.exp(x - x.amax(r.attr("stabilize"), keepdim=True))
             elif r.kind in _UNARY or r.kind in _REFERENCE_ONLY:
                 env[r.out] = getattr(torch, r.kind)(env[r.args[0]])
             else:

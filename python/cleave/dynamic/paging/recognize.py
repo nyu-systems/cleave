@@ -87,8 +87,10 @@ def _folded_scale(chain) -> float:
     """The multiplier ``chain`` applies to the scores; shifts do not affect it.
 
     A shift is dropped by the access layer, which is sound: softmax is shift-invariant,
-    and the paged operator's log-sum-exp is defined without one (none of the shipped
-    kernels subtract a max).
+    and the paged operator's log-sum-exp is defined without one. Whatever the dense body
+    subtracts, the layer builds its own, exact softmax: it subtracts the running row max of
+    its own masked, scaled scores and adds that max back in the log-sum-exp
+    (``stages._online_softmax``).
     """
     scale = 1.0
     for node in chain:
@@ -589,10 +591,13 @@ def read_dense_combine(graph: Graph) -> CombineTiling:
                 f"the combine also holds {node.name}; the access layer rebuilds only the "
                 "two split sums and the divide, and would drop it"
             )
-    if not (len(placed) == 2 and all(r.axis == 0 for r, _ in placed)):
+    # The axis each sum was built to reduce (``flat_axis``), which is what "the split axis"
+    # asks. ``axis`` is the emitted one: counted in the stored tile, where a front-named
+    # axis behind unit extents also reads 0, and the built axis for one named from the end.
+    if not (len(placed) == 2 and all(r.flat_axis == 0 for r, _ in placed)):
         raise NotDenseAttention(
             "expected two reductions over the leading (split) axis, got "
-            f"{[(n.name, getattr(n, 'axis', None)) for n, _ in placed]}"
+            f"{[(n.name, getattr(n, 'flat_axis', None)) for n, _ in placed]}"
         )
     by_rank = {len(r.dims): (r, tier) for r, tier in placed}
     if set(by_rank) != {2, 3}:

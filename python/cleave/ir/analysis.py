@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, FrozenSet, List, Optional, Set, Tuple
+from typing import Dict, FrozenSet, List, NamedTuple, Optional, Set, Tuple
 
 from .graph import OutputNode, PlaceHolderNode
 from tvm import tirx  # after ..graph: tilelang puts tvm on sys.path
@@ -115,6 +115,11 @@ def _reduction_axes(consumer, input_id, producer_rank, consumer_rank):
 def _binary_axes(consumer, input_id, producer_rank, consumer_rank):
     if input_id == 0 or consumer.const is not None or consumer.broadcast == -1:
         return _identity_axis_map(producer_rank, consumer_rank=consumer_rank)
+    if consumer.broadcast == 0:
+        # B is A without its last axis: every B axis is the same-numbered consumer axis.
+        # (Identical to the rule below while B is `(*batch, M)`; needed once the product
+        # keeps more than two non-batch dims, where "B's last axis" is not `n_batch`.)
+        return _identity_axis_map(producer_rank, consumer_rank=consumer_rank)
 
     n_batch = consumer.n_batch_dims
     axis_map = [set() for _ in range(producer_rank)]
@@ -172,16 +177,79 @@ def _map_input_axes_to_consumer_axes(
     return mapper(consumer, input_id, producer_rank, consumer_rank)
 
 
-def infer_output_axis_dependencies(output_node: OutputNode) -> Dict[int, List[Set[int]]]:
+def infer_output_axis_dependencies(
+    output_node: OutputNode, siblings=()
+) -> Dict[str, List[Set[int]]]:
+    """For every node, the axes of ``output_node`` that each of its dims is indexed by.
+
+    The grid is launched over the axes of one output (the canonical one), so this is what
+    says which launch coordinate walks which dim of a tensor. ``siblings`` are the graph's
+    other outputs, each with the canonical axis its own axes are launched on
+    (``(output node, [canonical axis per axis])``): a node that only they descend from --
+    the row sum next to the value matmul of a split-attention partial -- is not an
+    ancestor of the canonical output and has no dependency on it otherwise. What the
+    canonical output gives a node is never changed by a sibling.
+    """
+    return launch_axis_dependencies(output_node, siblings)[0]
+
+
+class AxisDisagreement(NamedTuple):
+    """A dim that a sibling output and the view in force do not index by the same axes."""
+
+    sibling: str  # the output whose launch axes are in question
+    node: str  # an ancestor it shares with an output that came before it
+    dim: int
+    axes: FrozenSet[int]  # the launch axes that index the dim, as the grid is built
+    sibling_axes: FrozenSet[int]  # the ones that would, were the sibling right
+
+
+def launch_axis_dependencies(
+    output_node: OutputNode, siblings=()
+) -> Tuple[Dict[str, List[Set[int]]], List[AxisDisagreement]]:
+    """``infer_output_axis_dependencies`` and where the siblings contradict it.
+
+    A sibling is launched on canonical axes that were chosen for it by position and extent
+    (``schedule.tiling._get_same_launch_output_axis_map``), which says nothing about what
+    its data is indexed by. Followed back from the sibling, those axes give every one of
+    its ancestors a view of its own; an ancestor that the canonical output (or an earlier
+    sibling) also has keeps the view it had, and each dim on which the two differ is
+    reported. ``sum(w, 0)`` next to ``x @ w`` with as many rows as columns is launched on
+    the rows while ``w`` is sliced by the columns; ``exp(x) * 2`` next to ``exp(x) @ b``
+    is launched on the columns of the product while ``exp(x)`` holds the contracted axis
+    whole. Whether that is a wrong kernel depends on the grid: see
+    ``schedule.tiling._refuse_siblings_on_another_axis``.
+    """
     if len(output_node.inputs) == 0:
-        return {}
+        return {}, []
     output_src = output_node.inputs[0].src_node
     output_rank = len(output_src.get_shape(output_node.inputs[0].src_id))
-    output_identity = [{axis} for axis in range(output_rank)]
+    deps = _axis_dependencies(output_node, [{axis} for axis in range(output_rank)])
+    disagreements: List[AxisDisagreement] = []
+    for sibling, axis_map in siblings:
+        if len(sibling.inputs) == 0:
+            continue
+        seen_from_sibling = _axis_dependencies(sibling, [{axis} for axis in axis_map])
+        for name, node_deps in seen_from_sibling.items():
+            in_force = deps.setdefault(name, node_deps)
+            if in_force is node_deps:
+                continue
+            for dim, (axes, sibling_axes) in enumerate(zip(in_force, node_deps)):
+                if axes != sibling_axes:
+                    disagreements.append(
+                        AxisDisagreement(
+                            sibling.name, name, dim, frozenset(axes), frozenset(sibling_axes)
+                        )
+                    )
+    return deps, disagreements
 
-    deps: Dict[int, List[Set[int]]] = {
-        output_node.name: [set(s) for s in output_identity],
-        output_src.name: [set(s) for s in output_identity],
+
+def _axis_dependencies(output_node: OutputNode, axes: List[Set[int]]) -> Dict[str, List[Set[int]]]:
+    """The dims of every ancestor of ``output_node`` in terms of ``axes``, the launch axes
+    that index the dims of ``output_node`` itself."""
+    output_src = output_node.inputs[0].src_node
+    deps: Dict[str, List[Set[int]]] = {
+        output_node.name: [set(s) for s in axes],
+        output_src.name: [set(s) for s in axes],
     }
     worklist = [output_src]
 

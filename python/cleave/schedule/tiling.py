@@ -1,7 +1,8 @@
+import weakref
 from collections import Counter
 from dataclasses import dataclass
 from math import prod
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, NamedTuple, Optional, Set
 from tilelang.carver.roller.node import Edge
 from ..core.errors import ScheduleRejected
 from ..ir.graph import (
@@ -11,6 +12,7 @@ from ..ir.graph import (
     GraphNode,
     PlaceHolderNode,
     Iterator,
+    TensorOp,
     ViewOpNode,
 )
 from ..ir.ops import ReduceSum
@@ -19,7 +21,7 @@ from ..ir.offsets import OffsetTerm, TileOffset, get_offset_lambda
 from ..ir.analysis import (
     build_output_axis_provenance,
     build_reduction_axis_provenance,
-    infer_output_axis_dependencies,
+    launch_axis_dependencies,
     nearest_reductions,
 )
 from ..ir.graph_utils import (
@@ -27,6 +29,7 @@ from ..ir.graph_utils import (
     gather_all_nodes,
     find_topo_sort,
     clone_graph,
+    graph_tiers,
     lock_graph,
     unlock_graph,
 )
@@ -263,6 +266,68 @@ def _get_same_launch_output_axis_map(canonical_node, output_node):
     return axis_map
 
 
+def _sibling_launch_axes(canonical_output, output_nodes):
+    """``(output, [canonical axis per axis of it])`` for the outputs next to the canonical one.
+
+    The same map the outputs of a loop are stored by (``_get_same_launch_output_axis_map``):
+    batch axes in order, the other axes onto the canonical output's leading non-batch axes.
+    An output that has no such map is left out; its own ancestors then depend on no launch
+    axis, and a tiling whose grid would have to walk them is refused as before.
+
+    The map pairs axes by position and extent, not by what indexes them: whether an axis
+    of a sibling really is the canonical axis it was paired with is checked against the
+    graph, per tiling, by ``_refuse_siblings_on_another_axis``.
+    """
+    canonical = _get_output_binding_node(canonical_output)
+    siblings = []
+    for output in output_nodes:
+        if output is canonical_output:
+            continue
+        try:
+            axis_map = _get_same_launch_output_axis_map(
+                canonical, _get_output_binding_node(output)
+            )
+        except NotImplementedError:
+            continue
+        siblings.append((output, axis_map))
+    return siblings
+
+
+def _refuse_siblings_on_another_axis(disagreements, axis_coord_exprs):
+    """Refuse a grid that walks an axis on which a sibling output is wrongly launched.
+
+    A sibling output is launched and stored on the canonical axes its extents were paired
+    with (``_get_same_launch_output_axis_map``; the policy tiles it by the same pairing).
+    ``disagreements`` (``ir.analysis.launch_axis_dependencies``) are the dims of the
+    ancestors it shares with the canonical output that this pairing would have indexed by
+    other launch axes than the canonical output does. A tensor has one tile and one offset,
+    the canonical output's, so wherever the grid walks an axis the two views do not share,
+    the sibling's own ops are cut along an axis their operand is not cut along:
+    ``exp(x) * 2`` next to ``exp(x) @ b`` took its column block ``i1`` from the first
+    columns of an ``exp(x)`` held whole, and ``sum(w, 0)`` next to ``x @ w`` stored the
+    column sums of column block ``i1`` at row block ``i0`` -- kernels that were built,
+    lowered, and wrote wrong values (several blocks to one slice). While the grid stands
+    still on those axes, both views slice every tensor alike and the tiling is served.
+    """
+
+    def walked(axes):
+        return {
+            axis
+            for axis in axes
+            if axis in axis_coord_exprs and axis_coord_exprs[axis].expr != "0"
+        }
+
+    for sibling, node, dim, axes, sibling_axes in disagreements:
+        if walked(axes) != walked(sibling_axes):
+            raise ScheduleRejected(
+                f"{sibling} is launched on the axes of the canonical output by extent, but "
+                f"dim {dim} of {node} is indexed by launch axes {sorted(axes)} for the "
+                f"canonical output and {sorted(sibling_axes)} for {sibling}: the grid walks "
+                f"{sorted(walked(axes) ^ walked(sibling_axes))}, where the two are not the "
+                "same axis."
+            )
+
+
 def _build_group_axis_coord_expr(
     arg_name: str, group_extents: List[int], axis_pos: int
 ) -> _OutputAxisCoordExpr:
@@ -330,6 +395,28 @@ def _resolve_iter_coord_exprs(
     coord_exprs: List[Optional[_OutputAxisCoordExpr]] = [None] * len(iter_dims)
     for dim_idx, is_iter in enumerate(iter_dims):
         if not is_iter:
+            # The block holds this dim whole. That serves every reader only while the
+            # grid stands still on the launch axes that index it: a dim that two launch
+            # axes index has two readers (``x @ x.mT`` reads the rows of ``x`` as rows and
+            # as columns of the output), and when the grid walks one of them that reader
+            # needs a slice while the other needs the whole. A tensor has one tile, the
+            # last reader's; the kernel was built and failed TileLang's gemm shape check.
+            dep_axes = (
+                sorted(node_axis_deps[dim_idx])
+                if node_axis_deps is not None and dim_idx < len(node_axis_deps)
+                else []
+            )
+            walked = [
+                axis
+                for axis in dep_axes
+                if axis in output_axis_coord_exprs
+                and output_axis_coord_exprs[axis].expr != "0"
+            ]
+            if len(dep_axes) > 1 and walked:
+                raise ScheduleRejected(
+                    f"Dim {dim_idx} is held whole but launch axes {dep_axes} index it and "
+                    f"the grid walks {walked}: one tile cannot be a slice and the whole."
+                )
             continue
 
         dep_axes = []
@@ -352,7 +439,9 @@ def _resolve_iter_coord_exprs(
             coord_expr = output_axis_coord_exprs[output_split_axis]
 
         if coord_expr is None or coord_expr.expr == "0":
-            raise ValueError(
+            # A refusal of this tiling, not a bug: the grid would have to walk a dim that
+            # no launch axis (or more than one) indexes.
+            raise ScheduleRejected(
                 f"Expected exactly one launch-axis mapping for iter dim {dim_idx}, got {dep_axes}."
             )
         coord_exprs[dim_idx] = coord_expr
@@ -537,17 +626,15 @@ def assign_tensor_map(
             top_bind_node[n.name] = top_bind_node[outer_node.name]
         bind_node = top_bind_node[n.name] if isinstance(n, PlaceHolderNode) else n
 
-        # get tile shape and tile size from candidate
-        shape = [
-            t
-            for i, t in enumerate(tile_map[bind_node.name])
-            if not n.is_batch_dim[i] or itile_map[bind_node.name][i] > 1
-        ]
-        tile_size = [
-            t
-            for i, t in enumerate(itile_map[bind_node.name])
-            if not n.is_batch_dim[i] or t > 1
-        ]
+        # get tile shape and tile size from candidate. The loop is handed the buffer its
+        # parent stores, which has no dim the block holds a single element of (codegen's
+        # ``kept_extents``; an all-unit tile stays 1-D), so the tier carries exactly the
+        # other dims -- whether or not they are batch dims, and also where an iteration
+        # takes one element of them: that extent is squeezed when the slice is loaded.
+        block_tile = tile_map[bind_node.name]
+        axes = [i for i, t in enumerate(block_tile) if t > 1] or [len(block_tile) - 1]
+        shape = [block_tile[i] for i in axes]
+        tile_size = [itile_map[bind_node.name][i] for i in axes]
         iter_dims = [i // j > 1 for i, j in zip(shape, tile_size)]
         num_args = (
             len(graph_node.graph.extent)
@@ -561,39 +648,106 @@ def assign_tensor_map(
             get_offset_lambda(tile_size, arg_indices, num_args),
             shape=shape,
             tile_size=tile_size,
+            axes=tuple(axes),
         )
 
 
+def _is_unit(extent) -> bool:
+    """Whether codegen squeezes ``extent`` out of a stored tile (its ``kept_extents``)."""
+    return isinstance(extent, int) and extent <= 1
+
+
+def _rebase_reduction_axis(node: ReduceSum, tile):
+    """Point the ``dim`` that ``node`` emits at its reduced axis in the stored input tile.
+
+    ``tile`` is the tile of the node's input over the node's full ``dims``. A kernel
+    stores a tile without its unit extents, so the reduced axis has as many dims in
+    front of it as ``tile`` has non-unit extents there; an axis given from the end is
+    kept in that form and counted from the end. The answer is derived from the axis the
+    node was built with (``flat_axis``), never from an earlier answer: a loop's nodes
+    are visited again on every merge into that loop.
+    """
+    axis = node.flat_axis
+    node.axis, node.axis_arg = axis, node.flat_axis_arg
+    node.stored_axis = axis
+    if tile is None or len(tile) != len(node.dims) or _is_unit(tile[axis]):
+        # A unit extent on the reduced axis itself (a loop that walks the axis one
+        # element at a time) leaves the stored tile without that axis: there is no
+        # ``dim`` to give, and such a tiling does not compile.
+        return
+    # Where the axis sits in the stored tile, whichever end it was named from.
+    node.stored_axis = sum(1 for extent in tile[:axis] if not _is_unit(extent))
+    if node.flat_axis_arg < 0:
+        node.axis_arg = -1 - sum(1 for extent in tile[axis + 1 :] if not _is_unit(extent))
+    else:
+        node.axis = node.axis_arg = node.stored_axis
+
+
+def _tile_over_dims(node: ReduceSum, tile) -> Optional[list]:
+    """``tile``, a tile of the value ``node`` reads over that value's own dims, as a tile
+    over ``node.dims``: a dim the value does not have (an input read through a split
+    view, ``ReduceSum.operand_dims``) is one the block holds one element of. ``tile``
+    itself where it is not over the value's dims."""
+    if tile is None:
+        return None
+    dims, own = node.operand_dims()
+    if len(tile) != own:
+        return list(tile)
+    return [1 if d is None else tile[d] for d in dims]
+
+
 def _normalize_inner_reduction_axes(graph_node: GraphNode, itile_map: dict):
+    """Rebase the reduction axes of a loop tier onto the iteration tiles they read."""
     for node in graph_node.graph.nodes:
-        if (
-            not isinstance(node, ReduceSum)
-            or len(node.inputs) != 1
-            # Negative axes remain stable when leading batch dims are dropped.
-            # Positive axes need to be rebased onto the visible tiled input rank.
-            or getattr(node, "axis_arg", -1) < 0
-        ):
+        if not isinstance(node, ReduceSum) or len(node.inputs) != 1:
             continue
-
-        input_edge = node.inputs[0]
-        src_node = input_edge.src_node
+        src_node = node.inputs[0].src_node
         bind_node = graph_node.graph.binding.get(src_node.name, src_node)
-        full_tile = itile_map.get(bind_node.name)
-        batch_flags = list(getattr(src_node, "is_batch_dim", []) or [])
-        if full_tile is None or len(batch_flags) != len(full_tile):
-            continue
+        _rebase_reduction_axis(node, _tile_over_dims(node, itile_map.get(bind_node.name)))
 
-        visible_axes = [
-            axis
-            for axis, (is_batch_dim, tile_extent) in enumerate(zip(batch_flags, full_tile))
-            if not is_batch_dim or tile_extent > 1
-        ]
-        if node.axis not in visible_axes:
-            continue
 
-        visible_axis = visible_axes.index(node.axis)
-        node.axis = visible_axis
-        node.axis_arg = visible_axis
+def rebase_reduction_axis(node: ReduceSum, it: Iterator):
+    """``_rebase_reduction_axis`` from ``it``, the tile of the node's input in its tier.
+
+    ``apply_tiling`` does this for every reduction it schedules. A reduction added to a
+    scheduled graph afterwards has to be given its ``dim`` the same way, from the
+    ``Iterator`` of the tensor it reads.
+    """
+    rank = len(node.dims)
+    tile = [1] * rank  # a dim the tier does not carry is one the tile holds one element of
+    for dim in range(rank):
+        position = node.position_in(it, dim)
+        if position is not None:
+            tile[dim] = it.tile_size[position]
+    _rebase_reduction_axis(node, tile)
+
+
+def _normalize_main_reduction_axes(main: Graph):
+    """Rebase the reduction axes of the main tier onto the tiles they read.
+
+    A reduction that is not looped stays in the main tier, where a batch dim is a unit
+    extent of every tile and is squeezed like any other: without this, a sum over a
+    non-leading axis is emitted with its flat ``dim`` and reduces the next axis over.
+    """
+    for node in main.nodes:
+        if not isinstance(node, ReduceSum) or len(node.inputs) != 1:
+            continue
+        edge = node.inputs[0]
+        if isinstance(edge.src_node, GraphNode):
+            # A loop's accumulator: the buffer is the one the loop's own tier allocates.
+            accum_node = getattr(edge, "accum_node", None)
+            it = None if accum_node is None else edge.src_node.graph.tmap.get(accum_node)
+            if isinstance(it, Iterator):
+                rebase_reduction_axis(node, it)
+            else:
+                _rebase_reduction_axis(node, None)
+        else:
+            # A tile of this tier is over the dims of the value it stores: the node's
+            # own, but for an input read through a split view. One of another rank (a
+            # unit dim that is not a batch dim has no tile) is left alone.
+            _rebase_reduction_axis(
+                node, _tile_over_dims(node, list(main.tmap[edge.src_node].tile_size))
+            )
 
 
 def _iterative_reductions(nodes, rstep_map):
@@ -607,7 +761,18 @@ def _iterative_reductions(nodes, rstep_map):
     ]
 
 
-def absorbed_reductions(nodes, rstep_map):
+def reduction_ancestors(nodes):
+    """``{reduction: its op ancestors}`` for the reductions of ``nodes``.
+
+    What ``absorbed_reductions`` asks of the graph. It does not depend on the steps, so
+    a caller that rates many step maps of one graph (the policy's search walk) builds it
+    once and passes it in, instead of walking the graph for every pair of reductions of
+    every step map.
+    """
+    return {n: frozenset(get_op_ancestors(n)) for n in nodes if len(n.raxis) > 0}
+
+
+def absorbed_reductions(nodes, rstep_map, ancestors=None):
     """The reductions of ``nodes`` that ``apply_tiling`` schedules inside another's loop.
 
     A reduction that iterates (step < extent) while one of its descendant reductions
@@ -616,35 +781,110 @@ def absorbed_reductions(nodes, rstep_map):
     axis; it cannot also advance the absorbed reduction's axis. An absorbed reduction
     is therefore computed over its whole axis in every iteration, whatever its step:
     the tiling is the kernel of the one that steps it at its extent.
+
+    ``ancestors`` is ``reduction_ancestors(nodes)`` when the caller already has it.
     """
     active = _iterative_reductions(nodes, rstep_map)
+    if len(active) < 2:
+        return []
+    if ancestors is None:
+        ancestors = reduction_ancestors(active)
     return [
         a
         for a in active
-        if any(r is not a and a in get_op_ancestors(r) for r in active)
+        if any(r is not a and a in ancestors[r] for r in active)
     ]
 
 
-def _absorbed_axis_tokens(ordered_nodes, rstep_map):
-    """``(absorbed, pinned tokens, provenance)`` of the absorbed reductions of a tiling.
+class _ScheduledAxes(NamedTuple):
+    """What the absorbed-reduction pin asks of a flat graph, whatever the candidate."""
 
-    Raises ``ScheduleRejected`` for a tiling in which another reduction steps an absorbed
-    reduction's axis: its loop would have to advance an axis that has to stay whole.
+    structure: tuple  # ``_structure`` of the flat graph these were read from
+    nodes: list  # op nodes of the scheduled clone (split views removed)
+    out_tokens: dict  # ``build_output_axis_provenance`` of ``nodes``
+    red_tokens: dict  # ``build_reduction_axis_provenance`` of ``nodes``
+    ancestors: dict  # ``reduction_ancestors`` of ``nodes``
+
+
+# id(flat graph) -> (weak reference to it, its _ScheduledAxes). A ``Graph`` is a mutable
+# dataclass and so not hashable; the entry goes when the graph does.
+_SCHEDULED_AXES: dict = {}
+
+
+def _structure(flat_graph) -> tuple:
+    """The nodes of ``flat_graph`` and how they are wired, by name."""
+    return tuple(
+        (n.name, tuple((e.src_node.name, e.src_id) for e in n.inputs))
+        for n in flat_graph.nodes
+    )
+
+
+def _scheduled_axes(flat_graph) -> _ScheduledAxes:
+    """Axis provenance and reduction ancestors of ``flat_graph`` as ``apply_tiling`` sees it.
+
+    They depend on the flat graph only, and every candidate of a search shares one flat
+    graph, so they are read once per graph instead of once per candidate (it was two
+    thirds of ``apply_tiling``'s time on a candidate). They are read off a clone of
+    their own -- the one ``apply_tiling`` schedules is taken apart by it -- and are
+    indexed by node: nodes compare by name, so the nodes of any clone find their entry.
+    A graph that was rewired since (``_structure``) is read again.
     """
-    absorbed = absorbed_reductions(ordered_nodes, rstep_map)
-    if not absorbed:
-        return absorbed, set(), None
+    structure = _structure(flat_graph)
+    entry = _SCHEDULED_AXES.get(id(flat_graph))
+    if entry is not None and entry[0]() is flat_graph and entry[1].structure == structure:
+        return entry[1]
 
+    _, pruned = _extract_split_extent(flat_graph)
+    ordered_nodes = [
+        n for n in pruned.nodes if not n.is_placeholder() and not n.is_output()
+    ]
     out_tokens = build_output_axis_provenance(ordered_nodes)
-    red_tokens = build_reduction_axis_provenance(ordered_nodes, out_tokens)
+    axes = _ScheduledAxes(
+        structure,
+        ordered_nodes,
+        out_tokens,
+        build_reduction_axis_provenance(ordered_nodes, out_tokens),
+        reduction_ancestors(ordered_nodes),
+    )
+
+    key = id(flat_graph)
+
+    def forget(ref):
+        if _SCHEDULED_AXES.get(key, (None,))[0] is ref:
+            del _SCHEDULED_AXES[key]
+
+    _SCHEDULED_AXES[key] = (weakref.ref(flat_graph, forget), axes)
+    return axes
+
+
+def scheduled_reductions(flat_graph):
+    """``(op nodes, reduction-axis provenance)`` of ``flat_graph`` as ``apply_tiling`` sees it.
+
+    ``apply_tiling`` schedules a clone of the flat graph with its split views removed, and
+    decides what an absorbed reduction holds whole from the axis provenance of that clone.
+    Anything that has to agree with it (the policy's verdict on a candidate) reads the
+    provenance from here. Nodes compare by name, so a step map keyed by the nodes of
+    ``flat_graph`` indexes the returned ones.
+    """
+    axes = _scheduled_axes(flat_graph)
+    return axes.nodes, axes.red_tokens
+
+
+def _held_axis_tokens(ordered_nodes, rstep_map, red_tokens, ancestors=None):
+    """Provenance tokens of the axes that absorbed reductions hold whole.
+
+    Raises ``ScheduleRejected`` for a tiling no loop can serve: one in which another
+    reduction steps an axis that an absorbed reduction has to keep whole.
+    """
 
     def axis_tokens(node):
         tokens = red_tokens.get(node)
         return tokens[0] if tokens else set()
 
+    absorbed = absorbed_reductions(ordered_nodes, rstep_map, ancestors)
     # These are refusals, not asserts: without them the tiling would be scheduled into
     # a kernel that reads the wrong slices, and ``python -O`` drops an assert.
-    pinned = set()
+    held = set()
     for node in absorbed:
         tokens = axis_tokens(node)
         if not tokens:
@@ -652,32 +892,50 @@ def _absorbed_axis_tokens(ordered_nodes, rstep_map):
                 f"No axis provenance for the reduction axis of {node.name}; cannot tell "
                 "which tensor dims it runs over."
             )
-        pinned |= tokens
+        held |= tokens
     for node in _iterative_reductions(ordered_nodes, rstep_map):
         # Keeping a loop's own axis at block extent would stop the loop from advancing.
-        if node not in absorbed and pinned & axis_tokens(node):
+        if node not in absorbed and held & axis_tokens(node):
             raise ScheduleRejected(
                 f"Reduction axis of {node.name} is shared with an absorbed ancestor "
                 "reduction; one loop cannot both advance it and hold it whole."
             )
-    return absorbed, pinned, out_tokens
+    return held
 
 
-def _pin_absorbed_reduction_axes(ordered_nodes, rstep_map, tile_map, itile_map):
+def absorbed_axis_conflict(ordered_nodes, rstep_map, red_tokens, ancestors=None) -> Optional[str]:
+    """Why ``apply_tiling`` refuses ``rstep_map`` over its absorbed reductions, or ``None``.
+
+    ``ordered_nodes`` and ``red_tokens`` are those of ``scheduled_reductions``;
+    ``ancestors`` is ``reduction_ancestors(ordered_nodes)`` when the caller has it.
+    """
+    try:
+        _held_axis_tokens(ordered_nodes, rstep_map, red_tokens, ancestors)
+    except ScheduleRejected as refusal:
+        return str(refusal)
+    return None
+
+
+def _pin_absorbed_reduction_axes(flat_graph, rstep_map, tile_map, itile_map):
     """Iteration tiles with every absorbed reduction axis kept at its block extent.
 
     Each tensor dim that carries the axis of an absorbed reduction (see
     ``absorbed_reductions``) keeps its block tile, so ``assign_tensor_map`` does not
     slice it with the counter of the loop the reduction was absorbed into.
+    ``flat_graph`` is the candidate's; what is asked of it is the same for every
+    candidate (``_scheduled_axes``).
 
-    Raises ``ScheduleRejected`` as ``_absorbed_axis_tokens`` does.
+    Raises ``ScheduleRejected`` for a tiling in which another reduction steps that same
+    axis: its loop would have to advance an axis that has to stay whole.
     """
-    absorbed, pinned, out_tokens = _absorbed_axis_tokens(ordered_nodes, rstep_map)
-    if not absorbed:
+    axes = _scheduled_axes(flat_graph)
+    if not absorbed_reductions(axes.nodes, rstep_map, axes.ancestors):
         return itile_map
 
+    pinned = _held_axis_tokens(axes.nodes, rstep_map, axes.red_tokens, axes.ancestors)
+
     itile_map = dict(itile_map)
-    for (node, out_id), dim_tokens in out_tokens.items():
+    for (node, out_id), dim_tokens in axes.out_tokens.items():
         if out_id != 0 or node.name not in itile_map:
             continue
         tile, itile = tile_map[node.name], list(itile_map[node.name])
@@ -688,6 +946,333 @@ def _pin_absorbed_reduction_axes(ordered_nodes, rstep_map, tile_map, itile_map):
                 itile[dim] = tile[dim]
         itile_map[node.name] = itile
     return itile_map
+
+
+def _refuse_per_iteration_values_read_outside(main: Graph):
+    """Refuse a loop whose per-iteration value is also read by a node outside the loop.
+
+    A reduction that iterates takes its ancestors into its loop. An ancestor that has a
+    second reader which did not come along -- ``exp`` under a looped row sum, also read by
+    the ``div`` that normalizes it -- then exists once per iteration, and only as that
+    iteration's slice: the reader outside has nothing to read. Only an accumulator leaves a
+    loop. Checked once every merge is done, because a later reduction may still take the
+    reader into the loop.
+    """
+    for tier, owner in graph_tiers(main):
+        if owner is None:
+            continue
+        inside = {id(n) for n in tier.nodes}
+        carried = {id(n) for n in tier.accum_nodes}
+        for node in tier.nodes:
+            if not isinstance(node, TensorOp) or id(node) in carried:
+                continue
+            for edge in node.outputs:
+                if id(edge.dst_node) not in inside:
+                    raise ScheduleRejected(
+                        f"{node.name} is computed per iteration of {owner.name} but also "
+                        f"read by {edge.dst_node.name} outside it"
+                    )
+
+
+def _refuse_loops_that_miscount_their_tiles(main: Graph):
+    """Refuse a loop whose trip count is not the number of tiles it steps through.
+
+    A loop has one counter, and every inner tensor dim that is cut into more than one tile
+    is sliced with it (``assign_tensor_map``). The trip count comes from the reduction that
+    created the loop; a reduction merged into the loop later with another step leaves dims
+    cut into a different number of tiles ("the existing inner graph extent wins"). The
+    loop then runs past the end of those dims, or stops short of it: 4096 iterations over
+    128 tiles of 32. Such a kernel reads memory it does not own or drops part of the sum.
+
+    A loop that cuts nothing at all is the same miscount at its extreme: every iteration
+    reads the whole of every tensor, and the sum is taken once per iteration. It comes
+    from a step map that names a reduction axis the node does not have: the trip count
+    is read off the map's only value, the tiles off the node's own axis, which then has
+    no step.
+    """
+    for tier, owner in graph_tiers(main):
+        if owner is None:
+            continue
+        cut = False
+        for node, it in tier.tmap.items():
+            for dim, (extent, step) in enumerate(zip(it.shape, it.tile_size)):
+                tiles = int(extent) // int(step)
+                if tiles > 1 and int(extent) % int(step):
+                    # the count below is rounded down: the loop would stop short of the end
+                    raise ScheduleRejected(
+                        f"{owner.name} steps dim {dim} of {node.name} by {step}, which does "
+                        f"not divide its {extent} elements: the tail would never be read"
+                    )
+                cut = cut or tiles > 1
+                if tiles > 1 and tiles != tier.extent:
+                    raise ScheduleRejected(
+                        f"{owner.name} runs {tier.extent} iterations but dim {dim} of "
+                        f"{node.name} is cut into {tiles} tiles ({step} of {extent})"
+                    )
+        if not cut and isinstance(tier.extent, int) and tier.extent > 1:
+            raise ScheduleRejected(
+                f"{owner.name} runs {tier.extent} iterations but cuts none of its tensors "
+                "into tiles: every iteration would read the same slice"
+            )
+
+
+# The narrowest innermost extent, in bytes, of a slice TileLang transfers in a pipeline.
+_PIPELINED_SLICE_BYTES = 16
+# The boundary, in bytes, a bulk tensor transfer needs its destination on.
+_TRANSFER_ALIGNMENT_BYTES = 128
+
+
+def _is_one_run(region, shape) -> bool:
+    """Whether ``region`` (an extent per dim) of a row-major tensor of ``shape`` is one run
+    of consecutive elements: whole dims behind at most one partial dim, single elements in
+    front of it."""
+    inner = len(shape)
+    while inner > 0 and int(region[inner - 1]) == int(shape[inner - 1]):
+        inner -= 1
+    return all(int(extent) == 1 for extent in region[: max(inner - 1, 0)])
+
+
+def _pipeline_one_loop(main: Graph, tile_map: dict, itile_map: dict, top_bind_node: dict):
+    """Leave ``T.Pipelined`` to the one loop of a kernel that TileLang can pipeline.
+
+    A loop tier is emitted as ``T.Pipelined``, which lets TileLang turn the copies of the
+    slices each iteration loads into asynchronous bulk transfers. The vendored TileLang
+    loses the loop variable of such a loop in two cases, and the kernel then fails at
+    the very end of lowering ("In PrimFunc main_kernel variables (i0,) are used, but are
+    not passed in as API arguments"):
+
+    * it is not the first pipelined loop of the kernel: two sums looped with different
+      steps (a split combine), or two matmuls that share no operand, each get a loop of
+      their own, and every such kernel died there;
+    * the loop loads no slice it can transfer that way: the innermost extent of every
+      region it reads per iteration is under 16 bytes (four float16 row sums of a split
+      combine with only that sum looped; one, two or four columns of a matmul's
+      partials). A loop that also loads one wider slice lowers as it is.
+
+    In a third case the kernel lowers and then faults on the device ("CUDA error:
+    misaligned address"):
+
+    * the loop transfers a slice that is not a whole number of 128-byte units and is not
+      one run of consecutive elements of its tensor (two partials of 8 or 16 float16 row
+      sums out of a longer row; two partials of a matmul on tiles of 16 or 8 elements).
+      A pipeline keeps several iterations' slices in one
+      buffer, the slice of stage ``k`` at ``k`` times the slice's size, and a slice that
+      is not one run is loaded as a tensor tile, which needs its destination on a
+      128-byte boundary: stage 1 of a 32- or 64-byte slice is not on one. (A slice that
+      is one run is loaded as a flat range, for which the 16 bytes every transferred
+      slice is a multiple of are enough.)
+
+    All three lower as a plain loop, which computes the same thing: a loop with nothing to
+    transfer has nothing to overlap, and a plain loop keeps one slice at the start of its
+    buffer. Of two loops the first keeps its pipeline (with the first serial and the
+    second pipelined TileLang lowers some kernels and not others). ``main.nodes`` is in
+    emission order.
+    """
+
+    def slices_loaded(tier: Graph):
+        """``(tensor, extents, bytes of an element)`` of every region the loop loads per
+        iteration."""
+        for node in tier.nodes:
+            if not isinstance(node, PlaceHolderNode) or node.name not in top_bind_node:
+                continue
+            bound = top_bind_node[node.name]
+            block, step = tile_map.get(bound.name), itile_map.get(bound.name)
+            if block is None or step is None or len(block) != len(step):
+                continue
+            if not any(int(b) // int(t) > 1 for b, t in zip(block, step)):
+                continue  # handed down whole: the parent loads it once
+            yield bound, [int(t) for t in step], (int(bound.get_dtype(0).bits) + 7) // 8
+
+    def lands_off_its_boundary(bound, step, width) -> bool:
+        """A slice loaded as a tensor tile whose later stages miss the boundary."""
+        if step[-1] * width < _PIPELINED_SLICE_BYTES or step[-1] * width % 16:
+            return False  # not transferred: copied element by element
+        size = width
+        for extent in step:
+            size *= extent
+        shape = [int(extent) for extent in bound.get_shape(0)]
+        return size % _TRANSFER_ALIGNMENT_BYTES != 0 and not (
+            len(shape) == len(step) and _is_one_run(step, shape))
+
+    pipelined = False
+    for tier, owner in graph_tiers(main):
+        if owner is None or tier.loop_kind != "pipelined":
+            continue
+        slices = list(slices_loaded(tier))
+        transfers = any(step[-1] * width >= _PIPELINED_SLICE_BYTES for _, step, width in slices)
+        if pipelined or not transfers or any(lands_off_its_boundary(*s) for s in slices):
+            tier.loop_kind = "serial"
+        pipelined = True  # a later loop is not the first, whatever this one became
+
+
+def _refuse_tile_that_misses_dims(node, shape, tile, expanded_tile):
+    """Refuse a tiling whose tile has fewer dims than the tensor it tiles.
+
+    The policy gives a tile one extent per axis the op iterates. A dim of extent 1 is not
+    iterated, so it has no extent in the tile; ``_expand_tile_to_shape_rank`` puts it back
+    when it is a batch dim. A unit dim that is not a batch dim stays missing: the output
+    of ``x @ column`` (a ``Matmul`` with N = 1) is ``(M, 1)`` with the tile ``[m]``. The
+    grid extent would then be taken from the dims the tile happens to cover, and the
+    launch-axis plan and the offsets built for a tensor of lower rank (it used to end in
+    ``KeyError: 1`` or an assert on ``iter_repeat_factors``, depending on the loop).
+
+    Next to batch dims the tile has the tensor's rank after all, with its extents on the
+    wrong dims: for ``(B, M, 1)`` the policy tiles ``(B, M)`` as ``[b, m]`` and the
+    expansion reads that as ``[1, b, m]``, ``m`` rows of the unit dim. Same defect, same
+    refusal (it used to end in whichever guard the nonsense tripped first).
+    """
+    misplaced = len(tile) != len(shape) and any(
+        int(extent) == 1 and int(step) > 1 for extent, step in zip(shape, expanded_tile)
+    )
+    if len(expanded_tile) != len(shape) or misplaced:
+        raise ScheduleRejected(
+            f"{node.name}: tile {list(tile)} does not cover the {len(shape)} dims of its "
+            f"tensor {tuple(int(s) for s in shape)}; a unit dim that is not a batch dim "
+            "has no tile"
+        )
+
+
+def _stored_rank(tile) -> int:
+    """The rank of the buffer a tile is stored in: its unit extents are squeezed out
+    (codegen's ``kept_extents``), and a tile of unit extents only is stored 1-D."""
+    return max(1, sum(1 for extent in tile if not _is_unit(extent)))
+
+
+def _operand_tile(tier: Graph, edge) -> Optional[Iterator]:
+    """The tile of the value ``edge`` reads, in the tier that stores it."""
+    if isinstance(edge.src_node, GraphNode):
+        accum_node = getattr(edge, "accum_node", None)
+        it = None if accum_node is None else edge.src_node.graph.tmap.get(accum_node)
+    else:
+        it = tier.tmap.get(edge.src_node)
+    return it if isinstance(it, Iterator) else None
+
+
+def refuse_unit_extents(main: Graph) -> None:
+    """Refuse a scheduled graph whose kernel does not compile because of a unit extent.
+
+    A kernel stores a tile without its unit extents. Three kinds of op are emitted for the
+    rank of the tensor, not of the tile, and a tiling that takes one element of a
+    non-batch dim leaves them a buffer of lower rank than they index:
+
+    * a reduction that is handed one element of the axis it reduces per step (a loop that
+      walks the axis one element at a time): the slice has no such axis, so there is no
+      ``dim`` to reduce over (TileLang: "Invalid reduce output shape");
+    * an elementwise op, whose macro has one index per non-batch dim (a block of a single
+      row: "not enough values to unpack", "Can't deduce copy extents");
+    * a matmul, whose operands and result must be stored 2-D (a single row or column:
+      "Swizzle layout expects rank >= 2", the gemm 2-D assert).
+
+    Such a candidate used to be built and handed to TileLang, where it died at parse or in
+    layout inference, each with whatever message the missing dim produced first. This is
+    the default build's check (``schedule_kernel``), not ``apply_tiling``'s: the paged path
+    schedules step-1 tilings only to read them (``read_dense_combine``) and emits its own
+    kernels for them.
+    """
+    from ..ir.ops import Matmul
+    from ..ir.ops.elementwise import BinaryElementwise, UnaryElementwise
+
+    for tier, _ in graph_tiers(main):
+        for node in tier.nodes:
+            if isinstance(node, ReduceSum) and len(node.inputs) == 1:
+                it = _operand_tile(tier, node.inputs[0])
+                if it is None:
+                    continue
+                position = node.position_in(it)
+                step = 1 if position is None else it.tile_size[position]
+                if _is_unit(step):
+                    raise ScheduleRejected(
+                        f"{node.name} is handed one element of the axis it reduces per step "
+                        f"({int(node.dims[node.flat_axis])} in all): the stored slice has no "
+                        "such axis to reduce over"
+                    )
+            elif isinstance(node, (BinaryElementwise, UnaryElementwise)):
+                it = tier.tmap.get(node)
+                if not isinstance(it, Iterator):
+                    continue
+                indexed = len(node.dims) - node.n_batch_dims
+                tile = tuple(int(t) for t in it.tile_size)
+                if _stored_rank(tile) != indexed:
+                    raise ScheduleRejected(
+                        f"{node.name} indexes {indexed} dims but its tile {tile} is stored "
+                        f"with {_stored_rank(tile)}: a unit extent that is not a batch dim "
+                        "is squeezed out of the tile"
+                    )
+            elif isinstance(node, Matmul):
+                tiles = [("result", tier.tmap.get(node))] + [
+                    (f"operand {edge.dst_id}", _operand_tile(tier, edge)) for edge in node.inputs
+                ]
+                for what, it in tiles:
+                    if not isinstance(it, Iterator):
+                        continue
+                    tile = tuple(int(t) for t in it.tile_size)
+                    if _stored_rank(tile) != 2:
+                        raise ScheduleRejected(
+                            f"{node.name}: its {what} tile {tile} is stored with "
+                            f"{_stored_rank(tile)} dim(s); a matmul takes 2-D operands and "
+                            "gives a 2-D result, so a single row or column has no kernel"
+                        )
+
+
+def schedule_kernel(cand) -> Graph:
+    """``apply_tiling`` for a candidate the default build emits a kernel for.
+
+    The scheduled graph, or ``ScheduleRejected``: from ``apply_tiling`` itself (the
+    stabilization rewrite included), or because the kernel could not compile for a unit
+    extent (``refuse_unit_extents``). The default build (``runtime.compile.
+    build_candidate``) and the softmax accept filter (``stabilize.stabilize_accept``)
+    both schedule through here, so what the filter keeps is what the build schedules, by
+    construction. The paged path calls ``apply_tiling`` itself: it schedules step-1
+    tilings only to read them and emits its own kernels for them.
+    """
+    tiled = apply_tiling(cand)
+    refuse_unit_extents(tiled)
+    refuse_parts_of_computed_tiles(tiled)
+    return tiled
+
+
+def refuse_parts_of_computed_tiles(main: Graph) -> None:
+    """Refuse a scheduled graph in which an elementwise op reads a part of a tile that its
+    own block computed.
+
+    An elementwise macro reads its operand at the indices it writes. That is right for an
+    input (the kernel hands the block the slice it was launched on) and for a computed
+    tile of the same extents. It is wrong for a computed tile that is wider than what the
+    op writes: attention weights ``exp / sum(exp)`` on an output tile of 32 of 256 columns
+    keep the whole row of ``exp`` in the block, because the row sum next to the divide
+    needs it, and the divide then read the first 32 of them in every block, whatever
+    columns the block was launched on. The row sums were right and 7 of 8 blocks returned
+    the weights of other keys (on a GPU: 12 of the 16 tilings of ``matmul_softmax_graph``
+    that hold the row in one step, off by the row maximum). Nothing here offsets a
+    fragment by the launch index, so such a tiling has no kernel; the tilings whose
+    output tile holds what the block computes are unaffected.
+
+    The default build's check (``schedule_kernel``), like ``refuse_unit_extents``.
+    """
+    from ..ir.ops.elementwise import BinaryElementwise, UnaryElementwise
+
+    for tier, _ in graph_tiers(main):
+        for node in tier.nodes:
+            if not isinstance(node, (BinaryElementwise, UnaryElementwise)):
+                continue
+            it = tier.tmap.get(node)
+            if not isinstance(it, Iterator):
+                continue
+            written = tuple(int(t) for t in it.tile_size)
+            for edge in node.inputs:
+                src = edge.src_node
+                if src.is_placeholder() or isinstance(src, GraphNode):
+                    continue
+                held = tier.tmap.get(src)
+                if not isinstance(held, Iterator):
+                    continue
+                read = tuple(int(t) for t in held.tile_size)
+                if len(read) == len(written) and any(r > w for r, w in zip(read, written)):
+                    raise ScheduleRejected(
+                        f"{node.name} writes a tile {written} and reads {src.name}, which "
+                        f"its block holds as {read}: it would read the first elements of "
+                        "that tile in every block, wherever the block is launched"
+                    )
 
 
 def _merge_into_loop(
@@ -742,45 +1327,33 @@ def _merge_into_loop(
     _normalize_inner_reduction_axes(gnode, itile_map)
 
 
-def _reduction_axis_tokens(ops) -> Dict[str, set]:
+def _reduction_axis_tokens(flat_graph) -> Dict[str, set]:
     """Source axes (provenance tokens) of each reduction's first axis, by node name.
 
-    Read on the graph as the policy saw it: removing split views loses the provenance.
+    Read off the candidate's flat graph once per graph, as everything ``apply_tiling``
+    decides on axis provenance (``_scheduled_axes``), not once per candidate.
     """
-    out_tokens = build_output_axis_provenance(ops)
     return {
         node.name: set(tokens[0]) if tokens else set()
-        for node, tokens in build_reduction_axis_provenance(ops, out_tokens).items()
+        for node, tokens in _scheduled_axes(flat_graph).red_tokens.items()
     }
 
 
-def _check_iterates_with_loop(
-    node, gnode, rstep_map, reduction_axis_tokens, *, shares_nodes
-):
+def _check_iterates_with_loop(node, gnode, reduction_axis_tokens, *, shares_nodes):
     """Refuse to merge reduction ``node`` into the loop of ``gnode`` where it cannot run.
 
     The loop has one counter. An ancestor of the loop's reductions is absorbed (its axis
     is held whole, see ``_pin_absorbed_reduction_axes``). Any other reduction steps with
-    the counter:
-    - it needs the loop's trip count, or the kernel reads past the shorter axis or
-      covers only part of it (and an input the two share is sliced once, with one
-      step, for both: LoRA's X@W and X@A at different K steps gave TileLang
-      ``T.gemm K shape check failed``); the policy steps such siblings together;
-    - sharing nodes with the loop (whose tiles are sliced along the loop's axis), it
-      must run over that axis, when the provenance of both axes is known.
-    Raises ``ScheduleRejected`` (a second loop in one kernel is not supported by code
-    generation).
+    the counter. Sharing nodes with the loop (whose tiles are sliced along the loop's
+    axis), it must run over that axis, when the provenance of both axes is known. (That it
+    needs the loop's trip count as well -- or the kernel reads past the shorter axis or
+    covers only part of it, LoRA's X@W and X@A at different K steps -- is refused once every
+    merge is done, by ``_refuse_loops_that_miscount_their_tiles``; the policy steps such
+    siblings together.) Raises ``ScheduleRejected`` (one loop cannot advance two axes).
     """
     loop_reductions = [n for n in gnode.graph.accum_nodes if n.raxis]
     if any(node in get_op_ancestors(r) for r in loop_reductions):
         return
-    step = _get_rstep_for_axis(node, rstep_map[node])
-    trips = int(node.raxis[0].dom.extent) // step
-    if trips != int(gnode.graph.extent):
-        raise ScheduleRejected(
-            f"Reduction {node.name} takes {trips} steps of {step} but would join the "
-            f"loop of {gnode.name}, which takes {gnode.graph.extent}."
-        )
     if shares_nodes:
         axis_tokens = reduction_axis_tokens()
         tokens = axis_tokens.get(node.name, set())
@@ -1032,38 +1605,6 @@ def _with_token_axis_deps(output_axis_deps, flat_graph, output_node, inter_chain
     return deps
 
 
-def _with_sibling_axis_deps(output_axis_deps, output_nodes, output_node, inter_chains):
-    """``output_axis_deps`` completed for the tensors only an intra sibling output reads.
-
-    A sibling launched with the canonical output (``e @ u`` next to ``e @ v``) has its
-    own ancestors (``u``); their dims depend on the canonical axes the sibling's axes
-    map onto (``_get_same_launch_output_axis_map``). Nodes already mapped through the
-    canonical output keep their dependencies (single-output programs are unchanged).
-    """
-    canonical = _get_output_binding_node(output_node)
-    deps = output_axis_deps
-    for sibling in output_nodes:
-        bound = _get_output_binding_node(sibling)
-        if sibling is output_node or bound.name in inter_chains:
-            continue
-        sibling_deps = infer_output_axis_dependencies(sibling)
-        if all(name in deps for name in sibling_deps):
-            continue
-        try:
-            axis_map = _get_same_launch_output_axis_map(canonical, bound)
-        except NotImplementedError:  # not a same-launch sibling: left as it was
-            continue
-        if deps is output_axis_deps:
-            deps = dict(output_axis_deps)
-        for name, dim_deps in sibling_deps.items():
-            if name in deps:
-                continue
-            deps[name] = [
-                {axis_map[a] for a in axes if 0 <= a < len(axis_map)} for axes in dim_deps
-            ]
-    return deps
-
-
 def apply_tiling(cand: List) -> List[Graph]:
     # accumulation context per output-feeding node name (empty: every output intra)
     accumulation = {
@@ -1080,17 +1621,21 @@ def apply_tiling(cand: List) -> List[Graph]:
         if accumulation.get(n.name) == INTRA
         for r in nearest_reductions(n, flat_ops)
     ]
-    # read lazily (only a sibling merge needs it), on the graph before it is restructured
-    reduction_axis_tokens = lambda: _reduction_axis_tokens(flat_ops)  # noqa: E731
+    # read lazily (only a sibling merge needs it), off the flat graph, which is not restructured
+    reduction_axis_tokens = lambda: _reduction_axis_tokens(cand.flat_graph)  # noqa: E731
     output_nodes = [n for n in cand.flat_graph.nodes if n.is_output()]
     output_node = _select_launch_output_node(output_nodes, accumulation)
 
     # this needs to be called before any graph modifications
     # to correctly infer output axis dependencies for the
-    # original output node
-    output_axis_deps = infer_output_axis_dependencies(output_node)
-    output_axis_deps = _with_sibling_axis_deps(
-        output_axis_deps, output_nodes, output_node, inter_chains
+    # original output node. An inter output is not launched on the canonical axes
+    # (its block is whole but for its batch axes, ``_inter_output_coord_exprs``), so it
+    # is no sibling here; the tensors only it reads get their axes by provenance.
+    launched = [
+        n for n in output_nodes if _get_output_binding_node(n).name not in inter_chains
+    ]
+    output_axis_deps, sibling_disagreements = launch_axis_dependencies(
+        output_node, _sibling_launch_axes(output_node, launched)
     )
     if inter_chains:
         # tensors only an inter output reads are not ancestors of the canonical output
@@ -1124,7 +1669,7 @@ def apply_tiling(cand: List) -> List[Graph]:
     tile_map = {k.name: v for k, v in cand.tile_map.items()}
     itile_map = {k.name: v for k, v in cand.itile_map.items()}
     itile_map = _pin_absorbed_reduction_axes(
-        ordered_nodes, cand.rstep_map, tile_map, itile_map
+        cand.flat_graph, cand.rstep_map, tile_map, itile_map
     )
 
     # set top level threadblock extent and tmap based on the
@@ -1136,6 +1681,7 @@ def apply_tiling(cand: List) -> List[Graph]:
             _get_output_binding_node(node).name if node.is_output() else node.name
         ]
         expanded_tile = _expand_tile_to_shape_rank(node, tile)
+        _refuse_tile_that_misses_dims(node, shape_owner.get_shape(), tile, expanded_tile)
         threadblock_extent_map[node.name] = tuple(
             i // j for i, j in zip(shape_owner.get_shape(), expanded_tile)
         )
@@ -1153,6 +1699,7 @@ def apply_tiling(cand: List) -> List[Graph]:
 
     launch_axis_plan = _build_launch_axis_plan(output_node, dshape)
     graphs["main"].extent = launch_axis_plan.extent
+    _refuse_siblings_on_another_axis(sibling_disagreements, launch_axis_plan.axis_coord_exprs)
 
     for node in reversed(ordered_nodes):
         if node.name in inter_chain_nodes:
@@ -1167,9 +1714,20 @@ def apply_tiling(cand: List) -> List[Graph]:
             for gnode in graphs["main"].nodes:
                 if isinstance(gnode, GraphNode):
                     accum_node = gnode.graph.accum_nodes[0]  # assume one accum node
-                    same_rstep = (
+                    node_rstep = _get_rstep_for_axis(node, cand.rstep_map[node])
+                    # A reduction that shares nothing with the loop joins it only
+                    # where the loop already steps the way the reduction does:
+                    # the same step, the same number of times. Equal steps over
+                    # axes of different length are not that: x @ w over K = 256
+                    # and y @ z over K2 = 512, both stepped by 32, were put in one
+                    # loop of 8 iterations that cut z into 16 tiles, and every
+                    # such tiling was then refused for the miscount. It gets a
+                    # loop of its own, as with any other pair of steps.
+                    same_loop = (
                         _get_rstep_for_axis(accum_node, cand.rstep_map[accum_node])
-                        == _get_rstep_for_axis(node, cand.rstep_map[node])
+                        == node_rstep
+                        and int(node.raxis[0].dom.extent) // node_rstep
+                        == gnode.graph.extent
                     )
 
                     # merge node and its ancestors into an existing graph when
@@ -1200,7 +1758,7 @@ def apply_tiling(cand: List) -> List[Graph]:
                     ]
 
                     if (
-                        not same_rstep
+                        not same_loop
                         and not shared_inner_nodes
                         and not existing_placeholders
                     ):
@@ -1209,7 +1767,6 @@ def apply_tiling(cand: List) -> List[Graph]:
                     _check_iterates_with_loop(
                         node,
                         gnode,
-                        cand.rstep_map,
                         reduction_axis_tokens,
                         shares_nodes=bool(shared_inner_nodes),
                     )
@@ -1242,7 +1799,14 @@ def apply_tiling(cand: List) -> List[Graph]:
             )
             raxis = node.raxis[0]
             node_rstep = _get_rstep_for_axis(node, cand.rstep_map[node])
-            assert raxis.dom.extent % node_rstep == 0
+            if int(raxis.dom.extent) % int(node_rstep):
+                # A refusal, not an assert: ``python -O`` drops an assert, and the loop
+                # built then never reads the tail of the axis (4 steps of 64 over 257).
+                raise ScheduleRejected(
+                    f"{node.name}: its reduction over {int(raxis.dom.extent)} elements is "
+                    f"stepped by {int(node_rstep)}, which does not divide it; "
+                    "the last tile of a reduction is not padded"
+                )
             inner_graph.extent = int(
                 raxis.dom.extent // node_rstep
             )
@@ -1286,9 +1850,13 @@ def apply_tiling(cand: List) -> List[Graph]:
         for gnode in graphs["main"].nodes:
             if isinstance(gnode, GraphNode) and gnode.graph.accumulation:
                 gnode.graph.invariant_nodes = loop_invariant_nodes(gnode.graph)
+    # Every merge is done, the inter outputs' included: a loop's readers are all in it.
+    _refuse_per_iteration_values_read_outside(graphs["main"])
+    _refuse_loops_that_miscount_their_tiles(graphs["main"])
     lock_graph(graphs["main"])  # graph structure is fixed after this point
 
     graphs["main"].nodes = find_topo_sort(main_output_nodes)
+    _pipeline_one_loop(graphs["main"], tile_map, itile_map, top_bind_node)
     canonical_output_binding = _get_output_binding_node(output_node)
     for node in graphs["main"].nodes:
         tile_size = []
@@ -1324,6 +1892,7 @@ def apply_tiling(cand: List) -> List[Graph]:
             physical_shape = logical_shape
             physical_tile_size = logical_tile_size
             physical_coord_exprs = logical_coord_exprs
+            stored_axes = tuple(range(len(logical_shape)))
             split_axis = getattr(bound_node, "_split_axis", None)
             if (
                 len(main_output_nodes) > 1
@@ -1337,11 +1906,21 @@ def apply_tiling(cand: List) -> List[Graph]:
                 physical_shape = [logical_shape[axis] for axis in reorder]
                 physical_tile_size = [logical_tile_size[axis] for axis in reorder]
                 physical_coord_exprs = [logical_coord_exprs[axis] for axis in reorder]
+                stored_axes = tuple(reorder)
 
             while len(physical_shape) < len(canonical_output_binding.get_shape()):
                 physical_shape.append(1)
                 physical_tile_size.append(1)
                 physical_coord_exprs.append(None)
+
+            # The stored layout is decided here and nowhere else, so it is recorded here:
+            # no consumer has to recover it from the extents of the two shapes. The pad is
+            # counted against the rank, not against `logical_shape`: without a reorder
+            # that is the very list the unit dims were just appended to.
+            graphs["main"].stored_layouts[node.name] = (
+                stored_axes,
+                len(physical_shape) - len(stored_axes),
+            )
 
             num_args = (
                 len(graphs["main"].extent)
@@ -1359,6 +1938,8 @@ def apply_tiling(cand: List) -> List[Graph]:
 
         tile_size = _expand_tile_to_shape_rank(node, tile_size)
         shape = _get_schedule_shape_owner(node).get_shape()
+        if isinstance(node, OutputNode):  # stored as its producer computes it
+            graphs["main"].stored_layouts[node.name] = (tuple(range(len(shape))), 0)
         iter_dims = [i // j > 1 for i, j in zip(shape, tile_size)]
         num_args = (
             len(graphs["main"].extent)
@@ -1391,5 +1972,12 @@ def apply_tiling(cand: List) -> List[Graph]:
             shape=shape,
             tile_size=tile_size,
         )
+    _normalize_main_reduction_axes(graphs["main"])
 
+    if any(getattr(n, "stabilize", None) is not None for n in ordered_nodes):
+        # A softmax exp the scale analysis marked gets its max here, where the tiers are
+        # final. Lazy: the pass is not even imported for a graph without one.
+        from .stabilize import stabilize
+
+        return stabilize(graphs["main"])
     return graphs["main"]

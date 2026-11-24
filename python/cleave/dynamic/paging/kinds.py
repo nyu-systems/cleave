@@ -74,7 +74,10 @@ _MLA_FIELDS_READ = {
     MLA_PAGED_PREFILL_CAUSAL: {"tokens_dim", "query_indptr_input"},
 }
 
-# The two partial tensors a split-KV pair hands from its partial kernel to its combine. The
-# fused emitter turns them into the parameters `Partial_<name>_split` / `_combine`.
+# The three partial tensors a split-KV pair hands from its partial kernel to its combine, in
+# the order both declare them. The fused emitter turns them into the parameters
+# `Partial_<name>_split` / `_combine`. The row sums and the values of a split are relative
+# to that split's own running max, which is the third: the combine weighs every split by it.
 PARTIAL_ROWSUM = "ROWSUM"
 PARTIAL_VALUE = "VALUE"
+PARTIAL_MAX = "MAX"

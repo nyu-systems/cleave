@@ -422,6 +422,28 @@ class PagedKernel(Kernel):
         scalars = iter(p for p in inputs if p.is_scalar)
         return [s if s is not None else next(scalars) for s in slots]
 
+    def _no_key_in_any_cache(self, bound) -> bool:
+        """Whether the caches have no row at all and the KV table gives no request one.
+
+        That is the one call a kernel cannot be launched for whose answer the inputs still
+        define. Caches without a row under a table that gives requests keys, or one cache
+        with rows next to one without, define no answer: such a call is refused."""
+        caches = self.attention.caches
+        empty = [c.name for c in caches if bound[c.name].numel() == 0]
+        if not empty:
+            return False
+        if len(empty) < len(caches):
+            filled = [c.name for c in caches if c.name not in empty]
+            raise ValueError(f"{self.name}: {', '.join(empty)} has no row but "
+                             f"{', '.join(filled)} does; the caches are read through one table")
+        indptr = self.attention._table_param(self.attention.pages.indptr)
+        table = bound[indptr.name]
+        spanned = int(table[-1]) - int(table[0]) if table.numel() else 0
+        if spanned:
+            raise ValueError(f"{self.name}: {indptr.name} gives the requests {spanned} "
+                             f"entries of caches that have no row ({', '.join(empty)})")
+        return True
+
     def __call__(self, *args, **named):
         import torch
 
@@ -443,9 +465,6 @@ class PagedKernel(Kernel):
                 raise ValueError(f"{self.name}: page_size=1 reads no {p.name}; pass None")
             if p in kept and bound.get(p.name) is None:
                 raise TypeError(f"{self.name}: missing input {p.name!r}")
-        self.compile()
-        if self._slots is None:
-            self._slots = self._kernel_slots()
         sizes = {}
         for p in kept:
             if not p.is_scalar:
@@ -456,6 +475,19 @@ class PagedKernel(Kernel):
         outs = [torch.empty([sizes[d.name] if hasattr(d, "name") else int(d) for d in dims],
                             dtype=dt.torch, device=q.device)
                 for dims, dt in zip(self.attention.output_dims(), self.attention.output_dtypes())]
+        if self._no_key_in_any_cache(bound):
+            # No request has a key, so every output row is what the operator defines for
+            # an empty window: 0, and -inf in the lse. Nothing is launched: the ragged and
+            # slab kernels address their caches through TMA descriptors, and one cannot be
+            # built for a zero-sized tensor (TileLang 0.1.13 raises "globalAddress must be
+            # non-null" before the kernel starts).
+            outs[0].zero_()
+            for lse in outs[1:]:
+                lse.fill_(float("-inf"))
+            return outs[0] if len(outs) == 1 else tuple(outs)
+        self.compile()
+        if self._slots is None:
+            self._slots = self._kernel_slots()
         self._compiled(*[bound[p.name] for p in self._slots], *outs)
         return outs[0] if len(outs) == 1 else tuple(outs)
 
@@ -471,7 +503,10 @@ def compile_dynamic(fn, *, dtype=None, preset="default", superopt=None, schedule
     ``max_workloads`` of them. ``reference``: also measure the registry's tuned kernel (it
     cannot win). ``dispatch``: with split pairs, calibrate the split/single choice per workload.
     ``tolerance``: one ``cl.Tolerance`` per output (default: the registry operator's).
-    ``adversarial``: also validate on the registry operator's adversarial softmax workloads."""
+    A registry operator validated on the registry's workloads is validated on its
+    adversarial softmax workloads as well, single kernels and split pairs alike: the softmax
+    of every paged layer is exact, so they are part of what a correct kernel passes.
+    ``adversarial`` asks for them by name and is refused for a caller's own workloads."""
     from ..frontend.paged import trace_paged
     from ..dynamic.paging import SPLIT_KINDS
     from ..runtime.autotune import (benchmark_over_workloads, compile_and_validate_over_workloads,
@@ -508,7 +543,13 @@ def compile_dynamic(fn, *, dtype=None, preset="default", superopt=None, schedule
                            filter_before_topk=filter_before_topk)
     note("schedule", plans)
     if not plans:
-        raise CleaveError(f"{program.name}: the access layer refused every tiling\n{plans.summary()}")
+        # The tilings are ranked by cost before the access layer reads them, so a small
+        # topk can hold none it accepts (MLA decode: none of the first 100).
+        hint = "" if filter_before_topk else (
+            f" of the {sc.topk} ranked first; raise topk, or pass filter_before_topk=True "
+            "to rank only the tilings the layer accepts")
+        raise CleaveError(f"{program.name}: the access layer refused every tiling{hint}\n"
+                          f"{plans.summary()}")
     t2 = time.perf_counter()
     by_cand = {}
     for p in plans:
@@ -518,6 +559,10 @@ def compile_dynamic(fn, *, dtype=None, preset="default", superopt=None, schedule
     cands = [c for c, _ in by_cand.values()]
     tuned = _tuned_reference(attention, spec, cands) if reference else None
     success, errors = [], []
+    # The registry's workloads include the operator's adversarial ones: every candidate,
+    # single kernel or split pair, is held to them. Timing and the dispatch calibration
+    # below stay on the captured workloads.
+    adversarial = adversarial or (workloads is None and _registry_op(attention) is not None)
     compile_and_validate_over_workloads(cands, factory(0, adversarial), success, errors,
                                         tolerance=tol)
     t3 = time.perf_counter()

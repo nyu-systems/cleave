@@ -60,5 +60,7 @@ def test_apply_tiling_refuses_shared_input_merge_with_other_trip_count():
     (axis,) = rstep_map[base]
     rstep_map[base][axis] *= 2  # half the trips of the loop it would join
     tile = policy.compute_tile_dict(list(cand.output_tile), rstep_map)
-    with pytest.raises(ScheduleRejected, match="mma_base takes"):
+    # refused once the loop is built: it cuts the shared X into more tiles than it runs
+    with pytest.raises(ScheduleRejected,
+                       match=r"runs \d+ iterations but dim 1 of PlaceHolder_AA is cut into"):
         apply_tiling(tile)

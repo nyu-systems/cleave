@@ -95,11 +95,18 @@ class PlanSet(Sequence):
 
 def lower(graph: SearchedGraph, split_factor: int | None = None) -> list:
     """``[graph]`` for solo, ``[partial, combine]`` for a split graph at ``split_factor``."""
+    bundle = _lower_structure(graph, graph.structure, split_factor)
+    if getattr(graph.program, "stabilize_requests", ()):
+        bundle = _annotate_softmax(graph, bundle)
+    return bundle
+
+
+def _lower_structure(graph: SearchedGraph, structure, split_factor: int | None = None) -> list:
     from ..lower.process import to_bundles
 
     dtype = graph.dtype
     try:
-        bundles = to_bundles([graph.structure], symbol_map=graph.symbol_map,
+        bundles = to_bundles([structure], symbol_map=graph.symbol_map,
                              split_factors=None if split_factor is None else [split_factor],
                              dtype=dtype, out_dtype=dtype)
     except Exception as e:  # noqa: BLE001
@@ -113,29 +120,100 @@ def lower(graph: SearchedGraph, split_factor: int | None = None) -> list:
     return bundle
 
 
-def bind_inputs(ir_graph, graph: SearchedGraph) -> tuple[str | None, ...] | None:
-    """Placeholder name for each Program input, by input identity; None for an unread input.
+def _annotate_softmax(graph: SearchedGraph, bundle: list) -> list:
+    """The freshly lowered graph(s) of a program that asked for a softmax, with its exps
+    marked.
 
-    The k-th ``kn_input_op`` of the structure is Program input k, and its tensor's guid names
-    the lowered placeholder (``input_<guid>``). Shapes cannot decide: same-shaped inputs would
-    bind in placeholder (first-use) order. None (unbindable) if a placeholder is not a
-    structure input or the input counts differ.
+    ``cl.softmax`` records a plain ``exp`` plus a request; which Exp of *this* graph the
+    request means is derived by the scale analysis. The flat graph stays shift-free (the
+    tiling policy must not see a max ahead of the sums): the mark is what the reference
+    honours and what the per-schedule stabilization consumes after tiling.
+
+    A split pair keeps a softmax on either side of the cut: the partial's, whose shift it
+    exports as one more output, and the combine's over the split axis, which weights the
+    partials by that shift (``cleave.lower.scale.stabilize_split``).
+
+    The search computes a value once: where the program wrote several exps of one tensor
+    (``cl.softmax(x) + cl.exp(x)``, two softmaxes of ``x`` over different axes) the solo
+    graph it returns has one, whose factor does not cancel. Such a graph is lowered with
+    that exp computed again for a part of its readers (``cleave.lower.unmerge``): the first
+    such structure the analysis accepts, in a fixed order, so lowering the graph again
+    gives the same one. The structure of the searched graph itself is left as it is.
+    """
+    from ..lower.scale import ScaleError, annotate, stabilize_split, written_exps
+    from ..lower.unmerge import exp_ops, unmerged
+
+    try:
+        if graph.is_split:
+            return list(stabilize_split(*bundle, graph.program))
+        annotate(bundle[0], graph.program)
+    except ScaleError as e:
+        merged = 0 if graph.is_split else written_exps(graph.program) - exp_ops(graph.structure)
+        for structure in unmerged(graph.structure, merged):
+            try:
+                served = _lower_structure(graph, structure)
+                annotate(served[0], graph.program)
+            except (LoweringRejected, ScaleError):
+                continue
+            return served
+        why = ("; the search merged exps the program wrote apart, and computing the merged "
+               "one again for a part of its readers does not serve the softmax either"
+               if merged > 0 else "")
+        raise LoweringRejected(
+            f"graph {graph.index}: softmax cannot be stabilized: {e}{why}") from e
+    return bundle
+
+
+def bind_inputs(ir_graph, program) -> tuple[str | None, ...] | None:
+    """Placeholder name for each Program input; None for an input the graph does not read.
+
+    Paired by the position lowering recorded on each graph input (``input_index``: the
+    structure declares its inputs in the program's order, and an input no output reads
+    keeps its position but has no placeholder -- a per-output search, or the merge of
+    several, leaves such inputs). ``ir_graph.nodes`` is a topological order, so two inputs
+    of one shape may come the other way round there; a graph without the record is only
+    bound where the shapes leave no choice, and only when it reads every input.
+
+    A recorded input is bound when the graph declares it with the program's shape give
+    or take unit axes: lowering declares an input written in keepdim form next to a
+    reduced value (``rowsum(x) / y`` with ``y`` of shape ``(R, 1)``) the way its consumer
+    reads it, ``(R,)``. Those are the same elements in the same order, and
+    ``Kernel.__call__`` views each input as its placeholder's shape.
     """
     from ..ir.graph import PlaceHolderNode
-    from ..lower.convert import input_name
 
-    program = graph.program
     if program is None or not hasattr(program, "inputs"):
         return None
-    guids = [op["output_tensors"][0]["guid"] for op in graph.structure
-             if op["op_type"] == "kn_input_op"]
-    if len(guids) != len(program.inputs):
+    phs = [n for n in ir_graph.nodes if isinstance(n, PlaceHolderNode)]
+    want = [tuple(int(s) for s in spec.shape) for spec in program.inputs]
+    declared = [getattr(n, "input_index", None) for n in phs]
+    if (None not in declared and len(set(declared)) == len(declared)
+            and set(declared) <= set(range(len(want)))):
+        by_index = dict(zip(declared, phs))
+        if all(_without_units(_shape(n)) == _without_units(want[i])
+               for i, n in by_index.items()):
+            return tuple(by_index[i].name if i in by_index else None for i in range(len(want)))
+    if len(phs) != len(want):
         return None
-    names = {n.name: n for n in ir_graph.nodes if isinstance(n, PlaceHolderNode)}
-    bound = tuple(PlaceHolderNode.full_name(input_name(g)) for g in guids)
-    if not set(names) <= set(bound):
-        return None
-    return tuple(b if b in names else None for b in bound)
+    ph_shapes = [_shape(n) for n in phs]
+    taken, names = set(), []
+    for shape in want:
+        hits = [i for i, s in enumerate(ph_shapes) if s == shape and i not in taken]
+        if len(hits) != 1:
+            return None
+        taken.add(hits[0])
+        names.append(phs[hits[0]].name)
+    return tuple(names)
+
+
+def _shape(node) -> tuple[int, ...]:
+    return tuple(int(s) for s in node.get_shape(0))
+
+
+def _without_units(shape) -> tuple[int, ...]:
+    """``shape`` without its unit axes: equal for two layouts of the same elements in the
+    same order."""
+    return tuple(s for s in shape if s != 1)
 
 
 def describe_tile(t) -> str:
@@ -156,11 +234,23 @@ def describe_tile(t) -> str:
     return text
 
 
-MAX_ROW_LIMIT = "a max over a row longer than one block needs online softmax, which is not implemented"
+# (Short enough for a refusal's one-line reason. A softmax that is returned itself -- a
+# standalone softmax, attention weights -- needs its row in one block with cl.softmax too:
+# the advice is for a softmax that is summed or multiplied over its row.)
+MAX_ROW_LIMIT = ("a max written by hand needs its whole row in one block, and this row is longer; "
+                 "cl.softmax carries a running max over any row it feeds to a sum or a matmul")
 
 
-def _search(ir_graph, topk: int, force: bool, hints: dict | None):
+def _search(ir_graph, topk: int, force: bool, hints: dict | None,
+            refused: Counter | None = None):
+    """The top ``topk`` tilings of one lowered graph.
+
+    A graph with a marked softmax exp keeps only the tilings ``apply_tiling`` builds,
+    stabilization included, decided before the top-k cut; the reasons of the others are
+    added to ``refused``. For any other graph nothing changes.
+    """
     from ..schedule import search_tiling
+    from ..schedule.stabilize import stabilize_accept
 
     kw = dict(hints or {})
     if kw:
@@ -168,10 +258,21 @@ def _search(ir_graph, topk: int, force: bool, hints: dict | None):
         unknown = [k for k in kw if k not in accepted]
         if unknown:
             raise ScheduleRejected(f"search_tiling does not accept hints {unknown}")
+    stable = stabilize_accept(ir_graph)
+    if stable is not None:
+        user = kw.get("accept")
+        kw["accept"] = stable if user is None else (lambda cand: user(cand) and stable(cand))
     try:
         return list(search_tiling(ir_graph, topk=topk, force_fusion=force, **kw))
+    except ScheduleRejected:
+        raise  # the policy's own refusal of the whole graph, with its reason
     except Exception as e:  # noqa: BLE001
+        # Not a refused candidate: the filter drops those itself. Whatever else it or the
+        # search raises is a bug, and names itself in the refusal of the whole graph.
         raise ScheduleRejected(f"{type(e).__name__}: {e}") from e
+    finally:
+        if stable is not None and refused is not None:
+            refused.update(stable.reasons)
 
 
 def _schedule_once(graphs: GraphSet, config: ScheduleConfig, force: bool):
@@ -180,13 +281,17 @@ def _schedule_once(graphs: GraphSet, config: ScheduleConfig, force: bool):
     topk, hints = config.topk, config.hints
 
     def add(g, variant, role, ir, factor, inputs=None):
+        reasons = Counter()
         try:
-            tiles = _search(ir, topk, force, hints)
+            tiles = _search(ir, topk, force, hints, reasons)
         except ScheduleRejected as e:
             refused.append(Refusal(g.index, variant, role, e))
             return
         if not tiles:
             why = MAX_ROW_LIMIT if "max" in g.ops else "no tiling candidates"
+            if reasons:  # every tiling was refused by the softmax filter: say why
+                why += f" ({sum(reasons.values())} refused: " + "; ".join(
+                    f"{n}x {reason}" for reason, n in reasons.most_common()) + ")"
             refused.append(Refusal(g.index, variant, role, ScheduleRejected(why)))
         for rank, t in enumerate(tiles):
             label = f"g{g.index} {variant} {role} #{rank} {describe_tile(t)}"
@@ -205,7 +310,7 @@ def _schedule_once(graphs: GraphSet, config: ScheduleConfig, force: bool):
             except LoweringRejected as e:
                 refused.append(Refusal(g.index, "solo", "main", e))
                 continue
-            add(g, "solo", "main", ir, None, bind_inputs(ir, g))
+            add(g, "solo", "main", ir, None, bind_inputs(ir, program))
             continue
         if not config.split_k:
             refused.append(Refusal(g.index, "split", "partial",
@@ -218,7 +323,7 @@ def _schedule_once(graphs: GraphSet, config: ScheduleConfig, force: bool):
             except LoweringRejected as e:
                 refused.append(Refusal(g.index, variant, "partial", e))
                 continue
-            add(g, variant, "partial", partial, f, bind_inputs(partial, g))
+            add(g, variant, "partial", partial, f, bind_inputs(partial, program))
             if f not in combined:  # the combine is searched once per factor
                 combined.add(f)
                 add(g, variant, "combine", combine, f)

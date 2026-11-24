@@ -1,6 +1,6 @@
 import copy
 from dataclasses import dataclass, field, fields, replace
-from typing import Callable, List, Union, Dict, Tuple, Optional
+from typing import Callable, List, NamedTuple, Union, Dict, Tuple, Optional
 
 from tilelang.carver.roller.node import (
     Edge,
@@ -52,10 +52,26 @@ class Iterator:
         offset: Callable[[str], tuple[str]],
         shape: tuple[int],
         tile_size: tuple[int],
+        axes: Optional[tuple[int]] = None,
     ):
         self.offset = offset  # offset('i') -> index expression tuple
         self.shape = shape
         self.tile_size = tile_size
+        # Which dims of the node's own shape the entries of ``shape`` / ``tile_size``
+        # stand for, when the tile leaves some out: a loop tier of ``apply_tiling`` does
+        # not carry a dim its block holds one element of. ``None``: not recorded -- the
+        # tile is over the node's dims, any missing ones missing from the front.
+        self.axes = axes
+
+    def position(self, dim: int, rank: int) -> Optional[int]:
+        """Where dim ``dim`` of a node with ``rank`` dims sits in this tile.
+
+        ``None`` if the tile does not carry it: it then holds one element of that dim.
+        """
+        if self.axes is not None:
+            return self.axes.index(dim) if dim in self.axes else None
+        position = len(self.tile_size) - (rank - dim)  # aligned from the end
+        return position if position >= 0 else None
 
     def __repr__(self):
         return f"Iterator(offset={self.offset}, shape={self.shape}, tile_size={self.tile_size})"
@@ -225,6 +241,34 @@ class Graph:
         # implicit __syncthreads(); (b) the union of active slots must cover every
         # declared output element -- nothing else checks that.
     )
+    lag_nodes: List[Node] = field(
+        default_factory=list
+    )  # nodes of an iterative graph that snapshot an accumulator of the same loop (their
+    # single input) BEFORE this iteration updates it. A lag node is an ordinary compute
+    # node of the dataflow -- a `Copy` -- except for where it is emitted: an edge orders a
+    # reader after its producer, and this reader has to see the value the previous
+    # iteration left. So the emitter ignores a lag node's own input edge when ordering and
+    # makes the lag node a dependency of the accumulator it reads instead. Its consumers
+    # keep ordinary edges. Used by the rolling (online) softmax: `m_prev = lag(m)`.
+    accum_scale: dict[Node, Node] = field(
+        default_factory=dict
+    )  # accumulator -> factor node. Right before the accumulator's own macro runs, its
+    # buffer is multiplied in place by the factor (indexed by the accumulator's leading
+    # axes): `acc *= factor; acc += update`. The factor is an ordinary node of this graph,
+    # ordered before the accumulator although no edge joins them. Used by the rolling
+    # softmax: every accumulator downstream of `exp(s - m)` is rescaled by
+    # `alpha = exp(m_prev - m)` when the running max moves. With both fields empty the
+    # emitted text is exactly what it is without them.
+    stored_layouts: dict[str, tuple] = field(
+        default_factory=dict
+    )  # output name -> (axes, pad): how the kernel stores that output. `axes[p]` is the
+    # logical axis kept at stored position `p` and `pad` the number of unit dims appended,
+    # so stored_shape == tuple(logical[a] for a in axes) + (1,) * pad. Written by
+    # `apply_tiling` for every output of the main graph: a split partial with several
+    # outputs stores each with the split axis first, and a lower-rank sibling of the
+    # widest output is padded to its rank. It depends on the tiling, not only on the flat
+    # graph, and it never reaches the generated source: validation and the partial ->
+    # combine hand-off are given it next to the source (`cleave.runtime.reference`).
 
     def clone(self) -> "Graph":
         """Copy every field, node and edge (nested graphs included).
@@ -309,9 +353,32 @@ def _remap(value, memo):
     return value
 
 
+class Boundary(NamedTuple):
+    """Which tensor of a lowered graph a placeholder or an output is, by declaration.
+
+    ``to_ir`` gives every ``PlaceHolderNode`` the position of its input op among the
+    structure's input ops and every ``OutputNode`` the position of its output op among
+    the output ops. A graph's node list is rebuilt in discovery order from its outputs,
+    so neither position can be read back from the graph afterwards.
+
+    For a split pair this is the identity of a tensor crossing the cut: the partial's
+    output ``k`` and the combine's input ``k`` are the same tensor, whatever order or
+    names the two graphs give their nodes. Pair them with
+    :func:`cleave.ir.graph_utils.boundary_signature`, never by position, extent or
+    element count.
+
+    ``role`` is ``""`` for a tensor the cut produced; a tensor a later rewrite adds to
+    the cut names what it carries, so that it cannot be taken for one of the others.
+    """
+
+    index: int
+    role: str = ""
+
+
 class PlaceHolderNode(Node):
     index_only = False  # read for values only (an indptr); takes no tile
     producer_op = None  # op that fills this inner placeholder's tile (see codegen)
+    boundary: Optional[Boundary] = None  # set by ``to_ir``; None on a hand-built graph
 
     def __init__(self, name=""):
         super().__init__(name=self.full_name(name))
@@ -811,7 +878,10 @@ class TensorOp(PrimFuncNode):
 
 
 class ComputeOpNode(TensorOp):
-    pass
+    # True for an op whose accumulator is meaningful before its loop ends: a running max.
+    # A partial sum is not, so these are the only accumulators a node of their own loop
+    # may read (the lag snapshot of ``Graph.lag_nodes`` aside).
+    running_max: bool = False
 
 
 class ViewOpNode(TensorOp):
@@ -819,6 +889,8 @@ class ViewOpNode(TensorOp):
 
 
 class OutputNode(Node):
+    boundary: Optional[Boundary] = None  # set by ``to_ir``; None on a hand-built graph
+
     def __init__(self, node, dtype, id=0):
         # connect node and output node
         super().__init__(name="OutputNode")
@@ -953,6 +1025,13 @@ class GraphNode(Node):
             ):
                 if node in self.graph.accum_nodes:
                     continue
+                # A rescale factor has no dataflow consumer (it is read through
+                # `accum_scale`), and neither has an unused lag node; both are
+                # per-iteration temporaries, not state carried across iterations.
+                if any(node is f for f in self.graph.accum_scale.values()):
+                    continue
+                if any(node is n for n in self.graph.lag_nodes):
+                    continue
 
                 self.graph.accum_nodes.append(node)
                 output_id = len(self.graph.accum_nodes) - 1
@@ -962,10 +1041,13 @@ class GraphNode(Node):
                     assert (
                         edge.dst_node not in self.graph.nodes
                     ), f"Destination node {edge.dst_node.name} should not be in inner graph nodes."
+                    # src_id is the accumulator's index (what `_resolve_output_binding`
+                    # goes by), not the edge count: an accumulator may have several
+                    # readers outside the loop.
                     new_edge = AccumEdge(
                         self,
                         edge.dst_node,
-                        len(self.outputs),
+                        output_id,
                         edge.dst_id,
                         accum_node=node,
                     )
@@ -974,6 +1056,36 @@ class GraphNode(Node):
                 assert (
                     len(node.outputs) == 0
                 ), f"All outputs of accum_node {node.name} should be removed after assigning AccumEdge."
+
+    def carry(self, node) -> int:
+        """Register ``node`` as an accumulator although the loop also reads it; its index.
+
+        ``_assign_accum_nodes`` only takes nodes without a consumer inside the loop: a sum
+        that is read in the loop it accumulates in is a partial sum, which nothing wants.
+        A running max is the exception -- its partial value is exactly what the rolling
+        softmax subtracts -- so it is declared, not inferred. Appended, never inserted:
+        accumulator order is positional (macro signatures, ``_resolve_output_binding``).
+        Consumers outside the loop, if any, are rewired to ``AccumEdge``s; consumers
+        inside keep reading the carried buffer through their ordinary edges. A node that
+        already is an accumulator is left as it is.
+        """
+        inner = self.graph
+        assert any(node is n for n in inner.nodes), f"{node.name} is not a node of {self.name}."
+        assert isinstance(node, ComputeOpNode), f"{node.name} is not a compute node."
+        for index, accum in enumerate(inner.accum_nodes):
+            if accum is node:
+                return index
+        inner.accum_nodes.append(node)
+        output_id = len(inner.accum_nodes) - 1
+        self.set_shape(node.get_shape(0), id=output_id, overwrite=True)
+        self.set_dtype(node.get_dtype(0), id=output_id)
+        for edge in list(node.outputs):
+            if any(edge.dst_node is n for n in inner.nodes):
+                continue
+            new_edge = AccumEdge(self, edge.dst_node, output_id, edge.dst_id, accum_node=node)
+            self.outputs.append(new_edge), node.outputs.remove(edge)
+            edge.dst_node.set_inputs(new_edge.dst_id, new_edge)
+        return output_id
 
     def _resolve_output_binding(self, output_id: int):
         if output_id < len(self.graph.accum_nodes):

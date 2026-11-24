@@ -60,12 +60,20 @@ def _run_task(task):
 
     ``check_fn`` returns ``(cuda_src, latency_ms)``, optionally followed by the measured
     error per output; a validation failure may carry one too (``exc.measured``).
+    The candidate's stored output layouts are handed over only when the build recorded
+    them, and the roles of its outputs only when one of them has a role, so a ``check_fn``
+    written without those keywords keeps working.
     """
     try:
+        extra = {}
+        if task.get("stored_layouts") is not None:
+            extra["stored_layouts"] = task["stored_layouts"]
+        if task.get("roles") is not None:
+            extra["roles"] = task["roles"]
         cuda_src, latency_ms, *rest = task["check_fn"](
             task["code_str"], out_idx=task["out_idx"],
             reference_cache_dir=task["reference_cache_dir"],
-            tolerance=task["tolerance"], benchmark=task["benchmark"],
+            tolerance=task["tolerance"], benchmark=task["benchmark"], **extra,
         )
         return {"ok": True, "cuda_src": cuda_src, "latency_ms": latency_ms,
                 "measured": rest[0] if rest else None}
@@ -84,13 +92,21 @@ def _run_task(task):
 
 
 def _cuda_context_healthy():
-    """False once a kernel fault has left this process's CUDA context unusable."""
+    """False once a kernel fault has left this process's CUDA context unusable.
+
+    The probe launches a fill, so it waits for the device like any other work of a worker
+    (``gpu._gpu_exec_guard``): launched next to the kernel another worker is validating or
+    timing, it can leave that kernel running for good.
+    """
     torch = sys.modules.get("torch")
     if torch is None or not torch.cuda.is_initialized():
         return True
+    from .gpu import _gpu_exec_guard
+
     try:
-        torch.cuda.synchronize()
-        torch.zeros(1, device="cuda").item()
+        with _gpu_exec_guard():
+            torch.cuda.synchronize()
+            torch.zeros(1, device="cuda").item()
     except Exception:  # noqa: BLE001 - any failure means the context is gone
         return False
     return True

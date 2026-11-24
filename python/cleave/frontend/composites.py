@@ -58,11 +58,24 @@ def rms_norm(x, dim: int = -1, eps: float = 0.0):
     return x * rsqrt(ms)
 
 
-def softmax(x, dim: int = -1, shift: float | None = None):
-    """``shift=None``: the exact ``exp(x - max(x)) / sum(...)``. A constant
-    ``shift`` is the fixed-shift ``exp(x + shift) / sum(exp(x + shift))`` (no max op)."""
-    if shift is None:
-        e = exp(x - max(x, dim, keepdim=True))
-    else:
-        e = exp(x + shift) if shift else exp(x)
+def softmax(x, dim: int = -1):
+    """The exact softmax, ``exp(x - max(x)) / sum(...)`` over ``dim``.
+
+    Traced, it records ``exp, sum, div`` and asks for the exp to be stabilized
+    (``Program._stable_exp``): the search sees no max, and each schedule gets the shift it
+    needs -- the row max where a tile holds the whole row, a running max where the row is
+    looped over, the max of each split where the row is split. Eagerly it is the max written
+    out. (``cl.exp(x) / cl.sum(cl.exp(x), dim, keepdim=True)`` written by hand makes no such
+    request: it is the plain exp, and overflows where its logits do.)
+
+    A row of any length is served where the softmax feeds a sum or a matmul over that row
+    (attention's ``softmax(...) @ v``). A softmax that is returned itself -- a standalone
+    softmax, attention weights -- is served while its row fits one block. Next to another
+    ``exp`` of the same tensor the search computes that ``exp`` once and the lowering
+    computes it again for the softmax (``cleave.lower.unmerge``); the softmax is a returned
+    one there too. ``cl.softmax(x) + cl.exp(x)`` has plans for float16 rows of 4096 and none
+    at 8192 (where a softmax alone still has one). A second softmax of ``x`` over another
+    axis needs a row and a column in one block, which is the whole tensor: 16x32 and 64x128
+    have plans, 64x256 has none."""
+    e = x.program._stable_exp(x, dim) if _traced(x) else exp(x - max(x, dim, keepdim=True))
     return e / sum(e, dim, keepdim=True)

@@ -50,7 +50,8 @@ class Case:
         if self.out_idx is not None:
             kw.update(
                 out_idx=self.out_idx,
-                workloads_fn=lambda: cases(self.name, dims, **self.workload_kw),
+                # keyed, so the validation log says which workload an error belongs to
+                workloads_fn=lambda: cases(self.name, dims, keyed=True, **self.workload_kw),
             )
         elif len(self.parts) > 1:
             kw.update(scratch_source_graph=self.source(*self.source_dims))
@@ -77,6 +78,10 @@ def _fused(name, partial, combine, partial_dims, source):
 def _paged(name, dims, out_idx, **workload_kw):
     if name.startswith("mla"):
         workload_kw["scale"] = _schedule(name).SM_SCALE
+    # Every operator's softmax is exact, so every one also runs its adversarial workloads
+    # (logits x100 through the queries and through the scale, increasing along the keys,
+    # one dominant key in the last tile), at the same declared tolerance.
+    workload_kw["adversarial"] = True
     return Case(
         name, ((name, dims),), OPERATORS[name].tolerance, out_idx=out_idx,
         workload_kw=workload_kw, dtype="bfloat16",
@@ -104,6 +109,9 @@ _ALL = [
     _static("matmul_splitk_combine", (4, 128, 128), g.matmul_splitk_combine_graph),
     _static("matmul_splitk_partial", (4, 128, 128, 1024), g.matmul_splitk_partial_graph),
     _static("mha_bhsd", (1, 32, 4096, 4096, 64), g.mha_bhsd_graph),
+    # The same operator with a rolling softmax in place of the fixed shift: the shift
+    # cancels in O / l, so it is held to the reference and the tolerance of mha_bhsd.
+    _static("mha_bhsd_rolling", (1, 32, 4096, 4096, 64), g.mha_bhsd_graph),
     _static("mha_bshd", (1, 4096, 4096, 32, 64), g.mha_bshd_graph),
     _static("mha_split_combine", (32, 4, 4096, 64), g.mha_split_combine_graph),
     _static("mha_split_partial", (1, 32, 4, 4096, 1024, 64), g.mha_split_partial_graph),

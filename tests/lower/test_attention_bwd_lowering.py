@@ -5,7 +5,7 @@ import re
 import pytest
 
 from cleave.codegen.tensor_codegen import gen_tensor_allocation_str
-from cleave.lower.convert import _infer_broadcast_index
+from cleave.lower.convert import _broadcast_fits, _keepdim_broadcast
 from cleave.pipeline import GraphSet, ScheduleConfig, schedule
 from cleave.runtime.compile import build_candidate_code
 from tests.lower import _attention_bwd as A
@@ -18,10 +18,12 @@ def _plans(name, topk=8):
 @pytest.mark.parametrize("other, expect", [
     ((2, 256), 0), ((2, 256, 1), 0),  # a row vector, with or without its keepdim axis
     ((2, 128), 1), ((2, 1, 128), 1),  # a column vector
-    ((2, 256, 128), -1), ((2, 128, 1), -1),
+    ((2, 256, 128), -1), ((2, 128, 1), None),
 ])
 def test_keepdim_operand_is_a_broadcast(other, expect):
-    assert _infer_broadcast_index((2, 256, 128), other) == expect
+    # without the unit axis the value shape fits; with it, an input is read the same way
+    fits = _broadcast_fits((2, 256, 128), other)
+    assert (fits[0] if fits else _keepdim_broadcast((2, 256, 128), other)) == expect
 
 
 def test_log_sum_exp_input_lowers_as_row_broadcast():

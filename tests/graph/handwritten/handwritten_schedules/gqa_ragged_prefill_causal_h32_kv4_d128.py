@@ -11,14 +11,19 @@ from cleave.ir.graph import (
     ScalarScan,
 )
 from cleave.ir.ops import (
+    NEG_FLT_MAX,
     CausalMaskedExp,
+    CausalMaskedScore,
+    Exp2,
     IndptrTileScan,
     MaskedDiv,
-    MaskedLog2,
+    MaskedLse2,
     Matmul,
+    ReduceMax,
     ReduceSum,
 )
 from cleave.ir.graph_utils import gather_all_nodes, lock_graph
+from cleave.ir.rolling import rolling_nodes
 
 DTYPE = "bfloat16"
 ACCUM_DTYPE = "float32"
@@ -37,6 +42,8 @@ LOG2E = 1.4426950408889634
 # Floors the softmax denominator. A query row whose causal window is empty sums to zero
 # over a zero numerator; the floor turns that 0/0 into the 0 the operator defines,
 # instead of a NaN the benchmark's sanity check would reject outright.
+# That is all it does: with the exact softmax below a row with any live key has a row sum
+# of at least 1 (its largest term is exp2(0)).
 DENOM_FLOOR = 1e-30
 
 # Symbolic extents, one per var axis. Each appears bare in some tensor shape (TOTAL_Q in
@@ -66,6 +73,27 @@ def get_handwritten_scheduled_graph(dims):
     # host planner used to precompute is derived on the device by scanning qo_indptr
     # (``graph.prologue``), and every per-block scalar below is an expression over that
     # scan's result plus the two indptr tensors.
+    #
+    # The softmax is exact (online): the loop carries the running row max m of the scaled
+    # scores and every tile is taken relative to it,
+    #
+    #     s      = live ? (q . k) * scale2 : -FLT_MAX      score_0, in the log2 domain
+    #     m_prev = m                                       lag node, before m is updated
+    #     m      = max(m, max_kv s)                        exp_0_max, starts at -FLT_MAX
+    #     P      = live ? exp2(s - m) : 0                  exp_0
+    #     alpha  = exp2(m_prev - m)
+    #     l      = l * alpha + sum_kv P                    rowsum_0
+    #     O      = O * alpha[row] + P @ V                  mma_1
+    #
+    # and after the loop out = O / max(l, floor), lse = log2(l) + m. "live" is the causal
+    # mask, the same predicate in the score and in the exp. The max is taken after scaling
+    # because the scale is a runtime scalar of unknown sign. Masked scores and the start of
+    # the max are the most negative finite float32, never -inf: m is then finite at every
+    # program point, so neither exp2 can see (-inf) - (-inf), and a masked P is the literal
+    # 0 through the predicate rather than an exp2 of anything. A row whose causal window
+    # ends before a tile has every score of that tile masked: its max does not move, its
+    # alpha is exp2(0) and its P is 0. A row with no window at all keeps l = 0 and
+    # m = -FLT_MAX to the end: out = 0 and lse = log2(0) + m = -inf.
     mma_0 = Matmul(
         (BM, BN, head_dim),
         dtype=DTYPE,
@@ -74,14 +102,35 @@ def get_handwritten_scheduled_graph(dims):
         transpose_B=True,
         warp_policy="cols",
     )
+    score_0 = CausalMaskedScore(
+        (BM, BN),
+        scalar_args=("tile_base", "valid_len", "diag", "scale2"),
+        dtype=ACCUM_DTYPE,
+        out_dtype=ACCUM_DTYPE,
+        name="score_0",
+        n_batch_dims=0,
+    )
+    # float32 like the score: its start value is no bfloat16 number.
+    exp_0_max = ReduceMax(
+        (BM, BN),
+        axis=-1,
+        dtype=ACCUM_DTYPE,
+        out_dtype=ACCUM_DTYPE,
+        name="exp_0_max",
+        accum_init=NEG_FLT_MAX,
+    )
     exp_0 = CausalMaskedExp(
         (BM, BN),
         scale=None,
-        scalar_args=("tile_base", "valid_len", "diag", "scale2"),
+        scalar_args=("tile_base", "valid_len", "diag"),
+        shift=True,
         dtype=ACCUM_DTYPE,
         out_dtype=ACCUM_DTYPE,
         name="exp_0",
         n_batch_dims=0,
+    )
+    max_prev, max_step, alpha = rolling_nodes(
+        exp_0_max, stem="exp_0", rows=(BM,), n_batch_dims=0, exp_cls=Exp2
     )
     rowsum_0 = ReduceSum(
         (BM, BN), axis=-1, dtype=ACCUM_DTYPE, out_dtype=ACCUM_DTYPE, name="rowsum_0"
@@ -99,7 +148,10 @@ def get_handwritten_scheduled_graph(dims):
     # with ptx_stmatrix and reading it back (wgmma_ss). Worth 1.04x here. The paged
     # operators keep the shared hop -- their P tile is the one their layout pass needs.
 
-    _connect(mma_0, exp_0, 0, 0)
+    _connect(mma_0, score_0, 0, 0)
+    _connect(score_0, exp_0_max, 0, 0)
+    _connect(score_0, exp_0, 0, 0)
+    _connect(exp_0_max, exp_0, 0, 1)
     _connect(exp_0, rowsum_0, 0, 0)
     _connect(exp_0, mma_1, 0, 0)
 
@@ -112,6 +164,11 @@ def get_handwritten_scheduled_graph(dims):
     ph_vf.name = "PlaceHolder_V"
 
     inner_graph = Graph(nodes=gather_all_nodes(rowsum_0, mma_1))
+    # Declared before the GraphNode exists: alpha has no dataflow consumer, and must not be
+    # taken for an accumulator. Both accumulators sum exp2(s - m) terms, so both are
+    # multiplied by alpha, in place, right before they accumulate this tile.
+    inner_graph.lag_nodes = [max_prev]
+    inner_graph.accum_scale = {rowsum_0: alpha, mma_1: alpha}
     # A serial loop with a runtime trip count never reads the static extent.
     inner_graph.extent = 1
     # Pipelined, and warp-specialised with it. The KV tiles are affine slices handed down
@@ -164,6 +221,9 @@ def get_handwritten_scheduled_graph(dims):
     node_0 = GraphNode(name="GraphNode_0", graph=inner_graph)
     rowsum_id = node_0.graph.accum_nodes.index(rowsum_0)
     value_id = node_0.graph.accum_nodes.index(mma_1)
+    # The max is read inside the loop, so it is carried by declaration; appended last.
+    max_id = node_0.carry(exp_0_max)
+    assert (rowsum_id, value_id, max_id) == (0, 1, 2)
 
     inner_q = inner_graph.binding[ph_q.name]
     inner_k = inner_graph.binding[ph_kf.name]
@@ -186,21 +246,25 @@ def get_handwritten_scheduled_graph(dims):
     node_0._out_edges.append(e_rs)
     div_0.set_inputs(1, e_rs)
 
-    log2_0 = MaskedLog2(
+    # lse = log2(l) + m, the row sum read as it is (unfloored).
+    lse_0 = MaskedLse2(
         (BM,),
         scalar_args=("n_rows",),
         dtype=ACCUM_DTYPE,
         out_dtype=ACCUM_DTYPE,
-        name="log2_0",
+        name="lse_0",
         n_batch_dims=0,
     )
-    e_lse = AccumEdge(node_0, log2_0, rowsum_id, 0, accum_node=rowsum_0)
+    e_lse = AccumEdge(node_0, lse_0, rowsum_id, 0, accum_node=rowsum_0)
     node_0._out_edges.append(e_lse)
-    log2_0.set_inputs(0, e_lse)
+    lse_0.set_inputs(0, e_lse)
+    e_max = AccumEdge(node_0, lse_0, max_id, 1, accum_node=exp_0_max)
+    node_0._out_edges.append(e_max)
+    lse_0.set_inputs(1, e_max)
 
     out_o = OutputNode(div_0, dtype=OUT_DTYPE)
     out_o.name = "OutputNode_0"
-    out_lse = OutputNode(log2_0, dtype=ACCUM_DTYPE)
+    out_lse = OutputNode(lse_0, dtype=ACCUM_DTYPE)
     out_lse.name = "OutputNode_1"
 
     # Read for their values, not gathered from, so they stay out of the *_iter call.
@@ -311,6 +375,7 @@ def get_handwritten_scheduled_graph(dims):
         Iterator(
             lambda i, h: ("0", "0"), shape=(BM, head_dim), tile_size=(BM, head_dim)
         ),
+        Iterator(lambda i, h: ("0",), shape=(BM,), tile_size=(BM,)),
     ]
 
     q_abs = f"{q_beg} + {tile_base}"
@@ -322,10 +387,10 @@ def get_handwritten_scheduled_graph(dims):
         tile_size=(BM, 1, head_dim),
     )
     graph.tmap[out_o] = graph.tmap[div_0]
-    graph.tmap[log2_0] = Iterator(
+    graph.tmap[lse_0] = Iterator(
         lse_offset, shape=(TOTAL_Q, num_qo_heads), tile_size=(BM, 1)
     )
-    graph.tmap[out_lse] = graph.tmap[log2_0]
+    graph.tmap[out_lse] = graph.tmap[lse_0]
 
     inner_whole = lambda shape: Iterator(  # noqa: E731
         lambda i: tuple("0" for _ in shape), shape=tuple(shape), tile_size=tuple(shape)
@@ -342,10 +407,15 @@ def get_handwritten_scheduled_graph(dims):
     inner_graph.tmap[mma_0] = Iterator(
         lambda i: ("0", "0"), shape=(BM, BN), tile_size=(BM, BN)
     )
+    inner_graph.tmap[score_0] = inner_graph.tmap[mma_0]
     inner_graph.tmap[exp_0] = inner_graph.tmap[mma_0]
     inner_graph.tmap[rowsum_0] = Iterator(
         lambda i: ("0",), shape=(BM,), tile_size=(BM,)
     )
+    for node in (exp_0_max, max_prev, max_step, alpha):  # one value per query row
+        inner_graph.tmap[node] = Iterator(
+            lambda i: ("0",), shape=(BM,), tile_size=(BM,)
+        )
     inner_graph.tmap[mma_1] = Iterator(
         lambda i: ("0", "0"), shape=(BM, head_dim), tile_size=(BM, head_dim)
     )
@@ -358,7 +428,7 @@ def get_handwritten_scheduled_graph(dims):
         ph_kv: ("PlaceHolder_KV_INDPTR", "g"),
         node_0: ("t_GraphNode_0", "r"),
         div_0: ("OutputNode_0", "g"),
-        log2_0: ("OutputNode_1", "g"),
+        lse_0: ("OutputNode_1", "g"),
         out_o: ("OutputNode_0", "g"),
         out_lse: ("OutputNode_1", "g"),
     }
@@ -370,6 +440,11 @@ def get_handwritten_scheduled_graph(dims):
         inner_k: (inner_k.name, "s"),
         inner_v: (inner_v.name, "s"),
         mma_0: ("t_mma_0", "r"),
+        score_0: ("t_score_0", "r"),
+        exp_0_max: ("t_exp_0_max", "r"),
+        max_prev: ("t_exp_0_max_prev", "r"),
+        max_step: ("t_exp_0_max_step", "r"),
+        alpha: ("t_exp_0_alpha", "r"),
         exp_0: ("t_exp_0", "r"),
         rowsum_0: ("t_rowsum_0", "r"),
         mma_1: ("t_mma_1", "r"),

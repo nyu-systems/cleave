@@ -229,7 +229,7 @@ def evaluate(graph, inputs):
     (the Program's, in its order); one tensor per output (the kernel's shape)."""
     ir = to_ir(graph.structure, symbol_map=graph.symbol_map, dtype="float32",
                out_dtype="float32")
-    names = bind_inputs(ir, graph)
+    names = bind_inputs(ir, graph.program)
     assert names is not None
     by_name = {n: x.float() for n, x in zip(names, inputs) if n is not None}
     return rt.execute(ir, [by_name[ph.name].reshape(tuple(int(d) for d in ph.get_shape(0)))
@@ -291,7 +291,7 @@ def test_an_unread_declared_input_is_not_derived():
     p = attention_bwd()
     g = superopt.SearchedGraph(0, _identity_parts(p), None, False, p)
     ir = to_ir(g.structure, symbol_map=None)
-    names = bind_inputs(ir, g)
+    names = bind_inputs(ir, g.program)
     assert names[5] is None and None not in names[:5]
     hook = rt.declared_inputs_hook(p, names, ir)
     x = rt.make_inputs(ir, "float16", seed=0, device="cpu", derive=hook)
@@ -311,7 +311,7 @@ def test_a_read_declared_input_needs_its_sources():
     g = superopt.SearchedGraph(0, po.merge([sub.to_graph_structure()], [kept], [{}], inputs),
                                None, False, p)
     ir = to_ir(g.structure, symbol_map=None)
-    names = bind_inputs(ir, g)
+    names = bind_inputs(ir, g.program)
     assert names[1] is None and names[2] is not None
     with pytest.raises(SpecError, match="does not read"):
         rt.declared_inputs_hook(p, names, ir)

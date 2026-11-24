@@ -20,8 +20,13 @@ _MARKERS = {
         "tests/test_runtime_tolerance.py",
         "tests/frontend_dynamic/test_paged_pipeline.py::test_compile_end_to_end",
         "tests/pipeline_api/test_e2e.py",
+        "tests/pipeline_api/test_split_attention.py::test_gpu_",
+        "tests/pipeline_api/test_exact_split_attention.py::test_gpu_",
+        "tests/pipeline_api/test_exact_split_rows.py::test_gpu_",
         "tests/runtime/test_run_candidates.py",
         "tests/runtime/test_inter_outputs.py",
+        "tests/runtime/test_stored_layout.py::test_gpu_",
+        "tests/runtime/test_thread_stacks.py::test_gpu_",
         "tests/frontend/test_exact_softmax.py::test_gpu_",
         "tests/lower/test_attention_bwd_gpu.py",
     ),
@@ -36,8 +41,18 @@ _MARKERS = {
         "tests/pipeline/",
         "tests/superoptimizer/python/search/",
         "tests/graph/apply_paging/test_searched_tiling.py",
+        "tests/demo/test_demos.py::test_search_",
         "tests/frontend/test_exact_softmax.py::test_search_",
         "tests/frontend/test_exact_softmax.py::test_gpu_",
+        "tests/lower/test_broadcast_axis.py::test_search_",
+        "tests/pipeline_api/test_bind_inputs.py::test_search_",
+        "tests/pipeline_api/test_softmax_lowering.py::test_search_",
+        "tests/pipeline_api/test_split_attention.py::test_search_",
+        "tests/pipeline_api/test_split_attention.py::test_gpu_",
+        "tests/pipeline_api/test_exact_split_attention.py::test_search_",
+        "tests/pipeline_api/test_exact_split_attention.py::test_gpu_",
+        "tests/pipeline_api/test_exact_split_rows.py::test_search_",
+        "tests/pipeline_api/test_exact_split_rows.py::test_gpu_",
     ),
     "slow": (
         "tests/schedule/end2end/",
@@ -120,6 +135,15 @@ def pytest_collection_modifyitems(config, items):
                 continue
             if key.startswith(prefixes):
                 item.add_marker(getattr(pytest.mark, name))
+
+
+@pytest.fixture(autouse=True)
+def _validation_context(request, monkeypatch):
+    """Every comparison a test logs (``CLEAVE_VALIDATION_LOG``) is filed under the test's
+    node id: ``tests._measure_tolerances`` reads the operator off it. The library takes
+    the label it is given and knows nothing of the test runner; candidate workers inherit
+    it with the environment."""
+    monkeypatch.setenv("CLEAVE_VALIDATION_CONTEXT", request.node.nodeid)
 
 
 def _root_entries():

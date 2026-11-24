@@ -29,9 +29,9 @@ def lora(x: cl.Tensor["M", "K"], w: cl.Tensor["K", "N"], a: cl.Tensor["K", "R"],
 
 @jit
 def attention(q: cl.Tensor["HQ", "SQ", "D"], k: cl.Tensor["HKV", "SKV", "D"], v: cl.Tensor["HKV", "SKV", "D"]):
-    """MHA (HQ == HKV) and GQA (HQ = g * HKV) decode with the demos' fixed -50 max-shift."""
-    n = q.shape[-1] ** 0.5
-    return cl.matmul(cl.softmax(cl.matmul(q, k.mT) / n, dim=-1, shift=-50 / n), v)
+    """MHA (HQ == HKV) and GQA (HQ = g * HKV) attention, as demo/attention.py writes it:
+    ``cl.softmax`` is the exact softmax (the requested exp, its sum, the division)."""
+    return cl.matmul(cl.softmax(cl.matmul(q, k.mT) / q.shape[-1] ** 0.5, dim=-1), v)
 
 
 @jit

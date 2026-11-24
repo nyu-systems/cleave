@@ -6,8 +6,9 @@ explores (``[Search] Total states explored: N`` on stderr) is the finest cheap w
 it moves with any change of the candidate ops, of their order, of the pattern pruning, of the
 reducibility flags or of the verifier. The counts below are the demos' searches at their own
 configs (the costliest demo searches, 170k-390k states each, are left out: ``mha_decode`` with
-its split covers that path), pinned at 9af4dd3. They do not depend on the process nor on the
-thread count (checked with 1 and 8 threads, in fresh processes, before pinning).
+its split covers that path), pinned at 9af4dd3 and re-pinned where the demo programs moved
+(the attention demos' exact softmax). They do not depend on the process nor on the thread
+count (checked with 1 and 8 threads, in fresh processes, before pinning).
 
 Each case runs in a fresh interpreter on the CPU, without a cache, with 4 search threads.
 """
@@ -62,15 +63,14 @@ CASES = {
     "matmul_rowsum": ("matmul_rowsum", [], 13, 2717, 4),
     "matmul_matmul": ("matmul_matmul", [], 13, 614, 4),
     "matmul_matmul-split": ("matmul_matmul", ["--preset", "split"], 8, 12426, 12),
-    "mha_decode": ("mha_decode", [], 14, 210646, 30),
-    "mha_decode-nosplit": ("mha_decode", ["--split", "none"], 14, 1292, 2),
-    "gqa_decode-nosplit": ("gqa_decode", ["--split", "none"], 14, 1080, 2),
-    "mha_prefill": ("mha_prefill", [], 12, 467, 2),
-    "gqa_prefill": ("gqa_prefill", [], 13, 722, 2),
-    "mla_prefill": ("mla_prefill", [], 12, 467, 2),
-    "mla_decode": ("mla_decode", [], 13, 2231, 2),
-    "qknorm": ("qknorm", [], 26, 5151, 2),
-    "mha_decode_exact": ("mha_decode_exact", [], 14, 833, 2),
+    "mha_decode": ("mha_decode", [], 13, 184088, 24),
+    "mha_decode-nosplit": ("mha_decode", ["--split", "none"], 13, 2077, 2),
+    "gqa_decode-nosplit": ("gqa_decode", ["--split", "none"], 13, 1770, 2),
+    "mha_prefill": ("mha_prefill", [], 11, 692, 2),
+    "gqa_prefill": ("gqa_prefill", [], 13, 1770, 2),
+    "mla_prefill": ("mla_prefill", [], 11, 692, 2),
+    "mla_decode": ("mla_decode", [], 13, 2558, 2),
+    "qknorm": ("qknorm", [], 25, 5390, 2),
 }
 
 
