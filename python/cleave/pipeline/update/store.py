@@ -16,11 +16,17 @@ symbols, the data of the references: E1-E6, E10-E12, E15) is stored for that rec
 under the record key and ``Recipe.key``: another program of the same loop structure
 derives its own.
 
-A stored rule is never trusted: on load every rule is proved again on the graph at hand
-(``proof.prove(update_of(F), ...)``). A rule that is not proved, a key or recipe that
-differs from the stored one, or an unreadable file is a miss: the caller derives and
-overwrites. A stored refusal is returned as it is (it only keeps a pin). ``E13`` is never
-stored.
+A stored rule is never trusted. On load every factor ``F`` must be one the engine could
+have chosen for the graph at hand: an expression of the search's ops over ``m`` and ``m'``
+alone that ``repair_of`` reads back from ``update_of(F)``, that the assembly can emit
+(``rolling.check_expression``), that is structurally stable under the full-extent value's
+reducer (``rank.structurally_stable``: the ranking's replays are not stored, and an unstable
+factor such as ``exp(m) / exp(m')`` overflows where they would have rejected it), and that is
+proved again (``proof.prove(update_of(F), ...)``). A factor that fails any of these, or makes
+any of them raise, a key or recipe that differs from the stored one, or an unreadable file is
+a miss: the caller derives and overwrites. (So a rule the ranking chose although it is not
+structurally stable is derived again in every process.) A stored refusal is returned as it is
+(it only keeps a pin). ``E13`` is never stored.
 """
 
 from __future__ import annotations
@@ -31,7 +37,7 @@ import os
 import tempfile
 from pathlib import Path
 
-from ...ir.update_rule import update_of
+from ...ir.update_rule import repair_of, update_of
 
 _HERE = Path(__file__).resolve().parent
 
@@ -109,9 +115,40 @@ def save(d) -> Path | None:
         return None
 
 
+def well_formed(factor) -> bool:
+    """Whether ``factor`` is an expression of the search's ops over ``m`` and ``m'`` alone
+    (``search.BINARY`` and the unary ``exp``; no constant, no other leaf)."""
+    from .search import BINARY
+
+    if isinstance(factor, str):
+        return factor in ("m", "m'")
+    if not isinstance(factor, tuple) or not factor:
+        return False
+    op, *args = factor
+    arity = 1 if op == "exp" else 2 if op in BINARY else None
+    return arity == len(args) and all(well_formed(a) for a in args)
+
+
+def _trusted(factor, flat_graph, full: str, acc: str, reducer: str, prove) -> bool:
+    """Whether a stored factor is one the engine could have chosen for ``flat_graph``."""
+    from ...ir.rolling import check_expression
+    from .rank import structurally_stable
+
+    update = update_of(factor)
+    if not well_formed(factor) or repair_of(update) != factor:
+        return False
+    try:
+        check_expression(factor, stem=full)
+    except ValueError:
+        return False
+    if not structurally_stable(update, reducer):
+        return False
+    return prove(update, flat_graph, full, acc).proved
+
+
 def load(record_key: str, flat_graph, obstacle, recipe_key: str = ""):
     """The stored derivation of ``record_key`` (with ``recipe_key``: that recipe's stored
-    refusal) with every rule proved again on ``flat_graph``; None on a miss."""
+    refusal) with every rule checked and proved again on ``flat_graph``; None on a miss."""
     from .engine import Derivation
     from .proof import prove
 
@@ -133,9 +170,13 @@ def load(record_key: str, flat_graph, obstacle, recipe_key: str = ""):
         return None
     if tuple(acc for acc, _ in rules) != tuple(obstacle.loops):
         return None
-    for acc, factor in rules:
-        if not prove(update_of(factor), flat_graph, obstacle.full, acc).proved:
-            return None
+    try:
+        reducer = type(next(n for n in flat_graph.nodes if n.name == obstacle.full)).combine
+        for acc, factor in rules:
+            if not _trusted(factor, flat_graph, obstacle.full, acc, reducer, prove):
+                return None
+    except Exception:  # noqa: BLE001 - a malformed stored factor is a miss, not an E13
+        return None
     d.rules = rules
     d.chosen = {acc: update_of(factor) for acc, factor in rules}
     return d

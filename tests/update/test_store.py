@@ -146,6 +146,53 @@ def test_a_tampered_rule_is_proved_wrong_and_derived_again(fresh, monkeypatch):
     assert json.loads(path.read_text())["rules"] == json.loads(json.dumps(first.rules))  # overwritten
 
 
+E = ["exp", ["sub", "m", "m'"]]
+
+
+@pytest.mark.parametrize("factor", [
+    ["sub", ["add", "a", E], "a"],  # proved over the reals, but reads the accumulator
+    ["div", ["exp", "m"], ["exp", "m'"]],  # proved, emittable, but overflows: never ranked
+    5,  # malformed: no expression at all
+    "x",  # malformed: a leaf the factor cannot read
+    ["sqrt", "m"],  # an op the search never forms
+    ["exp", ["sub", "m", "m'"], "m"],  # the wrong arity
+], ids=["reads_a", "unstable", "int", "unknown_leaf", "unknown_op", "arity"])
+def test_a_stored_factor_the_engine_would_not_choose_is_derived_again(fresh, monkeypatch,
+                                                                      factor):
+    """Re-proving is not enough: a factor that reads ``a``, that the ranking would have
+    rejected, or that is not an expression at all is a miss -- derived again and
+    overwritten -- never the record, and never an E13 that pins the loop structure."""
+    ir, ob, recipe = setting()
+    first = update_package.derive(ir, ob, recipe)
+    path = store.path_of(first.key)
+    entry = json.loads(path.read_text())
+    entry["rules"][0][1] = factor
+    path.write_text(json.dumps(entry))
+    assert store.load(first.key, ir, ob) is None
+    runs = []
+    real = engine.run
+
+    def counted(*args, **kwargs):
+        runs.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(engine, "run", counted)
+    again = derive_again(ir, ob, recipe, monkeypatch)
+    assert not again.bug and not again.refused and not again.from_store and runs == [1]
+    assert again.rules == first.rules
+    assert json.loads(path.read_text())["rules"] == json.loads(json.dumps(first.rules))
+    assert derive_again(ir, ob, recipe, monkeypatch).from_store  # the overwrite is read back
+
+
+def test_the_stored_factor_checks_accept_what_the_engine_chooses(fresh):
+    ir, ob, recipe = setting()
+    first = update_package.derive(ir, ob, recipe)
+    assert all(store.well_formed(f) for _, f in first.rules)
+    assert not store.well_formed(("exp", ("sub", "m", "a")))
+    assert not store.well_formed(("const", 1.0))
+    assert not store.well_formed(())
+
+
 @pytest.mark.parametrize("damage", ["key", "unreadable", "loops"])
 def test_an_entry_that_is_not_this_graphs_is_a_miss(fresh, monkeypatch, damage):
     ir, ob, recipe = setting()

@@ -19,9 +19,10 @@ references are all read off the flat graph. Every reason an obstacle keeps its p
 typed refusal (``texts``); ``derive`` never raises.
 
 A derivation is made once per loop structure (``update_rule.loop_key``): in a process
-(``_DERIVED``) and on disk (``store``, every stored rule proved again on load). The loop
-key has no extents, so two programs can share it; a rule holds for both (it is proved on
-the flat graph, which the key pins), and so does a refusal read off the flat graph alone.
+(``_DERIVED``) and on disk (``store``, every stored rule checked and proved again on load).
+The loop key has no extents, so two programs can share it; a rule holds for both (it is
+proved on the flat graph, which the key pins), and so does a refusal read off the flat graph
+alone.
 A refusal that depends on the recipe (E1-E6, E10-E12, E15: the symbols, the extents, the
 references) is kept under the loop key AND the recipe's key: another program of the same
 loop structure derives its own. A rule of the loop structure is looked up first.
