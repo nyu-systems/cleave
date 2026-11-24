@@ -131,7 +131,9 @@ served wrongly):
   matrix): its tile has no dim, for the same reason;
 - a matmul that reads its first operand from another matmul's accumulator (attention's
   `P @ V`) with fewer than 16 rows a warp, or over two warp groups at another M than 128
-  unless the operand is staged through shared memory: 64 query rows have no 256-thread tiling;
+  unless the operand is staged through shared memory: 64 query rows have no 256-thread tiling
+  (M is the rows of one iteration: for the backward's `dQ` summed across thread blocks, one
+  step of the `S_Q` loop);
 - for 16-bit dtypes, a matmul that contracts a length no multiple of 16 divides (float16
   attention at `S_KV = 1000`), and for float32 one no multiple of 8 divides;
 - a row that a tile has to hold whole and whose length is not a power of two (a standalone
