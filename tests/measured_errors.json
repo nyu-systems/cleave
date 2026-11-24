@@ -72,9 +72,9 @@
    "abs": 1.0,
    "absolute": false,
    "dtype": "float16",
-   "rel": 0.0009661835501901805,
+   "rel": 0.0009689922444522381,
    "seeds": 3,
-   "validated": 27
+   "validated": 135
   }
  ],
  "demo:matmul": [
@@ -92,17 +92,17 @@
    "abs": 2.0,
    "absolute": false,
    "dtype": "float16",
-   "rel": 0.0009756097570061684,
+   "rel": 0.0009765625,
    "seeds": 3,
-   "validated": 201
+   "validated": 693
   }
  ],
  "demo:matmul_rowsum": [
   {
-   "abs": 1.0,
+   "abs": 0.5,
    "absolute": false,
    "dtype": "float16",
-   "rel": 0.0004887585528194904,
+   "rel": 0.00029256875859573483,
    "seeds": 3,
    "validated": 24
   }
@@ -114,7 +114,7 @@
    "dtype": "float16",
    "rel": 0.001123595517128706,
    "seeds": 3,
-   "validated": 36
+   "validated": 48
   },
   {
    "abs": 0.0001220703125,
@@ -122,7 +122,7 @@
    "dtype": "float16",
    "rel": 0.001145475427620113,
    "seeds": 3,
-   "validated": 36
+   "validated": 48
   },
   {
    "abs": 0.0001220703125,
@@ -130,7 +130,7 @@
    "dtype": "float16",
    "rel": 0.0009765625,
    "seeds": 3,
-   "validated": 36
+   "validated": 48
   }
  ],
  "demo:mha_decode": [
@@ -144,7 +144,7 @@
     "float16",
     "float32"
    ],
-   "validated": 1176
+   "validated": 1596
   },
   {
    "abs": 6.4849853515625e-05,
@@ -155,7 +155,7 @@
    "stored": [
     "float32"
    ],
-   "validated": 336
+   "validated": 588
   },
   {
    "abs": 2.384185791015625e-06,
@@ -164,7 +164,7 @@
    "rel": 5.912488063586352e-07,
    "role": "shift",
    "seeds": 3,
-   "validated": 336
+   "validated": 588
   }
  ],
  "demo:mha_prefill": [
@@ -296,7 +296,7 @@
    "dtype": "float16",
    "rel": 0.0012845215387642384,
    "seeds": 3,
-   "validated": 69
+   "validated": 96
   }
  ],
  "demo:rmsnorm_matmul": [
@@ -498,7 +498,7 @@
    "dtype": "float16",
    "rel": 0.0009765625,
    "seeds": 3,
-   "validated": 288
+   "validated": 336
   },
   {
    "abs": 0.0009765625,
@@ -506,7 +506,33 @@
    "dtype": "float16",
    "rel": 0.0011370097054168582,
    "seeds": 3,
-   "validated": 144
+   "validated": 192
+  }
+ ],
+ "test:attention_bwd": [
+  {
+   "abs": 0.00048828125,
+   "absolute": false,
+   "dtype": "float16",
+   "rel": 0.0009708738070912659,
+   "seeds": 3,
+   "validated": 27
+  },
+  {
+   "abs": 0.00048828125,
+   "absolute": false,
+   "dtype": "float16",
+   "rel": 0.0009661835501901805,
+   "seeds": 3,
+   "validated": 12
+  },
+  {
+   "abs": 0.00048828125,
+   "absolute": false,
+   "dtype": "float16",
+   "rel": 0.0009505703346803784,
+   "seeds": 3,
+   "validated": 6
   }
  ],
  "test:batched_matmul_graph": [
@@ -541,12 +567,12 @@
  ],
  "test:dual_softmax": [
   {
-   "abs": 0.0001220703125,
+   "abs": 6.103515625e-05,
    "absolute": false,
    "dtype": "float16",
    "rel": 0.000965250947047025,
    "seeds": 3,
-   "validated": 1389
+   "validated": 1179
   }
  ],
  "test:exact_attention": [
@@ -556,7 +582,7 @@
    "dtype": "float16",
    "rel": 0.0010615711798891425,
    "seeds": 3,
-   "validated": 1080
+   "validated": 1752
   }
  ],
  "test:exact_split_attention": [
@@ -682,7 +708,7 @@
    "dtype": "float16",
    "rel": 0.0009756097570061684,
    "seeds": 3,
-   "validated": 33
+   "validated": 39
   },
   {
    "abs": 2.0,
@@ -690,7 +716,7 @@
    "dtype": "float16",
    "rel": 0.0010362694738432765,
    "seeds": 3,
-   "validated": 33
+   "validated": 39
   }
  ],
  "test:l2_normalize": [
@@ -720,7 +746,7 @@
    "dtype": "float16",
    "rel": 0.0009708738070912659,
    "seeds": 3,
-   "validated": 15
+   "validated": 21
   }
  ],
  "test:matmul": [
@@ -901,6 +927,24 @@
    "validated": 165
   }
  ],
+ "test:per_output_pair": [
+  {
+   "abs": 0.125,
+   "absolute": false,
+   "dtype": "float16",
+   "rel": 0.0009302325779572129,
+   "seeds": 3,
+   "validated": 195
+  },
+  {
+   "abs": 0.0,
+   "absolute": false,
+   "dtype": "float16",
+   "rel": 0.0,
+   "seeds": 3,
+   "validated": 195
+  }
+ ],
  "test:product_and_chain": [
   {
    "abs": 0.03125,
@@ -937,24 +981,6 @@
    "validated": 174
   }
  ],
- "test:per_output_pair": [
-  {
-   "abs": 0.125,
-   "absolute": false,
-   "dtype": "float16",
-   "rel": 0.0009302325779572129,
-   "seeds": 3,
-   "validated": 75
-  },
-  {
-   "abs": 0.0,
-   "absolute": false,
-   "dtype": "float16",
-   "rel": 0.0,
-   "seeds": 3,
-   "validated": 75
-  }
- ],
  "test:qknorm_graph": [
   {
    "abs": 0.0001220703125,
@@ -962,7 +988,7 @@
    "dtype": "float16",
    "rel": 0.0012861735885962844,
    "seeds": 3,
-   "validated": 69
+   "validated": 96
   }
  ],
  "test:rmsnorm_matmul_graph": [

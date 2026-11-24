@@ -118,6 +118,9 @@ TOLERANCES = {
     "lse_attention": Tolerance(rtol=5e-3),
     "inter_pair": Tolerance(rtol=5e-3),
     "per_output_pair": Tolerance(rtol=5e-3),
+    # dQ, dK, dV of the attention backward kernels of tests/lower (_attention_bwd.py),
+    # against torch autograd of the forward
+    "attention_bwd": Tolerance(rtol=5e-3),
 }
 
 
