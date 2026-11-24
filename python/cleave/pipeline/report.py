@@ -52,50 +52,61 @@ def tolerance_dicts(tolerance) -> list | dict | None:
     return [entry(t) for t in items]
 
 
-def bounds_by_output(tolerance, roles_of_results):
-    """What governs each output index of a report: ``tolerance`` itself, or for a
-    declaration keyed by role one entry per output index -- the bound of the role that
-    output has in the plans measured (``roles_of_results``: the output roles of each), None
-    where plans disagree on it."""
-    if not isinstance(tolerance, Mapping):
-        return tolerance
-    at = {}
-    for roles in roles_of_results:
-        for i, role in enumerate(roles):
-            at.setdefault(i, set()).add(role)
-    return [tolerance.get(next(iter(roles))) if len(roles) == 1 else None
-            for _, roles in sorted(at.items())]
-
-
-def worst_measured(measurements) -> list | None:
-    """Per output index, ``{"rel", "abs"}``: the largest of each over ``measurements``.
+def worst_measured(measurements, roles=None) -> list | None:
+    """Per output, ``{"rel", "abs"}``: the largest of each over ``measurements``.
 
     As long as the longest measurement: a split partial has more outputs than a solo plan.
+    With ``roles`` (the boundary roles of each measurement's outputs, in the same order),
+    outputs are grouped as the tolerance measurement groups them
+    (``tests/_measure_tolerances``): an output with a boundary role -- the float32 max a
+    split partial returns, role ``"shift"``, wherever the kernel returns it -- is a row of
+    its own under that role (the row has ``"role"``), after the outputs without one, which
+    are numbered among themselves. A partial's shift is then never the solo kernel's output
+    0, and its error is never hidden behind theirs.
     """
-    out = None
-    for measured in measurements:
+    rows, order = {}, []
+    measurements = list(measurements)
+    roles = list(roles) if roles is not None else [None] * len(measurements)
+    for measured, kinds in zip(measurements, roles):
         if measured is None:
             continue
-        out = out or []
-        out += [{"rel": 0.0, "abs": 0.0} for _ in range(len(measured) - len(out))]
-        for worst, m in zip(out, measured):
+        kinds = tuple(kinds) if kinds is not None else ("",) * len(measured)
+        seen = Counter()
+        for m, role in zip(measured, kinds):
+            key = (role, seen[role])
+            seen[role] += 1
+            if key not in rows:
+                rows[key] = {"rel": 0.0, "abs": 0.0, **({"role": role} if role else {})}
+                order.append(key)
+            worst = rows[key]
             worst["rel"], worst["abs"] = max(worst["rel"], m.rel), max(worst["abs"], m.abs)
-    return out
+    if not rows:
+        return None
+    ranked = sorted(order, key=lambda key: (key[0] != "", key[0], key[1]))
+    return [rows[key] for key in ranked]
+
+
+def bounds_of(worst, tolerance):
+    """The bound beside each row of ``worst_measured``: for a declaration keyed by role, the
+    bound of the row's role; otherwise ``tolerance`` itself (one, or one per output)."""
+    if not isinstance(tolerance, Mapping) or not worst:
+        return tolerance
+    return [tolerance.get(w.get("role", "")) for w in worst]
 
 
 def format_measured(worst, tolerance=None) -> str:
     """``rel 6.1e-04 of rtol 0.005`` per output, for the stage report: the measured error
     beside the bound that governs it. Both errors when the tolerance is not known, and when
-    it has both terms: neither error alone is then a fraction of its term."""
+    it has both terms: neither error alone is then a fraction of its term. A row with a
+    boundary role is named by it (``shift rel 9.7e-07 of rtol 5e-06``); the others are
+    ``out0``, ``out1``, ... where there are several rows."""
     if not worst:
         return ""
-    if isinstance(tolerance, Mapping):  # by role: which output has which is not known here
-        tolerance = None
-    bounds = tolerance_dicts(tolerance) or [None] * len(worst)
+    bounds = tolerance_dicts(bounds_of(worst, tolerance)) or [None] * len(worst)
     if len(bounds) == 1:
         bounds = bounds * len(worst)
-    parts = []
-    for i, (w, bound) in enumerate(zip(worst, bounds)):
+    parts, plain = [], 0
+    for w, bound in zip(worst, bounds):
         both = f"rel {w['rel']:.1e} abs {w['abs']:.1e}"
         if bound is None:
             text = both
@@ -107,8 +118,21 @@ def format_measured(worst, tolerance=None) -> str:
             text = f"abs {w['abs']:.1e} of atol {bound['atol']:g}"
         else:
             text = f"{both} of an exact bound"
-        parts.append((f"out{i} " if len(worst) > 1 else "") + text)
+        if w.get("role"):
+            name = f"{w['role']} "
+        else:
+            name, plain = (f"out{plain} " if len(worst) > 1 else ""), plain + 1
+        parts.append(name + text)
     return "; ".join(parts)
+
+
+def _roles_of(result, output_roles):
+    """The boundary roles of a result's outputs, or None where its plan has no graph."""
+    graph = getattr(getattr(getattr(result, "plan", None), "tile", None), "flat_graph", None)
+    if graph is None:
+        return None
+    roles = output_roles(graph)
+    return roles if len(roles) == len(result.measured) else None
 
 
 @dataclass(eq=False)
@@ -334,15 +358,14 @@ class Report(_Results):
                     ("#", "variant", "role", "us", "plan"))
 
     def measured_error(self) -> list | None:
-        """Per output, the largest error measured over the candidates that passed."""
-        return worst_measured(r.measured for r in self.correct)
-
-    def _bounds(self):
-        """The bound beside each entry of ``measured_error()``."""
+        """Per output, the largest error measured over the candidates that passed, grouped
+        by boundary role (``worst_measured``): a split partial's shift has a row of its own,
+        ``{"role": "shift", ...}``, beside the outputs without a role."""
         from ..runtime.reference import output_roles
 
-        return bounds_by_output(self.tolerance, (
-            output_roles(r.plan.tile.flat_graph) for r in self.correct if r.measured is not None))
+        correct = [r for r in self.correct if r.measured is not None]
+        roles = [_roles_of(r, output_roles) for r in correct]
+        return worst_measured([r.measured for r in correct], roles)
 
     def to_dict(self) -> dict:
         variants = self.variants()
@@ -420,7 +443,7 @@ class Report(_Results):
         rows.append(("build", text + (f"  [{build_fail}]" if build_fail else ""), self.timings.get("build")))
         val_fail = Failures(r for r in self.results if not r.ok and r.stage == "validate")
         n_val = len(self) - len(build_fail)
-        worst = format_measured(self.measured_error(), self._bounds())
+        worst = format_measured(self.measured_error(), self.tolerance)
         rows.append(("validate", f"{n_val - len(val_fail)} ok / {len(val_fail)} failed"
                      + (f"  [{val_fail}]" if val_fail else "")
                      + (f"  max error {worst}" if worst else "") + self._inputs_text()
