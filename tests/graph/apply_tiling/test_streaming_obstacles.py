@@ -167,7 +167,7 @@ def test_a_refused_obstacle_keeps_its_pin_whatever_record_it_has():
 # ------------------------------------------- a record derived for another graph is not served
 
 
-def test_r1_a_record_of_another_graph_keeps_the_pin():
+def test_a_record_of_another_graph_keeps_the_pin():
     ir = X.streamed_ir(X.flash_attention, SMALL)
     (m,) = X.maxes(ir)
     m.streaming = dataclasses.replace(m.streaming, key="0" * 64)

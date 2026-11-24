@@ -57,7 +57,7 @@ def test_a_carried_max_whose_update_rule_is_still_on_it_is_refused():
     assert "ukernel_rescale_1dims_rr" in TilelangCodeGen().gen(t.main)
 
 
-# V2 ------------------------------------------------------------------------------------
+# Rolling state belongs to a loop, never to the main graph ------------------------------
 @pytest.mark.parametrize("field", ["lag_nodes", "accum_scale"])
 def test_rolling_state_is_refused_in_the_main_graph(field):
     t = _tier()
@@ -101,7 +101,7 @@ def test_a_snapshot_of_a_max_that_is_not_carried_is_refused():
     _refused(t, "lag node 'exp_0_max_prev' snapshots 'exp_0_max', which is not an accumulator")
 
 
-# V3 ------------------------------------------------------------------------------------
+# Only an accumulator is rescaled -------------------------------------------------------
 def test_only_an_accumulator_is_rescaled():
     t = _tier()
     t.inner.accum_scale[t.p] = t.alpha
@@ -153,14 +153,14 @@ def test_a_rescaled_accumulator_tile_has_no_unit_extent():
     _refused(t, r"rescaled accumulator 'psum_0' has a unit extent in its tile \(16, 1\)")
 
 
-# V4 ------------------------------------------------------------------------------------
+# A rescaled accumulator starts at zero -------------------------------------------------
 def test_a_rescaled_accumulator_starts_at_zero():
     t = _tier()
     t.rowsum.accum_init = 1.0
     _refused(t, "rescaled accumulator 'rowsum_0' starts at 1.0")
 
 
-# V5 ------------------------------------------------------------------------------------
+# A finite start value needs a float32 accumulator --------------------------------------
 def test_a_finite_start_value_needs_a_float32_accumulator():
     t = _tier()
     t.m.out_dtype = "float16"  # -FLT_MAX rounds to -inf there
@@ -178,7 +178,7 @@ def test_the_identity_of_max_is_fine_in_any_dtype():
     assert "T.fill(t_exp_0_max, -T.infinity(" in TilelangCodeGen().gen(t.main)
 
 
-# V6 ------------------------------------------------------------------------------------
+# A partial sum is not read inside its loop ---------------------------------------------
 def test_a_partial_sum_is_not_read_inside_its_loop():
     t = _tier()
     peek = Copy((ROWS,), name="peek", n_batch_dims=0)
@@ -204,7 +204,7 @@ def test_a_running_max_may_be_read_inside_its_loop():
                 "inside the loop")
 
 
-# V7 ------------------------------------------------------------------------------------
+# A max over a slice is refused ---------------------------------------------------------
 def test_a_max_over_a_slice_is_refused():
     """The silent wrong kernel: a max the loop reads is not an accumulator by inference, so
     it restarts on every tile while the sums it normalises accumulate over all of them."""

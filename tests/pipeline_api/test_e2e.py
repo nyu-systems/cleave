@@ -30,8 +30,8 @@ def cache_root(tmp_path, monkeypatch):
 
 def _hold(out, ref, what="returned kernel"):
     """The kernel ``compile`` returned (or loaded, or chained), on inputs it was not
-    validated on, against the program's own reference at the bound the matmul declares.
-    (This compared elementwise at 2e-2 + 5e-2: a kernel 1.5% off everywhere passed.)"""
+    validated on, against the program's own reference at the bound the matmul declares, so
+    a kernel that is off by more than that bound anywhere fails."""
     from cleave.runtime.validate import compare_outputs
 
     (measured,) = compare_outputs([out], [ref.to(out.device)], TOLERANCE, what=what)

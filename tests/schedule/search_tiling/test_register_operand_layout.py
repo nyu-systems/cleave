@@ -174,9 +174,9 @@ def test_a_softmax_over_256_queries_has_no_tiling_and_says_why():
 
 def test_two_staged_accumulators_of_64_rows_keep_two_warp_groups():
     """``dV += P^T dO`` and ``dK += dS^T q`` in one loop over a block of 64 keys on 256
-    threads: proposed, like every other assignment. (Ten of them once validated wrong on an
-    H100; the cause was a shared operand placed off the 1024-byte boundary its swizzle
-    needs, not the thread count: tests/codegen/test_operand_names.py.)"""
+    threads: proposed, like every other assignment. The thread count is not what makes
+    such a kernel right or wrong; a shared operand's 1024-byte swizzle alignment is, and
+    tests/codegen/test_operand_names.py pins that."""
     from cleave.pipeline import GraphSet, ScheduleConfig, schedule
     from tests.lower import _attention_bwd as A
 
@@ -256,8 +256,8 @@ def test_a_operand_staged_through_shared_is_not_refused():
 def test_a_gemm_whose_output_keeps_one_dim_is_not_an_internal_error():
     """``exp(x @ w) @ v`` with ``v`` one column wide: the value gemm reads the scores'
     accumulator from registers, and its iteration tile is one-dimensional (``[M, 1]``
-    squeezes to ``[M]``). The rule has no rows to judge there; it used to index them and
-    end the whole tiling search with ``IndexError: list index out of range``."""
+    squeezes to ``[M]``). The rule has no rows to judge there, so it leaves such a tile
+    alone instead of ending the whole tiling search with an untyped error."""
     import cleave.lang as cl
     from cleave.frontend import trace
     from cleave.pipeline import GraphSet, ScheduleConfig, schedule
