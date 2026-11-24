@@ -35,9 +35,13 @@ Two more of the same kind:
   columns alike, with or without this change. A row the tile has to hold whole compiles
   where its length is a power of two; any other needs a padded last tile, which is not
   built here.);
-* the output tile of a tensor-core matmul starts at 64 rows and 32 columns whatever the
-  extents are, and the walk over the output tiles died on that start for 96 or 100 rows or
-  48 columns (``ValueError: 64 is not in list``). That is a refusal with its reason too.
+* the output tile of a tensor-core matmul started at 64 rows and 32 columns whatever the
+  extents were, and the walk over the output tiles died on that start for 96 or 100 rows or
+  48 columns (``ValueError: 64 is not in list``). It starts at the largest step of the axis
+  at or below that tile now (32 of 96 rows, 16 of 48 columns), and only an axis with no
+  step a tensor-core tile takes (100 rows: 1, 2, 4, 100) is refused, with that reason. The
+  tilings TileLang cannot partition among the warps or lay out are not proposed
+  (``GEMM_TILE_CONFLICT``): attention over 96 queries has none left, and says so.
 """
 
 import re
@@ -339,21 +343,44 @@ def plain_matmul(x: cl.Tensor["M", "K"], w: cl.Tensor["K", "N"]):
     return x @ w
 
 
-def _no_tile(axis, extent, start):
-    return (rf"\w+: axis {axis} of the output has {extent} elements and its tile starts "
-            rf"at {start}, which is none of that axis's steps \[[\d, ]+\]; an output tile "
-            "is not padded")
+def _no_tile(axis, extent, steps):
+    return (rf"\w+: axis {axis} of the output has {extent} elements and no step of 16 to 64 "
+            rf"\(its steps: \[{steps}\]\); a tensor-core tile is not padded")
 
 
-@pytest.mark.parametrize("shapes, reason", [
-    (dict(M=96, K=256, N=128), _no_tile(0, 96, 64)),
-    (dict(M=100, K=256, N=128), _no_tile(0, 100, 64)),
-    (dict(M=192, K=256, N=48), _no_tile(1, 48, 32)),
-], ids=["96_rows", "100_rows", "48_columns"])
-def test_an_output_axis_the_tensor_core_tile_does_not_divide_is_refused_with_its_reason(
-        shapes, reason):
-    """It ended the search with ``ValueError: 64 is not in list`` (``32`` for the columns):
-    the same list lookup as for the reduction axis, on the output axes."""
+@pytest.mark.parametrize("shapes", [
+    dict(M=96, K=4096, N=128), dict(M=80, K=256, N=128), dict(M=192, K=256, N=48),
+    dict(M=128, K=256, N=80),
+], ids=["96_rows", "80_rows", "48_columns", "80_columns"])
+def test_an_output_axis_the_tensor_core_tile_does_not_divide_starts_at_a_step_it_has(shapes):
+    """The tensor-core tile starts at 64 rows and 32 columns; for 96 or 80 rows, or 48 or 80
+    columns, that is none of the axis's steps, and the walk refused every such matmul ("an
+    output tile is not padded", and before that ``ValueError: 64 is not in list``). It
+    starts at the largest step at or below it now (32 of 96 rows, 16 of 80, 16 of 48 or 80
+    columns): nothing needs padding. Every proposed tiling lowers, with the device compile;
+    those TileLang cannot partition or lay out are not proposed (``GEMM_TILE_CONFLICT``)."""
+    from tests._lowering import lower_to_cuda
+
+    ir = _lowered(plain_matmul, shapes)
+    cands = list(search_tiling(ir, topk=100000))
+    assert cands
+    seen = {}
+    for c in cands:
+        seen.setdefault((tuple(int(x) for x in c.output_tile), c.n_threads), c)
+    for (tile, threads), c in sorted(seen.items()):
+        assert shapes["M"] % tile[0] == 0 and shapes["N"] % tile[1] == 0, tile
+        lower_to_cuda(build_candidate_code(c), device_compile=True)
+    plans = P.schedule(GraphSet.identity(trace(plain_matmul, shapes, cl.f16)),
+                       P.ScheduleConfig(topk=16))
+    assert plans and not plans.refused
+
+
+def test_a_row_count_with_no_step_a_tensor_core_tile_takes_is_refused_with_its_reason():
+    """100 rows: the steps that divide 100 are 1, 2, 4 and 100, none from the 16 rows a
+    tensor-core matmul tile needs to the 64 it starts at. That is the reason: the last tile
+    of the output is not padded."""
+    shapes = dict(M=100, K=256, N=128)
+    reason = _no_tile(0, 100, "1, 2, 4, 100")
     ir = _lowered(plain_matmul, shapes)
     for force in (False, True):
         with pytest.raises(ScheduleRejected, match=reason):
@@ -368,10 +395,47 @@ def test_an_output_axis_the_tensor_core_tile_does_not_divide_is_refused_with_its
     assert "ValueError" not in text and "not in list" not in text and text in plans.summary()
 
 
-def test_attention_over_96_queries_is_refused_with_the_same_reason():
-    ir = _lowered(X.flash_attention, dict(H=12, SQ=96, SKV=256, D=64))
-    with pytest.raises(ScheduleRejected, match=_no_tile(1, 96, 64)):
-        list(search_tiling(ir, topk=16))
+def test_attention_over_96_queries_is_refused_with_the_partition_reason():
+    """The rows start at 32 of 96 now, and the walk proposes 96-row tiles, which the
+    warp-group MMA cannot split, and 32-row ones, which leave a warp fewer than 16 rows of
+    the exp's registers to read. No tiling: the reason is what TileLang cannot do."""
+    from cleave.schedule.policy.default import GEMM_TILE_CONFLICT
+
+    shapes = dict(H=12, SQ=96, SKV=256, D=64)
+    assert list(search_tiling(_lowered(X.flash_attention, shapes), topk=16)) == []
+    plans = P.schedule(GraphSet.identity(trace(X.flash_attention, shapes, cl.f16)),
+                       P.ScheduleConfig(topk=16))
+    assert not plans and plans.refused
+    for refusal in plans.refused:
+        text = str(refusal.error)
+        assert text.startswith("no tiling candidates") and f"x {GEMM_TILE_CONFLICT}" in text
+        assert "not padded" not in text
+
+
+def test_the_gemm_tile_rule_is_what_tilelang_cannot_build():
+    """Each case of ``TCPolicy._gemm_tile_conflict`` on sm_90, and none elsewhere."""
+    import copy
+
+    ir = _lowered(plain_matmul, dict(M=256, K=256, N=256))
+    policy = TCPolicy([n for n in ir.nodes if n.is_output()],
+                      __import__("cleave.core.target", fromlist=["x"]).current_target().arch,
+                      flat_graph=ir)
+    (mma,) = [n for n in ir.nodes if n.get_tag("tensorcore_config")]
+    cand = copy.copy(next(iter(search_tiling(ir, topk=1))))
+
+    def conflict(rows, cols, threads):
+        cand.get_itile = lambda node: [rows, cols]
+        return policy._gemm_tile_conflict(cand, threads)
+
+    assert not conflict(64, 32, 128) and not conflict(64, 32, 256)
+    assert not conflict(32, 32, 256) and not conflict(128, 16, 256) and not conflict(64, 48, 128)
+    assert conflict(16, 32, 256)  # room for 4 warps only
+    assert conflict(96, 64, 128) and conflict(80, 128, 256)  # warp-group MMA rows
+    assert conflict(64, 16, 256) and conflict(192, 48, 256)  # two warp groups, 16 / 48 columns
+    assert mma is not None
+    policy.arch = copy.copy(policy.arch)
+    policy.arch.sm_version = 80
+    assert not conflict(96, 64, 128)
 
 
 @pytest.mark.parametrize("shapes", [dict(M=128, K=256, N=128), dict(M=64, K=256, N=32),

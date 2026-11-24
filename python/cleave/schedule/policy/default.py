@@ -51,6 +51,13 @@ ROW_REDUCTION_CONFLICT = (
     "a reduction over the rows of a matmul's accumulator would hold more than 16 of those "
     "rows a warp, which TileLang's reduction cannot lower"
 )
+# ... and for a tiling whose matmul tile TileLang cannot partition among the warps or lay out
+# (``_gemm_tile_conflict``).
+GEMM_TILE_CONFLICT = (
+    "a matmul's tile would give a warp fewer than 16 rows or 8 columns, or have more than 64 "
+    "rows that 64 does not divide, or, on two warp groups, fewer than 128 rows by a number "
+    "of columns 32 does not divide, which TileLang cannot partition or lay out"
+)
 # Ops an inter output may apply between its reduction and the output: linear in the
 # reduction's result (one input; a scalar operand is folded into the op), so the sum of
 # the per-CTA partials is the output.
@@ -66,6 +73,10 @@ def _reads_placeholder(src) -> bool:
 
 
 class DefaultPolicy:
+    # Whether the walk over the output tiles may add a power of two up to 32 that does not
+    # divide an axis (``dfs_smem_tile``); ``TCPolicy`` takes dividing steps only.
+    PADDED_OUTPUT_TILES = True
+
     def __init__(self, output_nodes, arch, force_fusion=False, flat_graph=None) -> None:
         self.arch = arch
         self.ordered_nodes = list(
@@ -1168,7 +1179,8 @@ class DefaultPolicy:
                 filter(
                     lambda s: s < steps[i][-1]
                     and s > steps[i][0]
-                    and s not in steps[i],
+                    and s not in steps[i]
+                    and (self.PADDED_OUTPUT_TILES or int(visible_shape[i]) % s == 0),
                     [2, 4, 8, 16, 32],
                 )
             )
@@ -1748,19 +1760,42 @@ class TCPolicy(DefaultPolicy):
                 return super()._assign_reduce_step(node)
         return result
 
+    # The smallest output tile a tensor-core matmul has, per axis (rows, columns): TileLang's
+    # gemm fragment needs ``warp_m % 16 == 0`` and ``warp_n % 8 == 0``.
+    TC_MIN_TILE = (16, 8)
+    # The walk over the output tiles takes only steps that divide an axis (no step of 32 for
+    # 48 columns or 80 rows): a tensor-core output tile is not padded.
+    PADDED_OUTPUT_TILES = False
+
     def get_base_tile(self):
+        """The output tile the walk starts from: per non-batch axis the largest of the
+        axis's steps (the powers of two that divide its extent, and the extent) at or below
+        the tensor-core tile (64 rows, 32 columns). It used to be the tensor-core tile
+        itself, which is none of the steps of 96 or 80 rows or 48 columns, and the walk
+        refused every such matmul. A start below the smallest tile a tensor-core matmul has
+        (``TC_MIN_TILE``: 100 rows, whose steps are 1, 2, 4 and 100) is refused with that
+        reason: an output tile is not padded."""
         out_node = self.canonical_output_node
         shape = self._get_visible_output_shape(out_node)
         visible_batch_flags = self._get_visible_output_batch_dim_flags(out_node)
         visible_batch_dims = sum(1 for is_batch_dim in visible_batch_flags if is_batch_dim)
-        base_tile = [
-            (
-                1
-                if i < visible_batch_dims
-                else min(self.wmma[i - visible_batch_dims], shape[i])
-            )
-            for i in range(len(shape))
-        ]
+        base_tile = []
+        for i, extent in enumerate(shape):
+            if i < visible_batch_dims:
+                base_tile.append(1)
+                continue
+            axis = i - visible_batch_dims
+            start = min(self.wmma[axis], int(extent))
+            steps = get_all_round_factors(int(extent))
+            snapped = max(step for step in steps if step <= start)
+            least = self.TC_MIN_TILE[axis] if axis < len(self.TC_MIN_TILE) else 1
+            if snapped < min(least, int(extent)):
+                raise ScheduleRejected(
+                    f"{out_node.name}: axis {i} of the output has {int(extent)} elements and "
+                    f"no step of {least} to {int(self.wmma[axis])} (its steps: "
+                    f"{[int(x) for x in steps]}); a tensor-core tile is not padded"
+                )
+            base_tile.append(snapped)
         return base_tile
 
     # Thread counts (i.e. warp counts, warp_size=32) tried per tile candidate.
@@ -1945,8 +1980,60 @@ class TCPolicy(DefaultPolicy):
                 return True
         return False
 
+    def _gemm_tile_conflict(self, candidate, n_threads):
+        """Would TileLang fail to partition or lay out a matmul's tile on ``n_threads``?
+
+        Measured on sm_90 by lowering every (tile, threads) the policy proposes for plain
+        float16 matmuls of 80, 96, 112, 160 rows and 16, 48, 80 columns and for attention
+        over 96 queries (TileLang 0.1.13, device compile; the vendored TileLang cannot be
+        patched). Each of these fails, and every other proposed pair lowered:
+
+        * fewer than 16 rows or 8 columns a warp: ``makeGemmFragmentC`` needs ``warp_m % 16
+          == 0`` and ``warp_n % 8 == 0``, so a ``(m, n)`` tile has room for at most
+          ``(m // 16) * (n // 8)`` warps ("No valid warp partition for T.gemm: M=16, N=32
+          cannot be evenly covered by 8 warps"). Judged for a tile of at least 16 x 8 only:
+          a smaller one is not the tile codegen multiplies (a step of one query of the
+          softmax over the queries emits the kernel of its step of 16), and the register
+          operand rule speaks for the one-query attention;
+        * more than 64 rows that 64 does not divide (80, 96, 112, 160): the warp-group MMA
+          takes them, and cannot split them on 4 or on 8 warps ("No valid warp partition for
+          T.gemm (Warp-Group MMA): M=96");
+        * on two warp groups (256 threads), a tile 128 does not divide in rows -- the
+          non-warp-group MMA -- whose columns 32 does not divide (16, 48, 80): its shared
+          second operand is laid out two ways ("Get different layout for <B>").
+
+        sm_90 only, like the other layout rules. The tile is the gemm's tile of one iteration
+        (``get_itile``), the one codegen multiplies. Not judged: a paged layer's dense body
+        (``paging.stage_as_layer`` marks it), whose kernel the layer rebuilds around the
+        tiling with gemms of its own (its decode tiling of 16 query rows by 32 keys on 256
+        threads validates), and a tile that does not have the gemm's rank (a unit dim it
+        misses is refused when the tiling is built, with that reason).
+        """
+        if getattr(self.arch, "sm_version", None) != 90:
+            return False
+        if getattr(self.flat_graph, "paged_layer", None) is not None:
+            return False
+        warps = n_threads // 32
+        for node in self.ordered_nodes:
+            if not isinstance(node, Matmul) or not node.get_tag("tensorcore_config"):
+                continue
+            tile = candidate.get_itile(node)
+            if len(tile) < 2 or len(tile) != len(node.get_shape()):
+                continue
+            try:
+                rows, cols = int(tile[-2]), int(tile[-1])
+            except (TypeError, ValueError):
+                continue
+            if rows >= 16 and cols >= 8 and (rows // 16) * (cols // 8) < warps:
+                return True
+            if rows > 64 and rows % 64:
+                return True
+            if warps > 4 and rows % 128 and cols % 32:
+                return True
+        return False
+
     def get_num_threads(self, candidates):
-        expanded_candidates, conflicts, row_conflicts = [], 0, 0
+        expanded_candidates, conflicts, row_conflicts, tile_conflicts = [], 0, 0, 0
         for candidate in candidates:
             n_threads_options = list(self.PRIMARY_N_THREADS)
             if self._requires_low_thread_counts(candidate):
@@ -1958,13 +2045,18 @@ class TCPolicy(DefaultPolicy):
                 if self._row_reduction_layout_conflict(candidate, n_threads):
                     row_conflicts += 1
                     continue
+                if self._gemm_tile_conflict(candidate, n_threads):
+                    tile_conflicts += 1
+                    continue
                 expanded = copy.copy(candidate)
                 expanded.n_threads = n_threads
                 expanded_candidates.append(expanded)
         if self.flat_graph is not None:
             # Where this leaves the graph no tiling at all, that is why, and nothing else
-            # says so: the schedule's report reads it off the graph (``REGISTER_OPERAND_
-            # CONFLICT``, ``ROW_REDUCTION_CONFLICT``; ``pipeline.plans._no_tiling``).
+            # says so: the schedule's report reads it off the graph (``GEMM_TILE_CONFLICT``,
+            # ``REGISTER_OPERAND_CONFLICT``, ``ROW_REDUCTION_CONFLICT``;
+            # ``pipeline.plans._no_tiling``).
+            self.flat_graph.gemm_tile_conflicts = 0 if expanded_candidates else tile_conflicts
             self.flat_graph.register_operand_conflicts = (
                 0 if expanded_candidates else conflicts
             )

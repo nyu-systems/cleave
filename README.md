@@ -141,8 +141,11 @@ served wrongly):
   attention at `S_KV = 1000`), and for float32 one no multiple of 8 divides;
 - a row that a tile has to hold whole and whose length is not a power of two (a standalone
   softmax or a row sum over 96 or 257 columns): the last tile of a reduction is not padded;
-- a matmul output with more than 64 rows that 64 does not divide, or more than 32 columns
-  that 32 does not divide (`M = 96`, `N = 48`);
+- a matmul output axis with no step a tensor-core tile takes (`M = 100`, whose steps are 1,
+  2, 4 and 100): an output tile is not padded. (`M = 96` starts at 32 rows, `N = 48` at 16
+  columns.) Tilings TileLang cannot partition or lay out are not proposed: fewer than 16 rows
+  or 8 columns a warp, more than 64 rows that 64 does not divide, or, on 256 threads, fewer
+  than 128 rows by columns 32 does not divide; attention over 96 queries has no tiling left;
 - a reduction over a dim of one element (`sum(x, -1)` of a `64 x 1` tensor): the search
   builds no reduction over a single element, so `superoptimize` finds no graph and raises
   `SuperoptError` with that reason (as it does for any search that finds none, such as a
