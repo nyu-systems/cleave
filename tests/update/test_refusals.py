@@ -187,6 +187,30 @@ def test_e11_no_rule_within_the_budgets_and_how_far_the_search_got():
     assert not d.ranked
 
 
+def test_a_division_by_an_input_gets_the_canonical_rule_not_e11():
+    """``exp(x - max(x)) / w``: the right rule is proved under ``w != 0`` (the flat graph is
+    undefined where ``w`` is 0), so neither hole is refused at (i) alone."""
+    from ._attention import FACTOR
+    from ._programs import divided_rows
+
+    for shapes in (dict(R=16, C=64, D=8), dict(R=64, C=4096, D=64)):
+        ir, ob, d = refused(divided_rows, shapes)
+        assert d.refused == "" and not d.bug
+        assert d.rules == tuple((acc, FACTOR) for acc in ob.loops)
+        assert {name_of(ir, ReduceSum), name_of(ir, Matmul, -1)} == set(ob.loops)
+
+
+def test_e11_a_divisor_computed_from_the_max_is_not_assumed_defined():
+    """``exp(s) / (s - 1)`` with ``s = x - max(x)``: no rule over ``a``, ``m``, ``m'`` is
+    proved without assuming ``s - 1 != 0`` at every running max, which the flat graph does
+    not give; the obstacle keeps its pin with E11."""
+    from ._programs import self_divided_rows
+
+    ir, ob, d = refused(self_divided_rows)
+    assert d.refused.startswith("no proven update of ") and " within 5 ops (" in d.refused
+    assert not d.rules
+
+
 def test_e12_every_proven_rule_is_non_finite_on_a_case():
     ir, ob, d = refused(overflowing)
     assert [h.emittable != [] for h in d.holes] == [True, True]

@@ -93,6 +93,19 @@ def left_constant(x: cl.Tensor["R", "C"], v: cl.Tensor["C", "D"]):
     return (e @ v) / cl.sum(e, -1, keepdim=True)
 
 
+def divided_rows(x: cl.Tensor["R", "C"], w: cl.Tensor["R", "C"], v: cl.Tensor["C", "D"]):
+    """``exp(x - max(x)) / w``: a division by an input between the max and the sums."""
+    e = cl.exp(x - _max(x)) / w
+    return (e @ v) / cl.sum(e, -1, keepdim=True)
+
+
+def self_divided_rows(x: cl.Tensor["R", "C"], v: cl.Tensor["C", "D"]):
+    """``exp(s) / (s - 1)`` with ``s = x - max(x)``: a divisor computed from the max."""
+    s = x - _max(x)
+    e = cl.exp(s) / (s - 1.0)
+    return (e @ v) / cl.sum(e, -1, keepdim=True)
+
+
 def gqa(q: cl.Tensor["HQ", "SQ", "D"], k: cl.Tensor["HKV", "SKV", "D"],
         v: cl.Tensor["HKV", "SKV", "D"]):
     s = (q @ k.mT) / q.shape[-1] ** 0.5

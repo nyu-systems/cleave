@@ -30,7 +30,8 @@ valid iff ``lemmas and not goal`` is unsat:
 
     (D)  defined          for every division p / q in U: q != 0   (z3's division is total)
     (0)  accumulate form  U(a, .., r) - r == U(a, .., r2) - r2
-    (i)  one element      G(c(x.., m)) == c(x.., m1)
+    (i)  one element      G(c(x.., m)) == c(x.., m1), assuming q != 0 for every divisor q
+                          of c not computed from the full-extent value (``fixed_divisors``)
     (ii) distributes      G(a + b) == G(a) + G(b)
 
 Together: ``G(sum_j c(x_j, m)) = sum_j c(x_j, m1)`` for any number of elements, hence
@@ -192,7 +193,25 @@ def contribution(flat_graph, full: str, acc: str):
     ``Matmul`` the product of its two operands (the contraction is the looped sum).
     Raises :class:`Refused` (T5, E7, E8, E9) for anything else.
     """
-    from ...ir.ops import Exp, Matmul
+    build, leaves, _ = _walk(flat_graph, full, acc)
+    return build, leaves
+
+
+def fixed_divisors(flat_graph, full: str, acc: str) -> list:
+    """The divisors of the contribution to ``acc`` that are NOT computed from the full-extent
+    value: the free reals a ``Div`` between the two divides by (``exp(x - max(x)) / w``).
+
+    Where one of them is 0 the flat graph itself is undefined, and the kernel computes the
+    same inf / nan, so ``q != 0`` is a sound hypothesis of the one-element obligation (i):
+    z3's division is total, and ``c / 0`` would otherwise be an arbitrary value no repair
+    can relate. A divisor computed from the full-extent value (``exp(x - m) / (x - m)``) is
+    never assumed: the flat graph evaluates it at the final value only, the kernel at every
+    running one."""
+    return _walk(flat_graph, full, acc)[2]
+
+
+def _walk(flat_graph, full: str, acc: str):
+    from ...ir.ops import Div, Exp, Matmul
 
     z3 = _z3()
     check_contribution(flat_graph, full, acc)
@@ -200,18 +219,22 @@ def contribution(flat_graph, full: str, acc: str):
     full_node, acc_node = by_name[full], by_name[acc]
     computed = _between(by_name, full_node, acc_node) | {full}
     leaves = {}
+    divisors = {}  # sexpr -> z3 term of a divisor not computed from the full-extent value
 
     def term(n, m):
         if n is full_node:
             return m
         if n.name not in computed:
             return leaves.setdefault(n.name, z3.Real(f"x_{n.name}"))
-        args = [term(e.src_node, m) for e in sorted(n.inputs, key=lambda e: e.dst_id)]
+        operands = [e.src_node for e in sorted(n.inputs, key=lambda e: e.dst_id)]
+        args = [term(o, m) for o in operands]
         if type(n) is Exp:
             return _exp()(args[0])
         if n.const is not None:
             c = const(n.const)
             return type(n).py_op(c, args[0]) if n.const_on_left else type(n).py_op(args[0], c)
+        if type(n) is Div and operands[1].name not in computed:
+            divisors.setdefault(args[1].sexpr(), args[1])
         return type(n).py_op(args[0], args[1])
 
     def build(m):
@@ -220,8 +243,8 @@ def contribution(flat_graph, full: str, acc: str):
             return term(operands[0], m) * term(operands[1], m)
         return term(operands[0], m)
 
-    build(z3.Real("m"))  # fill ``leaves``
-    return build, leaves
+    build(z3.Real("m"))  # fill ``leaves`` and ``divisors``
+    return build, leaves, list(divisors.values())
 
 
 # --------------------------------------------------------------------- the update's term
@@ -360,13 +383,21 @@ def valid(goal, *context) -> str:
     return str(s.check())
 
 
+def _assuming(divisors, goal):
+    """``goal`` under ``q != 0`` for every divisor (the goal itself when there is none)."""
+    z3 = _z3()
+    if not divisors:
+        return goal
+    return z3.Implies(z3.And(*[q != 0 for q in divisors]), goal)
+
+
 def prove(update, flat_graph, full: str, acc: str) -> Verdict:
     """Prove the update ``update`` (leaves ``a``, ``m``, ``m'``, ``r``) of the accumulator
     ``acc`` under the full-extent node ``full`` of ``flat_graph``: (D), (0), (i), (ii)."""
     z3 = _z3()
     t0 = time.perf_counter()
     try:
-        build, _ = contribution(flat_graph, full, acc)
+        build, _, fixed = _walk(flat_graph, full, acc)
         m, m1, a, b, r, r2 = z3.Reals("m m1 a b r r2")
         base = {"m": m, "m'": m1}
 
@@ -382,7 +413,7 @@ def prove(update, flat_graph, full: str, acc: str) -> Verdict:
         goals = {
             OBLIGATIONS[0]: [(q != 0, (here,)) for q in divisors],
             OBLIGATIONS[1]: [(here - r == U(a, r2) - r2, ())],
-            OBLIGATIONS[2]: [(G(build(m)) == build(m1), ())],
+            OBLIGATIONS[2]: [(_assuming(fixed, G(build(m)) == build(m1)), ())],
             OBLIGATIONS[3]: [(G(a + b) == G(a) + G(b), ())],
         }
     except Refused as e:

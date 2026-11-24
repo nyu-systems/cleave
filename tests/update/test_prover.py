@@ -201,3 +201,35 @@ def test_stability_is_a_fact_about_the_exp_arguments():
     assert not proof.nonpositive_exp_args(("add", "r", ("div", "a", einv)), "max")
     # without what the reducer gives (m <= m') nothing is known about the sign
     assert not proof.nonpositive_exp_args(("add", "r", ("mul", "a", e)), "sum")
+
+
+def test_a_division_by_an_input_is_assumed_defined_in_the_one_element_obligation(monkeypatch):
+    """``exp(x - max(x)) / w``: z3's ``c / 0`` is an arbitrary value, so without ``w != 0``
+    obligation (i) has a countermodel at ``w = 0`` for the right rule too. Where ``w`` is 0
+    the flat graph is undefined itself, so the hypothesis is sound, and the canonical rule
+    is proved on both accumulators."""
+    from ._programs import divided_rows
+
+    ir = lowered(identity(divided_rows, dict(R=3, C=8, D=2)))
+    full, record = record_by_hand(ir)
+    (w,) = [n.name for n in ir.nodes if n.name.startswith("PlaceHolder")
+            and any(type(e.dst_node) is Div for e in n.outputs)]
+    for acc in record.loops:
+        assert [str(q) for q in proof.fixed_divisors(ir, full.name, acc)] == [f"x_{w}"]
+        verdict = prove(("add", "r", ("mul", "a", e)), ir, full.name, acc)
+        assert verdict.proved, verdict
+    monkeypatch.setattr(proof, "_assuming", lambda divisors, goal: goal)
+    for acc in record.loops:
+        verdict = prove(("add", "r", ("mul", "a", e)), ir, full.name, acc)
+        assert verdict.failed() == [ONE] and verdict.results[ONE] == "sat"
+
+
+def test_a_divisor_computed_from_the_max_is_never_assumed():
+    """``exp(s) / (s - 1)``: the flat graph evaluates the divisor at the final max only, the
+    kernel at every running one; it is not a hypothesis."""
+    from ._programs import self_divided_rows
+
+    ir = lowered(identity(self_divided_rows, dict(R=3, C=8, D=2)))
+    full, record = record_by_hand(ir)
+    for acc in record.loops:
+        assert proof.fixed_divisors(ir, full.name, acc) == []
