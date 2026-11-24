@@ -1690,6 +1690,16 @@ class TCPolicy(DefaultPolicy):
     def _assign_reduce_step(self, node):
         if not node.get_tag("tensorcore_config"):
             return super()._assign_reduce_step(node)
+        if node.reduction_block is None:
+            # A matmul whose contraction has one element (the rank-1 product ``x^T * s`` of
+            # an RMSNorm at M = 1, ``(K, 1) @ (1, N)``): the carver's schedule simplifies the
+            # unit reduction axis away, so the block has no reduction at all. A tensor-core
+            # gemm steps that axis in multiples of 16 (8 for float32), which 1 is none of.
+            raise ScheduleRejected(
+                f"{node.name} contracts 1 element (its unit reduction axis is simplified "
+                "away): a tensor-core matmul steps its reduction axis in multiples of 16 "
+                "(8 for float32 operands), and none divides that extent"
+            )
         # get reduce input size
         target_transaction = self.arch.transaction_size[0] * 2
         # 512 bytes // type bits

@@ -104,6 +104,29 @@ def test_an_extent_the_tensor_core_step_does_not_divide_is_refused_with_its_reas
     assert reason in plans.summary()
 
 
+def outer(x: cl.Tensor[1, "K"], s: cl.Tensor[1, "N"]):
+    """A matmul that contracts one element: the rank-1 product an RMSNorm at M = 1 becomes
+    (``x^T * rsqrt(...)``)."""
+    return x.mT @ s
+
+
+@pytest.mark.parametrize("n", [1, 64])
+def test_a_matmul_over_one_element_is_refused_with_its_reason(n):
+    """The carver simplifies the unit reduction axis away, so the matmul's block has no
+    reduction; reading its input buffers through it ended the tiling search with ``TypeError:
+    In "Schedule.get", "rand_var_or_sref" has wrong type`` (RMSNorm(x) @ W at M = 1)."""
+    plans = P.schedule(GraphSet.identity(trace(outer, dict(K=256, N=n), cl.f16)),
+                       P.ScheduleConfig(topk=8))
+    assert not plans and plans.refused
+    for refusal in plans.refused:
+        text = str(refusal.error)
+        assert re.fullmatch(r"mma_\d+ contracts 1 element \(its unit reduction axis is "
+                            r"simplified away\): a tensor-core matmul steps its reduction "
+                            r"axis in multiples of 16 \(8 for float32 operands\), and none "
+                            r"divides that extent", text), text
+        assert "TypeError" not in text and "rand_var_or_sref" not in text
+
+
 def test_the_policy_itself_raises_the_refusal():
     ir = _lowered(X.flash_attention, _shapes(1000))
     for force in (False, True):
