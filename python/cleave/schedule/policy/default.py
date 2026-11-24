@@ -1795,7 +1795,8 @@ class TCPolicy(DefaultPolicy):
         from it (directly or through elementwise ops, e.g. FlashAttention's
         ``exp(q k^T) @ v``) differ unless the block's M gives every warp at least 16 rows,
         and, with two warpgroups (256 threads), exactly 16 (M = 128); lowering fails with
-        ``Layout infer conflict between <frag> and <frag>/A_ptr``. An A operand computed
+        ``Layout infer conflict between <frag> and <frag>/A_ptr``. M is the gemm's tile in
+        one iteration (``get_itile``), the tile codegen multiplies. An A operand computed
         only from loaded tiles lowers at every M. Repros (lowering only, no GPU), in
         cleave-attn-bwd-evidence/scratch: p8-staging/repro_rs_gemm_layout.py,
         p8b-rsgemm/repro_variants.py (32..256 threads x M 16..256), p13-merged/repro_rs_m32.py.
@@ -1824,7 +1825,10 @@ class TCPolicy(DefaultPolicy):
                 # CompilerPassOptions.mla_decode_pass stages this A operand through shared
                 # (codegen/passes.py), and the candidate then compiles.
                 continue
-            tile = candidate.get_tile(node)
+            # The gemm codegen emits multiplies the tile of one iteration of the loop it is
+            # in: for an inter output (``dQ = dS @ k`` summed across CTAs) that is a step of
+            # the looped axis, not the block that spans it.
+            tile = candidate.get_itile(node)
             rows_per_warp = int(tile[-2]) / warps
             if rows_per_warp < 16 or (warps > 4 and rows_per_warp != 16):
                 if self._staged_as_misplaced(node, tile, n_threads):

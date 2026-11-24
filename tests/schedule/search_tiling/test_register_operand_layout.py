@@ -49,6 +49,41 @@ def test_two_warpgroups_read_a_gemm_accumulator_only_at_block_m_128():
     assert m_128 == {m for m in m_128 if m >= 64} and len(m_128) > 1  # one warpgroup: M >= 64
 
 
+def test_an_inter_output_gemm_is_judged_by_the_rows_of_one_iteration():
+    """``dQ = dS @ k`` of the attention backward reads ``dS`` from registers. Summed across
+    thread blocks (``acc=[inter,intra,intra]``), its block spans the whole of S_Q (4096 rows)
+    while the gemm codegen emits multiplies one step of the S_Q loop. Judged by the block,
+    every such tiling passed at 128 threads (1024 rows a warp: the steps of 32 rows, 8 a
+    warp, failed to lower with ``Layout infer conflict``) and was let through at 256 threads
+    as staged (codegen stages by the rows of the step, so none was, and all failed the same
+    way): 16 of the 36 tilings of demo/mha_backward. By the iteration's rows only steps of 64
+    rows at 128 threads remain, and every tiling that is proposed lowers."""
+    from tests._lowering import lower_to_cuda
+    from cleave.runtime.compile import build_candidate_code
+    from tests.schedule.search_tiling import test_accumulation_contexts as AC
+
+    assert current_target().arch.sm_version == 90
+    graph = AC._lower(AC.attention_bwd(32, 4096, 4096))
+    policy = AC._policy(graph)
+    (dq,) = [n for n in _register_a_matmuls(graph) if not n.transpose_A
+             and policy._reads_gemm_accumulator(n.inputs[0].src_node)]
+    cands = search_tiling(graph, topk=10000)
+    rows = {
+        (",".join(AC._contexts(c).values()), c.n_threads, int(c.get_tile(dq)[-2]),
+         int(c.get_itile(dq)[-2]))
+        for c in cands
+    }
+    assert {r for r in rows if r[0].startswith("inter")} == {("inter,intra,intra", 128, 4096, 64)}
+    assert {(t, m) for acc, t, m, _ in rows if acc.startswith("intra")} == {
+        (128, 64), (128, 128), (128, 256), (256, 128), (256, 256)}
+    for acc in ("inter,intra,intra", "intra,inter,inter"):
+        for threads in (128, 256):
+            some = [c for c in cands if c.n_threads == threads
+                    and ",".join(AC._contexts(c).values()) == acc]
+            if some:
+                lower_to_cuda(build_candidate_code(some[0]))
+
+
 def test_lora_up_projection_needs_16_rows_per_warp():
     # (X@A)@B with M = 16: only one warp (32 threads) gives it 16 rows.
     graph = lora_graph(16, 4096, 4096, 16)
