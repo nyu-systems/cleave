@@ -51,6 +51,14 @@ REGISTER_OPERAND_CONFLICT = (
 _LINEAR_POST_OPS = (Mul, Div, Copy)
 
 
+def _reads_placeholder(src) -> bool:
+    """Whether a gemm operand produced by ``src`` is a placeholder (seen through views),
+    which codegen loads rather than holds as a computed fragment."""
+    while isinstance(src, ViewOpNode) and src.inputs:
+        src = src.inputs[0].src_node
+    return src.is_placeholder()
+
+
 class DefaultPolicy:
     def __init__(self, output_nodes, arch, force_fusion=False, flat_graph=None) -> None:
         self.arch = arch
@@ -824,9 +832,13 @@ class DefaultPolicy:
         reductions that get a loop of their own; their consumers read them through the loop
         node, which that pass does not look through on the gemm side (it does for the row
         sum's operand: a gemm in its own loop makes it gemm-derived too). The older
-        two-fragment gemm staging is not counted.
+        two-fragment gemm staging is not counted: a gemm that reads no placeholder (QKNorm's
+        ``q_n @ k_n^T``) has both operands staged by it, whether or not one is read
+        transposed, so the transposed operand adds no buffer of its own there.
         """
         if isinstance(node, Matmul):
+            if not any(_reads_placeholder(e.src_node) for e in node.inputs):
+                return ()
             return tuple(
                 i
                 for i, (edge, flag) in enumerate(
