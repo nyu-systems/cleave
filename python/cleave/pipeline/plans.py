@@ -400,10 +400,18 @@ def _no_tiling(g, ir, reasons: Counter, whole: Counter) -> str:
     record in one step (``whole`` is empty): the policy made none, or the softmax filter
     refused only tilings that step such a max. Then, for a max whose streaming obstacle is
     not served, why it is not carried across a loop instead. Otherwise the graph has no
-    tiling for the reasons the filter counted (``reasons``), whatever its maxes.
+    tiling for the reasons the filter counted (``reasons``), whatever its maxes, and for
+    those of the policy: tilings it gave no thread count (``REGISTER_OPERAND_CONFLICT``),
+    whose row it did not get to judge.
     """
+    from ..schedule.policy.default import REGISTER_OPERAND_CONFLICT
+
     unstreamed = "; ".join(getattr(ir, "streaming_refusals", None) or ())
-    if "max" in g.ops and not whole:
+    # Tilings the policy made and then gave no thread count: it says how many on the graph.
+    conflicts = getattr(ir, "register_operand_conflicts", 0)
+    if conflicts:
+        reasons = reasons + Counter({REGISTER_OPERAND_CONFLICT: conflicts})
+    if "max" in g.ops and not whole and not conflicts:
         why = MAX_ROW_LIMIT
         if unstreamed:
             why += f"; it is not carried across a loop: {unstreamed}"

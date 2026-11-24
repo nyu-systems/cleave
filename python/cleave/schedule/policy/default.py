@@ -39,6 +39,12 @@ DEFAULT_N_THREADS = 128
 # read and written back once per CTA, hence the weight on its 4-byte elements.
 ATOMIC_ACCUM_BYTES = 4
 ATOMIC_COST_WEIGHT = 2
+# Why ``TCPolicy`` proposes no thread count for a tiling (``_register_operand_layout_conflict``).
+REGISTER_OPERAND_CONFLICT = (
+    "a matmul would read its first operand from another matmul's accumulator in registers "
+    "with fewer than 16 rows a warp, or over two warp groups at another M than 128, which "
+    "TileLang cannot lay out"
+)
 # Ops an inter output may apply between its reduction and the output: linear in the
 # reduction's result (one input; a scalar operand is folded into the op), so the sum of
 # the per-CTA partials is the output.
@@ -1836,15 +1842,23 @@ class TCPolicy(DefaultPolicy):
         return register_operand_is_misplaced(node.warp_policy, rows, cols, n_threads)
 
     def get_num_threads(self, candidates):
-        expanded_candidates = []
+        expanded_candidates, conflicts = [], 0
         for candidate in candidates:
             n_threads_options = list(self.PRIMARY_N_THREADS)
             if self._requires_low_thread_counts(candidate):
                 n_threads_options.extend(self.LOW_N_THREADS)
             for n_threads in n_threads_options:
                 if self._register_operand_layout_conflict(candidate, n_threads):
+                    conflicts += 1
                     continue
                 expanded = copy.copy(candidate)
                 expanded.n_threads = n_threads
                 expanded_candidates.append(expanded)
+        if self.flat_graph is not None:
+            # Where this leaves the graph no tiling at all, that is why, and nothing else
+            # says so: the schedule's report reads it off the graph (``REGISTER_OPERAND_
+            # CONFLICT``; ``pipeline.plans._no_tiling``).
+            self.flat_graph.register_operand_conflicts = (
+                0 if expanded_candidates else conflicts
+            )
         return expanded_candidates

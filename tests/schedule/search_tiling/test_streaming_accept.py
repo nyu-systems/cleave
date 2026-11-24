@@ -25,6 +25,7 @@ from cleave.frontend import trace
 from cleave.pipeline import plans
 from cleave.pipeline.superopt import GraphSet
 from cleave.runtime.compile import build_candidate_code
+from cleave.schedule.policy.default import REGISTER_OPERAND_CONFLICT
 from cleave.schedule import search_tiling
 from cleave.schedule.tiling import schedule_kernel
 
@@ -86,7 +87,9 @@ def test_the_filter_is_the_build(traced):
     accept = stream.streaming_accept(traced)
     raw = search_tiling(traced, topk=1000)
     kept = [cand for cand in raw if accept(cand)]
-    assert (len(raw), len(kept)) == (32, 8)
+    # (64 query rows have no 256-thread tiling: the value matmul would read 8 rows a warp
+    # of the exp's registers, TCPolicy._register_operand_layout_conflict)
+    assert (len(raw), len(kept)) == (16, 4)
     for cand in raw:
         try:
             build_candidate_code(cand)  # anything but a refusal propagates
@@ -96,7 +99,7 @@ def test_the_filter_is_the_build(traced):
         assert built == any(cand is k for k in kept)
     assert dict(accept.reasons) == {
         "div_4 is computed per iteration of GraphNode_reduce_max_2_5 but also read by sub_6 "
-        "outside it": 24
+        "outside it": 12
     }
     again = search_tiling(traced, topk=1000, accept=stream.streaming_accept(traced))
     assert [plans.describe_tile(t) for t in again] == [plans.describe_tile(t) for t in kept]
@@ -106,8 +109,8 @@ def test_a_served_obstacle_keeps_every_tiling_that_builds(flash):
     accept = stream.streaming_accept(flash)
     raw = search_tiling(flash, topk=1000)
     kept = [cand for cand in raw if accept(cand)]
-    assert len(raw) == len(kept) == 32 and not accept.reasons
-    assert _kinds(kept) == {"looped": 24, "one tile": 8}
+    assert len(raw) == len(kept) == 16 and not accept.reasons
+    assert _kinds(kept) == {"looped": 12, "one tile": 4}
 
 
 def test_topk_is_cut_after_the_filter(traced):
@@ -124,15 +127,15 @@ def test_a_user_accept_hint_still_applies(traced):
 
     def user(cand):
         asked.append(cand)
-        return cand.n_threads == 256
+        return cand.output_tile[-1] == 64
 
     refused = Counter()
     tiles = plans._search(traced, 1000, False, {"accept": user}, refused)
-    assert len(tiles) == 4 and {t.n_threads for t in tiles} == {256}
-    assert _kinds(tiles) == {"one tile": 4}
-    assert len(asked) == 32
-    # only what the user let through was tiled: 16 candidates, 12 of them refused
-    assert sum(refused.values()) == 12
+    assert len(tiles) == 2 and {t.output_tile[-1] for t in tiles} == {64}
+    assert _kinds(tiles) == {"one tile": 2}
+    assert len(asked) == 16
+    # only what the user let through was tiled: 8 candidates, 6 of them refused
+    assert sum(refused.values()) == 6
 
 
 def test_schedule_keeps_the_served_tilings(flash, monkeypatch):
@@ -210,8 +213,9 @@ def test_the_row_limit_where_every_tiling_the_filter_dropped_steps_the_max(monke
 
 
 @pytest.mark.parametrize("fn, shapes, refused, reason", [
-    # served: the max is carried, it needs no row in one block; every tiling has a unit dim
-    (X.flash_attention, dict(H=2, SQ=1, SKV=256, D=64), (), UNIT_DIM),
+    # served: the max is carried, it needs no row in one block; every tiling would have a
+    # unit dim, and before that a value matmul reading one row of the exp's registers
+    (X.flash_attention, dict(H=2, SQ=1, SKV=256, D=64), (), REGISTER_OPERAND_CONFLICT),
     # not served (T4), and the row of 64 fits; the one tiling that holds it has one row
     (X.softmax_rows, dict(R=1, C=64), ("is also read by",), UNIT_DIM),
 ], ids=["carried_max_one_query", "returned_softmax_one_row"])
