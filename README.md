@@ -141,7 +141,11 @@ served wrongly):
 - a reduction over a dim of one element (`sum(x, -1)` of a `64 x 1` tensor): the search
   builds no reduction over a single element, so `superoptimize` finds no graph and raises
   `SuperoptError` with that reason (as it does for any search that finds none, such as a
-  `max_ops` below the program's own op count).
+  `max_ops` below the program's own op count);
+- one value returned twice, or returned and also read by another op (`x @ w` next to
+  `exp(x @ w)`): the search counts as outputs only the tensors nothing reads and adds no op
+  twice to the same operands, so it finds such a program only where it computes the value a
+  second time in another form, and otherwise raises `SuperoptError` saying so.
 
 A program with an input that no op reads is a `SpecError` in `superoptimize` (an `Equals`
 input aside: the search reads it through its definition): the search counts a tensor that

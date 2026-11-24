@@ -119,6 +119,22 @@ REFUSED = {
                             f"{NO_GRAPH}13; its sum over dim C {UNIT_DIM}"),
     "max_over_a_unit_dim": (X, "cl.max(x, -1, keepdim=True)", UNIT, "", "SuperoptError",
                             f"{NO_GRAPH}13; its max over dim C {UNIT_DIM}"),
+    # The search counts as outputs the tensors nothing reads and adds no op twice to the same
+    # operands, so one value returned twice, or returned and read by another op, has a graph
+    # only where the search computes it a second time in another form; these have none. (An
+    # empty GraphSet came back before; the program of main's test_per_output returned x @ w
+    # twice.)
+    "returned_twice": (
+        X, "(cl.exp(x), cl.exp(x))", WIDE, "", "SuperoptError",
+        f"{NO_GRAPH}13; outputs 'out0' and 'out1' are one value, and the search adds no op "
+        "twice to the same operands, so it finds them only where it computes that value a "
+        "second time in another form"),
+    "returned_and_read": (
+        XY, "(x @ y.mT, cl.exp(x @ y.mT))", WIDE, "", "SuperoptError",
+        f"{NO_GRAPH}13; the value of output 'out0' is also read by another op, and the search "
+        "counts as outputs only the tensors nothing reads and adds no op twice to the same "
+        "operands, so it finds that output only where it computes it a second time in "
+        "another form"),
     "softmax_within_five_ops": (
         X, "cl.softmax(x, -1)", WIDE, "max_ops=5", "SuperoptError",
         f"{NO_GRAPH}5; max_ops=5 is less than the program's own 6 ops (inputs and compute "

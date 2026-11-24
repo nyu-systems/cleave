@@ -144,6 +144,51 @@ def _returned_inputs(program) -> list[tuple[str, str]]:
             if o.tensor.id in names]
 
 
+def _returned_values_causes(program) -> list[str]:
+    """Outputs the search cannot reach as the program writes them.
+
+    The search counts as outputs the tensors nothing reads, and adds no op twice to the same
+    operands (an op is only added after every op with a smaller operand list). So a graph
+    has an output that another op also reads, or two outputs of one value, only where it
+    computes that value a second time in another form: ``x @ w`` returned next to
+    ``exp(x @ w)``, or returned twice, has no graph.
+    """
+    records = [r for r in getattr(program, "_records", ()) if r.kind != "output"]
+    by_out = {r.out: r for r in records}
+    keys = {}
+
+    def key(vid):
+        # one value per structure: two records of one op on equal operands are one value
+        if vid not in keys:
+            r = by_out.get(vid)
+            if r is None or r.kind == "input":
+                keys[vid] = ("input", vid)
+            else:
+                keys[vid] = (r.kind, tuple(key(a) if isinstance(a, int) else ("scalar", a)
+                                           for a in r.args), repr(r.attrs))
+        return keys[vid]
+
+    outputs = list(getattr(program, "outputs", ()))
+    read = {key(a) for r in records if r.kind != "input" for a in r.args if isinstance(a, int)}
+    causes, seen = [], {}
+    for o in outputs:
+        if by_out.get(o.tensor.id) is None or by_out[o.tensor.id].kind == "input":
+            continue
+        k = key(o.tensor.id)
+        if k in seen:
+            causes.append(f"outputs {seen[k]!r} and {o.name!r} are one value, and the search "
+                          "adds no op twice to the same operands, so it finds them only where "
+                          "it computes that value a second time in another form")
+        else:
+            seen[k] = o.name
+        if k in read:
+            causes.append(f"the value of output {o.name!r} is also read by another op, and the "
+                          "search counts as outputs only the tensors nothing reads and adds no "
+                          "op twice to the same operands, so it finds that output only where "
+                          "it computes it a second time in another form")
+    return causes
+
+
 def _no_graph(program, max_ops: int) -> str:
     """Why the search returned no graph, as far as the program shows it."""
     from ..frontend.tensor import Dim, extent
@@ -158,6 +203,7 @@ def _no_graph(program, max_ops: int) -> str:
                 causes.append(f"its {r.kind.removeprefix('reduce_')} over {label} reduces one "
                               "element, and the search builds no reduction over a dim of one "
                               "element")
+    causes += _returned_values_causes(program)
     own = getattr(program, "op_count", 0)
     if max_ops < own:
         causes.append(f"max_ops={max_ops} is less than the program's own {own} ops (inputs "
