@@ -251,3 +251,21 @@ def test_a_operand_staged_through_shared_is_not_refused():
     assert threads(None) == set()
     assert threads(decode) == {128, 256}
     assert threads(ragged) == set()  # ragged prefill reads P from registers
+
+
+def test_a_gemm_whose_output_keeps_one_dim_is_not_an_internal_error():
+    """``exp(x @ w) @ v`` with ``v`` one column wide: the value gemm reads the scores'
+    accumulator from registers, and its iteration tile is one-dimensional (``[M, 1]``
+    squeezes to ``[M]``). The rule has no rows to judge there; it used to index them and
+    end the whole tiling search with ``IndexError: list index out of range``."""
+    import cleave.lang as cl
+    from cleave.frontend import trace
+    from cleave.pipeline import GraphSet, ScheduleConfig, schedule
+
+    def exp_matmul(x: cl.Tensor["M", "K"], w: cl.Tensor["K", "N"], v: cl.Tensor["N", "D"]):
+        return cl.exp(x @ w) @ v
+
+    graphs = GraphSet.identity(trace(exp_matmul, dict(M=4096, K=64, N=4096, D=1), cl.f16))
+    plans = schedule(graphs, ScheduleConfig(topk=8))
+    assert not [str(r.error) for r in plans.refused if "IndexError" in str(r.error)]
+    assert len(plans) > 0

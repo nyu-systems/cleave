@@ -1842,6 +1842,12 @@ class TCPolicy(DefaultPolicy):
             # in: for an inter output (``dQ = dS @ k`` summed across CTAs) that is a step of
             # the looped axis, not the block that spans it.
             tile = candidate.get_itile(node)
+            if len(tile) < 2:
+                # A matmul whose output keeps one dim (``[1, N]``: a keepdim row of a
+                # vector-matrix product) has no rows in its tile to share among warps; its
+                # tilings are refused when they are built (a unit dim that is not a batch
+                # dim has no tile), with that reason.
+                continue
             rows_per_warp = int(tile[-2]) / warps
             if rows_per_warp < 16 or (warps > 4 and rows_per_warp != 16):
                 if self._staged_as_misplaced(node, tile, n_threads):
@@ -1922,7 +1928,7 @@ class TCPolicy(DefaultPolicy):
             try:
                 (rows,) = [int(step) for step in candidate.get_rstep(node).values()]
                 cols = int(candidate.get_itile(gemm)[-1])
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, IndexError):
                 continue
             row_warps = wgmma_row_warps(gemm.warp_policy, rows, cols, n_threads) or (warps,)
             if min(rows // w for w in row_warps) > 16:
