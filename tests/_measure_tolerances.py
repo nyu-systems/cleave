@@ -107,8 +107,8 @@ def valid_limit(dtype: str) -> float:
 
 # demo -> the runs that cover its plans (fast settings; lora and qknorm keep the fast
 # preset's topk because few of their tilings survive, mla_decode needs its whole tiling
-# pool: its first valid tiling ranks far below the top 32, and mha_backward's top 8 tilings
-# all fail to compile).
+# pool: its first valid tiling ranks far below the top 32; mha_backward runs the fast preset
+# as it is).
 # The attention demos declare their tolerance by boundary role, because ``cl.softmax`` is
 # exact and a split partial of it returns its max (role "shift"). The decode demos split by
 # default; the MHA / GQA / MQA prefill demos get a second run with the split their
