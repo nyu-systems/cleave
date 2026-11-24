@@ -55,8 +55,9 @@ ROW_REDUCTION_CONFLICT = (
 # (``_gemm_tile_conflict``).
 GEMM_TILE_CONFLICT = (
     "a matmul's tile would give a warp fewer than 16 rows or 8 columns, or have more than 64 "
-    "rows that 64 does not divide, or, on two warp groups, fewer than 128 rows by a number "
-    "of columns 32 does not divide, which TileLang cannot partition or lay out"
+    "rows that 64 does not divide, or, on two warp groups, a number of rows 128 does not "
+    "divide by a number of columns 32 does not divide, which TileLang cannot partition or "
+    "lay out"
 )
 # Ops an inter output may apply between its reduction and the output: linear in the
 # reduction's result (one input; a scalar operand is folded into the op), so the sum of
