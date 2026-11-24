@@ -64,17 +64,13 @@ n_idx = T.symbolic("n_idx")
 @T.macro
 def ukernel_mma_ssr_transB_clear(A, B, C):
 
-    A_ptr = A
-
-    B_ptr = B
-
     C_ptr = C
 
     T.clear(C_ptr)
 
     T.gemm(
-        A_ptr,
-        B_ptr,
+        A,
+        B,
         C_ptr,
         transpose_A=False,
         transpose_B=True,
@@ -145,15 +141,11 @@ def ukernel_rescale_1dims_rr(S, ACC):
 @T.macro
 def ukernel_mma_ssr(A, B, C):
 
-    A_ptr = A
-
-    B_ptr = B
-
     C_ptr = C
 
     T.gemm(
-        A_ptr,
-        B_ptr,
+        A,
+        B,
         C_ptr,
         transpose_A=False,
         transpose_B=False,

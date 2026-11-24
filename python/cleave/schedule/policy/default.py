@@ -51,12 +51,6 @@ ROW_REDUCTION_CONFLICT = (
     "a reduction over the rows of a matmul's accumulator would hold more than 16 of those "
     "rows a warp, which TileLang's reduction cannot lower"
 )
-# ... and for one that accumulates two staged transposed gemms of 64 rows on two warp
-# groups (``_staged_accumulators_conflict``).
-STAGED_ACCUMULATORS_CONFLICT = (
-    "two gemms that read a transposed computed operand would accumulate 64 rows each over a "
-    "loop on 256 threads, which TileLang computes wrong"
-)
 # Ops an inter output may apply between its reduction and the output: linear in the
 # reduction's result (one input; a scalar operand is folded into the op), so the sum of
 # the per-CTA partials is the output.
@@ -1935,48 +1929,8 @@ class TCPolicy(DefaultPolicy):
                 return True
         return False
 
-    def _staged_accumulators_conflict(self, candidate, n_threads):
-        """Would two warp groups accumulate two staged transposed gemms of 64 rows?
-
-        TileLang 0.1.13 limitation on sm_90 (the vendored TileLang cannot be patched): a loop
-        that accumulates in registers two gemms each reading a transposed computed first
-        operand (staged through shared memory: ``dV += P^T dO`` and ``dK += dS^T q`` of the
-        attention backward) over a block of 64 rows comes out wrong on 256 threads; it
-        lowers, runs, and almost every element of the first accumulator is off. Measured on
-        an H100 (all the plans of tests/lower/_attention_bwd.py at S_Q = S_KV = 4096,
-        against autograd): 10 of the 14 such tilings of ``dkdv``, ``dkdv_o`` and ``fused_o``
-        validated wrong, at every step of the loop, and 4 right; with one such gemm (``dk``,
-        ``dv``), 128 threads, 128 rows, or an accumulator summed across thread blocks
-        (``inter``, its rows following the loop) every tiling validated. All 14 are refused.
-        """
-        if getattr(self.arch, "sm_version", None) != 90 or n_threads // 32 <= 4:
-            return False
-        accumulation = getattr(candidate, "accumulation", None) or {}
-        inter = {
-            self._reduction_chain(out)[-1]
-            for out, context in accumulation.items()
-            if context == INTER
-        }
-        staged = 0
-        for node in self.ordered_nodes:
-            if (
-                not isinstance(node, Matmul)
-                or not node.transpose_A
-                or not isinstance(node.inputs[0].src_node, ComputeOpNode)
-                or node in inter
-            ):
-                continue
-            try:
-                (step,) = [int(s) for s in candidate.get_rstep(node).values()]
-                rows = int(candidate.get_itile(node)[-2])
-            except (TypeError, ValueError):
-                continue
-            if step < int(node.raxis[0].dom.extent) and rows <= 64:
-                staged += 1
-        return staged >= 2
-
     def get_num_threads(self, candidates):
-        expanded_candidates, conflicts, row_conflicts, staged_conflicts = [], 0, 0, 0
+        expanded_candidates, conflicts, row_conflicts = [], 0, 0
         for candidate in candidates:
             n_threads_options = list(self.PRIMARY_N_THREADS)
             if self._requires_low_thread_counts(candidate):
@@ -1988,24 +1942,17 @@ class TCPolicy(DefaultPolicy):
                 if self._row_reduction_layout_conflict(candidate, n_threads):
                     row_conflicts += 1
                     continue
-                if self._staged_accumulators_conflict(candidate, n_threads):
-                    staged_conflicts += 1
-                    continue
                 expanded = copy.copy(candidate)
                 expanded.n_threads = n_threads
                 expanded_candidates.append(expanded)
         if self.flat_graph is not None:
             # Where this leaves the graph no tiling at all, that is why, and nothing else
             # says so: the schedule's report reads it off the graph (``REGISTER_OPERAND_
-            # CONFLICT``, ``ROW_REDUCTION_CONFLICT``, ``STAGED_ACCUMULATORS_CONFLICT``;
-            # ``pipeline.plans._no_tiling``).
+            # CONFLICT``, ``ROW_REDUCTION_CONFLICT``; ``pipeline.plans._no_tiling``).
             self.flat_graph.register_operand_conflicts = (
                 0 if expanded_candidates else conflicts
             )
             self.flat_graph.row_reduction_conflicts = (
                 0 if expanded_candidates else row_conflicts
-            )
-            self.flat_graph.staged_accumulators_conflicts = (
-                0 if expanded_candidates else staged_conflicts
             )
         return expanded_candidates

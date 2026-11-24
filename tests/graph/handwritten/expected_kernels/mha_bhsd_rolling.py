@@ -60,17 +60,13 @@ PASS_CONFIGS = {
 @T.macro
 def ukernel_mma_ssr_transB_clear(A, B, C):
 
-    A_ptr = A
-
-    B_ptr = B
-
     C_ptr = C
 
     T.clear(C_ptr)
 
     T.gemm(
-        A_ptr,
-        B_ptr,
+        A,
+        B,
         C_ptr,
         transpose_A=False,
         transpose_B=True,
@@ -128,15 +124,11 @@ def ukernel_exp_1dims_rr(A, B):
 @T.macro
 def ukernel_mma_rsr(A, B, C):
 
-    A_ptr = A
-
-    B_ptr = B
-
     C_ptr = C
 
     T.gemm(
-        A_ptr,
-        B_ptr,
+        A,
+        B,
         C_ptr,
         transpose_A=False,
         transpose_B=False,

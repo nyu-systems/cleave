@@ -105,7 +105,7 @@ def test_cache_schema_retires_kernels_built_before_a_scheduler_fix(monkeypatch):
 
     prog = trace(P.matmul, dict(M=128, N=128, K=4096), cl.f16)
     cfgs = resolve_configs(prog)
-    assert cache.SCHEMA >= 42
+    assert cache.SCHEMA >= 43
     key = _kernel_key(prog, *cfgs)
     monkeypatch.setattr(cache, "SCHEMA", 1)
     assert _kernel_key(prog, *cfgs) != key

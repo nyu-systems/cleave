@@ -82,8 +82,6 @@ def ukernel_mma_ggr_clear(A, B, C):
 @T.macro
 def ukernel_mma_rgr_clear(A, B, C):
 
-    A_ptr = A
-
     B_ptr = T.alloc_shared(B.shape, "float16")
     T.copy(B, B_ptr)
 
@@ -92,7 +90,7 @@ def ukernel_mma_rgr_clear(A, B, C):
     T.clear(C_ptr)
 
     T.gemm(
-        A_ptr,
+        A,
         B_ptr,
         C_ptr,
         transpose_A=False,

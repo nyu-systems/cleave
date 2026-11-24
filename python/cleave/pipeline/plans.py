@@ -417,19 +417,16 @@ def _no_tiling(g, ir, reasons: Counter, whole: Counter) -> str:
     made no tiling at all, that is not the max's doing, and the text says so. Otherwise the
     graph has no tiling for the reasons the filter counted (``reasons``), whatever its
     maxes, and for those of the policy: tilings it gave no thread count
-    (``REGISTER_OPERAND_CONFLICT``, ``ROW_REDUCTION_CONFLICT``,
-    ``STAGED_ACCUMULATORS_CONFLICT``), whose row it did not get to judge.
+    (``REGISTER_OPERAND_CONFLICT``, ``ROW_REDUCTION_CONFLICT``), whose row it did not get
+    to judge.
     """
-    from ..schedule.policy.default import (
-        REGISTER_OPERAND_CONFLICT, ROW_REDUCTION_CONFLICT, STAGED_ACCUMULATORS_CONFLICT,
-    )
+    from ..schedule.policy.default import REGISTER_OPERAND_CONFLICT, ROW_REDUCTION_CONFLICT
 
     unstreamed = "; ".join(getattr(ir, "streaming_refusals", None) or ())
     # Tilings the policy made and then gave no thread count: it says how many on the graph.
     by_reason = Counter({
         REGISTER_OPERAND_CONFLICT: getattr(ir, "register_operand_conflicts", 0),
         ROW_REDUCTION_CONFLICT: getattr(ir, "row_reduction_conflicts", 0),
-        STAGED_ACCUMULATORS_CONFLICT: getattr(ir, "staged_accumulators_conflicts", 0),
     })
     conflicts = sum(by_reason.values())
     if conflicts:

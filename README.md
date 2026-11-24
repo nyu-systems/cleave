@@ -134,9 +134,6 @@ served wrongly):
   unless the operand is staged through shared memory: 64 query rows have no 256-thread tiling
   (M is the rows of one iteration: for the backward's `dQ` summed across thread blocks, one
   step of the `S_Q` loop);
-- on 256 threads, a loop over a block of 64 rows that accumulates two matmuls reading a
-  transposed computed operand (the attention backward's `dV += P^T dO` and `dK += dS^T q`),
-  which TileLang computes wrong: such a block gets 128 threads;
 - a sum or max over the rows of a matmul's accumulator (a softmax over the queries,
   `dim=-2`) that would give a warp more than 16 of those rows, which TileLang's reduction
   cannot lower: attention normalized over 64 queries has plans, over 256 none;

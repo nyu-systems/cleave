@@ -176,24 +176,30 @@ class Matmul(ComputeOpNode):
             "cols": "T.GemmWarpPolicy.FullCol",
         }[self.warp_policy]
 
+        # A shared or register operand goes to the gemm as it is, never rebound to a name
+        # of the macro's own: a rebinding renames the caller's buffer, and TileLang keys the
+        # shared-memory alignment its op lowering records by buffer name. A staged 128B-swizzle
+        # operand renamed ``A_ptr`` took the 512 bytes a TMA-loaded ``A_ptr`` of another gemm
+        # recorded, instead of the 1024 a wgmma descriptor needs, and was read with the wrong
+        # swizzle (tests/codegen/test_operand_names.py).
+        a_operand = "A_ptr" if a_scope == "g" else "A"
+        b_operand = "B_ptr" if b_scope == "g" else "B"
         macro_str = f"""\
         @T.macro
         def {self.get_macro_name(**kwargs)}(A, B, C):
             {f"A_ptr = T.alloc_shared(A.shape, '{self.dtype}')" if a_scope == "g" else ""}
             {"T.copy(A, A_ptr)" if a_scope == "g" else ""}
-            {"A_ptr = A" if a_scope in ("s", "r") else ""}
 
             {f"B_ptr = T.alloc_shared(B.shape, '{self.dtype}')" if b_scope == "g" else ""}
             {"T.copy(B, B_ptr)" if b_scope == "g" else ""}
-            {"B_ptr = B" if b_scope in ("s", "r") else ""}
 
             C_ptr = C
 
             {"T.clear(C_ptr)" if kwargs["clear"] else ""}
 
             T.gemm(
-                A_ptr,
-                B_ptr,
+                {a_operand},
+                {b_operand},
                 C_ptr,
                 transpose_A={self.transpose_A},
                 transpose_B={self.transpose_B},
