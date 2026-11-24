@@ -353,6 +353,7 @@ def describe_tile(t) -> str:
 # longer, and the filter's reasons are the reason).
 MAX_ROW_LIMIT = "a max needs its whole row in one block, and this row is longer"
 NO_TILING = "no tiling candidates"
+EVERY_MAX_CARRIED = "every max is carried across its loop"
 
 
 def _search(ir_graph, topk: int, force: bool, hints: dict | None,
@@ -393,17 +394,31 @@ def _search(ir_graph, topk: int, force: bool, hints: dict | None,
             whole.update(stable.whole)
 
 
+def _row_maxes(ir) -> tuple:
+    """``(maxes, held)``: the names of the row maxes of ``ir``, and of those held whole --
+    carried by no loop, because they have no honoured, served record
+    (``tiling.carried_reductions``)."""
+    from ..ir.ops import ReduceMax
+    from ..schedule.tiling import carried_reductions
+
+    maxes = [n.name for n in ir.nodes if isinstance(n, ReduceMax)]
+    carried = {n.name for n in carried_reductions(ir)} if maxes else set()
+    return maxes, [name for name in maxes if name not in carried]
+
+
 def _no_tiling(g, ir, reasons: Counter, whole: Counter) -> str:
     """Why lowered graph ``ir`` of searched graph ``g`` has no tiling.
 
-    The row limit only where no tiling the policy made held the row of every max without a
-    record in one step (``whole`` is empty): the policy made none, or the softmax filter
-    refused only tilings that step such a max. Then, for a max whose streaming obstacle is
-    not served, why it is not carried across a loop instead. Otherwise the graph has no
-    tiling for the reasons the filter counted (``reasons``), whatever its maxes, and for
-    those of the policy: tilings it gave no thread count (``REGISTER_OPERAND_CONFLICT``,
-    ``ROW_REDUCTION_CONFLICT``, ``STAGED_ACCUMULATORS_CONFLICT``), whose row it did not get
-    to judge.
+    The row limit only where a max of ``ir`` is held whole (no loop carries it) and no
+    tiling the policy made held the row of every such max in one step (``whole`` is empty):
+    the policy made none, or the softmax filter refused only tilings that step such a max.
+    Then, for a max whose streaming obstacle is not served, why it is not carried across a
+    loop instead. A graph whose every max is carried has no row limit: where the policy
+    made no tiling at all, that is not the max's doing, and the text says so. Otherwise the
+    graph has no tiling for the reasons the filter counted (``reasons``), whatever its
+    maxes, and for those of the policy: tilings it gave no thread count
+    (``REGISTER_OPERAND_CONFLICT``, ``ROW_REDUCTION_CONFLICT``,
+    ``STAGED_ACCUMULATORS_CONFLICT``), whose row it did not get to judge.
     """
     from ..schedule.policy.default import (
         REGISTER_OPERAND_CONFLICT, ROW_REDUCTION_CONFLICT, STAGED_ACCUMULATORS_CONFLICT,
@@ -419,7 +434,8 @@ def _no_tiling(g, ir, reasons: Counter, whole: Counter) -> str:
     conflicts = sum(by_reason.values())
     if conflicts:
         reasons = reasons + by_reason
-    if "max" in g.ops and not whole and not conflicts:
+    maxes, held = _row_maxes(ir) if "max" in g.ops else ([], [])
+    if held and not whole and not conflicts:
         why = MAX_ROW_LIMIT
         if unstreamed:
             why += f"; it is not carried across a loop: {unstreamed}"
@@ -427,6 +443,8 @@ def _no_tiling(g, ir, reasons: Counter, whole: Counter) -> str:
         why = NO_TILING
         if unstreamed:
             why += f"; a max is not carried across a loop: {unstreamed}"
+        elif maxes and not held and not reasons:  # nothing else says why: not the max
+            why += f"; {EVERY_MAX_CARRIED}"
     if reasons:  # every tiling was refused by the softmax filter: say why
         why += f" ({sum(reasons.values())} refused: " + "; ".join(
             f"{n}x {reason}" for reason, n in reasons.most_common()) + ")"

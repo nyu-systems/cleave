@@ -151,6 +151,33 @@ def test_refusal_reason_reaches_the_plan_summary():
         assert refusal.reason in plans.summary()
 
 
+def test_a_carried_max_is_not_blamed_when_the_policy_makes_no_tiling():
+    """MHA at D = 2048 over 4096 keys: the flash form's max has its record and nothing is
+    pinned, yet no tiling fits (the 2048-wide head dim under a key loop). That is
+    NO_TILING, not the row limit; the traced form, whose max is held whole, keeps the row
+    limit with its reason."""
+    from cleave.pipeline.plans import EVERY_MAX_CARRIED, NO_TILING
+    from cleave.schedule.tiling import carried_reductions
+
+    wide = dict(H=1, SQ=64, SKV=4096, D=2048)
+    (graph,) = list(GraphSet.identity(trace(flash, wide, cl.f16)))
+    (ir,) = lower(graph)
+    assert ir.streaming_refusals == []
+    assert [n.name for n in carried_reductions(ir)] == [
+        n.name for n in ir.nodes if getattr(n, "streaming", None) is not None]
+    plans = P.schedule(GraphSet.identity(trace(flash, wide, cl.f16)), P.ScheduleConfig(topk=1000))
+    assert not plans and plans.refused
+    for refusal in plans.refused:
+        text = str(refusal.error)
+        assert MAX_ROW_LIMIT not in text
+        assert text == f"{NO_TILING}; {EVERY_MAX_CARRIED}", text
+
+    plans = P.schedule(GraphSet.identity(trace(traced, wide, cl.f16)), P.ScheduleConfig(topk=1000))
+    assert not plans and plans.refused
+    for refusal in plans.refused:
+        assert str(refusal.error).startswith(f"{MAX_ROW_LIMIT}; it is not carried across a loop: ")
+
+
 def test_search_graphs_keep_the_max():
     """The max is an opaque reduction of the searched graph: every graph the search returns
     for ``cl.softmax`` has it, and its exp is an exact softmax by structure."""
