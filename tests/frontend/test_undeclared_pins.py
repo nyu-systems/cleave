@@ -2,8 +2,9 @@
 
 Fingerprints, op counts and the ``random_inputs`` stream (sha256 of the raw bytes) of a few
 existing programs, recorded at 9af4dd3 (before ``Program.input(equals=/sample=)``). The
-softmax programs are re-pinned where ``cl.softmax`` records its exact softmax differently
-(their input streams are as recorded).
+attention and qknorm programs of ``_programs.py`` are re-pinned where their softmax moved from
+the fixed shift to ``cl.softmax``'s recorded max (their input streams are as recorded; the
+exact softmax was the max already, and is as recorded).
 """
 
 import hashlib
@@ -35,10 +36,10 @@ PROGRAMS = {
 
 PINS = {  # name: (op_count, fingerprint, sha256[:16] of random_inputs(seed=3, device="cpu"))
     "matmul": (3, "8c9286f7441314f43b3009f91e43859a133b2bc7025b2481c17fce59f74aa25e", "517a979467082951"),
-    "attention": (9, "4f3776ad9bf86d366b1dbd6aa9f02c1f1d2c1f91dc803192c7d30871d8aa2c15", "05d633b95cb6af29"),
-    "qknorm": (23, "5a7005934c038a5c89b0eb8d1c25e6e21471197bb5df37988fc6b565b576f903", "6524ebb6c2bf49a8"),
+    "attention": (11, "ce163953213b1beb4836766f52533fedec41f4abaab50f06d2a420ee12dfc6ca", "05d633b95cb6af29"),
+    "qknorm": (25, "eca73aea797eeba5889bcdd5ed98f2b9d20ec39f83c95966f53ced79238201cc", "6524ebb6c2bf49a8"),
     "lora_builder": (8, "0ab6318f8c248fab357cf7ba6fd18bb05146e08ea3ceb73b69bfac526b19ad1b", "339bc1ab9d060d50"),
-    "exact_softmax_f32w": (6, "0a2a9f13089bd077ce776c6cbeb329f3eccf307cc354bec781da59227e3a3e92",
+    "exact_softmax_f32w": (8, "34a9d405fe3dc5b0db5946d661eb7d2565a865d644271f31ad00947be36a7d22",
                            "49a3cb5a7d1d627b"),
 }
 

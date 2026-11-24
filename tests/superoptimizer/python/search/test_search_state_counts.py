@@ -5,10 +5,14 @@ must leave the searches of the programs that do not use it alone. The number of 
 explores (``[Search] Total states explored: N`` on stderr) is the finest cheap witness of that:
 it moves with any change of the candidate ops, of their order, of the pattern pruning, of the
 reducibility flags or of the verifier. The counts below are the demos' searches at their own
-configs (the costliest demo searches, 170k-390k states each, are left out: ``mha_decode`` with
-its split covers that path), pinned at 9af4dd3 and re-pinned where the demo programs moved
-(the attention demos' exact softmax). They do not depend on the process nor on the thread
-count (checked with 1 and 8 threads, in fresh processes, before pinning).
+configs (the costliest demo searches, 170k-390k states each, are left out: a split search is
+covered by ``matmul_matmul`` with its split), pinned at 9af4dd3 and re-pinned where the demo
+programs moved: ``cl.softmax`` records its max (``exp(x - max(x)) / sum``), so the attention
+demos are other programs, and a split over the dim their max reduces is searched unsplit
+(``pipeline.superopt.max_split_dims``; ``mha_decode`` with its split explores the states of
+the unsplit search, at the unsplit budget, and its config names the split program's budget).
+They do not depend on the process nor on the
+thread count (checked with 1 and 8 threads, in fresh processes, before pinning).
 
 Each case runs in a fresh interpreter on the CPU, without a cache, with 4 search threads.
 """
@@ -63,14 +67,14 @@ CASES = {
     "matmul_rowsum": ("matmul_rowsum", [], 13, 2717, 4),
     "matmul_matmul": ("matmul_matmul", [], 13, 614, 4),
     "matmul_matmul-split": ("matmul_matmul", ["--preset", "split"], 8, 12426, 12),
-    "mha_decode": ("mha_decode", [], 13, 184088, 24),
-    "mha_decode-nosplit": ("mha_decode", ["--split", "none"], 13, 2077, 2),
-    "gqa_decode-nosplit": ("gqa_decode", ["--split", "none"], 13, 1770, 2),
-    "mha_prefill": ("mha_prefill", [], 11, 692, 2),
-    "gqa_prefill": ("gqa_prefill", [], 13, 1770, 2),
-    "mla_prefill": ("mla_prefill", [], 11, 692, 2),
-    "mla_decode": ("mla_decode", [], 13, 2558, 2),
-    "qknorm": ("qknorm", [], 25, 5390, 2),
+    "mha_decode": ("mha_decode", [], 15, 483, 2),
+    "mha_decode-nosplit": ("mha_decode", ["--split", "none"], 13, 483, 2),
+    "gqa_decode-nosplit": ("gqa_decode", ["--split", "none"], 13, 450, 2),
+    "mha_prefill": ("mha_prefill", [], 11, 164, 2),
+    "gqa_prefill": ("gqa_prefill", [], 13, 450, 2),
+    "mla_prefill": ("mla_prefill", [], 11, 164, 2),
+    "mla_decode": ("mla_decode", [], 14, 2552, 2),
+    "qknorm": ("qknorm", [], 27, 5224, 2),
 }
 
 

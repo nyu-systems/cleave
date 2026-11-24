@@ -49,7 +49,8 @@ def test_the_eager_softmax_is_the_max_written_out():
 
 def test_the_kernel_key_is_made_of_the_program_and_its_configs():
     """``pipeline.compile._kernel_key``: the validation schema, the program's fingerprint,
-    its input and output names, the budget and the configs -- nothing else."""
+    its input and output names, the budget and the configs -- nothing else (``per_output``
+    only where it is on, and it is not for this program)."""
     import dataclasses
 
     from cleave.pipeline import cache
@@ -64,7 +65,7 @@ def test_the_kernel_key_is_made_of_the_program_and_its_configs():
     names = [[s.name for s in program.inputs], [o.name for o in program.outputs]]
     assert _kernel_key(program, so, sc, ev) == cache.digest(
         "kernel", cache.VALIDATION, program.fingerprint(), names, so.resolve_max_ops(program),
-        fields(so, "threads", "cache", "max_ops"), fields(sc),
+        fields(so, "threads", "cache", "max_ops", "per_output"), fields(sc),
         fields(ev, "max_parallel", "timeout_s"))
 
 
