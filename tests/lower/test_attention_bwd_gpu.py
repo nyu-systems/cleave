@@ -2,8 +2,9 @@
 
 Inputs are realistic: L = logsumexp(q k^T c) in fp32, o = softmax(q k^T c) v, D = rowsum(dO * o).
 The reference is autograd in fp32 from the fp16 inputs, rounded to fp16; every kernel measured
-<= 9.71e-4 row-normalized (one fp16 ulp of the row max). The bound is the operator's declared
-one (``attention_bwd`` in tests/_tolerances.py), from the measurement as for any operator.
+<= 9.71e-4 row-normalized (one fp16 ulp of the row max), hence the bound 1.5e-3. It is the
+operator's declared one (``attention_bwd`` in tests/_tolerances.py), held there below the 5e-3
+the measurement rule gives (``HELD`` in tests/test_tolerance_declarations.py).
 """
 
 import pytest

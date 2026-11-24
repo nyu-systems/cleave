@@ -43,6 +43,11 @@ HELD = {
     # kernels). With the max in the flat graph three seeds measure 9.7e-4 over 33 kernels,
     # just under one float16 ulp of the row max (9.8e-4), for which the rule gives 5e-3.
     "softmax_plus_exp": "the rule would loosen 2e-3 to 5e-3 on the three-seed measurement",
+    # 1.5e-3 is the bound the attention backward came with (main's
+    # tests/lower/test_attention_bwd_gpu.py), above every kernel it measured (9.71e-4, one
+    # float16 ulp of the row max). Three seeds measure 9.71e-4 / 9.66e-4 / 9.51e-4 for the
+    # first, second and third output of the kernels, for which the rule gives 5e-3.
+    "attention_bwd": "the rule would loosen 1.5e-3 to 5e-3 on the three-seed measurement",
 }
 
 
