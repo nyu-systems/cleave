@@ -1,28 +1,33 @@
-"""Streaming obstacles: a loop that sits under a value which needs the whole looped dim.
+"""Reduction conflicts: a loop that sits under a value which needs the whole looped dim.
 
-A flat graph can keep the stable softmax as it is written, ``exp(x - max(x)) / sum(...)``.
 A reduction over a dim whose operand is computed from another reduction over that same dim
-(the row max) cannot simply be looped: every iteration would need the finished max. The
-policy pins such a reduction to its full extent, and a row longer than one tile has no
-tiling.
+cannot simply be looped: every iteration would need the finished value of the other one
+(the row max of ``exp(x - max(x)) / sum(...)``, the sum of ``exp(x - sum(x))``, the sum of
+squares of an RMS norm in front of a contraction over the normed dim). The policy pins such
+a reduction to its full extent, and a row longer than one tile has no tiling. Which op the
+ancestor is plays no part in finding the pair: it is the overlap of their reduced dims.
 
-The pair is a *streaming obstacle* when all of this holds (:func:`obstacles`):
+Every such pair is a *conflict* (:func:`obstacles`, one ``Obstacle`` per ancestor). It can
+be streamed when all of this holds:
 
-  1. the ancestor reduction is a running reducer (``running_max``): its value over a prefix
-     of the dim is the value the flat graph computes for that prefix;
+  0. the ancestor's class declares how it is carried (``combine``, ``carry_init``): its
+     value over a prefix of the dim and its value over the next tile combine to its value
+     over both;
+  1. it reduces one axis;
   2. it and every descendant reduction it overlaps reduce the same tensor dim (one axis
      each, of one extent, the descendant's over at least the ancestor's provenance), so
      one loop counter steps all of them;
   3. no overlapped descendant is itself an ancestor of another one over that dim (that
      needs two passes: the traced order ``(exp / sum) @ v``);
   4. nothing computed from the ancestor on the way to the descendants is read elsewhere;
-  5. every overlapped descendant is a plain sum or matmul (by exact type) that starts at
-     zero: the repair multiplies what such an accumulator holds, and nothing else is
-     modelled by the proof (a max of the scaled value starts at ``-inf``).
+  5. every overlapped descendant accumulates by addition from zero
+     (``update_rule.accumulates``): the repair multiplies what such an accumulator holds,
+     and nothing else is modelled by the proof (a max of the scaled value is not).
 
-An overlap that fails condition k is refused with its text (``Obstacle.refused``); the tests
-call those texts T1 to T5 (T3: two passes over the row, T4: a value of the max read
-elsewhere, T5: ``pipeline.update.texts.T5``). A step map in which the carried max does not
+A conflict that fails condition k is refused with its text (``Obstacle.refused``) and keeps
+its pin; the tests call those texts T0 to T5 (T3: two passes over the row, T4: a value of
+the ancestor read elsewhere, T5: ``pipeline.update.texts.T5``). The update search may refuse
+it as well (``pipeline.update.texts``). A step map in which the carried value does not
 step with the loop that carries it is refused as well
 (``tiling._refuse_carried_out_of_step``): stepped by another step than a descendant that
 iterates (C1 in the tests), or stepped while a descendant that reads its finished value is
@@ -32,14 +37,15 @@ It is *served* where, in addition, an update rule was found and PROVEN for every
 overlapped descendant (``cleave.pipeline.update``): the full-extent node carries a
 ``Streaming`` record (``cleave.ir.update_rule``) whose key is the key of the very graph it
 sits on (:func:`streamed`). Then the policy lets the descendants step (no pin), steps the
-max with them, and ``apply_tiling`` builds the one loop it always built. :func:`assemble`,
-called at the tail of ``apply_tiling``, makes the max carried state and puts the proven
-repair in front of each accumulator through the loop-carried mechanism
-(``GraphNode.carry``, ``Graph.lag_nodes``, ``Graph.accum_scale``). Every other overlap
-keeps its pin and its refusal.
+full-extent value with them, and ``apply_tiling`` builds the one loop it always built; the
+tilings that hold the dim whole stay candidates too. :func:`assemble`, called at the tail of
+``apply_tiling``, makes the full-extent value carried state (starting at its class's
+``carry_init``) and puts the proven repair in front of each accumulator through the
+loop-carried mechanism (``GraphNode.carry``, ``Graph.lag_nodes``, ``Graph.accum_scale``).
+Every other conflict keeps its pin and its refusal.
 
-A graph without a record never gets past the first line of :func:`streamed`: every hook of
-this module is inert for it.
+A graph without a record never gets past the first line of :func:`streamed`: the policy and
+the assembly are inert for it.
 """
 
 from __future__ import annotations
@@ -51,9 +57,9 @@ from dataclasses import dataclass
 from ..core.errors import ScheduleRejected
 from ..ir.graph import AccumEdge, ComputeOpNode, Graph, Iterator
 from ..ir.graph_utils import edit_graph, graph_tiers, tmap_by_name
-from ..ir.ops import Copy, Exp, Matmul, ReduceSum, wire_input
+from ..ir.ops import Copy, Exp, Matmul, wire_input
 from ..ir.rolling import STAT_DTYPE, build_expression, check_expression
-from ..ir.update_rule import Obstacle, Streaming, loop_key
+from ..ir.update_rule import Obstacle, Streaming, accumulates, loop_key
 
 __all__ = [
     "FOREIGN_RECORD", "Obstacle", "Site", "Streaming", "StreamingRefused", "assemble",
@@ -77,28 +83,31 @@ def _axis_tokens(red_tokens, node):
 
 
 def obstacles(ordered_nodes, red_tokens, ancestors) -> list:
-    """Every ancestor/descendant reduction overlap of a flat graph whose ancestor is a
-    running reducer, classified (``Obstacle.refused`` says why one is not a streaming
-    obstacle). ``red_tokens`` is ``build_reduction_axis_provenance``, ``ancestors`` is
-    ``tiling.reduction_ancestors``; both are what the policy already has.
+    """Every reduction conflict of a flat graph, classified, whatever its ops.
+
+    A conflict is an ancestor reduction and the descendant reductions that reduce a dim it
+    reduces: the overlap the policy pins by (``DefaultPolicy._build_reduction_axis_overlap_
+    pairs``, any axis of the ancestor against any axis of the descendant). Each one is an
+    ``Obstacle``; ``Obstacle.refused`` says why it cannot be streamed (it then keeps its
+    pin, as every conflict did before). ``red_tokens`` is ``build_reduction_axis_provenance``,
+    ``ancestors`` is ``tiling.reduction_ancestors``; both are what the policy already has.
     """
     reductions = [n for n in ordered_nodes if n in red_tokens and len(n.raxis) > 0]
     found = []
     for full in reductions:
-        if not getattr(full, "running_max", False):
-            continue
-        tokens = _axis_tokens(red_tokens, full)
-        if not tokens:
+        axes = [t for t in red_tokens[full] if t]
+        if not axes:
             continue
         loops = [
             d for d in reductions
             if d is not full and full in ancestors.get(d, ()) and any(
-                t & tokens for t in red_tokens[d] if t)
+                a & t for a in axes for t in red_tokens[d] if t)
         ]
         if not loops:
             continue
-        refused = ""
-        if len(full.raxis) != 1:
+        tokens = _axis_tokens(red_tokens, full)
+        refused = _not_carried(full)
+        if not refused and len(full.raxis) != 1:
             refused = f"{full.name} reduces {len(full.raxis)} axes; one is carried"
         for d in loops:
             if refused:
@@ -128,12 +137,20 @@ def obstacles(ordered_nodes, red_tokens, ancestors) -> list:
     return found
 
 
+def _not_carried(full) -> str:
+    """Why the value of ``full`` cannot be carried across a loop, or ``""``: its class
+    declares how its value over a prefix and its value over the next tile combine
+    (``combine``) and where the carried value starts (``carry_init``)."""
+    if getattr(type(full), "combine", None) is not None:
+        return ""
+    return (f"{full.name} is a {type(full).__name__}: it declares no combine of its value "
+            "over a prefix and over the next tile, so it cannot be carried across a loop")
+
+
 def _not_a_sum(full, d) -> str:
-    """Why ``d`` cannot accumulate under a carried ``full``, or ``""``: the repair rescales
-    what an accumulator holds, which is right for a sum (or a contraction) that starts at
-    zero and nothing else the proof models. A subclass may accumulate otherwise (a max is
-    a ``ReduceSum``), so the type is asked exactly."""
-    if type(d) in (ReduceSum, Matmul) and getattr(d, "accum_init", None) is None:
+    """Why ``d`` cannot accumulate under a carried ``full``, or ``""``
+    (``update_rule.accumulates``)."""
+    if accumulates(d):
         return ""
     return (f"{d.name} is a {type(d).__name__}: the reductions that loop under {full.name} "
             "must be sums or matmuls that start at zero")
@@ -548,20 +565,26 @@ def streaming_accept(flat_graph):
     else ``None``: a candidate is kept iff the default build schedules it (the same
     ``schedule_kernel`` the build calls), decided before the top-k cut. ``accept.reasons``
     counts the refusals by reason; ``accept.whole`` counts, by reason, the refused tilings
-    that reduce every max without a record in one step (its row fitted one block, so the
-    tiling was refused for something else).
+    that reduce every conflict's ancestor without a record in one step (its row fitted one
+    block, so the tiling was refused for something else).
 
-    Also for a graph whose obstacle is NOT served (``streaming_refusals`` lists why): the
-    policy still steps such a max on its own while its descendants are pinned, and every
-    one of those tilings is refused by ``apply_tiling`` (the scores would exist per
-    iteration and whole at once).
+    Also for a graph whose conflict is NOT served (``streaming_refusals`` lists why): the
+    policy still steps such an ancestor on its own while its descendants are pinned, and
+    every one of those tilings is refused by ``apply_tiling`` (its value would be needed
+    per iteration and whole at once).
     """
     if not recorded(flat_graph) and not getattr(flat_graph, "streaming_refusals", None):
         return None
-    from .tiling import _iterative_reductions, schedule_kernel
+    from .tiling import _iterative_reductions, reduction_ancestors, schedule_kernel, \
+        scheduled_reductions
 
+    try:
+        nodes, red = scheduled_reductions(flat_graph)
+        fulls = {ob.full for ob in obstacles(nodes, red, reduction_ancestors(nodes))}
+    except NotImplementedError:
+        fulls = set()
     held = [n for tier, _ in graph_tiers(flat_graph) for n in tier.nodes
-            if getattr(n, "running_max", False) and getattr(n, "streaming", None) is None
+            if n.name in fulls and getattr(n, "streaming", None) is None
             and len(n.raxis) > 0]
 
     def accept(cand) -> bool:

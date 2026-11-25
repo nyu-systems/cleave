@@ -9,7 +9,7 @@ configs (the costliest demo searches, 170k-390k states each, are left out: a spl
 covered by ``matmul_matmul`` with its split), pinned at 9af4dd3 and re-pinned where the demo
 programs moved: ``cl.softmax`` records its max (``exp(x - max(x)) / sum``), so the attention
 demos are other programs, and a split over the dim their max reduces is searched unsplit
-(``pipeline.superopt.max_split_dims``; ``mha_decode`` with its split explores the states of
+(``pipeline.superopt.state_split_dims``; ``mha_decode`` with its split explores the states of
 the unsplit search, at the unsplit budget, and its config names the split program's budget).
 They do not depend on the process nor on the
 thread count (checked with 1 and 8 threads, in fresh processes, before pinning).

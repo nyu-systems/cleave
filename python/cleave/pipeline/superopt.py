@@ -118,18 +118,27 @@ class GraphSet(Sequence):
 
 def state_split_of(graphs, program) -> tuple:
     """The split to build from the loop state of ``graphs``: the split their search was
-    asked for, where every one is solo and a max of ``program`` reduces a dim of it (what
-    ``superoptimize`` records as ``GraphSet.state_split``); ``()`` otherwise."""
+    asked for, where every one is solo and a dim of it is one the search cannot split
+    (``state_split_dims``; what ``superoptimize`` records as ``GraphSet.state_split``);
+    ``()`` otherwise."""
     splits = {tuple(g.split) for g in graphs}
     if program is None or len(splits) != 1 or any(g.is_split or g.invalid_split for g in graphs):
         return ()
     (split,) = splits
-    return split if split and max_split_dims(program, split) else ()
+    return split if split and state_split_dims(program, split) else ()
 
 
-def max_split_dims(program, split) -> tuple[str, ...]:
-    """The dims of ``split`` that a ``reduce_max`` record of ``program`` reduces (the
-    softmax dim of ``cl.softmax``), in the order ``split`` names them."""
+# The reductions the superoptimizer cannot split: it combines the partials of a split by
+# summing them, and these have no sum-combine. A split over a dim one of them reduces is
+# built from the loop state of the solo graph instead (``pipeline.plans.state_pair``), with
+# the reducer's own combine and the proven update rule. (A sum the search splits itself.)
+UNSPLIT_BY_SEARCH = ("reduce_max",)
+
+
+def state_split_dims(program, split) -> tuple[str, ...]:
+    """The dims of ``split`` that a record of ``program`` the search cannot split reduces
+    (``UNSPLIT_BY_SEARCH``: the softmax dim of ``cl.softmax``), in the order ``split``
+    names them."""
     from ..frontend.tensor import Dim, split_names
 
     names = split_names(split)
@@ -137,7 +146,7 @@ def max_split_dims(program, split) -> tuple[str, ...]:
     values = getattr(program, "_values", {})
     reduced = set()
     for r in records:
-        if r.kind == "reduce_max":
+        if r.kind in UNSPLIT_BY_SEARCH:
             dim = values[r.args[0]].dims[r.attr("dim")]
             if isinstance(dim, Dim):
                 reduced.add(dim.name)
@@ -260,11 +269,11 @@ def superoptimize(program, config: SuperoptConfig | None = None) -> GraphSet:
             "value)")
     if config.resolve_per_output(program):
         return _superoptimize_per_output(program, config)
-    # A split over the dim a max reduces: the search would return no valid split graph (the
-    # max is opaque to it), so it runs unsplit, on the budget and with the cache entry of
-    # the unsplit search, and the result says which split was asked for (all of it: the
-    # refusals of ``schedule`` name every dim that is not split).
-    state_split = config.split if max_split_dims(program, config.split) else ()
+    # A split over a dim a reduction the search cannot split reduces (``UNSPLIT_BY_SEARCH``):
+    # the search would return no valid split graph, so it runs unsplit, on the budget and
+    # with the cache entry of the unsplit search, and the result says which split was asked
+    # for (all of it: the refusals of ``schedule`` name every dim that is not split).
+    state_split = config.split if state_split_dims(program, config.split) else ()
     searched = config.replace(split=()) if state_split else config
     max_ops = searched.resolve_max_ops(program)
     t0 = time.perf_counter()

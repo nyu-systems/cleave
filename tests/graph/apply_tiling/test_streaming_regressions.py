@@ -45,6 +45,8 @@ from cleave.schedule.tiling import schedule_kernel
 
 from tests import _explicit_softmax as X
 
+# the traced order's row sum: a conflict of its own, which the engine refuses (E14)
+SUM_UNDER = "is computed from"
 
 OUTSIDE = (ScheduleRejected,
            r"\w+ is computed per iteration of GraphNode_\w+ but also read by \w+ outside it")
@@ -88,11 +90,11 @@ CASES = {
                       [(ONE_DIM_TWO_AXES, 8), (ALSO_ITS_TRAILING_DIM, 4)]),
     "max_normalized": (X.max_normalized, dict(R=256, C=4096, D=64),
                        ("must be sums or matmuls that start at zero",), 0, []),
-    "sum_next_to_exp": (X.sum_next_to_exp, dict(R=256, C=4096), ("two passes",), 14,
+    "sum_next_to_exp": (X.sum_next_to_exp, dict(R=256, C=4096), ("two passes", SUM_UNDER), 14,
                         [(UNIT_ROW, 7)]),
     # (64 query rows: no 256-thread tiling, TCPolicy._register_operand_layout_conflict)
     "unscaled_attention": (X.unscaled_attention, dict(H=32, SQ=64, SKV=256, D=64),
-                           ("two passes",), 4, [(OUTSIDE, 12)]),
+                           ("two passes", SUM_UNDER), 4, [(OUTSIDE, 12)]),
 }
 
 

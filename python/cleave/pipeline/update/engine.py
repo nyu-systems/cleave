@@ -41,7 +41,7 @@ class Derivation:
     key: str
     full: str
     loops: tuple
-    cases: list = field(default_factory=list)  # (label, share of rows whose max moved)
+    cases: list = field(default_factory=list)  # (label, share of rows whose full value moved)
     adequacy: dict = field(default_factory=dict)  # acc -> discriminating rows
     holes: list = field(default_factory=list)  # Hole
     ranked: list = field(default_factory=list)  # rank.Ranked, best first
@@ -58,7 +58,7 @@ class Derivation:
     bug: bool = False  # refused with E13: an unexpected exception (never stored)
     # ``Recipe.key`` of a refusal that depends on the recipe (E1-E6, E10-E12, E15): it is
     # kept for that recipe only. "" for a rule and for a refusal read off the flat graph
-    # alone (T5, E7, E8, E9, E14): those hold for the loop structure.
+    # alone (T5, E7, E8, E9, E14, E16): those hold for the loop structure.
     recipe_key: str = ""
     report_text: str = ""  # the report of a derivation read from the store
     references: list = field(default_factory=list, repr=False)  # reference.Case
@@ -122,12 +122,14 @@ def run(flat_graph, obstacle, recipe, *, key: str = "", budgets=BUDGETS, rank_ca
     t0 = time.perf_counter()
     graph_alone = True  # until the recipe is first used
     try:
-        # ---- what the proof can read, before anything is built (T5, E7, E8, E9, E14):
+        # ---- what the proof can read, before anything is built (T5, E7-E9, E14, E16):
         # read off the flat graph alone, so it holds for every graph of the loop structure
         for acc in d.loops:
             proof_module.check_contribution(flat_graph, d.full, acc)
         for acc in d.loops:
             proof_module.check_leaves(flat_graph, d.full, acc)
+        for acc in d.loops:
+            proof_module.check_running_divisors(flat_graph, d.full, acc)
         d.unary = unary_ops(flat_graph, d.full, d.loops)
         graph_alone = False
         _run(d, flat_graph, recipe, budgets, rank_cases, combine, t0)
@@ -199,7 +201,7 @@ def _run(d, flat_graph, recipe, budgets, rank_cases, combine, t0):
     if not d.ranked:
         first = rejected[0]
         case = first.case
-        if first.replays[case].finite:  # rejected for its max, not for a value
+        if first.replays[case].finite:  # rejected for its carried value, not for a value
             case += f", where the carried {full} is not the flat graph's"
         raise Refused(E12.format(loops=", ".join(loops), case=case))
     best = d.ranked[0]

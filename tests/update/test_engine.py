@@ -16,6 +16,7 @@ import pytest
 pytest.importorskip("torch")
 pytest.importorskip("z3")
 
+from cleave.ir.ops import ReduceMax
 from cleave.ir.update_rule import repair_of, show
 from cleave.pipeline import plans
 from cleave.pipeline.update import engine
@@ -149,27 +150,35 @@ def test_search_two_derivations_in_two_processes_are_equal(tmp_path):
 
 def test_search_qknorm_flash_form_gets_a_record_and_the_traced_form_its_reason():
     """RMS-normalized keys move the max little: the reference set's shaped sample is chosen
-    for the rows it discriminates, and the flash form gets the same rule as MHA."""
+    for the rows it discriminates, and the flash form gets the same rule as MHA. The sums of
+    squares of the two norms are conflicts as well (the score matmul contracts the normed
+    dim under them); the engine refuses them before it builds anything, for the ``rsqrt``
+    between, which the proof does not read (E7), and they keep their pins."""
     _, graphs = searched(qknorm, QKNORM, None)
     (ir,) = plans.lower(flash(graphs))
     (other,) = plans.lower(traced(graphs))
     (full,) = [n for n in ir.nodes if getattr(n, "streaming", None) is not None]
     record = full.streaming
     assert record.rules == tuple((acc, FACTOR) for acc in record.loops) and len(record.loops) == 2
-    assert ir.streaming_refusals == []
-    (d,) = ir.derivations
-    assert not d.refused and d.rules == record.rules
+    norms = [why for why in ir.streaming_refusals if " (RSqrt) lies between " in why]
+    assert len(norms) == 2 and norms == ir.streaming_refusals
+    (d,) = [d for d in ir.derivations if not d.refused]
+    assert d.full == full.name and d.rules == record.rules
+    assert all(not d.holes for d in ir.derivations if d.refused)  # nothing was searched
     # the traced order: the value matmul reads the finished row sum (T3)
     assert not [n for n in other.nodes if getattr(n, "streaming", None) is not None]
-    (why,) = other.streaming_refusals
+    (why,) = [w for w in other.streaming_refusals if w.startswith("reduce_max_")]
     assert why.endswith(", a finished reduction over the dim reduce_max_2_19 reduces: that "
                         "needs two passes over the row") and " reads reduction_2_22" in why
-    assert not hasattr(other, "derivations")
+    rest = [w for w in other.streaming_refusals if w != why]
+    assert len(rest) == 3 and all(" (RSqrt) lies between " in w or ", another reduction "
+                                  "over the dim reduction_2_22 reduces" in w for w in rest)
+    assert all(d.refused and not d.holes for d in other.derivations)
 
 
 def test_search_qknorm_reference_set_is_adequate():
     _, graphs = searched(qknorm, QKNORM, None)
-    d = derivation(flash(graphs))
+    d = derivation(flash(graphs), cls=ReduceMax)  # the norms' sums are conflicts too
     assert not d.refused, d.refused
     assert d.shaped == "shaped seed=9 none x1"
     assert d.adequacy == {"mma_23": 8, "reduction_2_22": 9}

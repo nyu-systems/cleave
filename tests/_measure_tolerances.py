@@ -153,6 +153,7 @@ GPU_TESTS = [
     "tests/frontend/test_exact_softmax.py", "tests/frontend_dynamic/test_paged_pipeline.py",
     "tests/pipeline_api/test_declared_validation.py", "tests/runtime/test_inter_outputs.py",
     "tests/pipeline_api/test_per_output_gpu.py", "tests/lower/test_attention_bwd_gpu.py",
+    "tests/pipeline_api/test_carried_sum_gpu.py",
 ]
 
 
@@ -520,6 +521,8 @@ def _test_operators():
             return "exact_split_attention"
         if path == "tests/pipeline_api/test_exact_split_rows.py":
             return "exact_split_rows"
+        if path == "tests/pipeline_api/test_carried_sum_gpu.py":
+            return "sum_shifted"
         if path == "tests/frontend/test_exact_softmax.py":
             if "middle_axis" in test:
                 return "softmax_mid"

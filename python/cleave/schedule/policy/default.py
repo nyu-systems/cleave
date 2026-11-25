@@ -105,8 +105,9 @@ class DefaultPolicy:
             self.reduction_axis_overlap_pairs,
             self.reduction_axis_overlap_descendants,
         ) = self._build_reduction_axis_overlap_pairs()
-        # TODO(david): this might change on a two pass approach
-        # (check this commit when implementing two pass itgraph):
+        # TODO(david): a conflict with no proven update rule could instead be resolved by a
+        # nested itGraph (a two pass approach: the ancestor's own loop first); until then
+        # it keeps this pin (check this commit when implementing two pass itgraph):
         # A descendant reduction axis that overlaps an ancestor reduction (they sum
         # over shared source tokens) must span its FULL extent: e.g. QKNorm's QK^T
         # matmul contracts over HD while an ancestor RMSNorm reduces sum-of-squares
@@ -117,12 +118,13 @@ class DefaultPolicy:
         # Asked for every pair of reductions of every step map the search rates (see
         # _kernel_rstep_map); it does not depend on the steps, so it is built once.
         self._reduction_ancestors = reduction_ancestors(self.ordered_nodes)
-        # The exception to the pin is a *streaming obstacle* that is served
-        # (``schedule.streaming``): the ancestor is a running max over the very dim its
-        # descendants reduce, and it carries an update rule proven for each of them on
-        # this graph. The loop then advances the max with the sums and carries it; nothing
-        # is pinned, and the max steps with its descendants (one group). Empty for a
-        # graph without such a record, and for a policy built without its flat graph.
+        # The exception to the pin is a reduction conflict that is served
+        # (``schedule.streaming``): the ancestor is carried over the very dim its
+        # descendants reduce, whatever its op, and it carries an update rule proven for each
+        # of them on this graph. The loop then advances the ancestor with the descendants
+        # and carries it; nothing is pinned, and the ancestor steps with its descendants
+        # (one group). Tilings that hold the dim whole stay candidates. Empty for a graph
+        # without such a record, and for a policy built without its flat graph.
         self.streamed = streamed(
             self.ordered_nodes,
             self.reduction_axis_provenance,

@@ -96,8 +96,8 @@ class PlanSet(Sequence):
 def lower(graph: SearchedGraph, split_factor: int | None = None) -> list:
     """``[ir]`` for a solo graph; ``[partial, combine]`` at ``split_factor`` for a split
     graph the search returned, and for a solo graph whose program asked for a split over
-    the dim a max of it reduces (``SearchedGraph.split``): that pair is built from the
-    loop state of the solo graph (:func:`state_pair`)."""
+    a dim the search cannot split (``SearchedGraph.split``, ``superopt.state_split_dims``):
+    that pair is built from the loop state of the solo graph (:func:`state_pair`)."""
     if graph.is_split:
         return _lower_structure(graph, graph.structure, split_factor)
     from .update.instantiate import Recipe
@@ -113,23 +113,26 @@ def lower(graph: SearchedGraph, split_factor: int | None = None) -> list:
 # ``graph {i}: split over {dim}: ``.
 NO_PROVEN_UPDATE = "this graph carries no proven update over that dim"  # P1 (+ ": {refusals}")
 NO_SPLIT_FACTOR = "the dim has {n} elements, which {f} does not divide"  # P5
-TWO_STATES = "{n} maxes are carried across a loop over that dim ({names}); a pair is built from one"
-NO_SPLIT_DIM = "a solo graph is split only over a dim a max of its program reduces; none is asked for"
+TWO_STATES = ("{n} values are carried across a loop over that dim ({names}); a pair is built "
+              "from one")
+NO_SPLIT_DIM = ("a solo graph is split from its loop state only over a dim that a reduction "
+                "the search cannot split reduces; none is asked for")
 SEVERAL_DIMS = "a pair is built from the loop state over one dim at a time"
 UNSEARCHED = "the graph was not searched; a pair is built on the symbolic dims of a searched graph"
 
 
 def state_pair(graph: SearchedGraph, ir, split_factor: int) -> list:
     """``[partial, combine]``: the split of solo graph ``graph`` (lowered to ``ir``, with
-    its records derived) over the dim of ``graph.split`` that a max of the program reduces,
-    built from the loop state of the streaming obstacle served over that dim
-    (``lower.state_split``).
+    its records derived) over the dim of ``graph.split`` the search cannot split
+    (``superopt.state_split_dims``), built from the loop state of the conflict served over
+    that dim (``lower.state_split``), whatever its reducer.
 
     The partial is the flat graph up to the loop state on a split of that dim: each split
-    returns its accumulators and its own max, float32 at the cut. The combine takes the max
-    over the splits, applies the proven repair of each accumulator with ``m := m_i``,
-    ``m' := max_i m_i``, sums over the splits and runs the solo graph's own epilogue. Both
-    are flat graphs with a max in front of their sums, so each gets its own derivation.
+    returns its accumulators and its own full-extent value, float32 at the cut. The combine
+    folds those over the splits with the reducer, applies the proven repair of each
+    accumulator with ``m := m_i``, ``m' := combine_i m_i``, sums over the splits and runs the
+    solo graph's own epilogue. Both are flat graphs with the full-extent reduction in front
+    of their sums, so each gets its own derivation.
 
     ``LoweringRejected("graph {i}: split over {dim}: {reason}")`` when no pair is built.
     """
@@ -138,10 +141,10 @@ def state_pair(graph: SearchedGraph, ir, split_factor: int) -> list:
     from ..lower.state_split import (SplitRefused, combine_graph, lower_partial, op_indices,
                                      split_position)
     from ..runtime.reference import output_order, placeholder_order
-    from .superopt import max_split_dims
+    from .superopt import state_split_dims
     from .update.instantiate import Recipe
 
-    dims = max_split_dims(graph.program, graph.split)
+    dims = state_split_dims(graph.program, graph.split)
     if len(dims) != 1:
         names = ",".join(dims or split_names(graph.split)) or "no dim"
         why = SEVERAL_DIMS if len(dims) > 1 else NO_SPLIT_DIM
@@ -225,8 +228,9 @@ def _derive_updates(ir, recipe) -> None:
     rules are derived once per loop structure (``pipeline.update.derive``: references from
     this very graph, built again at small shapes by its recipe, search, z3 proof, ranking)
     and written on the full-extent node as a ``Streaming`` record. The policy lets a loop
-    step under a max only where it finds that record; without one the pin and the refusal
-    stay. Nothing the engine does raises out of here (an unexpected error is ``E13``).
+    step under a full-extent value only where it finds that record; without one the pin
+    and the refusal stay. Nothing the engine does raises out of here (an unexpected error
+    is ``E13``).
 
     ``ir.streaming_refusals`` (``["{full}: {reason}", ...]``) exists exactly when the graph
     has an obstacle; ``ir.derivations`` holds every derivation the engine made for it.
@@ -346,14 +350,17 @@ def describe_tile(t) -> str:
     return text
 
 
-# Why a graph with a max has no tiling at all. A max is a max, whoever wrote it, and a loop
-# carries it wherever its streaming obstacle is served; a graph with an obstacle that is not
-# served says why after this text (``_schedule_once``). Only where it is true: not when the
-# softmax filter refused a tiling that held every such row in one block (then the row was not
-# longer, and the filter's reasons are the reason).
-MAX_ROW_LIMIT = "a max needs its whole row in one block, and this row is longer"
+# Why a graph with a reduction conflict has no tiling at all: the ancestor of a conflict
+# (``schedule.streaming.obstacles``, whatever its op) is carried by a loop wherever the
+# conflict is served, and held whole otherwise; a graph with a conflict that is not served
+# says why after this text (``_schedule_once``). Only where it is true: not when the filter
+# of a graph with a conflict refused a tiling that held every such dim in one block (then the
+# dim was not longer, and the filter's reasons are the reason).
+ROW_LIMIT = ("a reduction that another one over its dim depends on needs that whole dim in "
+             "one block, and this dim is longer")
 NO_TILING = "no tiling candidates"
-EVERY_MAX_CARRIED = "every max is carried across its loop"
+EVERY_CONFLICT_CARRIED = ("every reduction that another one over its dim depends on is "
+                          "carried across its loop")
 
 
 def _search(ir_graph, topk: int, force: bool, hints: dict | None,
@@ -363,7 +370,7 @@ def _search(ir_graph, topk: int, force: bool, hints: dict | None,
     A graph with a streaming obstacle, served or not, keeps only the tilings the build
     schedules (``schedule.streaming.streaming_accept``), decided before the top-k cut; the
     reasons of the others are added to ``refused``, and those of the refused tilings that
-    reduce every max without a record in one step to ``whole``. For any other graph
+    reduce every conflict's ancestor without a record in one step to ``whole``. For any other graph
     nothing changes.
     """
     from ..schedule import search_tiling
@@ -394,29 +401,34 @@ def _search(ir_graph, topk: int, force: bool, hints: dict | None,
             whole.update(stable.whole)
 
 
-def _row_maxes(ir) -> tuple:
-    """``(maxes, held)``: the names of the row maxes of ``ir``, and of those held whole --
-    carried by no loop, because they have no honoured, served record
-    (``tiling.carried_reductions``)."""
-    from ..ir.ops import ReduceMax
-    from ..schedule.tiling import carried_reductions
+def _conflict_ancestors(ir) -> tuple:
+    """``(ancestors, held)``: the names of the ancestors of the reduction conflicts of
+    ``ir`` (``schedule.streaming.obstacles``), and of those held whole -- carried by no
+    loop, because they have no honoured, served record (``tiling.carried_reductions``)."""
+    from ..schedule.streaming import obstacles
+    from ..schedule.tiling import carried_reductions, reduction_ancestors, scheduled_reductions
 
-    maxes = [n.name for n in ir.nodes if isinstance(n, ReduceMax)]
-    carried = {n.name for n in carried_reductions(ir)} if maxes else set()
-    return maxes, [name for name in maxes if name not in carried]
+    try:
+        nodes, red = scheduled_reductions(ir)
+    except NotImplementedError:
+        return [], []
+    fulls = [ob.full for ob in obstacles(nodes, red, reduction_ancestors(nodes))]
+    carried = {n.name for n in carried_reductions(ir)} if fulls else set()
+    return fulls, [name for name in fulls if name not in carried]
 
 
 def _no_tiling(g, ir, reasons: Counter, whole: Counter) -> str:
     """Why lowered graph ``ir`` of searched graph ``g`` has no tiling.
 
-    The row limit only where a max of ``ir`` is held whole (no loop carries it) and no
-    tiling the policy made held the row of every such max in one step (``whole`` is empty):
-    the policy made none, or the softmax filter refused only tilings that step such a max.
-    Then, for a max whose streaming obstacle is not served, why it is not carried across a
-    loop instead. A graph whose every max is carried has no row limit: where the policy
-    made no tiling at all, that is not the max's doing, and the text says so. Otherwise the
+    The row limit only where the ancestor of a conflict of ``ir`` is held whole (no loop
+    carries it) and no tiling the policy made held the dim of every such ancestor in one
+    step (``whole`` is empty): the policy made none, or the filter refused only tilings that
+    step such an ancestor. Then, for a conflict that is not served, why it is not carried
+    across a loop instead. A graph whose every conflict is carried has no row limit: where
+    the policy made no tiling at all, that is not the conflict's doing, and the text says
+    so. Otherwise the
     graph has no tiling for the reasons the filter counted (``reasons``), whatever its
-    maxes, and for those of the policy: tilings it gave no thread count
+    conflicts, and for those of the policy: tilings it gave no thread count
     (``GEMM_TILE_CONFLICT``, ``REGISTER_OPERAND_CONFLICT``, ``ROW_REDUCTION_CONFLICT``),
     whose row it did not get to judge.
     """
@@ -434,18 +446,18 @@ def _no_tiling(g, ir, reasons: Counter, whole: Counter) -> str:
     conflicts = sum(by_reason.values())
     if conflicts:
         reasons = reasons + by_reason
-    maxes, held = _row_maxes(ir) if "max" in g.ops else ([], [])
+    fulls, held = _conflict_ancestors(ir)
     if held and not whole and not conflicts:
-        why = MAX_ROW_LIMIT
+        why = ROW_LIMIT
         if unstreamed:
             why += f"; it is not carried across a loop: {unstreamed}"
     else:
         why = NO_TILING
         if unstreamed:
-            why += f"; a max is not carried across a loop: {unstreamed}"
-        elif maxes and not held and not reasons:  # nothing else says why: not the max
-            why += f"; {EVERY_MAX_CARRIED}"
-    if reasons:  # every tiling was refused by the softmax filter: say why
+            why += f"; a reduction is not carried across a loop: {unstreamed}"
+        elif fulls and not held and not reasons:  # nothing else says why: not the conflict
+            why += f"; {EVERY_CONFLICT_CARRIED}"
+    if reasons:  # every tiling was refused by the conflict filter: say why
         why += f" ({sum(reasons.values())} refused: " + "; ".join(
             f"{n}x {reason}" for reason, n in reasons.most_common()) + ")"
     return why
@@ -511,14 +523,14 @@ def _state_split_plans(g, graphs, config, add, refused) -> None:
     factor of ``config.split_k`` the partial and the combine built from its loop state
     (``lower(g, f)``), or the reason there is no pair (``Refusal(..., "partial", ...)``,
     as for a searched split graph that has no cut). A split that names no factor is refused
-    once. No part of the split is dropped silently: a dim of it that no max reduces is not
-    split (the search ran unsplit), and one refusal per solo graph says so."""
+    once. No part of the split is dropped silently: a dim of it that no such reduction
+    reduces is not split (the search ran unsplit), and one refusal per solo graph says so."""
     from ..frontend.tensor import split_names
-    from .superopt import max_split_dims
+    from .superopt import state_split_dims
 
-    maxed = max_split_dims(graphs.program, graphs.state_split)
-    others = [d for d in split_names(graphs.state_split) if d not in maxed]
-    head = f"graph {g.index}: split over {','.join(maxed)}: "
+    carried = state_split_dims(graphs.program, graphs.state_split)
+    others = [d for d in split_names(graphs.state_split) if d not in carried]
+    head = f"graph {g.index}: split over {','.join(carried)}: "
     if others:
         refused.append(Refusal(g.index, "split", "partial", LoweringRejected(
             head + f"the search ran unsplit, so {','.join(others)} is not split")))

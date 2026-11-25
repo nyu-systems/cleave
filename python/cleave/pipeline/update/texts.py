@@ -41,10 +41,14 @@ E14 = ("{node}, which {acc} reads, is computed from {other}, another reduction o
 # cut the queries too).
 E15 = ("{node} is {a} at {n} elements of the looped dim of {full} and {b} at {m}: its symbol "
        "{symbol} also sizes a dim the loop does not step")
+# Beyond E1-E15: a divisor computed from the full-extent value that may be zero
+# (``proof.check_running_divisors``).
+E16 = ("{node} divides by a value computed from {full} that may be zero: the flat graph "
+       "divides by it at the finished value of {full} only, a loop at every running one, "
+       "and so would any update of {acc}")
 # The structural check of ``schedule.streaming.obstacles`` that refuses with T5 (every
-# reduction looped under the full-extent value is a ReduceSum or Matmul with no
-# accum_init), checked again here: the contribution of one element is only read off a
-# plain sum or matmul.
+# reduction looped under the full-extent value sums from zero: ``update_rule.accumulates``),
+# checked again here: the contribution of one element is only read off a sum or matmul.
 T5 = ("{d} is a {cls}: the reductions that loop under {full} must be sums or matmuls that "
       "start at zero")
 

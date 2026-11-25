@@ -148,13 +148,14 @@ def test_one_rescale_op_serves_a_reduce_sum_and_an_accumulate():
 
 
 def test_the_declaration_is_what_adds_the_rescale():
-    """Same nodes, fields left empty: no rescale, and the snapshot is taken too late."""
+    """Same nodes, fields left empty: nothing says the copy of the max is its snapshot, so
+    the running max is read inside its loop with nothing to repair what is accumulated
+    under it, and the codegen refuses the kernel (it would have no rescale, and take the
+    copy too late)."""
     t = build_rolling_tier(declare=False)
-    code = TilelangCodeGen().gen(schedule_rolling_tier(t))
-    assert "rescale" not in code
-    calls = [s for s in _calls(code, "GraphNode_0_iter") if s.startswith("ukernel_")]
-    assert calls.index("ukernel_reduce_max_axis1_rr(PlaceHolder_AA, t_exp_0_max)") < calls.index(
-        "ukernel_copy_1dims_rr(t_exp_0_max, t_exp_0_max_prev)")
+    with pytest.raises(AssertionError, match=r"accumulator 'exp_0_max' is read by .* inside "
+                                             "the loop that accumulates it"):
+        TilelangCodeGen().gen(schedule_rolling_tier(t))
 
 
 def test_clone_of_a_rolling_tier_generates_the_same_text():

@@ -61,9 +61,10 @@ def test_search_only_rules_the_assembly_can_emit_are_ranked():
     for acc in d.loops:
         assert prove(ratio, d.flat.program_graph, d.full, acc).proved
     ranked, rejected = rank.rank(d.kernel, d.loops, {a: [ratio, CANONICAL] for a in d.loops},
-                                 [(4, "normal")])
+                                 [(4, "normal")], reducer="max")
     assert [r.rules for r in ranked + rejected] == [{a: CANONICAL for a in d.loops}]
-    assert rank.rank(d.kernel, d.loops, {a: [ratio] for a in d.loops}, [(4, "normal")]) == ([], [])
+    assert rank.rank(d.kernel, d.loops, {a: [ratio] for a in d.loops}, [(4, "normal")],
+                     reducer="max") == ([], [])
 
 
 # exp(m - m') + (1 / exp(3 m') - 1 / exp(3 m')), the ones written exp(m - m): the canonical
@@ -87,11 +88,11 @@ def test_search_a_value_that_is_not_finite_at_an_inner_iteration_only_rejects():
     tile = int(re.fullmatch(rf"non-finite {re.escape(show(GROWING))} at tile (\d+)",
                             seen.why).group(1))
     assert tile > 0  # finite at the first iteration ...
-    assert not seen.finite and seen.same_max and np.isfinite(seen.error)  # ... and at the end
+    assert not seen.finite and seen.same_value and np.isfinite(seen.error)  # ... and at the end
     canonical = replay(d.kernel, {a: FACTOR for a in d.loops}, 32, "increasing")
     assert canonical.why == "" and seen.error == canonical.error  # the same outputs
     ranked, rejected = rank.rank(d.kernel, d.loops, {a: [update] for a in d.loops},
-                                 [(32, "normal"), (32, "increasing")])
+                                 [(32, "normal"), (32, "increasing")], reducer="max")
     assert not ranked and [r.case for r in rejected] == ["increasing@32"]
     assert rejected[0].rejected == f"{seen.why} on increasing@32"
 
@@ -101,15 +102,45 @@ def one_ulp_up(a, b):
     return torch.nextafter(m, torch.full_like(m, float("inf")))
 
 
+def test_search_a_carried_sum_is_its_sum_in_another_order_not_its_bits():
+    """A sum folded tile by tile is the same float32 sum in another order: it is held to
+    the rounding of that order (``reference.folds_to``), not bit for bit as a max is. A
+    fold one ulp off at every tile is within it; one that is off by more is rejected."""
+    from cleave.ir.ops import ReduceSum
+
+    from ._programs import identity, sum_shifted
+
+    d = derivation(identity(sum_shifted, dict(R=16, C=64, D=8)))
+    assert not d.refused and type(d.kernel.node(d.kernel.tile, d.full)) is ReduceSum
+    choices = {a: [CANONICAL] for a in d.loops}
+
+    def ulp_off(a, b):
+        s = a + b
+        return torch.nextafter(s, torch.full_like(s, float("inf")))
+
+    def off(a, b):
+        return a + b + 1e-3 * (a.abs() + b.abs() + 1.0)
+
+    for combine in (None, ulp_off):
+        ranked, rejected = rank.rank(d.kernel, d.loops, choices, [(32, "normal")],
+                                     combine=combine, reducer="add")
+        assert len(ranked) == 1 and not rejected
+        assert not ranked[0].stable  # a sum gives no order of m and m'
+    ranked, rejected = rank.rank(d.kernel, d.loops, choices, [(32, "normal")], combine=off,
+                                 reducer="add")
+    assert not ranked
+    assert rejected[0].rejected == f"the carried {d.full} is not the flat graph's on normal@32"
+
+
 def test_search_a_carried_max_one_ulp_off_rejects():
     d = mha_derivation()
     choices = {a: [CANONICAL] for a in d.loops}
-    ranked, rejected = rank.rank(d.kernel, d.loops, choices, [(4, "normal")])
+    ranked, rejected = rank.rank(d.kernel, d.loops, choices, [(4, "normal")], reducer="max")
     assert len(ranked) == 1 and not rejected  # the control
-    ranked, rejected = rank.rank(d.kernel, d.loops, choices, [(4, "normal")], combine=one_ulp_up)
+    ranked, rejected = rank.rank(d.kernel, d.loops, choices, [(4, "normal")], combine=one_ulp_up,
+                                 reducer="max")
     assert not ranked
-    assert rejected[0].rejected == (f"the carried {d.full} is not bit-equal to the flat graph's "
-                                    "on normal@4")
+    assert rejected[0].rejected == f"the carried {d.full} is not the flat graph's on normal@4"
     assert rejected[0].replays["normal@4"].finite
 
     _, graphs = searched(attention, MHA, 11)

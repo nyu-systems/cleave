@@ -21,7 +21,7 @@ from cleave import pipeline as P
 from cleave.frontend import trace
 from cleave.ir.ops import Exp, ReduceMax, Sub
 from cleave.ir.update_rule import loop_key
-from cleave.pipeline.plans import MAX_ROW_LIMIT, _lower_structure, describe_tile, lower
+from cleave.pipeline.plans import ROW_LIMIT, _lower_structure, describe_tile, lower
 from cleave.pipeline.superopt import GraphSet
 from cleave.runtime.inputs import softmax_axis
 from cleave.runtime.reference import fingerprint_seed
@@ -104,17 +104,20 @@ def test_flat_graph_has_the_max_ahead_of_the_exp():
 
 
 @pytest.mark.parametrize("fn, sizes, why", [
-    (traced, SHORT, "a finished reduction over the dim"),
-    (softmax, dict(R=64, C=256), "which is not summed over that dim"),
+    # the max (two passes), then the row sum under it (the exp it reads changes with the max)
+    (traced, SHORT, ("a finished reduction over the dim", "is computed from reduce_max_")),
+    (softmax, dict(R=64, C=256), ("which is not summed over that dim",)),
 ], ids=["traced_256", "softmax_256"])
 def test_a_refused_obstacle_leaves_the_tiling_candidates_as_they_are(fn, sizes, why):
-    """A graph whose obstacle is not served gets its reason, and ``search_tiling`` lists the
-    candidates of the same graph lowered without any derivation, in the same order."""
+    """A graph whose obstacles are not served gets their reasons, and ``search_tiling``
+    lists the candidates of the same graph lowered without any derivation, in the same
+    order."""
     from cleave.schedule import search_tiling
 
     _, ir = _lowered(fn, sizes)
-    (reason,) = ir.streaming_refusals
-    assert why in reason and not [n for n in ir.nodes if getattr(n, "streaming", None)]
+    reasons = ir.streaming_refusals
+    assert len(reasons) == len(why) and all(w in r for w, r in zip(why, reasons))
+    assert not [n for n in ir.nodes if getattr(n, "streaming", None)]
     plain = _without_derivation(fn, sizes)
     with_reason = [describe_tile(t) for t in search_tiling(ir, topk=16)]
     assert with_reason
@@ -146,7 +149,7 @@ def test_refusal_reason_reaches_the_plan_summary():
     assert not plans and plans.refused  # (fusion="auto": once unforced, once forced)
     for refusal in plans.refused:
         text = str(refusal.error)
-        assert text.startswith(f"{MAX_ROW_LIMIT}; it is not carried across a loop: reduce_max_")
+        assert text.startswith(f"{ROW_LIMIT}; it is not carried across a loop: reduce_max_")
         assert "is also read by mul_" in text and "which is not summed over that dim" in text
         assert refusal.reason in plans.summary()
 
@@ -156,7 +159,7 @@ def test_a_carried_max_is_not_blamed_when_the_policy_makes_no_tiling():
     pinned, yet no tiling fits (the 2048-wide head dim under a key loop). That is
     NO_TILING, not the row limit; the traced form, whose max is held whole, keeps the row
     limit with its reason."""
-    from cleave.pipeline.plans import EVERY_MAX_CARRIED, NO_TILING
+    from cleave.pipeline.plans import EVERY_CONFLICT_CARRIED, NO_TILING
     from cleave.schedule.tiling import carried_reductions
 
     wide = dict(H=1, SQ=64, SKV=4096, D=2048)
@@ -169,13 +172,13 @@ def test_a_carried_max_is_not_blamed_when_the_policy_makes_no_tiling():
     assert not plans and plans.refused
     for refusal in plans.refused:
         text = str(refusal.error)
-        assert MAX_ROW_LIMIT not in text
-        assert text == f"{NO_TILING}; {EVERY_MAX_CARRIED}", text
+        assert ROW_LIMIT not in text
+        assert text == f"{NO_TILING}; {EVERY_CONFLICT_CARRIED}", text
 
     plans = P.schedule(GraphSet.identity(trace(traced, wide, cl.f16)), P.ScheduleConfig(topk=1000))
     assert not plans and plans.refused
     for refusal in plans.refused:
-        assert str(refusal.error).startswith(f"{MAX_ROW_LIMIT}; it is not carried across a loop: ")
+        assert str(refusal.error).startswith(f"{ROW_LIMIT}; it is not carried across a loop: ")
 
 
 def test_search_graphs_keep_the_max():
@@ -208,8 +211,9 @@ def test_search_of_attention_records_the_flash_form_only():
     assert sorted(found) == ["solo matmul>div>max>sub>exp>sum>div>matmul",
                              "solo matmul>div>max>sub>exp>sum>matmul>div"]
     assert found["solo matmul>div>max>sub>exp>sum>matmul>div"] == (True, [])
-    recorded, (why,) = found["solo matmul>div>max>sub>exp>sum>div>matmul"]
+    recorded, (why, why_sum) = found["solo matmul>div>max>sub>exp>sum>div>matmul"]
     assert not recorded and "a finished reduction over the dim" in why
+    assert "another reduction over the dim" in why_sum  # the row sum, under the max
 
 
 def test_search_the_flash_form_split_lowers_to_two_flat_graphs_with_their_own_rules():

@@ -47,12 +47,17 @@ from cleave.pipeline.plans import (
     bind_inputs,
     lower,
 )
-from cleave.pipeline.superopt import GraphSet, SearchedGraph, max_split_dims
+from cleave.pipeline.superopt import GraphSet, SearchedGraph, state_split_dims
 from cleave.runtime.reference import output_order, output_roles, placeholder_order
 
 FACTOR = ("exp", ("sub", "m", "m'"))
 T3 = ("reduce_max_2_5: mma_10 reads reduction_2_8, a finished reduction over the dim "
       "reduce_max_2_5 reduces: that needs two passes over the row")
+# ... and the traced order's row sum, a conflict of its own, refused by the engine
+E14 = ("reduction_2_8: exp_7, which mma_10 reads, is computed from reduce_max_2_5, another "
+       "reduction over the dim reduction_2_8 reduces: it changes from one prefix of the loop "
+       "to the next")
+TRACED = f"{T3}; {E14}"
 
 
 def attention(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
@@ -116,10 +121,10 @@ def _refused(graph, factor):
 
 def test_the_dims_a_max_reduces():
     prog = trace(attention, SHAPES, cl.f16)
-    assert max_split_dims(prog, ("SKV",)) == ("SKV",)
-    assert max_split_dims(prog, cl.Split("SKV", (4, 8))) == ("SKV",)
-    assert max_split_dims(prog, ("SQ",)) == () and max_split_dims(prog, ()) == ()
-    assert max_split_dims(trace(matmul, dict(M=64, N=64, K=1024), cl.f16), ("K",)) == ()
+    assert state_split_dims(prog, ("SKV",)) == ("SKV",)
+    assert state_split_dims(prog, cl.Split("SKV", (4, 8))) == ("SKV",)
+    assert state_split_dims(prog, ("SQ",)) == () and state_split_dims(prog, ()) == ()
+    assert state_split_dims(trace(matmul, dict(M=64, N=64, K=1024), cl.f16), ("K",)) == ()
 
 
 def test_search_a_split_over_the_softmax_dim_is_searched_unsplit(tmp_path, monkeypatch):
@@ -166,7 +171,7 @@ def test_search_the_flash_graph_lowers_to_a_pair_built_from_its_loop_state():
 
 def test_search_every_factor_of_the_flash_graph_has_partial_and_combine_plans():
     """``schedule``: per factor the flash graph's partial and combine plans; the traced
-    graph has none, and says why (P1 with its T3 reason) once per factor."""
+    graph has none, and says why (P1 with its T3 and E14 reasons) once per factor."""
     graphs = _graphs(split=cl.Split("SKV", (4, 8)))
     plans = P.schedule(graphs, P.ScheduleConfig(topk=2, split_k=(4, 8)))
     flash, traced = _flash(graphs), _traced(graphs)
@@ -180,7 +185,7 @@ def test_search_every_factor_of_the_flash_graph_has_partial_and_combine_plans():
     split = [r for r in plans.refused if r.variant != "solo"]
     assert sorted((r.graph_index, r.variant, r.role) for r in split) == [
         (traced.index, f"split-k={f}", "partial") for f in (4, 8)]
-    why = f"graph {traced.index}: split over SKV: {NO_PROVEN_UPDATE}: {T3}"
+    why = f"graph {traced.index}: split over SKV: {NO_PROVEN_UPDATE}: {TRACED}"
     assert NO_PROVEN_UPDATE == "this graph carries no proven update over that dim"
     for refusal in split:
         assert isinstance(refusal.error, LoweringRejected) and str(refusal.error) == why
@@ -246,7 +251,7 @@ def test_search_no_part_of_the_split_is_dropped_without_a_reason():
     assert split == sorted(
         [(g.index, "split", f"graph {g.index}: split over SKV: {unsplit}") for g in graphs]
         + [(traced.index, "split-k=4",
-            f"graph {traced.index}: split over SKV: {NO_PROVEN_UPDATE}: {T3}")])
+            f"graph {traced.index}: split over SKV: {NO_PROVEN_UPDATE}: {TRACED}")])
 
 
 def test_search_a_program_without_such_a_max_is_split_by_the_search():
@@ -271,7 +276,7 @@ def test_search_p1_a_graph_whose_max_carries_nothing_over_the_dim():
 
 def test_search_p1_the_traced_graph_says_why_its_max_is_not_carried():
     assert _refused(_traced(_graphs()), 4) == (
-        f"graph {_traced(_graphs()).index}: split over SKV: {NO_PROVEN_UPDATE}: {T3}")
+        f"graph {_traced(_graphs()).index}: split over SKV: {NO_PROVEN_UPDATE}: {TRACED}")
 
 
 def test_search_p2_an_op_on_the_way_to_the_state_that_no_split_reaches():
@@ -362,7 +367,7 @@ def test_search_two_carried_maxes_over_the_dim():
     assert _refused(both, 4) == (f"graph {both.index}: split over C: " + TWO_STATES.format(
         n=2, names="reduce_max_1_3, reduce_max_1_4"))
     assert TWO_STATES.format(n=2, names="a, b") == (
-        "2 maxes are carried across a loop over that dim (a, b); a pair is built from one")
+        "2 values are carried across a loop over that dim (a, b); a pair is built from one")
     reasons = {_refused(g, 4).split(": ", 2)[2] for g in graphs if g is not both}
     assert any("an input of the program; the combine reads only" in r for r in reasons)
     assert any(r.startswith(NO_PROVEN_UPDATE) for r in reasons)

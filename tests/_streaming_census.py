@@ -411,10 +411,19 @@ def _staged(graph):
 class _Plain:
     """For the duration of a ``with``: ``apply_tiling`` builds the loop it always builds,
     and the records are taken off the TILED copy instead of being assembled -- the plain
-    twin of a kernel, the same loop without the snapshot and the repairs."""
+    twin of a kernel, the same loop without the snapshot and the repairs.
+
+    The twin reads its running value inside the loop with no snapshot and nothing
+    repaired, which the codegen refuses in a kernel (``codegen.validate``: such a value is
+    meaningful only as carried state). The twin is only lowered, to compare with the
+    assembled kernel, never run: the rolling-state checks are off inside the ``with``."""
 
     def __enter__(self):
+        from cleave.codegen.validate import GraphValidator
+
         self.assemble = streaming.assemble
+        self.validator = GraphValidator
+        self.rolling = GraphValidator._validate_rolling_state
 
         def plain(tiled, flat_graph=None):
             for _, _, node in recorded(tiled):
@@ -422,9 +431,11 @@ class _Plain:
             return tiled
 
         streaming.assemble = plain
+        GraphValidator._validate_rolling_state = lambda self, graph, where, is_main: None
 
     def __exit__(self, *exc):
         streaming.assemble = self.assemble
+        self.validator._validate_rolling_state = self.rolling
 
 
 def _lower(code, device_compile=False):

@@ -200,15 +200,36 @@ def test_a_division_by_an_input_gets_the_canonical_rule_not_e11():
         assert {name_of(ir, ReduceSum), name_of(ir, Matmul, -1)} == set(ob.loops)
 
 
-def test_e11_a_divisor_computed_from_the_max_is_not_assumed_defined():
+def test_e16_a_divisor_computed_from_the_max_is_not_assumed_defined():
     """``exp(s) / (s - 1)`` with ``s = x - max(x)``: no rule over ``a``, ``m``, ``m'`` is
     proved without assuming ``s - 1 != 0`` at every running max, which the flat graph does
-    not give; the obstacle keeps its pin with E11."""
+    not give, and any repair would divide by it as well: the obstacle keeps its pin with
+    E16, read off the flat graph before anything is searched (it was E11, after 636
+    matches of a search at budgets 4 and 5, none proved)."""
     from ._programs import self_divided_rows
 
     ir, ob, d = refused(self_divided_rows)
-    assert d.refused.startswith("no proven update of ") and " within 5 ops (" in d.refused
-    assert not d.rules
+    assert " divides by a value computed from " in d.refused and " that may be zero" in d.refused
+    assert not d.rules and not d.holes and d.recipe_key == ""
+
+
+def exp_over_exp_of_max(x: cl.Tensor["R", "C"], v: cl.Tensor["C", "D"]):
+    """``exp(x) / exp(max(x))``: the stable exp written as a quotient."""
+    e = cl.exp(x) / cl.exp(_max(x))
+    return (e @ v) / cl.sum(e, -1, keepdim=True)
+
+
+def test_e16_an_exp_of_the_max_is_a_divisor_that_is_never_zero():
+    """``exp(x) / exp(max(x))`` divides by a value computed from the max that is never zero
+    (``exp > 0``): no E16, and the flat graph gets its rule."""
+    from cleave.pipeline.update.proof import check_running_divisors
+
+    from ._attention import FACTOR
+
+    ir, ob, d = refused(exp_over_exp_of_max)
+    for acc in ob.loops:
+        check_running_divisors(ir, ob.full, acc)  # does not raise
+    assert not d.refused and d.rules == tuple((acc, FACTOR) for acc in ob.loops)
 
 
 def test_e12_every_proven_rule_is_non_finite_on_a_case():

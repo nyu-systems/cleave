@@ -11,7 +11,7 @@ Content: ``{"key", "recipe", "full", "loops", "rules", "refused", "report"}``; w
 atomically.
 
 The loop structure's entry (``recipe`` "") holds a rule, or a refusal read off the flat
-graph alone (T5, E7, E8, E9, E14). A refusal that depends on the recipe (the extents, the
+graph alone (T5, E7, E8, E9, E14, E16). A refusal that depends on the recipe (the extents, the
 symbols, the data of the references: E1-E6, E10-E12, E15) is stored for that recipe only,
 under the record key and ``Recipe.key``: another program of the same loop structure
 derives its own.
@@ -25,7 +25,8 @@ factor such as ``exp(m) / exp(m')`` overflows where they would have rejected it)
 proved again (``proof.prove(update_of(F), ...)``). A factor that fails any of these, or makes
 any of them raise, a key or recipe that differs from the stored one, or an unreadable file is
 a miss: the caller derives and overwrites. (So a rule the ranking chose although it is not
-structurally stable is derived again in every process.) A stored refusal is returned as it is
+structurally stable is derived again in every process: every rule under a sum, whose
+reducer gives no order of ``m`` and ``m'``.) A stored refusal is returned as it is
 (it only keeps a pin). ``E13`` is never stored.
 """
 

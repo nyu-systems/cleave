@@ -12,8 +12,9 @@ value (a score, a value-matrix entry).
 The contribution of ONE element to an accumulator, ``c(x.., m)``, is read off the program's
 own flat graph (:func:`contribution`). Only a fragment of the IR is read (``E7``-``E9``,
 ``T5``): exact ``Add`` / ``Sub`` / ``Mul`` / ``Div`` / ``Exp`` between the full-extent value
-and a plain ``ReduceSum`` / ``Matmul`` that starts at zero; constants exactly, as the
-rational the float is.
+and an accumulator that sums from zero (``update_rule.accumulates``: a sum or a matmul);
+constants exactly, as the rational the float is. Nothing is assumed of the full-extent
+value's own reducer: ``m`` and ``m1`` are free.
 
 ``exp`` is an uninterpreted function. Every lemma below is a theorem about the real ``exp``
 (``exp(x + y) = exp(x) exp(y)``, ``exp(0) = 1``), so a proof from them is a proof with the
@@ -45,7 +46,7 @@ import time
 from dataclasses import dataclass, field
 from fractions import Fraction
 
-from .texts import E7, E8, E9, E14, T5, Refused
+from .texts import E7, E8, E9, E14, E16, T5, Refused
 
 TIMEOUT_MS = 5000
 OBLIGATIONS = ("(D) defined", "(0) accumulate form", "(i) one element",
@@ -129,11 +130,12 @@ def _unmodelled(node) -> tuple | None:
 def check_contribution(flat_graph, full: str, acc: str) -> None:
     """The refusal (T5, E7, E8, E9) if the contribution of one element to ``acc`` cannot
     be read off the flat graph; nothing otherwise."""
-    from ...ir.ops import Add, Div, Exp, Matmul, Mul, ReduceSum, Sub
+    from ...ir.ops import Add, Div, Exp, Mul, Sub
+    from ...ir.update_rule import accumulates
 
     by_name = {n.name: n for n in flat_graph.nodes}
     full_node, acc_node = by_name[full], by_name[acc]
-    if type(acc_node) not in (ReduceSum, Matmul) or getattr(acc_node, "accum_init", None) is not None:
+    if not accumulates(acc_node):
         raise Refused(T5.format(d=acc, cls=type(acc_node).__name__, full=full))
     between = _between(by_name, full_node, acc_node)
     computed = between | {full}
@@ -193,7 +195,7 @@ def contribution(flat_graph, full: str, acc: str):
     ``Matmul`` the product of its two operands (the contraction is the looped sum).
     Raises :class:`Refused` (T5, E7, E8, E9) for anything else.
     """
-    build, leaves, _ = _walk(flat_graph, full, acc)
+    build, leaves, _, _ = _walk(flat_graph, full, acc)
     return build, leaves
 
 
@@ -206,8 +208,21 @@ def fixed_divisors(flat_graph, full: str, acc: str) -> list:
     z3's division is total, and ``c / 0`` would otherwise be an arbitrary value no repair
     can relate. A divisor computed from the full-extent value (``exp(x - m) / (x - m)``) is
     never assumed: the flat graph evaluates it at the final value only, the kernel at every
-    running one."""
+    running one (:func:`check_running_divisors`)."""
     return _walk(flat_graph, full, acc)[2]
+
+
+def check_running_divisors(flat_graph, full: str, acc: str) -> None:
+    """E16 unless every divisor of the contribution of one element to ``acc`` that IS
+    computed from the full-extent value is provably nonzero for every value of it (an
+    ``exp`` of it is; the value itself, or ``x - m``, is not). The flat graph divides by such
+    a divisor at the finished value only, a loop at every running one, and any update that
+    repairs the accumulator would divide by it as well, so (D) of :func:`prove` holds for
+    none: ``x / sum(x)``, whose running sum may be zero. Read off the flat graph alone,
+    before anything is searched."""
+    for node, divisor in _walk(flat_graph, full, acc)[3]:
+        if valid(divisor != 0) != "unsat":
+            raise Refused(E16.format(node=node, full=full, acc=acc))
 
 
 def _walk(flat_graph, full: str, acc: str):
@@ -220,6 +235,7 @@ def _walk(flat_graph, full: str, acc: str):
     computed = _between(by_name, full_node, acc_node) | {full}
     leaves = {}
     divisors = {}  # sexpr -> z3 term of a divisor not computed from the full-extent value
+    running = {}  # sexpr -> (node, z3 term) of a divisor that is computed from it
 
     def term(n, m):
         if n is full_node:
@@ -232,9 +248,13 @@ def _walk(flat_graph, full: str, acc: str):
             return _exp()(args[0])
         if n.const is not None:
             c = const(n.const)
+            if type(n) is Div and n.const_on_left:  # c / x: x is computed from it
+                running.setdefault(args[0].sexpr(), (n.name, args[0]))
             return type(n).py_op(c, args[0]) if n.const_on_left else type(n).py_op(args[0], c)
         if type(n) is Div and operands[1].name not in computed:
             divisors.setdefault(args[1].sexpr(), args[1])
+        elif type(n) is Div:
+            running.setdefault(args[1].sexpr(), (n.name, args[1]))
         return type(n).py_op(args[0], args[1])
 
     def build(m):
@@ -243,8 +263,8 @@ def _walk(flat_graph, full: str, acc: str):
             return term(operands[0], m) * term(operands[1], m)
         return term(operands[0], m)
 
-    build(z3.Real("m"))  # fill ``leaves`` and ``divisors``
-    return build, leaves, list(divisors.values())
+    build(z3.Real("m"))  # fill ``leaves``, ``divisors`` and ``running``
+    return build, leaves, list(divisors.values()), list(running.values())
 
 
 # --------------------------------------------------------------------- the update's term
@@ -397,7 +417,7 @@ def prove(update, flat_graph, full: str, acc: str) -> Verdict:
     z3 = _z3()
     t0 = time.perf_counter()
     try:
-        build, _, fixed = _walk(flat_graph, full, acc)
+        build, _, fixed, _ = _walk(flat_graph, full, acc)
         m, m1, a, b, r, r2 = z3.Reals("m m1 a b r r2")
         base = {"m": m, "m'": m1}
 
@@ -434,7 +454,7 @@ def prove(update, flat_graph, full: str, acc: str) -> Verdict:
     return Verdict(proved, results, time.perf_counter() - t0)
 
 
-def nonpositive_exp_args(update, combine: str = "max") -> bool:
+def nonpositive_exp_args(update, combine: str) -> bool:
     """Structural stability: every ``exp`` argument of ``update`` is provably ``<= 0``
     under what the full-extent value's reducer gives (``m <= m'`` for a max; nothing for
     another reducer). One query per argument."""

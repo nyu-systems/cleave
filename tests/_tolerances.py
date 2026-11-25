@@ -93,6 +93,10 @@ TOLERANCES = {
     # the exact softmax of an input, split from the loop state over the softmax axis: the
     # partial reads its logits from storage, so its shift is the max of stored values
     "exact_split_rows": {"": Tolerance(rtol=5e-3), "shift": Tolerance(rtol=2e-7)},
+    # the softmax of x / 16 shifted by the SUM of its row, every plan: the loop carries the
+    # sum and repairs the row sum and the value matmul (tests/pipeline_api/
+    # test_carried_sum_gpu.py)
+    "sum_shifted": Tolerance(rtol=5e-3),
     # ---- traced programs of tests/graph/apply_tiling
     # two reductions that share nothing, every tiling whose two steps agree
     # (test_unrelated_reductions.py): two outputs, and the two products added

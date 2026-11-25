@@ -16,7 +16,7 @@ Float32 throughout (or the program's own dtype, for ranking); no FP64.
 Every guard is a typed refusal (``texts``): the graph must lower at small shapes (E2) and be
 the same graph there (E3), the looped symbol must size the looped dim (E1) and nothing else
 of the state (E15), the inputs must carry the looped dim on one axis (E4), the cut must be
-right (E5: the full-extent value is its reducer's own fold, bit for bit), the rows of the
+right (E5: the full-extent value is its reducer's own fold, ``folds_to``), the rows of the
 full-extent value must lead its accumulators (E6), and the references must show what an
 update has to repair (E10).
 """
@@ -53,7 +53,29 @@ def combine_of(node):
     """The reducer of a full-extent node as a torch function (``type(node).combine``)."""
     import torch
 
-    return {"max": torch.maximum}[type(node).combine]
+    return {"max": torch.maximum, "add": torch.add}[type(node).combine]
+
+
+# Reducers whose fold is exact in float32 in any order: the value over a prefix and over the
+# next tile fold to the value over both bit for bit.
+EXACT = ("max",)
+
+
+def folds_to(combine: str, combined, whole, magnitude, count: int) -> bool:
+    """Whether ``combined`` (the fold ``combine`` of a full-extent value over a prefix and
+    over the next tile) is ``whole`` (its value over both, ``count`` elements of the looped
+    dim). Bit for bit for an exact reducer (``EXACT``). For ``add``, within what a float32
+    sum of the same elements in another order can differ by: ``(count + 1) * 2**-23 *
+    magnitude()`` per element, where ``magnitude()`` is the sum of the absolute values of
+    those elements (twice the standard bound ``count * u * sum |x|``, ``u = 2**-24``: one
+    rounding more for the fold). A value that is not a running reduction of the looped dim
+    misses by far more than that."""
+    import torch
+
+    if combine in EXACT:
+        return bool(torch.equal(combined, whole))
+    bound = (count + 1) * 2.0 ** -23 * magnitude()
+    return bool(((combined.float() - whole.float()).abs() <= bound).all())
 
 
 def _node(graph, name):
@@ -282,12 +304,21 @@ class Flat:
         env, _ = values(self.graph(length), self.cut(inputs, start, length), given)
         return {k: env[k].float() for k in (self.full, *self.accs)}
 
+    def magnitude(self, inputs, start: int, length: int):
+        """Per element of the full-extent value: the sum of the absolute values of what it
+        reduces over ``[start, start + length)`` of the looped dim (float32; ``folds_to``)."""
+        env, _ = values(self.graph(length), self.cut(inputs, start, length))
+        node = self.node(length, self.full)
+        operand = env[node.inputs[0].src_node.name].float().abs()
+        return operand.sum(dim=node.axis).reshape(env[self.full].shape)
+
     def start(self, like: dict) -> dict:
-        """The state before the first iteration: the reducer's start value and zeros."""
+        """The state before the first iteration: the reducer's start value (zero where it
+        has none: ``carry_init`` None, the identity of ``add``) and zeros."""
         import torch
 
         init = type(self.node(self.tile, self.full)).carry_init
-        out = {self.full: torch.full_like(like[self.full], init)}
+        out = {self.full: torch.full_like(like[self.full], 0.0 if init is None else init)}
         for acc in self.accs:
             out[acc] = torch.zeros_like(like[acc])
         return out
@@ -323,27 +354,27 @@ class Case:
             return {k: v.float().reshape(self.rows, -1)[keep] for k, v in d.items()}
 
         old, new = cut(self.old), cut(self.new)
-        moved = float((new[self.full] > old[self.full]).float().mean()) if keep.numel() else 0.0
+        moved = float((new[self.full] != old[self.full]).float().mean()) if keep.numel() else 0.0
         return Case(f"{self.label} (rows {keep.tolist()})", self.prefix, old, new,
                     cut(self.tile), moved, self.full)
 
 
 def extension(flat: Flat, inputs, prefix: int, label: str) -> Case:
     """The case ``F(H) -> F(H ++ T)`` for ``|H| = prefix`` and the next tile ``T``."""
-    import torch
-
     t = flat.tile
     new = flat.state(inputs, 0, prefix + t)
     own = flat.state(inputs, prefix, t)  # the tile on its own: only its full-extent value
     old = flat.state(inputs, 0, prefix) if prefix else flat.start(new)
-    # The full-extent value's own hole is its reducer's associativity, exact. Where it does
-    # not hold, the value is not a running reduction of the looped dim (its operand depends
-    # on the prefix, a max of ``exp(x - max(x))``) or the cut is wrong: no rule.
-    fold = combine_of(flat.node(t, flat.full))
-    if not torch.equal(fold(old[flat.full], own[flat.full]), new[flat.full]):
+    # The full-extent value's own hole is its reducer's associativity (``folds_to``). Where
+    # it does not hold, the value is not a running reduction of the looped dim (its operand
+    # depends on the prefix, a max of ``exp(x - max(x))``) or the cut is wrong: no rule.
+    node = flat.node(t, flat.full)
+    combined = combine_of(node)(old[flat.full], own[flat.full])
+    if not folds_to(type(node).combine, combined, new[flat.full],
+                    lambda: flat.magnitude(inputs, 0, prefix + t), prefix + t):
         raise Refused(E5.format(full=flat.full, label=label))
     tile = flat.state(inputs, prefix, t, given={flat.full: new[flat.full]})
-    moved = float((new[flat.full] > old[flat.full]).float().mean())
+    moved = float((new[flat.full] != old[flat.full]).float().mean())
     return Case(label, prefix, old, new, tile, moved, flat.full)
 
 

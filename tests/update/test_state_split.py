@@ -72,7 +72,7 @@ def test_search_partial_structure_replays_the_solo_graph_on_a_split_of_the_loope
     outputs = [op["input_tensors"][0]["dim"][: op["input_tensors"][0]["num_dims"]]
                for op in ops if op["op_type"] == "kn_output_op"]
     assert all(dims[0] == factor and looped not in dims for dims in outputs)
-    with pytest.raises(SplitRefused, match="is not a max"):
+    with pytest.raises(SplitRefused, match="is not a reduction of one axis"):
         partial_structure(graph.structure, acc_ops[0], acc_ops)
 
 

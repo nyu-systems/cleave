@@ -6,7 +6,7 @@ every combination of the holes' rules is replayed as the kernel runs it:
 
   * the flat graph re-instantiated in the program's dtype (a float16 operand is rounded
     where the kernel rounds it), a float32 carried state starting at the reducer's start
-    value and zeros, per tile ``m' = combine(m, max of the tile)``, the tile computation by
+    value and zeros, per tile ``m' = combine(m, its value over the tile)``, the tile computation by
     the flat graph with ``m'`` given, each accumulator updated as the kernel does it,
     ``a * F + r`` with every subterm of ``F`` evaluated as a node, and at the end the flat
     graph's own epilogue on the final state, compared with the flat graph on the whole input;
@@ -15,15 +15,17 @@ every combination of the holes' rules is replayed as the kernel runs it:
 
 A combination is REJECTED when, on any case, a subterm of a factor, a carried accumulator
 (after any iteration) or an output is non-finite, or the carried full-extent value at the
-end is not bit-equal to the flat graph's. The rest are ordered by the key
+end is not the flat graph's (``reference.folds_to``: bit for bit for a max, within float32
+reassociation for a sum). The rest are ordered by the key
 ``(grade, not stable, cost, size, text)``, smallest first:
 
   grade   accuracy at the output's resolution: with ``rho = ulp(output dtype) + n_tiles *
           2^-23`` and ``f = max(best error on the case, rho)``, an error ``v`` has grade
           ``max(0, ceil(log4(max(v, f) / f)) - 1)``; the combination's is its largest.
           Grade 0 = within 4x of what the output can resolve.
-  stable  every ``exp`` argument provably ``<= 0``, no division by and no subtraction of
-          a value that uses ``a`` or ``r``
+  stable  every ``exp`` argument provably ``<= 0`` under what the reducer gives (``m <=
+          m'`` for a max; nothing for a sum, so no ``exp`` of the carried value is), no
+          division by and no subtraction of a value that uses ``a`` or ``r``
   cost    distinct op nodes of the factors taken together (what the loop pays per iteration)
   size    sum of the tree sizes of the updates
   text    the updates' texts in accumulator-name order (the deterministic tie-break)
@@ -39,7 +41,7 @@ from dataclasses import dataclass
 
 from ...ir.update_rule import repair_of, show, size, subterms, uses
 from ...runtime.reference import values
-from .reference import Flat, combine_of
+from .reference import Flat, combine_of, folds_to
 
 ULP = {"float16": 2.0 ** -10, "bfloat16": 2.0 ** -7, "float32": 2.0 ** -23}
 
@@ -72,9 +74,9 @@ def evaluate(expr, env, memo=None):
 @dataclass
 class Replay:
     finite: bool  # every factor subterm, carried accumulator and output, at every iteration
-    same_max: bool  # the carried full-extent value at the end is bit-equal to the graph's
+    same_value: bool  # the carried full-extent value at the end is the graph's (folds_to)
     error: float  # largest output difference relative to the largest reference entry
-    why: str = ""  # what failed first: "non-finite <what> at tile <k>" or the max
+    why: str = ""  # what failed first: "non-finite <what> at tile <k>" or the carried value
 
 
 def replay(kernel: Flat, factors: dict, n: int, distribution: str, *, seed: int = 0,
@@ -107,7 +109,9 @@ def replay(kernel: Flat, factors: dict, n: int, distribution: str, *, seed: int 
             if not why and not bool(torch.isfinite(new[acc]).all()):
                 why = f"non-finite {acc} after tile {k}"
         state = new
-    same_max = bool(torch.equal(state[kernel.full], ref_env[kernel.full].float()))
+    reducer = type(kernel.node(t, kernel.full)).combine
+    same_value = folds_to(reducer, state[kernel.full], ref_env[kernel.full].float(),
+                          lambda: kernel.magnitude(inputs, 0, n), n)
     _, outputs = values(kernel.graph(n), inputs, given=state)
     worst = 0.0
     for out, ref in zip(outputs, reference):
@@ -115,9 +119,9 @@ def replay(kernel: Flat, factors: dict, n: int, distribution: str, *, seed: int 
             why = "non-finite output"
         scale = float(ref.float().abs().max()) or 1.0
         worst = max(worst, float((out.float() - ref.float()).abs().max()) / scale)
-    if not why and not same_max:
-        why = f"the carried {kernel.full} is not bit-equal to the flat graph's"
-    return Replay(not why.startswith("non-finite"), same_max, worst, why)
+    if not why and not same_value:
+        why = f"the carried {kernel.full} is not the flat graph's"
+    return Replay(not why.startswith("non-finite"), same_value, worst, why)
 
 
 def resolution(kernel: Flat, cases) -> float:
@@ -135,7 +139,7 @@ def grade(v: float, best: float, rho: float) -> int:
     return max(0, math.ceil(math.log(max(v, f) / f) / math.log(4.0)) - 1)
 
 
-def structurally_stable(update, combine: str = "max") -> bool:
+def structurally_stable(update, combine: str) -> bool:
     from .proof import nonpositive_exp_args
 
     def bad(e):
@@ -185,7 +189,7 @@ def order(rows: list, rho: float) -> list:
 
 
 def rank(kernel: Flat, loops: tuple, choices: dict, cases: list, *, combine=None,
-         reducer: str = "max"):
+         reducer: str):
     """Every combination of the holes' rules, ``(ranked best first, rejected)``.
 
     ``choices``: accumulator -> proven updates; only those the assembly can emit

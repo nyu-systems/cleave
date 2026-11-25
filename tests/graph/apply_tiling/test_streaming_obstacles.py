@@ -79,14 +79,37 @@ class _Stub:
 _stub = _Stub
 
 
-def test_t1_a_max_over_two_axes():
-    """No reduction lowering emits reduces two axes (``ReduceSum`` takes one); the rule is
-    held on the classifier's own inputs."""
-    full = _stub("m2", 2, running_max=True)
-    d = _stub("s", 1)
-    red = {full: [{(1, 0, 1)}, {(1, 0, 2)}], d: [{(1, 0, 1)}]}
+class _Carried(_Stub):
+    """A reduction whose class declares how it is carried."""
+
+    combine, carry_init = "add", None
+
+
+class _Opaque(_Stub):
+    """A reduction whose class declares no combine (a contraction is one)."""
+
+
+def test_t0_an_ancestor_that_declares_no_combine():
+    """Any reduction a descendant over its dim depends on is a conflict, whatever its op;
+    one whose class does not say how its value over a prefix and over the next tile
+    combine cannot be carried, and keeps its pin."""
+    full, d = _Opaque("c", 1), _Carried("s", 1)
+    red = {full: [{(1, 0, 1)}], d: [{(1, 0, 1)}]}
     found = stream.obstacles([full, d], red, {d: frozenset({full}), full: frozenset()})
-    assert found == [Obstacle("m2", ("s",), "m2 reduces 2 axes; one is carried")]
+    assert found == [Obstacle("c", ("s",), (
+        "c is a _Opaque: it declares no combine of its value over a prefix and over the next "
+        "tile, so it cannot be carried across a loop"))]
+
+
+def test_t1_a_carried_reduction_over_two_axes():
+    """No reduction lowering emits reduces two axes (``ReduceSum`` takes one); the rule is
+    held on the classifier's own inputs, and a dim either axis shares is a conflict."""
+    full = _Carried("m2", 2)
+    d = _Carried("s", 1)
+    for shared in ((1, 0, 1), (1, 0, 2)):
+        red = {full: [{(1, 0, 1)}, {(1, 0, 2)}], d: [{shared}]}
+        found = stream.obstacles([full, d], red, {d: frozenset({full}), full: frozenset()})
+        assert found == [Obstacle("m2", ("s",), "m2 reduces 2 axes; one is carried")]
 
 
 def max_of_a_sum(x: cl.Tensor["R", "C"], y: cl.Tensor["R", "C"]):
@@ -105,11 +128,18 @@ def test_t2_a_loop_that_does_not_run_over_the_whole_dim_of_the_max():
 
 
 def test_t3_the_traced_order():
+    """Two conflicts: the max, under which the value matmul reads the finished row sum (two
+    passes), and the row sum itself, under which the value matmul loops; that one the
+    scheduler classifies, and the engine refuses (the exp it reads changes with the max)."""
     ir = X.lowered(X.traced_attention, SMALL)
     m, total, reader = _names(ir, ReduceMax), _names(ir, ReduceSum), _names(ir, Matmul, 1)
-    assert _only(ir).refused == (
+    first, second = X.obstacles_of(ir)
+    assert first.full == m and first.refused == (
         f"{reader} reads {total}, a finished reduction over the dim {m} reduces: that needs "
         "two passes over the row")
+    assert second == Obstacle(total, (reader,), "")
+    assert f"is computed from {m}, another reduction over the dim {total} reduces" in (
+        X.engine_refusal(ir, second))
 
 
 def test_t4_a_returned_softmax():
@@ -151,7 +181,7 @@ def test_t5_comes_last():
     """The rules are asked in order: a graph that fails an earlier one is refused for it."""
     ir = X.lowered(X.traced_attention, SMALL)
     next(n for n in ir.nodes if type(n) is ReduceSum).accum_init = 1.0
-    assert "two passes over the row" in _only(ir).refused
+    assert "two passes over the row" in X.obstacles_of(ir)[0].refused
 
 
 def test_a_refused_obstacle_keeps_its_pin_whatever_record_it_has():
@@ -291,24 +321,25 @@ def test_a_graph_without_tilings_says_why_its_max_is_not_carried(monkeypatch):
     """The traced order at a row longer than a block: no tiling, and the report names the
     obstacle's reason, after the row limit."""
     shapes = dict(H=32, SQ=64, SKV=4096, D=64)
-    ir = X.streamed_ir(X.traced_attention, shapes, "two passes")
-    (why,) = ir.streaming_refusals
+    ir = X.streamed_ir(X.traced_attention, shapes, "two passes", "is computed from")
+    why, why_sum = ir.streaming_refusals
     plans = _schedule_ir(monkeypatch, X.traced_attention, shapes, ir, topk=8)
     assert not plans and {str(r.error).split(" (")[0] for r in plans.refused} == {
-        "a max needs its whole row in one block, and this row is longer; it is not carried "
-        f"across a loop: {why}"}
+        f"{plans_module.ROW_LIMIT}; it is not carried across a loop: {why}; {why_sum}"}
     assert why.startswith(f"{X.maxes(ir)[0].name}: mma_") and "a finished reduction" in why
 
 
-def test_a_max_without_an_obstacle_entry_and_without_tilings(monkeypatch):
-    """No list of reasons on the graph (no obstacle was looked at): the row limit alone. A
-    max is a max, whoever wrote it: the text gives no advice about ``cl.softmax``. (Which
-    graph has no tiling is the policy's business; here it has none.)"""
+def test_a_conflict_without_an_obstacle_entry_and_without_tilings(monkeypatch):
+    """No list of reasons on the graph (no obstacle was looked at): the row limit alone,
+    for the ancestor of a conflict, whatever its op: the text gives no advice about
+    ``cl.softmax``. (Which graph has no tiling is the policy's business; here it has
+    none.)"""
     ir = X.lowered(X.flash_attention, SMALL)
     assert not hasattr(ir, "streaming_refusals")
     monkeypatch.setattr(plans_module, "_search", lambda *args, **kwargs: [])
     plans = _schedule_ir(monkeypatch, X.flash_attention, SMALL, ir, topk=8)
     assert not plans and plans.refused
     texts = {str(r.error) for r in plans.refused}
-    assert texts == {"a max needs its whole row in one block, and this row is longer"}
-    assert texts == {plans_module.MAX_ROW_LIMIT}
+    assert texts == {"a reduction that another one over its dim depends on needs that whole "
+                     "dim in one block, and this dim is longer"}
+    assert texts == {plans_module.ROW_LIMIT}

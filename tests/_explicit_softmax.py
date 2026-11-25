@@ -173,11 +173,29 @@ def record(ir, obstacle, factor=FACTOR):
     return full, full.streaming
 
 
+def engine_refusal(ir, obstacle) -> str:
+    """What the engine says of an obstacle the scheduler classifies as streaming before it
+    builds anything (the refusals read off the flat graph alone: T5, E7-E9, E14, E16), or
+    ``""``."""
+    from cleave.pipeline.update import proof
+    from cleave.pipeline.update.texts import Refused
+
+    try:
+        for check in (proof.check_contribution, proof.check_leaves,
+                      proof.check_running_divisors):
+            for acc in obstacle.loops:
+                check(ir, obstacle.full, acc)
+    except Refused as e:
+        return str(e)
+    return ""
+
+
 def streamed_ir(fn, shapes, *refused, dtype=cl.f16, factor=FACTOR):
     """Lower ``fn`` and check its obstacles against ``refused``: one entry per obstacle in
     graph order, ``None`` for one that is classified as streaming (it gets a record) or a
     phrase of the reason it is not (it goes to ``ir.streaming_refusals``, as lowering
-    writes it). No entry at all: one obstacle, classified."""
+    writes it): the scheduler's, or for an obstacle it classifies the engine's
+    (:func:`engine_refusal`). No entry at all: one obstacle, classified."""
     ir = lowered(fn, shapes, dtype)
     found = obstacles_of(ir)
     refused = refused or (None,) * len(found)
@@ -188,8 +206,9 @@ def streamed_ir(fn, shapes, *refused, dtype=cl.f16, factor=FACTOR):
             assert not obstacle.refused, (obstacle.full, obstacle.refused)
             record(ir, obstacle, factor)
         else:
-            assert want in obstacle.refused, (obstacle.full, obstacle.refused, want)
-            reasons.append(f"{obstacle.full}: {obstacle.refused}")
+            why = obstacle.refused or engine_refusal(ir, obstacle)
+            assert want in why, (obstacle.full, why, want)
+            reasons.append(f"{obstacle.full}: {why}")
     if found:
         ir.streaming_refusals = reasons
     return ir

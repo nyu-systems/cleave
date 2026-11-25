@@ -36,6 +36,8 @@ from ._programs import (
     mla_decode,
     searched,
     softmax_rows,
+    sum_normalized,
+    sum_shifted,
     the_obstacle,
     traced_attention,
     two_softmaxes,
@@ -291,30 +293,34 @@ _ATT = dict(H=4, SQ=8, SKV=64, D=16)
 _ROWS = dict(R=16, C=64, D=8)
 CENSUS = [  # program, shapes, what lowering says for each obstacle
     (flash_attention, _ATT, ["record"]),
-    (traced_attention, _ATT, ["T3"]),
-    (unscaled_attention, _ATT, ["T3"]),
+    (traced_attention, _ATT, ["T3", "E14"]),  # the max, then the row sum under it
+    (unscaled_attention, _ATT, ["T3", "E14"]),
     (softmax_rows, dict(R=16, C=64), ["T4"]),
     (flash_rows, _ROWS, ["record"]),
-    (traced_rows, _ROWS, ["T3"]),
+    (traced_rows, _ROWS, ["T3", "E14"]),
     (column_average, dict(H=4, K=64, N=8), ["record"]),
     (column_average_2d, dict(K=64, N=8), ["record"]),
     (two_softmaxes, dict(R=16, C=64), ["E14", "E14"]),
     (max_normalized, _ROWS, ["T5"]),
     (column_weighted, dict(M=8, K=64, N=16), ["E6"]),
-    (sum_next_to_exp, dict(R=16, C=64), ["T3"]),
+    (sum_next_to_exp, dict(R=16, C=64), ["T3", "E14"]),
     (left_constant, _ROWS, ["record"]),
     (self_attention, dict(H=4, S=256, D=16), ["E15"]),
+    # conflicts whose ancestor is a sum: served by the same search, or refused by it
+    (sum_shifted, _ROWS, ["record"]),
+    (sum_normalized, _ROWS, ["E16"]),
 ]
 WHY = {"T3": " reads ", "T4": ", computed from ", "T5": " is a ReduceMax: ", "E14": ", which ",
-       "E6": " of one row changes with ", "E15": " also sizes a dim the loop does not step"}
+       "E6": " of one row changes with ", "E15": " also sizes a dim the loop does not step",
+       "E16": " divides by a value computed from "}
 
 
 @pytest.mark.parametrize("fn, shapes, want", CENSUS, ids=[c[0].__name__ for c in CENSUS])
 def test_every_softmax_program_is_served_or_says_why(fn, shapes, want, tmp_path, monkeypatch):
-    """Lowering: a record where the engine derives one, the reason
-    otherwise -- the structural ones of the scheduler (T3: two passes, T4: a value of the
-    max read outside the loop, T5: a reduction under the max that is no sum) without asking
-    the engine, the engine's own after."""
+    """Lowering: per conflict, whatever its ancestor, a record where the engine derives one,
+    the reason otherwise -- the structural ones of the scheduler (T3: two passes, T4: a value
+    of the ancestor read outside the loop, T5: a reduction under it that is no sum) without
+    asking the engine, the engine's own after."""
     import cleave
     from cleave.frontend import trace
     from cleave.pipeline import plans

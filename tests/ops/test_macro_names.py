@@ -131,13 +131,6 @@ def test_carried_max_start_is_per_instance():
     assert len(cg.generated_macros) == 1
 
 
-def test_only_a_max_is_a_running_accumulator():
-    assert ReduceMax.running_max is True and ReduceMax((16, 32)).running_max is True
-    assert AccumulateMax.running_max is True and AccumulateMax((16,)).running_max is True
-    for cls in (ReduceSum, Matmul, Accumulate, Mul):
-        assert cls.running_max is False, cls.__name__
-
-
 def test_accumulate_max_macro_names_and_bodies():
     """The elementwise running max: ``B = max(B, A)`` where ``Accumulate`` has ``B += A``."""
     cg = TilelangCodeGen()

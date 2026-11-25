@@ -134,6 +134,22 @@ def attention(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
     return cl.softmax((q @ k.mT) / q.shape[-1] ** 0.5, dim=-1) @ v
 
 
+# ---------------------------------------------- conflicts whose ancestor is not a max
+
+
+def sum_shifted(x: cl.Tensor["R", "C"], v: cl.Tensor["C", "D"]):
+    """``softmax(y) @ v`` for ``y = x / 16``, shifted by the SUM of the row of ``y`` instead
+    of its max: the row sum and the value matmul loop under a sum over their own dim."""
+    y = x * 0.0625
+    e = cl.exp(y - cl.sum(y, -1, keepdim=True))
+    return (e @ v) / cl.sum(e, -1, keepdim=True)
+
+
+def sum_normalized(x: cl.Tensor["R", "C"], v: cl.Tensor["C", "D"]):
+    """``(x / sum(x)) @ v``: the matmul loops under the sum it divides by."""
+    return (x / cl.sum(x, -1, keepdim=True)) @ v
+
+
 # --------------------------------------------------------------------------------- access
 
 
@@ -159,18 +175,23 @@ def lowered(graph):
     return ir
 
 
-def the_obstacle(ir):
-    """The one obstacle of ``ir`` that passes the structural rules."""
+def the_obstacle(ir, cls=None):
+    """The one obstacle of ``ir`` that passes the structural rules (with ``cls``: the one
+    whose ancestor is of that class; a graph may hold several conflicts that do, such as
+    the max of a softmax and the sums of squares of the RMS norms in front of it)."""
     nodes, red = scheduled_reductions(ir)
-    found = [ob for ob in obstacles(nodes, red, reduction_ancestors(nodes)) if not ob.refused]
+    by_name = {n.name: n for n in ir.nodes}
+    found = [ob for ob in obstacles(nodes, red, reduction_ancestors(nodes)) if not ob.refused
+             and (cls is None or type(by_name[ob.full]) is cls)]
     (ob,) = found
     return ob
 
 
-def derivation(graph, ir=None, **kw):
-    """``engine.run`` for the one obstacle of ``graph``'s flat graph (no memo, no store)."""
+def derivation(graph, ir=None, cls=None, **kw):
+    """``engine.run`` for the one obstacle of ``graph``'s flat graph (``the_obstacle``; no
+    memo, no store)."""
     ir = lowered(graph) if ir is None else ir
-    ob = the_obstacle(ir)
+    ob = the_obstacle(ir, cls)
     return engine.run(ir, ob, Recipe.of(graph), key=loop_key(ir, ob.full, ob.loops), **kw)
 
 

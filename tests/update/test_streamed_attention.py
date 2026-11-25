@@ -118,11 +118,19 @@ def test_search_mha_prefill_is_streamed_in_the_flash_form():
                  reader=node_of(ir, Matmul, 1).name)
     why = ("{full}: {reader} reads {total}, a finished reduction over the dim {full} reduces: "
            "that needs two passes over the row").format(**names)
-    assert ir.streaming_refusals == [why] and not hasattr(ir, "derivations")
+    # ... and the row sum is a conflict of its own (the value matmul loops under it), which
+    # the engine refuses before it builds anything: the exp it reads changes with the max
+    (exp,) = [n.name for n in ir.nodes if type(n).__name__ == "Exp"]
+    why_sum = ("{total}: {exp}, which {reader} reads, is computed from {full}, another "
+               "reduction over the dim {total} reduces: it changes from one prefix of the loop "
+               "to the next").format(exp=exp, **names)
+    assert ir.streaming_refusals == [why, why_sum]
+    (derivation,) = ir.derivations
+    assert derivation.full == names["total"] and not derivation.holes
     assert not [n for n in ir.nodes if getattr(n, "streaming", None) is not None]
     text = str(refusal.error)
-    assert text.startswith("a max needs its whole row in one block, and this row is longer; "
-                           "it is not carried across a loop: " + why)
+    assert text.startswith(f"{plans_module.ROW_LIMIT}; it is not carried across a loop: {why}; "
+                           f"{why_sum}")
 
 
 def test_search_a_short_row_has_one_tile_plans_as_well():
@@ -389,14 +397,14 @@ def test_a_long_row_with_a_record_of_another_graph_has_no_tiling_and_says_why(mo
                        P.ScheduleConfig(topk=8))
     assert not plans and plans.refused
     assert {str(r.error) for r in plans.refused} == {
-        "a max needs its whole row in one block, and this row is longer; it is not carried "
-        f"across a loop: {full.name}: its update rule was derived for another graph"}
+        f"{plans_module.ROW_LIMIT}; it is not carried across a loop: {full.name}: its update "
+        "rule was derived for another graph"}
     # without the list (no obstacle was looked at) the text is the one it always was
     del ir.streaming_refusals
     full.streaming = None
     plans = P.schedule(GraphSet.identity(trace(flash_by_hand, shapes, cl.f16)),
                        P.ScheduleConfig(topk=8))
-    assert {str(r.error) for r in plans.refused} == {plans_module.MAX_ROW_LIMIT}
+    assert {str(r.error) for r in plans.refused} == {plans_module.ROW_LIMIT}
 
 
 def unassembled(cand, monkeypatch):
@@ -628,7 +636,7 @@ def test_codegen_refuses_an_update_rule_that_was_not_assembled(monkeypatch):
     with pytest.raises(AssertionError) as error:
         TilelangCodeGen().gen(tiled)
     assert (f"{full.name!r} has an update rule that was not assembled; emitting it as a "
-            "plain max would take the max of one slice") in str(error.value)
+            "plain reduction would reduce one slice") in str(error.value)
     # the same candidate, assembled, is generated ...
     code, _ = build_candidate(cand)
     assert f"t_{full.name}_prev" in code and "ukernel_rescale" in code

@@ -276,7 +276,8 @@ def test_combine_weighs_every_split_by_its_max(operator, step):
     m = by_name["combine_max"]
     assert type(m) is (ReduceMax if step > 1 else AccumulateMax)
     assert m.accum_init == NEG_FLT_MAX and m.out_dtype == "float32"
-    assert m.running_max and m.inputs[0].src_node is ph_m
+    assert any(lag.inputs[0].src_node is m for lag in inner.lag_nodes)  # carried state
+    assert m.inputs[0].src_node is ph_m
     assert tuple(inner.tmap[m].tile_size) == (group,)
     if step > 1:
         assert m.axis == 0 and tuple(m.dims) == rows

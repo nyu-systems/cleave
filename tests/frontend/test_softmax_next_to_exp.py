@@ -22,7 +22,7 @@ import cleave.lang as cl
 from cleave import pipeline as P
 from cleave.frontend import trace
 from cleave.ir.ops import Exp
-from cleave.pipeline.plans import MAX_ROW_LIMIT, NO_TILING, lower
+from cleave.pipeline.plans import ROW_LIMIT, NO_TILING, lower
 from cleave.runtime.inputs import adversarial_cases, softmax_axis, why_not_adversarial
 from cleave.runtime.validate import Tolerance, compare_outputs
 from tests._lowering import run_lowered
@@ -129,7 +129,7 @@ def test_search_where_a_softmax_next_to_an_exp_of_its_logits_has_plans():
     plans = _plans(softmax_plus_exp, 64, 8192)
     assert len(plans) == 0
     reasons = _reasons(plans)
-    assert all(reason.startswith(f"{NO_TILING}; a max is not carried across a loop: ")
+    assert all(reason.startswith(f"{NO_TILING}; a reduction is not carried across a loop: ")
                and two_passes in reason and "a unit extent that is not a batch dim" in reason
                for reason in reasons), reasons
     # ... where the softmax alone still has one; it has none at 16384, where the only
@@ -139,7 +139,7 @@ def test_search_where_a_softmax_next_to_an_exp_of_its_logits_has_plans():
     plans = _plans(softmax_alone, 64, 16384)
     assert len(plans) == 0
     reasons = _reasons(plans)
-    assert all(reason.startswith(f"{NO_TILING}; a max is not carried across a loop: ")
+    assert all(reason.startswith(f"{NO_TILING}; a reduction is not carried across a loop: ")
                and two_passes in reason and "a unit extent that is not a batch dim" in reason
                for reason in reasons), reasons
     # two softmaxes, over the rows and over the columns: the tile is the whole tensor
@@ -149,7 +149,7 @@ def test_search_where_a_softmax_next_to_an_exp_of_its_logits_has_plans():
     plans = _plans(dual_softmax, 64, 256)
     assert len(plans) == 0, plans.summary()
     reasons = _reasons(plans)
-    assert all(MAX_ROW_LIMIT in reason and two_passes in reason for reason in reasons), reasons
+    assert all(ROW_LIMIT in reason and two_passes in reason for reason in reasons), reasons
 
 
 def test_search_every_graph_of_two_softmaxes_has_its_whole_tile_plan():

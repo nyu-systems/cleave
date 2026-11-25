@@ -249,6 +249,12 @@ class ReduceSum(ComputeOpNode):
     _tl_reduce = "T.reduce_sum"
     # Fill value of a loop accumulator before its first iteration (None: T.clear).
     accum_init = None
+    # As a value carried across a loop (``cleave.schedule.streaming``): how its value over a
+    # prefix and over the next tile combine to its value over both (the name of the
+    # reducer: ``pipeline.update.reference.combine_of``), and where the carried value
+    # starts (None: zero, the identity of ``add``; a float32 number otherwise).
+    combine = "add"
+    carry_init = None
 
     @staticmethod
     def _te_reduce(expr, axis):
@@ -390,11 +396,8 @@ class ReduceMax(ReduceSum):
     kind = "reduce_max"
     _tl_reduce = "T.reduce_max"
     accum_init = -float("inf")
-    running_max = True
-    # As a full-extent value carried across a loop (``cleave.schedule.streaming``): how its
-    # value over a prefix and over the next tile combine to its value over both, and where
-    # the carried value starts (a float32 number: the first repair is ``exp(start - m)``,
-    # which has to be 0 and not NaN).
+    # Carried (``ReduceSum.combine``): by max, from a float32 number, not ``-inf``: the first
+    # repair is ``exp(start - m)``, which has to be 0 and not NaN.
     combine = "max"
     carry_init = NEG_FLT_MAX
 
@@ -481,13 +484,13 @@ class AccumulateMax(Accumulate):
     ``ReduceMax`` to fold. What ``Accumulate`` is to ``ReduceSum``, this is to ``ReduceMax``:
     the same carried state, with the loop itself as the fold.
 
-    Like every running max it may be read inside the loop that carries it
-    (``running_max``), and it starts at ``accum_init``: the identity of max by default, a
-    finite value per instance where the loop also forms ``exp(m_prev - m)``.
+    Like every carried value it may be read inside the loop that carries it where a lag
+    node of that loop snapshots it (``Graph.lag_nodes``), and it starts at ``accum_init``:
+    the identity of max by default, a finite value per instance where the loop also forms
+    ``exp(m_prev - m)``.
     """
 
     accum_init = -float("inf")
-    running_max = True
 
     def __init__(
         self,

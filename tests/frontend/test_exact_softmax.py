@@ -224,7 +224,7 @@ def test_search_a_max_written_by_hand_is_carried_across_a_loop(tmp_path, monkeyp
     """A max written by hand is the max of ``cl.softmax``: at S_KV = 4096 the flash form the
     search finds carries it across the loop over the keys, and the traced order, whose value
     matmul reads the finished row sum, says why it has no tiling."""
-    from cleave.pipeline.plans import MAX_ROW_LIMIT
+    from cleave.pipeline.plans import ROW_LIMIT
     from cleave.schedule import apply_tiling
     from cleave.schedule.streaming import sites
 
@@ -237,7 +237,7 @@ def test_search_a_max_written_by_hand_is_carried_across_a_loop(tmp_path, monkeyp
     assert len(plans) == 2 and all(sites(apply_tiling(p.tile)) for p in plans)
     assert {p.graph.summary() for p in plans} == {"solo matmul>div>max>sub>exp>sum>matmul>div"}
     (refusal,) = plans.refused
-    assert str(refusal.error).startswith(f"{MAX_ROW_LIMIT}; it is not carried across a loop: ")
+    assert str(refusal.error).startswith(f"{ROW_LIMIT}; it is not carried across a loop: ")
     assert "a finished reduction over the dim" in str(refusal.error)
 
 
@@ -258,7 +258,7 @@ def test_search_a_returned_softmax_is_not_promised_a_row_of_any_length(tmp_path,
     from the max for every key, is also read by the division, which is not summed over the
     keys. ``compile`` ends on that report."""
     from cleave.core.errors import CleaveError
-    from cleave.pipeline.plans import MAX_ROW_LIMIT
+    from cleave.pipeline.plans import ROW_LIMIT
 
     monkeypatch.setenv("CLEAVE_CACHE_ROOT", str(tmp_path))
     shapes = dict(H=32, SQ=64, SKV=4096, D=64)
@@ -268,11 +268,11 @@ def test_search_a_returned_softmax_is_not_promised_a_row_of_any_length(tmp_path,
     plans = P.schedule(P.superoptimize(exact, P.SuperoptConfig(cache=False)),
                        P.ScheduleConfig(topk=2))
     assert not plans and plans.refused
-    assert len(MAX_ROW_LIMIT) <= 160  # a refusal's reason is one line of that many characters
-    assert "cl.softmax" not in MAX_ROW_LIMIT and "a row of any length" not in MAX_ROW_LIMIT
+    assert len(ROW_LIMIT) <= 160  # a refusal's reason is one line of that many characters
+    assert "cl.softmax" not in ROW_LIMIT and "a row of any length" not in ROW_LIMIT
     for refusal in plans.refused:
         text = str(refusal.error)
-        assert text.startswith(f"{MAX_ROW_LIMIT}; it is not carried across a loop: "), text
+        assert text.startswith(f"{ROW_LIMIT}; it is not carried across a loop: "), text
         assert re.search(r"exp_\d+, computed from reduce_max_\d+_\d+ for every element of the "
                          r"looped dim, is also read by div_\d+, which is not summed over that "
                          r"dim", text), text
@@ -280,13 +280,13 @@ def test_search_a_returned_softmax_is_not_promised_a_row_of_any_length(tmp_path,
         P.compile(attention_weights_by_hand, shapes=shapes, dtype=cl.f16, split=False,
                   preset="fast", schedule=P.ScheduleConfig(topk=2),
                   tolerance=tolerance_for("softmax"))
-    assert MAX_ROW_LIMIT in e.value.report.summary()
+    assert ROW_LIMIT in e.value.report.summary()
 
 
 def test_search_long_rows_schedule_with_rolling_plans(tmp_path, monkeypatch):
     """The same attention through ``cl.softmax``: S_KV = 4096 schedules, and every plan
     carries the max over the loop that tiles the keys (the online softmax)."""
-    from cleave.pipeline.plans import MAX_ROW_LIMIT
+    from cleave.pipeline.plans import ROW_LIMIT
     from cleave.schedule import apply_tiling
     from cleave.schedule.streaming import sites
 
@@ -305,7 +305,7 @@ def test_search_long_rows_schedule_with_rolling_plans(tmp_path, monkeypatch):
     (flash,) = {p.graph.summary() for p in plans}
     assert flash == "solo matmul>div>max>sub>exp>sum>matmul>div"
     ((variant, text),) = [(r.variant, str(r.error)) for r in plans.refused]
-    assert variant == "solo" and text.startswith(f"{MAX_ROW_LIMIT}; it is not carried across ")
+    assert variant == "solo" and text.startswith(f"{ROW_LIMIT}; it is not carried across ")
 
 
 # ------------------------------------------------------------------ GPU

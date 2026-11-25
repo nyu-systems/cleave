@@ -34,13 +34,15 @@ from tests._graphs import mha_bhsd_graph
 
 SMALL = dict(H=32, SQ=64, SKV=256, D=64)
 TWO_PASSES = "two passes"
+# the traced order's row sum: a conflict of its own, which the engine refuses (E14)
+SUM_UNDER = "is computed from"
 
 
 @pytest.fixture(scope="module")
 def traced():
-    """Traced-order attention at S_KV=256: the obstacle is refused (T3); only the tilings
-    that hold the row whole build."""
-    return X.streamed_ir(X.traced_attention, SMALL, TWO_PASSES)
+    """Traced-order attention at S_KV=256: both conflicts are refused (the max T3, the row
+    sum E14); only the tilings that hold the row whole build."""
+    return X.streamed_ir(X.traced_attention, SMALL, TWO_PASSES, SUM_UNDER)
 
 
 @pytest.fixture(scope="module")
@@ -187,8 +189,8 @@ def test_no_candidate_left_says_why(monkeypatch):
     ir = X.streamed_ir(X.softmax_rows, shapes, "is also read by")
     (why,) = ir.streaming_refusals
     planset = _scheduled(monkeypatch, X.softmax_rows, shapes, ir, topk=16, fusion="off")
-    counted = _no_tiling(planset, f"{plans.NO_TILING}; a max is not carried across a loop: {why} (")
-    assert UNIT_EXTENT in counted and plans.MAX_ROW_LIMIT not in str(planset.refused[0].error)
+    counted = _no_tiling(planset, f"{plans.NO_TILING}; a reduction is not carried across a loop: {why} (")
+    assert UNIT_EXTENT in counted and plans.ROW_LIMIT not in str(planset.refused[0].error)
 
 
 def two_outputs(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
@@ -204,11 +206,11 @@ def test_the_row_limit_where_every_tiling_the_filter_dropped_steps_the_max(monke
     the second matmul in every tiling it makes (32, 64, 128 of 256) and none holds the row
     in one block, so the row limit is the reason, then why the max is not carried (T3),
     then what the filter dropped."""
-    ir = X.streamed_ir(two_outputs, dict(H=2, SQ=64, SKV=256, D=64), TWO_PASSES)
-    (why,) = ir.streaming_refusals
+    ir = X.streamed_ir(two_outputs, dict(H=2, SQ=64, SKV=256, D=64), TWO_PASSES, SUM_UNDER)
+    why = "; ".join(ir.streaming_refusals)
     planset = _scheduled(monkeypatch, two_outputs, dict(H=2, SQ=64, SKV=256, D=64), ir,
                          topk=16, fusion="off")
-    counted = _no_tiling(planset, f"{plans.MAX_ROW_LIMIT}; it is not carried across a loop: {why} (")
+    counted = _no_tiling(planset, f"{plans.ROW_LIMIT}; it is not carried across a loop: {why} (")
     assert "is computed per iteration of GraphNode_mma_" in counted, counted
 
 
@@ -224,11 +226,11 @@ def test_a_row_that_fits_is_not_called_longer(monkeypatch, fn, shapes, refused, 
     reasons, after why a max is not carried where one is not, and never the row limit."""
     ir = X.streamed_ir(fn, shapes, *refused)
     why = "; ".join(ir.streaming_refusals)
-    head = f"{plans.NO_TILING}; a max is not carried across a loop: {why} (" if why else \
+    head = f"{plans.NO_TILING}; a reduction is not carried across a loop: {why} (" if why else \
         f"{plans.NO_TILING} ("
     planset = _scheduled(monkeypatch, fn, shapes, ir, topk=16, fusion="off")
     counted = _no_tiling(planset, head)
-    assert reason in counted and plans.MAX_ROW_LIMIT not in str(planset.refused[0].error)
+    assert reason in counted and plans.ROW_LIMIT not in str(planset.refused[0].error)
 
 
 def test_reason_key_folds_bare_numbers_only():

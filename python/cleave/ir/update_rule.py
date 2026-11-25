@@ -33,7 +33,7 @@ class Obstacle:
     accumulators) plus ``full``. Nothing else is state.
     """
 
-    full: str  # name of the full-extent reduction (the row max)
+    full: str  # name of the full-extent reduction (the ancestor: the row max of a softmax)
     loops: tuple  # names of the reductions that want to loop under it, in graph order
     refused: str = ""  # why the overlap is NOT a streaming obstacle ("" = it is one)
 
@@ -52,6 +52,17 @@ class Streaming:
     loops: tuple
     rules: tuple
     key: str
+
+
+def accumulates(node) -> bool:
+    """Whether ``node`` sums what it reads, from zero: a reduction whose class combines by
+    ``add`` (``combine``), or a contraction (the looped sum of products), with no start
+    value of its own. A repair rescales what such an accumulator holds; nothing else is
+    modelled by the proof (a max of the rescaled value is not)."""
+    from .ops import Matmul
+
+    combine = "add" if isinstance(node, Matmul) else getattr(type(node), "combine", None)
+    return combine == "add" and getattr(node, "accum_init", None) is None
 
 
 # ---------------------------------------------------------------------------- expressions

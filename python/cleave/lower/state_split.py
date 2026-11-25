@@ -1,8 +1,9 @@
 """A split pair BUILT from the loop state of a streaming obstacle.
 
-With the max explicit in the flat graph the superoptimizer returns no split graph (a max
-has no sum-combine). The pair is constructed instead, from the solo graph and the loop
-state the scheduler proposes for it (``cleave.ir.update_rule.Obstacle``):
+The superoptimizer combines the partials of a split by summing them, so for a reduction
+that has no sum-combine (a max: ``pipeline.superopt.UNSPLIT_BY_SEARCH``) it returns no
+split graph. The pair is constructed instead, from the solo graph and the loop state the
+scheduler proposes for it (``cleave.ir.update_rule.Obstacle``), whatever the reducer:
 
   partial   the solo structure up to the loop state, replayed on a split of the looped dim.
             Every split computes ``F(split_i)``: the full-extent value ``m_i`` of its own
@@ -11,22 +12,22 @@ state the scheduler proposes for it (``cleave.ir.update_rule.Obstacle``):
             format ``lower.split.cut_split_graph`` emits, and lowered by the same ``to_ir``.
 
   combine   the solo graph with its loop state substituted: the full-extent value becomes
-            ``M = max_i m_i`` over the split axis, each accumulator becomes
+            ``M = combine_i m_i`` over the split axis (its own reducer), each accumulator becomes
             ``sum_i repair(acc_i, m_i, M)`` with the PROVEN repair (the factor of the
             ``Streaming`` record with ``m := m_i``, ``m' := M``), and everything behind the
             accumulators is the solo graph's own (the final divide). Built at the IR level.
 
-Both are ordinary flat graphs with an explicit max in front of their sums: where a tiling
-loops the looped dim (the partial's keys, the combine's split axis) the scheduler finds
-the same streaming obstacle and serves it with a rule derived for that graph.
+Both are ordinary flat graphs with the full-extent reduction in front of their sums: where
+a tiling loops the looped dim (the partial's keys, the combine's split axis) the scheduler
+finds the same conflict and serves it with a rule derived for that graph.
 
 Reused from the split plumbing of searched split graphs: ``Boundary`` records and roles,
 the stored-layout record, the three-output partial, float32 at the cut, per-role
 tolerances, the hand-off.
 
-The pipeline builds a pair here for a solo graph whose program asked for a split over the
-dim its max reduces (``pipeline.plans.state_pair``, from ``lower(graph, split_factor)``),
-and derives each stage's own update rule.
+The pipeline builds a pair here for a solo graph whose program asked for a split over a
+dim such a reduction reduces (``pipeline.plans.state_pair``, from ``lower(graph,
+split_factor)``), and derives each stage's own update rule.
 """
 
 from __future__ import annotations
@@ -69,8 +70,8 @@ def partial_structure(structure, full_op: int, acc_ops: tuple):
     ops = list(structure)
     full = ops[full_op]
     kind_axis = _axis(full["op_type"])
-    if kind_axis is None or kind_axis[0] != "reduce_max":
-        raise SplitRefused(f"op {full_op} ({full['op_type']}) is not a max")
+    if kind_axis is None:
+        raise SplitRefused(f"op {full_op} ({full['op_type']}) is not a reduction of one axis")
     looped = _tensor_dims(full["input_tensors"][0])[kind_axis[1]]
     proxies = {d for op in ops for t in op["input_tensors"] + op["output_tensors"]
                for d in _tensor_dims(t)}
@@ -172,10 +173,10 @@ def lower_partial(searched, full_op: int, acc_ops: tuple, split_factor: int, *,
     outs = sorted((n for n in graph.nodes if n.is_output()), key=lambda n: n.boundary.index)
     shift = outs[-1]
     shift.boundary = Boundary(shift.boundary.index, SHIFT)
-    for out in outs:  # the sums and the max they are relative to cross the cut in float32
+    for out in outs:  # the sums and the value they are relative to cross the cut in float32
         out._dtypes[0] = DataType(STAT_DTYPE)
-    # The kernel returns the max first: the policy walks a graph from its outputs in order,
-    # and the max lets the scores go once the exp has read them.
+    # The kernel returns the full-extent value first: the policy walks a graph from its
+    # outputs in order, and that value lets its operand go once what reads it has.
     graph = Graph(nodes=find_topo_sort([shift] + outs[:-1]))
     graph.split_symbols = dict(factor=factor, looped=looped, inner=inner)
     return graph
@@ -195,7 +196,7 @@ def split_position(solo, full: str, partial) -> int:
     have = tuple(int(s) for s in shift.get_shape(0))
     fits = [p for p in range(len(have)) if have[:p] + have[p + 1:] == rows]
     if not fits:
-        raise SplitRefused(f"the partial returns its max as {have}, which is not {rows} with "
+        raise SplitRefused(f"the partial returns its carried value as {have}, which is not {rows} with "
                            "one more axis")
     batch = int(getattr(next(n for n in solo.nodes if n.name == full), "n_batch_dims", 0) or 0)
     return batch if batch in fits else fits[0]
@@ -226,10 +227,11 @@ def combine_graph(solo, full: str, rules: tuple, split_factor: int, split_pos: i
     nb = split_pos  # the batch dims in front of the split axis
     # M = the full-extent value over all splits: the reducer of the solo graph, over the
     # split axis
-    top = type(full_node)(rows, axis=split_pos, name="state_max", dtype=STAT_DTYPE,
+    stem = f"state_{type(full_node).combine}"
+    top = type(full_node)(rows, axis=split_pos, name=stem, dtype=STAT_DTYPE,
                           out_dtype=STAT_DTYPE)
     m_in = top.inputs[0].src_node
-    m_in.name = "PlaceHolder_state_max"
+    m_in.name = f"PlaceHolder_{stem}"
     m_in.boundary = Boundary(len(rules), SHIFT)
     m_in._dtypes[0] = _dtype(STAT_DTYPE)
     made = {}
@@ -266,7 +268,7 @@ def combine_graph(solo, full: str, rules: tuple, split_factor: int, split_pos: i
     for acc, summed in outputs_of.items():
         for edge in list(by_name[acc].outputs):
             wire_input(summed, edge.dst_node, edge.dst_id)
-    for edge in list(full_node.outputs):  # a reader of the finished max behind the loop
+    for edge in list(full_node.outputs):  # a reader of the finished value behind the loop
         if not _feeds(edge.dst_node, [by_name[a] for a, _ in rules]):
             wire_input(top, edge.dst_node, edge.dst_id)
     outs = [n for n in solo.nodes if isinstance(n, OutputNode)]

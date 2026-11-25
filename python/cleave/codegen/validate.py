@@ -2,7 +2,7 @@ import math
 
 from ..core.errors import CodegenError
 from ..ir.graph import AccumEdge, ComputeOpNode, GraphNode, Iterator, OutputNode, PlaceHolderNode
-from ..ir.ops.reduction import ReduceMax
+from ..ir.ops.reduction import ReduceSum
 from ..schedule.policy.hint import INTER, INTRA
 
 
@@ -212,11 +212,13 @@ class GraphValidator:
                 self._validate_graph(node.graph, is_main=False, seen=seen)
 
     def _validate_rolling_state(self, graph, where, is_main):
-        """Unassembled update rules, lag snapshots, rescaled accumulators and carried maxima."""
+        """Unassembled update rules, lag snapshots, rescaled accumulators and carried values."""
         tmap = graph.tmap if isinstance(graph.tmap, dict) else {}
         in_graph = {id(n) for n in graph.nodes}
         accum = {id(n) for n in graph.accum_nodes}
         lags = {id(n) for n in graph.lag_nodes}
+        # The carried values: what a lag node of this loop snapshots (``Graph.lag_nodes``).
+        snapshotted = {id(n.inputs[0].src_node) for n in graph.lag_nodes if n.inputs}
 
         def squeezed(node):
             it = tmap.get(node)
@@ -226,7 +228,7 @@ class GraphValidator:
             # A full-extent value whose update rule (``node.streaming``) is still on it was
             # not assembled. That is right where its dim is whole in the tile it is computed
             # from, and wrong in a loop that carries it or steps its dim: without the lag
-            # copy and the repairs the sums next to it would be relative to the max of one
+            # copy and the repairs the sums next to it would be relative to its value over one
             # slice.
             if is_main or getattr(node, "streaming", None) is None:
                 continue
@@ -238,7 +240,7 @@ class GraphValidator:
                 sliced = axis is not None and it.tile_size[axis] != it.shape[axis]
             assert id(node) not in accum and not sliced, (
                 f"{where}: {node.name!r} has an update rule that was not assembled; "
-                "emitting it as a plain max would take the max of one slice."
+                "emitting it as a plain reduction would reduce one slice."
             )
 
         # --- lag snapshots and rescaled accumulators: state carried across iterations ---
@@ -320,14 +322,15 @@ class GraphValidator:
                 for e in node.outputs
                 if id(e.dst_node) in in_graph and id(e.dst_node) not in lags
             ]
-            assert not readers or getattr(node, "running_max", False), (
+            assert not readers or id(node) in snapshotted, (
                 f"accumulator {node.name!r} is read by {readers} inside the loop that "
-                "accumulates it. Only a running max is meaningful before its loop ends; "
-                "a partial sum is not."
+                "accumulates it. A running value is meaningful before its loop ends only "
+                "as carried state, which a lag node snapshots so that what is accumulated "
+                "under it can be repaired; a plain partial result is not."
             )
         if not is_main:
             for node in graph.nodes:
-                if not isinstance(node, ReduceMax) or id(node) in accum:
+                if not isinstance(node, ReduceSum) or id(node) in accum:
                     continue
                 operand = node.inputs[0].src_node
                 it = None if isinstance(operand, GraphNode) else tmap.get(operand)
@@ -343,7 +346,7 @@ class GraphValidator:
                 else:
                     given, whole = it.tile_size[axis], it.shape[axis]
                 assert given == whole, (
-                    f"{where}: {node.name!r} takes a max over a slice: the loop gives it "
+                    f"{where}: {node.name!r} reduces a slice: the loop gives it "
                     f"{given} of {whole} elements of the reduced axis "
                     "per iteration, and it is not an accumulator, so every iteration "
                     "starts over."

@@ -49,6 +49,8 @@ SMALL = dict(H=32, SQ=64, SKV=256, D=64)
 COLUMN = dict(H=4, K=4096, N=256)
 RETURNED = "is also read by"  # T4: a value computed from the max is read next to its sum
 TWO_PASSES = "a finished reduction over the dim"  # T3: the traced order
+# ... whose row sum is a conflict of its own, which the engine refuses (E14)
+SUM_UNDER = "is computed from"
 
 
 # ------------------------------------------------------------------------------- helpers
@@ -370,7 +372,7 @@ def test_one_tile_reads_a_loop_accumulator_through_an_accum_edge():
     """``softmax(q @ k.mT) @ v`` in traced order: with QK^T looped over D the max and the
     shifted scores read an accumulator of that loop, both through an ``AccumEdge``. (The
     traced order keeps its pin: only the tilings that hold the row whole build.)"""
-    a = _attention(X.unscaled_attention, SMALL, TWO_PASSES)
+    a = _attention(X.unscaled_attention, SMALL, TWO_PASSES, SUM_UNDER)
     cands = search_tiling(a.ir, topk=1000)
     built = []
     for cand in cands:

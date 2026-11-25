@@ -3,7 +3,7 @@
 One hand-built rolling tier (``tests/graph/_rolling_tier.py``) that passes, and one mutation
 of it per rule. Each mutation would otherwise emit a kernel that compiles and computes
 something else: the max of one slice where a carried max was asked for, a snapshot taken
-after the update, a max that restarts every tile.
+after the update, a reduction that restarts every tile.
 """
 
 import pytest
@@ -52,7 +52,7 @@ def test_a_carried_max_whose_update_rule_is_still_on_it_is_refused():
     t.m.streaming = Streaming(("rowsum_0", "psum_0"),
                               (("rowsum_0", FACTOR), ("psum_0", FACTOR)), "a key")
     _refused(t, "'exp_0_max' has an update rule that was not assembled; emitting it as a "
-                "plain max would take the max of one slice")
+                "plain reduction would reduce one slice")
     t.m.streaming = None  # consumed, as ``streaming.assemble`` leaves it
     assert "ukernel_rescale_1dims_rr" in TilelangCodeGen().gen(t.main)
 
@@ -191,17 +191,30 @@ def test_a_partial_sum_is_not_read_inside_its_loop():
                 "accumulates it")
 
 
-def test_a_running_max_may_be_read_inside_its_loop():
+def test_a_carried_value_may_be_read_inside_its_loop():
+    """What a lag node of the loop snapshots is carried state, whatever reduces it: it may
+    be read before the loop ends, because what is accumulated under it is repaired."""
     t = _tier()
-    assert type(t.m).running_max is True
     readers = sorted(e.dst_node.name for e in t.m.outputs)
     assert readers == ["exp_0_max_prev", "exp_0_max_step", "exp_0_shifted"]
     TilelangCodeGen().gen(t.main)
-    # ... which is a property of the class, not of the instance.
+    # ... which is the snapshot's doing, not the class's: without it the max is refused
     t = _tier()
-    t.m.running_max = False
-    _refused(t, r"accumulator 'exp_0_max' is read by \['exp_0_max_step', 'exp_0_shifted'\] "
-                "inside the loop")
+    t.inner.lag_nodes = []
+    _refused(t, r"accumulator 'exp_0_max' is read by \[.*'exp_0_max_step'.*\] inside the loop")
+    # ... and a sum that a lag node snapshots may be read as well
+    t = _tier()
+    prev, peek = Copy((ROWS,), name="rowsum_prev", n_batch_dims=0), Copy((ROWS,), name="peek",
+                                                                       n_batch_dims=0)
+    with edit_graph(t.main):
+        wire_input(t.rowsum, prev, 0)
+        wire_input(t.rowsum, peek, 0)
+        for node in (prev, peek):
+            t.inner.nodes.append(node)
+            t.inner.tmap[node] = _row()
+            t.inner.tinfo_map[node] = (f"t_{node.name}", "r")
+        t.inner.lag_nodes.append(prev)
+    TilelangCodeGen()._validate_graph(t.main, is_main=True)
 
 
 # A max over a slice is refused ---------------------------------------------------------
@@ -210,7 +223,7 @@ def test_a_max_over_a_slice_is_refused():
     it restarts on every tile while the sums it normalises accumulate over all of them."""
     t = _tier(declare=False, carry=False)
     assert t.m not in t.inner.accum_nodes
-    _refused(t, "'exp_0_max' takes a max over a slice: the loop gives it 64 of 256 elements")
+    _refused(t, "'exp_0_max' reduces a slice: the loop gives it 64 of 256 elements")
 
 
 def test_a_max_over_the_whole_axis_is_fine_in_a_loop():
@@ -242,7 +255,7 @@ def test_a_max_over_a_slice_of_a_single_row_is_refused(max_axis):
     it = Iterator(lambda i: ("0", f"{STEP} * {i}"), shape=(1, KV), tile_size=(1, STEP))
     t = _sliced_max(max_axis, it)
     assert t.m.axis_arg == (0 if max_axis == 1 else -1)
-    _refused(t, "'exp_0_max' takes a max over a slice: the loop gives it 64 of 256 elements")
+    _refused(t, "'exp_0_max' reduces a slice: the loop gives it 64 of 256 elements")
 
 
 @pytest.mark.parametrize("max_axis", [1, -1])
@@ -253,14 +266,14 @@ def test_a_max_over_one_element_per_iteration_is_refused(max_axis):
     it = Iterator(lambda i: ("0", f"{i}"), shape=(KV,), tile_size=(1,), axes=(1,))
     t = _sliced_max(max_axis, it)
     assert t.m.axis_arg == max_axis
-    _refused(t, "'exp_0_max' takes a max over a slice: the loop gives it 1 of 256 elements")
+    _refused(t, "'exp_0_max' reduces a slice: the loop gives it 1 of 256 elements")
 
 
 def test_a_max_over_an_axis_the_tier_does_not_carry_is_refused():
     """The tile holds a single element of the reduced axis and does not carry the dim."""
     it = Iterator(lambda i: ("0",), shape=(ROWS,), tile_size=(ROWS,), axes=(0,))
     _refused(_sliced_max(-1, it),
-             "'exp_0_max' takes a max over a slice: the loop gives it 1 of 256 elements")
+             "'exp_0_max' reduces a slice: the loop gives it 1 of 256 elements")
 
 
 @pytest.mark.parametrize("max_axis", [1, -1])
