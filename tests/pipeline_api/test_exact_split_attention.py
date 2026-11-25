@@ -4,7 +4,7 @@
 returns no split graph for a softmax with its max, so the pair is built from the loop
 state of the flash graph (``pipeline.plans.state_pair``): each partial returns the
 accumulators of its own split and the max they are relative to, ``(o_i, l_i, m_i)``, and
-the combine takes ``M = max_i m_i`` and repairs each by the proven rule,
+the combine takes ``M = max_i m_i`` and repairs each by the found rule,
 ``o_i * exp(m_i - M)``, before it sums over the splits and divides. Both stages are flat
 graphs with a max in front of their sums, so each loops wherever its derivation lets it:
 the partial over the keys of its split, the combine over the splits. Three things are run

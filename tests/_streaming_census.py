@@ -3,7 +3,7 @@
     python tests/_streaming_census.py <outdir> list
     python tests/_streaming_census.py <outdir> <job> [--lower N|all] [--nvcc]
 
-For every tiling candidate of a graph with a streaming obstacle (``search_tiling`` with the
+For every tiling candidate of a graph with a streaming obstacle (``plans._search``'s, with the
 job's options, no top-k cut) it checks what unit tests cannot afford to:
 
   (a) accepted == builds   the accept filter (``streaming_accept``) keeps a candidate iff
@@ -29,14 +29,15 @@ job's options, no top-k cut) it checks what unit tests cannot afford to:
                            split, the max it returns is the carried max (an accumulator of
                            that loop, started at the most negative float32, one lag copy,
                            both sums repaired, read by the output through the loop), else
-                           the flat graph's own; it returns that max first and its two sums,
+                           the flat graph's own (whole, or out of its own loop ahead of the
+                           sums: two passes); it returns that max first and its two sums,
                            all float32. The combine loops over the splits in a plain loop.
 
 Jobs come from four sources.
 
 ``fixture`` jobs: the programs of ``tests/_explicit_softmax.py`` (the max written out),
-lowered as identity graphs; a classified obstacle gets a record by hand (the rule the
-engine proves for each of them), a refused one its reason.
+lowered as identity graphs; a conflict the engine serves gets a record by hand (the rule
+the engine finds for each of them), a refused one the engine's reason.
 
 ``demo:`` jobs: a demo's own program and configs (``cl.softmax`` records the explicit max),
 through ``superoptimize`` and ``plans.lower``: the searched graphs, with the records the
@@ -96,7 +97,6 @@ from tests import _explicit_softmax as X  # noqa: E402
 from tests._lowering import lower_to_cuda  # noqa: E402
 
 MLA = CompilerPassOptions(mla_decode_pass=True)
-TWO_PASSES = "a finished reduction over the dim"
 
 
 def _rsteps(cand):
@@ -114,13 +114,13 @@ FIXTURES = {
         {}, None, lambda c: _rsteps(c)[2:] == [256, 256] and c.n_threads == 128),
     "mha_256_traced": (
         lambda: [X.streamed_ir(X.traced_attention, dict(H=32, SQ=64, SKV=256, D=64),
-                               TWO_PASSES)],
+                               X.NO_RULE, X.NO_RULE)],
         {}, None, None),
     "returned_max": (
         lambda: [X.streamed_ir(X.flash_and_its_max, dict(H=32, SQ=64, SKV=4096, D=64))],
         {}, None, None),
     "softmax": (
-        lambda: [X.streamed_ir(X.softmax_rows, dict(R=64, C=1024), "is also read by")],
+        lambda: [X.streamed_ir(X.softmax_rows, dict(R=64, C=1024))],
         {}, None, lambda c: True),
     "rows_v": (
         lambda: [X.streamed_ir(X.flash_rows, dict(R=64, C=4096, D=64))], {}, None, None),
@@ -344,8 +344,9 @@ def _split_check(role):
     partial  where the keys of a split are looped, the max it returns is the carried max:
              an accumulator of that loop behind the sums it repairs, started at the most
              negative float32, snapshotted by one lag copy, and read by its output through
-             the loop; where a tile holds the split, the flat graph's own max. Either way
-             it returns the max first, then the two sums, all float32.
+             the loop; where a tile holds the split, the flat graph's own max (whole, or
+             out of its own loop ahead of the sums). Either way it returns the max first,
+             then the two sums, all float32.
     combine  where it loops over the splits, the loop is plain (it weights the partials it
              loads: ``streaming._weighted_slices``).
     """
@@ -366,7 +367,12 @@ def _split_check(role):
             return "the partial does not return its float32 max first, then two float32 sums"
         (edge,) = outs[0].inputs
         if not found:
-            return "the returned max is carried" if isinstance(edge, AccumEdge) else None
+            # the flat graph's own max: read whole, or out of its own loop ahead of the sums
+            # (two passes, a tiling without the record); never out of another loop
+            own = isinstance(edge, AccumEdge) and getattr(edge, "accum_node", None) is not None \
+                and edge.src_node.name == f"GraphNode_{edge.accum_node.name}"
+            return "the returned max is carried" if isinstance(edge, AccumEdge) and not own \
+                else None
         (site,) = found
         tier = tiers[site.tier]
         (full,) = [n for n in tier.nodes if n.name == site.full]
@@ -446,14 +452,27 @@ def _lower(code, device_compile=False):
         return _first(e)
 
 
+def _candidates(ir, search) -> list:
+    """Every candidate the pipeline's search is asked about (``plans._search``): the policy's,
+    then, where a record is served, those it makes without the records."""
+    from cleave.pipeline.plans import _served, describe_tile
+
+    cands = list(search_tiling(ir, **{"topk": 1000, **search}))
+    if _served(ir):
+        seen = {describe_tile(c) for c in cands}
+        cands += [c for c in search_tiling(ir, honour_records=False, **{"topk": 1000, **search})
+                  if describe_tile(c) not in seen]
+    return cands
+
+
 def census(ir, search, options, n_lower, nvcc, focus=None, check=None):
     options = options or CompilerPassOptions()
     problems, rows = [], []
     force = search.get("force_fusion", False)
-    cands = list(search_tiling(ir, **{"topk": 1000, **search}))
+    cands = _candidates(ir, search)
     if not cands and not force:  # fusion="auto": retry forced, as pipeline.schedule does
         search = {**search, "force_fusion": True}
-        cands = list(search_tiling(ir, **{"topk": 1000, **search}))
+        cands = _candidates(ir, search)
     accept = streaming_accept(ir)
     assert accept is not None, "census of a graph without a streaming obstacle"
     for i, cand in enumerate(cands):

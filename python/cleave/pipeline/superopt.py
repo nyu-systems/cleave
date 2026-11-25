@@ -131,7 +131,7 @@ def state_split_of(graphs, program) -> tuple:
 # The reductions the superoptimizer cannot split: it combines the partials of a split by
 # summing them, and these have no sum-combine. A split over a dim one of them reduces is
 # built from the loop state of the solo graph instead (``pipeline.plans.state_pair``), with
-# the reducer's own combine and the proven update rule. (A sum the search splits itself.)
+# the reducer's own combine and the searched update rule. (A sum the search splits itself.)
 UNSPLIT_BY_SEARCH = ("reduce_max",)
 
 

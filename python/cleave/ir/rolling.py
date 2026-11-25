@@ -8,11 +8,14 @@ rule builds its repair factor here (``build_expression``).
 
 from __future__ import annotations
 
-from .ops import Add, Copy, Div, Mul, Sub, wire_input
+from .ops import Add, Copy, Div, Mul, RSqrt, Silu, Sqrt, Sub, wire_input
 
 STAT_DTYPE = "float32"  # m, m_prev, the step and alpha: always float32
 
 _BINARY = {"add": Add, "sub": Sub, "mul": Mul, "div": Div}
+# The unary ops a searched factor may use besides ``exp`` (which is built with the class of
+# the exp the repaired values were computed with).
+_UNARY = {"sqrt": Sqrt, "rsqrt": RSqrt, "silu": Silu}
 
 
 def build_expression(expr, env, made, *, stem: str, rows: tuple, n_batch_dims: int, exp_cls,
@@ -45,11 +48,11 @@ def check_expression(expr, *, stem: str, narrow=()) -> None:
     if isinstance(expr, str):
         return
     op, *args = expr
-    if op != "exp" and op not in _BINARY:
+    if op != "exp" and op not in _BINARY and op not in _UNARY:
         raise ValueError(f"{stem}: the repair uses {op!r}, which has no tile op")
     for position, arg in enumerate(args):
-        if isinstance(arg, str) and arg in narrow and (op == "exp" or position == 0):
-            how = "of" if op == "exp" else "on the left of"
+        if isinstance(arg, str) and arg in narrow and (op not in _BINARY or position == 0):
+            how = "of" if op not in _BINARY else "on the left of"
             raise ValueError(
                 f"{stem}: the reduced value {arg!r} {how} {op!r} has no tile op")
         check_expression(arg, stem=stem, narrow=narrow)
@@ -66,6 +69,8 @@ def _build(expr, env, made, stem, rows, n_batch_dims, exp_cls, narrow):
               n_batch_dims=n_batch_dims)
     if op == "exp":
         node = exp_cls(rows, **kw)
+    elif op in _UNARY:
+        node = _UNARY[op](rows, **kw)
     else:
         if isinstance(args[1], str) and args[1] in narrow:
             kw["broadcast"] = 1  # the reduced value, across the first non-batch axis

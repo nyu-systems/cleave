@@ -20,8 +20,10 @@ pytest.importorskip("tvm")
 from tests import _explicit_softmax as X
 from tests import _streaming_census as tool
 
-ROWS = (X.softmax_rows, dict(R=64, C=1024), "is also read by")
+ROWS = (X.softmax_rows, dict(R=64, C=1024))  # served; every tiling that loops it is refused
 FLASH = (X.flash_attention, dict(H=32, SQ=64, SKV=256, D=64))
+# the traced order, whose conflicts the engine refuses
+TRACED = (X.traced_attention, dict(H=32, SQ=64, SKV=256, D=64), X.NO_RULE, X.NO_RULE)
 
 
 def _run(tmp_path, capsys, job, *flags):
@@ -39,17 +41,19 @@ def test_a_job_whose_checks_ran_is_ok(monkeypatch, tmp_path, capsys):
     _job(monkeypatch, lambda: [X.streamed_ir(*FLASH)])
     status, lines, report = _run(tmp_path, capsys, "job")
     assert status == 0 and lines[-1] == "job: ok"
-    assert lines[0].startswith("job: 16 raw candidates, 16 accepted, 16 build")
+    # (12 more raw: the tilings without the record, which step the max alone; refused)
+    assert lines[0].startswith("job: 28 raw candidates, 16 accepted, 16 build")
     assert not report["problems"] and not report["unchecked"]
-    assert sorted({r["tiling"] for r in report["rows"]}) == ["looped", "one tile"]
+    assert sorted({r["tiling"] for r in report["rows"] if r["accepted"]}) == ["looped", "one tile"]
 
 
 def test_a_refused_obstacle_is_censused_too(monkeypatch, tmp_path, capsys):
-    """A returned softmax: its obstacle is refused, and the filter keeps what builds."""
-    _job(monkeypatch, lambda: [X.streamed_ir(*ROWS)])
+    """The traced order of attention: its obstacles are refused, and the filter keeps what
+    builds."""
+    _job(monkeypatch, lambda: [X.streamed_ir(*TRACED)])
     status, lines, report = _run(tmp_path, capsys, "job")
     assert status == 0 and lines[-1] == "job: ok"
-    assert lines[0].startswith("job: 25 raw candidates, 20 accepted, 20 build")
+    assert lines[0].startswith("job: 16 raw candidates, 4 accepted, 4 build")
     assert {r["tiling"] for r in report["rows"] if r["accepted"]} == {"one tile"}
 
 
@@ -62,7 +66,7 @@ def test_a_failed_check_is_exit_status_1(monkeypatch, tmp_path, capsys):
     _job(monkeypatch, lambda: [X.streamed_ir(*ROWS)])
     monkeypatch.setattr(tool, "streaming_accept", keeps_everything)
     status, lines, report = _run(tmp_path, capsys, "job")
-    assert status == 1 and lines[-1] == "job: FAILED, 5 problem(s)"
+    assert status == 1 and lines[-1] == "job: FAILED, 29 problem(s)"
     assert all(p.startswith("(a) ") for p in report["problems"])
 
 
@@ -113,9 +117,10 @@ def test_a_graph_without_an_obstacle_is_not_checked(monkeypatch, tmp_path, capsy
 
 
 def test_a_job_that_accepts_no_candidate_is_not_checked(monkeypatch, tmp_path, capsys):
-    """A row too long for one block and no carried form: every tiling is refused, so
-    lowering parity, device compile and staging had nothing to look at."""
-    _job(monkeypatch, lambda: [X.streamed_ir(ROWS[0], dict(R=64, C=16384), ROWS[2])])
+    """A row too long for one block whose loops cannot be built (its exp is read outside
+    them): every tiling is refused, so lowering parity, device compile and staging had
+    nothing to look at."""
+    _job(monkeypatch, lambda: [X.streamed_ir(ROWS[0], dict(R=64, C=16384))])
     status, lines, report = _run(tmp_path, capsys, "job")
     assert status == 2 and lines[-1] == "job: NOT CHECKED, 1 item(s)"
     assert report["rows"] and not any(r["accepted"] for r in report["rows"])
@@ -172,7 +177,7 @@ def test_one_refused_graph_keeps_a_demo_job_from_ok(monkeypatch, tmp_path, capsy
     status, lines, report = _run(tmp_path, capsys, "demo:mha_prefill")
     assert status == 2 and lines[-1] == "demo:mha_prefill: NOT CHECKED, 1 item(s)"
     assert report["unchecked"] == [note] and not report["problems"]
-    assert lines[0].startswith("demo:mha_prefill[g0]: 25 raw candidates, 20 accepted, 20 build")
+    assert lines[0].startswith("demo:mha_prefill[g0]: 49 raw candidates, 20 accepted, 20 build")
     assert "    NOT CHECKED " + note in lines
 
 
@@ -229,7 +234,9 @@ def test_search_a_demo_job_censuses_the_searched_graphs(monkeypatch, tmp_path, c
         (len(rows), sum(r["accepted"] for r in rows), sum(r["tiling"] == "looped" for r in rows))
         for rows in by_graph.values()
     )
-    assert counts == [(16, 4, 0), (16, 16, 12)]
+    # (the flash form's 12 more: its tilings without the record, which step the max alone;
+    # refused)
+    assert counts == [(16, 4, 0), (28, 16, 12)]
     heads = [line for line in lines if line.startswith("demo:mha_decode@256[")]
     assert len(heads) == 2 and sum(line.endswith("[records: engine]") for line in heads) == 1
 
@@ -268,14 +275,17 @@ def test_search_a_split_job_censuses_the_partial_and_the_combine(monkeypatch, tm
     (partial,) = [rows for g, rows in by_graph.items() if g.endswith(".partial")]
     (combine,) = [rows for g, rows in by_graph.items() if g.endswith(".combine")]
     assert Counter(r["tiling"] for r in partial if r["accepted"]) == {"looped": 8, "one tile": 4}
-    assert Counter(r["tiling"] for r in combine if r["accepted"]) == {"looped": 21, "one tile": 3}
-    # (raw candidates, accepted, looped, one tile): the hand-derived pass's counts. The
-    # 12 combines that are not accepted step one partial at a time or hold a single row
-    assert _split_counts(partial) == (12, 12, 8, 4)
-    assert _split_counts(combine) == (36, 24, 21, 3)
+    assert Counter(r["tiling"] for r in combine if r["accepted"]) == {"looped": 21, "one tile": 15}
+    # (raw candidates, accepted, looped, one tile): the hand-derived pass's counts, and the
+    # tilings each stage has without its record (``plans._search``): 8 of the partial, which
+    # step the max alone and are refused, and 20 of the combine, 12 of which reduce the max
+    # over the splits in its own loop ahead of the sums (two passes). The combines that are
+    # not accepted step one partial at a time or hold a single row
+    assert _split_counts(partial) == (20, 12, 8, 4)
+    assert _split_counts(combine) == (56, 36, 21, 15)
     assert tool.SPLITS["mha_decode@32"] == ("mha_decode", 32)
     assert any("no pair: LoweringRejected" in line
-               and "carries no proven update over that dim: reduce_max_2_5" in line
+               and "carries no update rule over that dim: reduce_max_2_5" in line
                for line in lines)
 
 
@@ -288,20 +298,21 @@ def _split_counts(rows):
 
 def test_search_a_split_job_of_a_softmax_over_an_input(monkeypatch, tmp_path, capsys):
     """``softmax(x) @ v`` split over the softmax axis, 4 splits of 256 keys: the partial
-    reads the logits through the view of the split. All 12 of its tilings are served: 8
+    reads the logits through the view of the split. All 20 of its tilings are served: 8
     loop over the keys of a split with its returned max carried, 4 take a split in one
-    tile. (The 8 looped ones were once refused, by the hand-derived pass and on this path:
-    the tile of the input was asked for a dim of the split tensor.)"""
+    tile, and 8 more, its tilings without the record, reduce the max in its own loop ahead
+    of the sums (two passes). (The 8 looped ones were once refused, by the hand-derived pass
+    and on this path: the tile of the input was asked for a dim of the split tensor.)"""
     monkeypatch.setenv("CLEAVE_CACHE_ROOT", str(tmp_path / "cache"))
     status, lines, report = _run(tmp_path, capsys, "split:rows@4")
     assert status == 0 and lines[-1] == "split:rows@4: ok", lines[-8:]
     assert not report["unchecked"] and not report["problems"]
     partial = [r for r in report["rows"] if r["graph"].endswith(".partial")]
     combine = [r for r in report["rows"] if r["graph"].endswith(".combine")]
-    assert Counter(r["tiling"] for r in partial) == {"looped": 8, "one tile": 4}
+    assert Counter(r["tiling"] for r in partial) == {"looped": 8, "one tile": 12}
     assert all(r["accepted"] for r in partial)
-    assert _split_counts(partial) == (12, 12, 8, 4)
-    assert _split_counts(combine) == (21, 12, 6, 6)  # the hand-derived pass's counts, as above
+    assert _split_counts(partial) == (20, 20, 8, 12)
+    assert _split_counts(combine) == (35, 18, 6, 12)  # as above, the tilings without records too
     assert sorted(tool.PROGRAM_SPLITS) == ["rows@4", "rows@8"]
 
 

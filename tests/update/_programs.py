@@ -150,6 +150,19 @@ def sum_normalized(x: cl.Tensor["R", "C"], v: cl.Tensor["C", "D"]):
     return (x / cl.sum(x, -1, keepdim=True)) @ v
 
 
+def mean_shifted(x: cl.Tensor["R", "C"], v: cl.Tensor["C", "D"]):
+    """``softmax(y) @ v`` shifted by the MEAN of the row of ``y``: the mean is the row sum
+    over the dim's extent, so on a prefix of ``n`` elements it is the sum over ``n``."""
+    y = x * 0.0625
+    e = cl.exp(y - y.mean(-1, keepdim=True))
+    return (e @ v) / cl.sum(e, -1, keepdim=True)
+
+
+def l2_normalized(x: cl.Tensor["R", "C"], v: cl.Tensor["C", "D"]):
+    """``(x / |x|) @ v``: a norm in front of the contraction over the dim it is taken over."""
+    return (x / cl.sqrt(cl.sum(x * x, -1, keepdim=True))) @ v
+
+
 # --------------------------------------------------------------------------------- access
 
 
@@ -176,13 +189,13 @@ def lowered(graph):
 
 
 def the_obstacle(ir, cls=None):
-    """The one obstacle of ``ir`` that passes the structural rules (with ``cls``: the one
-    whose ancestor is of that class; a graph may hold several conflicts that do, such as
-    the max of a softmax and the sums of squares of the RMS norms in front of it)."""
+    """The one conflict of ``ir`` (with ``cls``: the one whose ancestor is of that class; a
+    graph may hold several, such as the max of a softmax and the sums of squares of the RMS
+    norms in front of it, or the max and the row sum of the traced order)."""
     nodes, red = scheduled_reductions(ir)
     by_name = {n.name: n for n in ir.nodes}
-    found = [ob for ob in obstacles(nodes, red, reduction_ancestors(nodes)) if not ob.refused
-             and (cls is None or type(by_name[ob.full]) is cls)]
+    found = [ob for ob in obstacles(nodes, red, reduction_ancestors(nodes))
+             if cls is None or type(by_name[ob.full]) is cls]
     (ob,) = found
     return ob
 

@@ -88,6 +88,9 @@ cdef extern from "cleave/superoptimizer/kernel/graph.h" namespace "cleave_supero
 
     string declaration_key(const CppKNOperator* op) except +
 
+cdef extern from "cleave/superoptimizer/kernel/fingerprint_cpu.h" namespace "cleave_superoptimizer::kernel":
+    vector[vector[unsigned short]] output_fingerprints(const CppKNGraph& g) except +
+
 cdef extern from "cleave/superoptimizer/kernel/element_binary.h" namespace "cleave_superoptimizer::kernel":
     cdef cppclass CppKNElementBinaryOp "cleave_superoptimizer::kernel::KNElementBinaryOp"(CppKNOperator):
         bool has_scalar

@@ -42,5 +42,18 @@ void clear_thread_fingerprints();
 void compute_declared_input_fingerprint(Graph const &host,
                                         KNInputOp const &input);
 
+// Fingerprints every operator of `g` into the calling thread's store, in
+// graph order: input k's fingerprint is a function of k, a declared input's is
+// its definition's over its sources'. What the probabilistic verifier runs on
+// the target and on every candidate.
+void fingerprint_graph(Graph const &g);
+
+// The fingerprints of the outputs of `g`, in the order of its output
+// operators, as `fingerprint_graph` computes them; the thread's store is
+// cleared afterwards. (The field semantics a caller outside the search can
+// hold its own evaluation to.)
+std::vector<std::vector<cleave_superoptimizer::type::FingerprintType>>
+    output_fingerprints(Graph const &g);
+
 } // namespace kernel
 } // namespace cleave_superoptimizer

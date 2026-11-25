@@ -1,47 +1,46 @@
-"""Prefix references: the flat graph itself, re-instantiated at small shapes.
+"""Test data: the flat graph's own loop states on prefixes of the looped dim.
 
-``F(prefix)`` is the state the flat graph computes when it is evaluated on a prefix of the
-looped dim. Nothing here knows what an online softmax is: the flat graph is built again by
-its recipe (``instantiate.Recipe``) with the looped dim at a few elements and every other
-dim small, evaluated node by node with the validation reference
-(``cleave.runtime.reference.values``), and the state is read off its nodes by name.
-Float32 throughout (or the program's own dtype, for ranking); no FP64.
+A candidate update is tested against the program itself: the flat graph built again (by its
+recipe, ``instantiate.Recipe``) at the first pass's own test sizes -- the extents the
+superoptimizer fingerprints at -- with the looped dim at a few elements, evaluated in the
+field of that fingerprint (``field``) on random inputs, and its state read off its nodes by
+name.
 
     old state   F(H)        graph at |H|      on the inputs cut to H
     new state   F(H ++ T)   graph at |H|+|T|  on the inputs cut to H ++ T
-    tile        the graph at |T| on the inputs cut to T, with the full-extent value
-                given as the NEW one (the tile computation re-wired to read m')
-    first iter  old state = the start values (``carry_init``, zeros); new state F(T)
+    tile        the graph at |T| on the inputs cut to T, with the full-extent value given
+                as the NEW one (the tile computation re-wired to read m')
+    first iter  old state = the full-extent value's start value and zeros
 
-Every guard is a typed refusal (``texts``): the graph must lower at small shapes (E2) and be
-the same graph there (E3), the looped symbol must size the looped dim (E1) and nothing else
-of the state (E15), the inputs must carry the looped dim on one axis (E4), the cut must be
-right (E5: the full-extent value is its reducer's own fold, ``folds_to``), the rows of the
-full-extent value must lead its accumulators (E6), and the references must show what an
-update has to repair (E10).
+for every draw of ``DRAWS`` and every prefix of ``STEPS``: every row of every case is a test.
+Where the graph cannot be built or evaluated so, there is no test (``NO_TEST``) and no rule.
+
+The same instances also run in floating point, in the program's dtype, for the ranking's
+replay of the loop (``rank``): ``sample``, ``state``, ``start``, ``magnitude``.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field as dfield
 
 import numpy as np
 
 from ...ir.update_rule import signature
 from ...runtime.reference import values
-from .search import LOOSE_RTOL
-from .texts import E1, E2, E3, E4, E5, E6, E10, E15, Refused
+from . import field
+from .texts import NO_TEST, Refused
 
-TILE = 4  # elements of the looped dim per iteration of the references
-N = 16  # looped extent of a reference sample: tile 4, prefixes 4 / 8 / 12
-PREFIXES = (4, 8, 12)
-SEEDS_NORMAL = (1, 2)
-TRY_SEEDS = tuple(range(16))
-SHAPINGS = (("none", 1.0), ("ramp", 1.0), ("ramp", 4.0), ("ramp", 16.0), ("tail", 2.0),
-            ("tail", 4.0))
+TILE = 4  # elements of the looped dim per step of the test
+STEPS = (0, 4, 8, 12)  # the prefixes; the longest instance has N elements
+N = STEPS[-1] + TILE
+DRAWS = (1, 2)  # random field inputs: each draw tests every row at every step
 # Distinct extents of the one lowering that finds the looped dim when the provenance does
 # not name it.
 _PROBE = (5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79)
+
+
+def no_test(full: str, why: str) -> Refused:
+    return Refused(NO_TEST.format(full=full, why=why[:300]))
 
 
 def symbol_order(s):
@@ -56,26 +55,25 @@ def combine_of(node):
     return {"max": torch.maximum, "add": torch.add}[type(node).combine]
 
 
-# Reducers whose fold is exact in float32 in any order: the value over a prefix and over the
-# next tile fold to the value over both bit for bit.
-EXACT = ("max",)
-
-
-def folds_to(combine: str, combined, whole, magnitude, count: int) -> bool:
-    """Whether ``combined`` (the fold ``combine`` of a full-extent value over a prefix and
-    over the next tile) is ``whole`` (its value over both, ``count`` elements of the looped
-    dim). Bit for bit for an exact reducer (``EXACT``). For ``add``, within what a float32
-    sum of the same elements in another order can differ by: ``(count + 1) * 2**-23 *
-    magnitude()`` per element, where ``magnitude()`` is the sum of the absolute values of
-    those elements (twice the standard bound ``count * u * sum |x|``, ``u = 2**-24``: one
-    rounding more for the fold). A value that is not a running reduction of the looped dim
-    misses by far more than that."""
-    import torch
-
-    if combine in EXACT:
-        return bool(torch.equal(combined, whole))
+def folds_to(combined, whole, magnitude, count: int) -> bool:
+    """Whether ``combined`` (the fold of a full-extent value over a prefix and over the next
+    tile, as the kernel carries it) is ``whole`` (its value over both, ``count`` elements of
+    the looped dim), in floating point: within what float32 arithmetic on the same elements
+    in another order or another tiling can differ by, ``(count + 1) * 2**-23 * magnitude()``
+    per element, ``magnitude()`` the sum of the absolute values of those elements. A value
+    that is not a running reduction of the looped dim misses by far more."""
     bound = (count + 1) * 2.0 ** -23 * magnitude()
     return bool(((combined.float() - whole.float()).abs() <= bound).all())
+
+
+def carry_init(flat_graph_node, full: str):
+    """Where the carried value of ``full`` starts (``carry_init`` of its class; None: zero),
+    or no test where its class declares no combine: such a value is not carried."""
+    cls = type(flat_graph_node)
+    if getattr(cls, "combine", None) is None:
+        raise no_test(full, f"{full} is a {cls.__name__}, which declares no combine of its "
+                      "value over a prefix and over the next tile: the loop cannot carry it")
+    return cls.carry_init
 
 
 def _node(graph, name):
@@ -98,20 +96,18 @@ def first_difference(a: list, b: list) -> str:
 
 def probe_looped(recipe, full: str):
     """The symbol ``full`` reduces, found by lowering with a distinct extent per symbol
-    (unit symbols stay 1): None when no symbol has the extent its axis has. A hit is
-    confirmed by one more lowering with another extent for that symbol: a literal dim whose
-    extent happens to be the probe's is no symbol of it."""
-    free = [s for s in sorted(recipe.symbols, key=symbol_order) if recipe.symbols[s] != 1]
+    (unit symbols stay 1): None when no single symbol has the extent its axis has."""
+    free = [s for s in sorted(recipe.symbols, key=symbol_order) if recipe.sizes.get(s) != 1]
     if not free or len(free) >= len(_PROBE):
         return None
     probe = {s: _PROBE[i] for i, s in enumerate(free)}
-    sizes = {**{s: 1 for s in recipe.symbols if recipe.symbols[s] == 1}, **probe}
+    sizes = {**{s: 1 for s in recipe.symbols if recipe.sizes.get(s) == 1}, **probe}
 
     def extent(sizes):
         try:
             graph = recipe.at(sizes, "float32")
-        except Exception as e:  # noqa: BLE001 - lowering refuses these extents
-            raise Refused(E2.format(error=f"{type(e).__name__}: {e}"[:200])) from e
+        except Exception:  # noqa: BLE001 - lowering refuses these extents
+            return None
         return int(_node(graph, full).raxis[0].dom.extent)
 
     hits = [s for s in free if probe[s] == extent(sizes)]
@@ -123,14 +119,13 @@ def probe_looped(recipe, full: str):
 
 @dataclass(eq=False)
 class Flat:
-    """One flat graph and the loop a rule is derived for, at small shapes.
+    """One flat graph and the loop a rule is derived for, at the first pass's test sizes.
 
-    ``recipe`` builds the graph again (``instantiate.Recipe``); ``program_graph`` is the
-    program's own (what every instance must equal, ``signature``); ``full`` the full-extent
-    node and ``accs`` the accumulators that loop under it; ``looped`` the symbol (or
-    frozenset of symbols) of the looped dim. ``small`` is the extent of every other symbol;
-    without it, the first sizing that lowers and passes the guard is chosen.
-    """
+    ``recipe`` builds the graph again; ``program_graph`` is the program's own (what every
+    instance must be, ``signature``); ``full`` the full-extent node and ``accs`` the
+    accumulators that loop under it; ``looped`` the symbol (or frozenset of symbols) of the
+    looped dim. Every other symbol is at ``recipe.sizes``; ``dtype`` is the dtype the
+    instances are lowered in (the program's own for the ranking's float replay)."""
 
     recipe: object
     program_graph: object
@@ -139,106 +134,42 @@ class Flat:
     looped: object
     dtype: str = "float32"
     tile: int = TILE
-    small: dict = None
-    _graphs: dict = field(default_factory=dict, repr=False)
-    _layout: list = field(default=None, repr=False)
+    _graphs: dict = dfield(default_factory=dict, repr=False)
+    _layout: list = dfield(default=None, repr=False)
 
     def __post_init__(self):
         self._looped = (set(self.looped) if isinstance(self.looped, frozenset)
                         else {self.looped})
-        self._want = signature(self.program_graph, dtypes=self.strict)
-        if self.small is None:
-            self.small = self._choose_sizes()
-
-    @property
-    def strict(self) -> bool:
-        """The guard compares dtypes too for an instance in the program's own dtype."""
-        return self.dtype != "float32"
-
-    def _sizings(self):
-        symbols = self.recipe.symbols
-        rest = [s for s in sorted(symbols, key=symbol_order) if s not in self._looped]
-        units = {s: 1 for s in rest if symbols[s] == 1}
-        free = [s for s in rest if symbols[s] != 1]
-        real = sorted({int(symbols[s]) for s in free if symbols[s] is not None})
-        power = {e: min(e, 2 ** (i + 1)) for i, e in enumerate(real)}
-        top = 2 ** (len(real) + 1)
-        ladder = [
-            {s: (2, 3)[i % 2] for i, s in enumerate(free)},  # alternating 2 / 3
-            {s: 2 for s in free},
-            {s: 3 for s in free},  # grouped batch dims: equal extents divide one another
-            {s: power[int(symbols[s])] if symbols[s] is not None else top for s in free},
-        ]
-        seen = []
-        for sizing in ladder:
-            sizing = {**units, **sizing}
-            if sizing not in seen:
-                seen.append(sizing)
-                yield sizing
-
-    def _choose_sizes(self) -> dict:
-        errors, differences = [], []
-        for sizing in self._sizings():
-            sizes = {**sizing, **{s: self.tile for s in self._looped}}
-            try:
-                graph = self.recipe.at(sizes, self.dtype)
-            except Exception as e:  # noqa: BLE001 - lowering refuses these extents
-                errors.append(f"{type(e).__name__}: {e}")
-                continue
-            difference = first_difference(signature(graph, dtypes=self.strict), self._want)
-            if difference:
-                differences.append(difference)
-                continue
-            self._graphs[self.tile] = graph
-            return sizing
-        if differences:
-            raise Refused(E3.format(difference=differences[0][:300]))
-        raise Refused(E2.format(error=(errors[-1] if errors else "no sizing")[:200]))
+        self._want = signature(self.program_graph, dtypes=self.dtype != "float32")
+        self.sizes = {s: self.recipe.sizes[s] for s in self.recipe.symbols
+                      if s not in self._looped}
 
     def graph(self, n: int):
-        """The flat graph with the looped dim at ``n`` and every other dim small; the same
-        graph as the program's, or ``E3``."""
+        """The flat graph with the looped dim at ``n``: the program's graph, or no test."""
         n = int(n)
         if n not in self._graphs:
-            sizes = {**self.small, **{s: n for s in self._looped}}
+            sizes = {**self.sizes, **{s: n for s in self._looped}}
             try:
                 graph = self.recipe.at(sizes, self.dtype)
             except Exception as e:  # noqa: BLE001
-                raise Refused(E2.format(error=f"{type(e).__name__}: {e}"[:200])) from e
-            difference = first_difference(signature(graph, dtypes=self.strict), self._want)
+                raise no_test(self.full, f"it does not lower with {n} elements of that dim "
+                              f"({type(e).__name__}: {e})") from e
+            difference = first_difference(signature(graph, dtypes=self.dtype != "float32"),
+                                          self._want)
             if difference:
-                raise Refused(E3.format(difference=difference[:300]))
+                raise no_test(self.full, f"it is another graph with {n} elements of that "
+                              f"dim ({difference})")
             self._graphs[n] = graph
         return self._graphs[n]
 
     def node(self, n: int, name: str):
         return _node(self.graph(n), name)
 
-    def check_loop(self) -> None:
-        """The looped symbol sizes the looped dim and nothing else of the state: at ``n``
-        elements ``full`` reduces ``n`` of them (else E1: the symbol is not its dim's), every
-        input carries it on one axis at most (E4, ``looped_layout``), and ``full`` and every
-        accumulator have the same shape at ``tile`` and ``2 * tile`` elements (else E15:
-        the symbol also names a dim the loop does not step, such as the queries' axis of a
-        self-attention written ``q, k: [.., S, ..]``)."""
-        t = self.tile
-        for n in (t, 2 * t):
-            if int(self.node(n, self.full).raxis[0].dom.extent) != n:
-                raise Refused(E1.format(full=self.full))
-        self.looped_layout()
-        symbol = ", ".join(sorted(map(str, self._looped)))
-        for name in (self.full, *self.accs):
-            a = [int(x) for x in self.node(t, name).get_shape(0)]
-            b = [int(x) for x in self.node(2 * t, name).get_shape(0)]
-            if a != b:
-                raise Refused(E15.format(node=name, a=a, n=t, full=self.full, b=b, m=2 * t,
-                                         symbol=symbol))
-
     def looped_layout(self) -> list:
         """Per placeholder (``placeholder_order``), ``(axis, groups)``: the axis that carries
         the looped dim (or None) and how many runs of it lie along that axis (an input read
-        through a split view holds one run per split: it grows by ``groups`` per element).
-        Read off two instances that differ in nothing else; more than one axis is E4."""
+        through a split view holds one run per split). Read off two instances that differ
+        in nothing else; an input that grows along two axes has no prefix: no test."""
         if self._layout is None:
             from ...runtime.reference import placeholder_order
 
@@ -249,41 +180,14 @@ class Flat:
                 diff = [(i, int(y) - int(x)) for i, (x, y) in
                         enumerate(zip(pa.get_shape(0), pb.get_shape(0))) if int(x) != int(y)]
                 if len(diff) > 1 or (diff and diff[0][1] % self.tile):
-                    raise Refused(E4.format(input=pa.name, k=len(diff)))
+                    raise no_test(self.full, f"{pa.name} grows along {len(diff)} axes with "
+                                  "that dim: a prefix of the loop is not a prefix of it")
                 layout.append((None, 1) if not diff else (diff[0][0], diff[0][1] // self.tile))
             self._layout = layout
         return self._layout
 
-    def sample(self, n: int, seed: int, distribution: str = "normal") -> list:
-        """Inputs of the graph at looped extent ``n``, in the instance's dtype (the float32
-        instance reads float32 values of what the program declares)."""
-        from ...runtime.reference import make_inputs
-
-        inputs = make_inputs(self.graph(n), self.dtype, seed=seed, device="cpu",
-                             distribution=distribution)
-        if self.dtype == "float32":
-            inputs = [x.float() if x.is_floating_point() else x for x in inputs]
-        return list(inputs)
-
-    def stored(self, inputs) -> list:
-        """``inputs`` as the program's inputs hold them: rounded to each placeholder's
-        dtype (then float32 again for the float32 instance). A shaped sample is computed in
-        float32; an input the program declares float16 never holds a value that float16
-        cannot, or the graph's own nodes would read it at two precisions."""
-        from ...runtime.reference import _placeholder_torch_dtype, placeholder_order, torch_dtype
-
-        out = []
-        for x, p in zip(inputs, placeholder_order(self.graph(self.tile))):
-            if x.is_floating_point():
-                x = x.to(_placeholder_torch_dtype(p, torch_dtype(self.dtype)))
-                x = x.float() if self.dtype == "float32" else x
-            out.append(x)
-        return out
-
     def cut(self, inputs, start: int, length: int) -> list:
-        """``inputs`` restricted to ``[start, start + length)`` of the looped dim. Whether
-        the restriction is the right one is not assumed: ``extension`` checks that the
-        full-extent values of prefix and tile fold to that of their concatenation."""
+        """``inputs`` restricted to ``[start, start + length)`` of the looped dim."""
         out = []
         for x, (ax, groups) in zip(inputs, self.looped_layout()):
             if ax is None:
@@ -298,26 +202,71 @@ class Flat:
                 out.append(y.reshape(shape[:ax] + [groups * length] + shape[ax + 1:]))
         return out
 
+    def _shapes(self, n: int) -> list:
+        from ...runtime.reference import placeholder_order
+
+        return [tuple(int(d) for d in p.get_shape(0)) for p in placeholder_order(self.graph(n))]
+
+    # ---------------------------------------------------------------- in the field
+
+    def field_sample(self, n: int, seed: int) -> list:
+        """Random field inputs of the graph at looped extent ``n``."""
+        return field.random_inputs(self._shapes(n), seed)
+
+    def field_state(self, inputs, start: int, length: int, given=None, given_zeros=None):
+        """``(values, zero-divisor bits)``: the full-extent value and the accumulators on
+        ``[start, start + length)``, in the field (``field.values``)."""
+        try:
+            env, _, zeros = field.values(self.graph(length), self.cut(inputs, start, length),
+                                         given, given_zeros, with_zeros=True)
+        except field.NoField as e:
+            raise no_test(self.full, str(e)) from e
+        names = (self.full, *self.accs)
+        return {k: env[k] for k in names}, {k: zeros[k] for k in names}
+
+    def field_start(self, like: dict) -> dict:
+        """The state before the first iteration: the full-extent value's start value (its
+        ``carry_init``, zero where it has none) and zeros."""
+        import torch
+
+        init = carry_init(self.node(self.tile, self.full), self.full)
+        start = 0 if init is None else field.scalar(init)
+        out = {self.full: torch.full_like(like[self.full], start)}
+        for acc in self.accs:
+            out[acc] = torch.zeros_like(like[acc])
+        return out
+
+    # ---------------------------------------------------------- in floating point
+
+    def sample(self, n: int, seed: int, distribution: str = "normal") -> list:
+        """Float inputs of the graph at looped extent ``n``, in the instance's dtype."""
+        from ...runtime.reference import make_inputs
+
+        inputs = make_inputs(self.graph(n), self.dtype, seed=seed, device="cpu",
+                             distribution=distribution)
+        if self.dtype == "float32":
+            inputs = [x.float() if x.is_floating_point() else x for x in inputs]
+        return list(inputs)
+
     def state(self, inputs, start: int, length: int, given=None) -> dict:
-        """The full-extent value and the accumulators of the flat graph on the slice
-        ``[start, start + length)`` of the looped dim (float32)."""
+        """The full-extent value and the accumulators on ``[start, start + length)``
+        (float32)."""
         env, _ = values(self.graph(length), self.cut(inputs, start, length), given)
         return {k: env[k].float() for k in (self.full, *self.accs)}
 
     def magnitude(self, inputs, start: int, length: int):
         """Per element of the full-extent value: the sum of the absolute values of what it
-        reduces over ``[start, start + length)`` of the looped dim (float32; ``folds_to``)."""
+        reduces over ``[start, start + length)`` (float32; ``folds_to``)."""
         env, _ = values(self.graph(length), self.cut(inputs, start, length))
         node = self.node(length, self.full)
         operand = env[node.inputs[0].src_node.name].float().abs()
         return operand.sum(dim=node.axis).reshape(env[self.full].shape)
 
     def start(self, like: dict) -> dict:
-        """The state before the first iteration: the reducer's start value (zero where it
-        has none: ``carry_init`` None, the identity of ``add``) and zeros."""
+        """The float state before the first iteration: the start value and zeros."""
         import torch
 
-        init = type(self.node(self.tile, self.full)).carry_init
+        init = carry_init(self.node(self.tile, self.full), self.full)
         out = {self.full: torch.full_like(like[self.full], 0.0 if init is None else init)}
         for acc in self.accs:
             out[acc] = torch.zeros_like(like[acc])
@@ -326,203 +275,66 @@ class Flat:
 
 @dataclass(eq=False)
 class Case:
-    """One prefix extension: everything a candidate update may read, and what it must give."""
+    """One step ``F(H) -> F(H ++ T)``: everything a candidate update may read, and what it
+    must give (field values), and where each of them is computed from a division by zero
+    (``zeros``: per part, ``field.zero_bits``)."""
 
     label: str
     prefix: int
     old: dict  # F(H): full-extent value and accumulators (the start state for H empty)
     new: dict  # F(H ++ T)
-    tile: dict  # the tile's finished results, computed with the NEW full-extent value
-    moved: float  # share of rows whose full-extent value moved
+    tile: dict  # the tile's results, computed with the NEW full-extent value
     full: str = ""
+    zeros: dict = None  # part -> {name: bits}
 
     @property
     def rows(self) -> int:
         return int(self.old[self.full].numel())
 
-    def view(self, part: str, name: str):
-        """``part`` (old / new / tile) of ``name`` as ``(rows, width)``, float32."""
-        return getattr(self, part)[name].float().reshape(self.rows, -1)
+    def view(self, part: str, name: str) -> np.ndarray:
+        """``part`` (old / new / tile) of ``name`` as ``(rows, width)`` int64."""
+        return getattr(self, part)[name].reshape(self.rows, -1).numpy()
 
-    def only(self, keep) -> "Case":
-        """The case restricted to the rows ``keep`` (a boolean mask or indices)."""
-        import torch
-
-        keep = torch.as_tensor(keep)
-
-        def cut(d):
-            return {k: v.float().reshape(self.rows, -1)[keep] for k, v in d.items()}
-
-        old, new = cut(self.old), cut(self.new)
-        moved = float((new[self.full] != old[self.full]).float().mean()) if keep.numel() else 0.0
-        return Case(f"{self.label} (rows {keep.tolist()})", self.prefix, old, new,
-                    cut(self.tile), moved, self.full)
+    def zeros_view(self, part: str, name: str) -> np.ndarray:
+        """The zero-divisor bits of :meth:`view`."""
+        return self.zeros[part][name].reshape(self.rows, -1).numpy()
 
 
 def extension(flat: Flat, inputs, prefix: int, label: str) -> Case:
     """The case ``F(H) -> F(H ++ T)`` for ``|H| = prefix`` and the next tile ``T``."""
     t = flat.tile
-    new = flat.state(inputs, 0, prefix + t)
-    own = flat.state(inputs, prefix, t)  # the tile on its own: only its full-extent value
-    old = flat.state(inputs, 0, prefix) if prefix else flat.start(new)
-    # The full-extent value's own hole is its reducer's associativity (``folds_to``). Where
-    # it does not hold, the value is not a running reduction of the looped dim (its operand
-    # depends on the prefix, a max of ``exp(x - max(x))``) or the cut is wrong: no rule.
-    node = flat.node(t, flat.full)
-    combined = combine_of(node)(old[flat.full], own[flat.full])
-    if not folds_to(type(node).combine, combined, new[flat.full],
-                    lambda: flat.magnitude(inputs, 0, prefix + t), prefix + t):
-        raise Refused(E5.format(full=flat.full, label=label))
-    tile = flat.state(inputs, prefix, t, given={flat.full: new[flat.full]})
-    moved = float((new[flat.full] != old[flat.full]).float().mean())
-    return Case(label, prefix, old, new, tile, moved, flat.full)
+    new, new_zeros = flat.field_state(inputs, 0, prefix + t)
+    own, _ = flat.field_state(inputs, prefix, t)  # the tile alone: its own shapes
+    for name in (flat.full, *flat.accs):
+        shapes = {tuple(new[name].shape), tuple(own[name].shape)}
+        if len(shapes) != 1:
+            raise no_test(flat.full, f"{name} changes shape with the looped dim "
+                          f"({sorted(shapes)}): the dim sizes more than the loop")
+    if prefix:
+        old, old_zeros = flat.field_state(inputs, 0, prefix)
+    else:
+        old = flat.field_start(new)
+        old_zeros = {k: v.new_zeros(v.shape) for k, v in old.items()}
+    tile, tile_zeros = flat.field_state(inputs, prefix, t, given={flat.full: new[flat.full]},
+                                        given_zeros={flat.full: new_zeros[flat.full]})
+    zeros = {"old": old_zeros, "new": new_zeros, "tile": tile_zeros}
+    return Case(label, prefix, old, new, tile, flat.full, zeros)
 
 
-# --------------------------------------------------------------------------- reference set
-
-MARGIN = 4 * LOOSE_RTOL  # a row discriminates where both errors exceed the search's filter 4x
-
-
-def discriminating(case: Case, acc: str):
-    """Per row of ``case``: does it tell the right update of ``acc`` from "no repair"
-    (``a + r``: the move of the full-extent value is visible) AND from "tile only" (``r``:
-    the old value is visible)? Relative to the largest ``|target|`` of the row."""
-    a, r, t = case.view("old", acc), case.view("tile", acc), case.view("new", acc)
-    scale = t.abs().amax(dim=1, keepdim=True) + 1e-30
-    move = ((a + r - t).abs() / scale).amax(dim=1)
-    old = ((r - t).abs() / scale).amax(dim=1)
-    return (move > MARGIN) & (old > MARGIN)
-
-
-def adequacy(cases, accs) -> dict:
-    """``{acc: discriminating rows}`` over the cases with a non-empty prefix."""
-    later = [c for c in cases if c.prefix]
-    return {acc: sum(int(discriminating(c, acc).sum()) for c in later) for acc in accs}
-
-
-def check_adequacy(cases, full: str, accs, needed: int) -> dict:
-    """``adequacy``, or E10 for the first accumulator with fewer than ``needed`` rows."""
-    counts = adequacy(cases, accs)
-    for acc in accs:
-        if counts[acc] < needed:
-            raise Refused(E10.format(full=full, acc=acc, k=counts[acc], n=needed))
-    return counts
-
-
-def shaped(flat: Flat, seed: int, kind: str, gain: float) -> list:
-    """A sample at ``N`` shaped so that the full-extent value moves.
-
-    ``ramp xg``: every input becomes ``1 + 0.25 tanh(x)``; the inputs with the looped dim
-    are multiplied by a ramp from 1 to 2.5 along it, the others by ``g``.
-    ``tail xg``: in the inputs that carry the looped dim (one run), the elements from the
-    first tile on are multiplied by ``g``.
-    """
-    import torch
-
-    inputs = flat.sample(N, seed)
-    if kind == "none":
-        return inputs  # as sampled: already what the inputs hold
-    out = []
-    for x, (ax, groups) in zip(inputs, flat.looped_layout()):
-        if kind == "ramp":
-            level = 1.0 + 0.25 * torch.tanh(x.float())
-            if ax is None:
-                out.append((gain * level).to(x.dtype))
-                continue
-            shape = [1] * x.dim()
-            shape[ax] = groups * N
-            ramp = (1.0 + 1.5 * torch.arange(N, dtype=torch.float32) / N).repeat(groups)
-            out.append((level * ramp.reshape(shape)).to(x.dtype))
-        else:  # tail
-            if ax is None or groups != 1:
-                out.append(x)
-                continue
-            y = x.clone()
-            part = y.narrow(ax, flat.tile, N - flat.tile)
-            part.copy_((part.float() * gain).to(y.dtype))
-            out.append(y)
-    return flat.stored(out)
-
-
-@dataclass
-class References:
-    cases: list  # Case, in order: per normal seed the first iteration and the prefixes; then
-    #              the shaped sample's prefixes
-    rows: int  # rows of the full-extent value (one case's worth)
-    adequacy: dict  # acc -> discriminating rows over the cases with a non-empty prefix
-    shaped: str  # label of the shaped sample that was chosen
-    tried: int  # shaped samples tried
-
-
-def reference_set(flat: Flat, *, check: bool = True) -> References:
-    """The reference set (per normal seed the first iteration and the prefixes, then the
-    shaped sample), with its adequacy checked (E10; ``check=False`` leaves the check to the
-    caller, which then has the cases for its report)."""
+def reference_set(flat: Flat) -> list:
+    """Every case: per draw of ``DRAWS``, every prefix of ``STEPS``."""
     cases = []
-    for seed in SEEDS_NORMAL:
-        inputs = flat.sample(N, seed)
-        cases.append(extension(flat, inputs, 0, f"first seed={seed}"))
-        cases += [extension(flat, inputs, p, f"normal seed={seed} prefix={p}") for p in PREFIXES]
-    rows = cases[0].rows
-    best, best_score, best_label, tried = None, -1, "", 0
-    goal = len(PREFIXES) * rows
-    for seed in TRY_SEEDS:
-        for kind, gain in SHAPINGS:
-            tried += 1
-            tag = f"shaped seed={seed} {kind} x{gain:g}"
-            inputs = shaped(flat, seed, kind, gain)
-            sample = [extension(flat, inputs, p, f"{tag} prefix={p}") for p in PREFIXES]
-            score = min(sum(int(discriminating(c, acc).sum()) for c in sample)
-                        for acc in flat.accs)
-            if score > best_score:
-                best, best_score, best_label = sample, score, tag
-            if best_score >= goal:
-                break
-        if best_score >= goal:
-            break
-    cases += best
-    counts = (check_adequacy(cases, flat.full, flat.accs, rows) if check
-              else adequacy(cases, flat.accs))
-    return References(cases, rows, counts, best_label, tried)
-
-
-def row_dependency(flat: Flat, seed: int = SEEDS_NORMAL[0]) -> None:
-    """E6 unless the full-extent value enters each accumulator row by row: raising it in
-    one row of the tile instance changes accumulator elements of that row only (the
-    accumulator viewed as ``rows + (-1,)``). This is what the search's typing, the kernel's
-    row-wise repair and the proof's single symbol per row assume."""
-    import torch
-
-    t = flat.tile
-    inputs = flat.sample(t, seed)
-    env, _ = values(flat.graph(t), inputs)
-    m = env[flat.full].float()
-    rows = int(m.numel())
-
-    def accs(value):
-        out, _ = values(flat.graph(t), inputs, {flat.full: value})
-        return {a: out[a].float() for a in flat.accs}
-
-    base = accs(m)
-    for acc, value in base.items():
-        if value.numel() % rows:
-            raise Refused(E6.format(acc=acc, full=flat.full))
-    for rho in range(rows):
-        bumped = m.clone().reshape(-1)
-        bumped[rho] += 1.0
-        moved = accs(bumped.reshape(m.shape))
-        for acc, value in moved.items():
-            changed = (value != base[acc]).reshape(rows, -1)
-            others = torch.ones(rows, dtype=torch.bool)
-            others[rho] = False
-            if bool(changed[others].any()):
-                raise Refused(E6.format(acc=acc, full=flat.full))
+    for seed in DRAWS:
+        inputs = flat.field_sample(N, seed)
+        cases += [extension(flat, inputs, p, f"draw {seed} prefix {p}") for p in STEPS]
+    return cases
 
 
 def block(cases, part: str, name: str) -> np.ndarray:
-    """One float32 block ``(rows of every case, width)``: ``part`` (old / new / tile) of
-    ``name`` in every case, stacked."""
-    out = [c.view(part, name).numpy() for c in cases]
-    for x in out:
-        assert x.dtype == np.float32, x.dtype
-    return np.concatenate(out, axis=0)
+    """One int64 block ``(rows of every case, width)``: ``part`` of ``name`` in every case."""
+    return np.concatenate([c.view(part, name) for c in cases], axis=0)
+
+
+def zeros_block(cases, part: str, name: str) -> np.ndarray:
+    """The zero-divisor bits of :func:`block`."""
+    return np.concatenate([c.zeros_view(part, name) for c in cases], axis=0)

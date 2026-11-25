@@ -2,17 +2,24 @@
 
 A conflict is a reduction that a descendant reduction over the same dim depends on
 (``schedule.streaming.obstacles``); which op the ancestor is plays no part in finding it,
-in classifying it, in deriving its update rule or in assembling the loop. Here the ancestor
+in deriving its update rule or in assembling the loop. Here the ancestor
 is a sum:
 
 * ``exp(y - sum(y))``: the row sum and the value matmul loop under the sum of the row. The
-  same search finds the same repair as for a max, ``a * exp(m - m')``, the same proof
-  proves it, and the loop carries the sum (from zero, its ``carry_init``) next to them;
-* its traced order: two conflicts, the first one two passes over the row, the second one
-  refused by the engine (the exp it reads changes with the first);
-* ``(x / sum(x)) @ v``: every update would divide by the running sum, which may be zero, so
-  the conflict is refused before anything is searched (E16) and keeps its pin: the dim is
-  held whole, as it always was.
+  same search finds the same repair as for a max, ``a * exp(m - m')``, the same tests
+  confirm it, and the loop carries the sum (from zero, its ``carry_init``) next to them;
+* its traced order: two conflicts, and no update reproduces either (the value matmul reads
+  the finished row sum; the exp it reads changes with the first sum);
+* ``(x / sum(x)) @ v``: the update divides by the running sum, ``a * (m / m') + r``. The test
+  is random, so it cannot tell that a running sum may be zero where the finished one is not
+  (the kernel would then divide by zero where the program does not): that is the price of
+  testing instead of proving, the one the first pass pays for the program's own divisions;
+* ``(x / |x|) @ v``: a norm in front of the contraction over its own dim, repaired by
+  ``a * sqrt(m / m') + r``. Its test data divides by zero in the field now and then (a
+  running sum of squares that is zero in a residue): those elements are skipped in that
+  residue, and the rule is found whatever the draw;
+* ``exp(y - mean(y))``: no rule. On a prefix of ``n`` elements the mean is the sum over
+  ``n``, which no factor over the value before and after the step gives.
 
 ``test_search_*`` run the superoptimizer first.
 """
@@ -22,19 +29,18 @@ import time
 import pytest
 
 pytest.importorskip("torch")
-pytest.importorskip("z3")
 
 from cleave.ir.graph_utils import graph_tiers
 from cleave.ir.ops import ReduceSum
 from cleave.ir.update_rule import loop_key, show
 from cleave.pipeline import plans
-from cleave.pipeline.update import texts
 from cleave.schedule import search_tiling
 from cleave.schedule.streaming import sites
 from cleave.schedule.tiling import schedule_kernel
 
 from ._attention import FACTOR
-from ._programs import searched, sum_normalized, sum_shifted
+from ._programs import (derivation, identity, l2_normalized, lowered, mean_shifted, searched,
+                        sum_normalized, sum_shifted)
 
 ROWS = tuple(dict(R=64, C=256, D=64).items())
 
@@ -84,27 +90,54 @@ def test_search_the_traced_order_of_a_sum_shift_says_why_twice():
     _, graphs = searched(sum_shifted, ROWS)
     (ir,) = plans.lower(_graph(graphs, "sum>div>matmul"))
     first, second = ir.streaming_refusals
-    assert first.endswith("a finished reduction over the dim reduction_1_3 reduces: that "
-                          "needs two passes over the row")
-    assert second.startswith("reduction_1_6: ") and (
-        "is computed from reduction_1_3, another reduction over the dim reduction_1_6 "
-        "reduces" in second)
+    assert first.startswith("reduction_1_3: no update of mma_8 of the form ")
+    assert second.startswith("reduction_1_6: no update of mma_8 of the form ")
     assert not [n for n in ir.nodes if getattr(n, "streaming", None) is not None]
 
 
-def test_search_a_division_by_a_running_sum_is_refused_before_anything_is_searched():
+def test_search_a_division_by_a_running_sum_divides_by_the_running_sum():
     _, graphs = searched(sum_normalized, ROWS)
     t0 = time.perf_counter()
     (ir,) = plans.lower(_graph(graphs, "sum>div>matmul"))
-    assert time.perf_counter() - t0 < 5.0  # the search alone took 20 s at budgets 4 and 5
+    assert time.perf_counter() - t0 < 10.0
     (d,) = ir.derivations
-    assert d.refused == texts.E16.format(node="div_3", full="reduction_1_2", acc="mma_4")
-    assert not d.holes and d.recipe_key == ""  # read off the flat graph: the loop structure's
-    assert ir.streaming_refusals == [f"reduction_1_2: {d.refused}"]
-    # the pin stays: every tiling holds the row of the matmul whole (the policy may still
-    # step the sum on its own; apply_tiling refuses those tilings)
-    assert {int(s) for c in search_tiling(ir, topk=1000) for n, steps in c.rstep_map.items()
-            if n.name == "mma_4" for s in steps.values()} == {256}
-    # and the other graph, which divides after the matmul, has no conflict at all
+    assert not d.refused and d.rules == (("mma_4", ("div", "m", "m'")),)
+    assert ir.streaming_refusals == []
+    # the other graph, which divides after the matmul, has no conflict at all
     (other,) = plans.lower(_graph(graphs, "sum>matmul>div"))
     assert not hasattr(other, "streaming_refusals") and not hasattr(other, "derivations")
+
+
+def test_a_norm_in_front_of_its_contraction_is_repaired_by_the_ratio_of_its_norms():
+    """The value matmul loops under the sum of squares it divides the row by (through its
+    square root). Some of its test data divides by zero in a residue; that is skipped there,
+    and the rule is the ratio of the norms before and after the step."""
+    from cleave.pipeline.update import engine
+    from cleave.pipeline.update.reference import reference_set
+
+    d = derivation(identity(l2_normalized, dict(R=64, C=256, D=64)))
+    assert not d.refused, d.refused
+    (acc,) = d.loops
+    assert show(d.chosen[acc]) == "(r + (a * sqrt((m / m'))))"
+    *_, excluded = engine.hole_blocks(reference_set(d.flat), d.full, acc)
+    assert excluded.any() and not (excluded == 3).all()
+
+
+def test_a_mean_shift_has_no_rule():
+    """The conflict is the row sum the mean divides by the dim's extent; on each prefix that
+    extent is the prefix's, so no factor over the sums before and after the step repairs
+    the accumulators."""
+    graph = identity(mean_shifted, dict(R=64, C=256, D=64))
+    assert sum(type(n).__name__ == "ReduceSum" for n in lowered(graph).nodes) == 2
+    d = derivation(graph)
+    assert d.refused.startswith("no update of ") and "reproduces the flat graph" in d.refused
+
+
+def test_search_a_conflict_without_a_rule_keeps_the_dim_whole():
+    """The traced order of the sum shift: no rule, so the pin stays and every tiling holds
+    the row of the value matmul whole (the policy may still step a sum on its own;
+    apply_tiling refuses those tilings)."""
+    _, graphs = searched(sum_shifted, ROWS)
+    (ir,) = plans.lower(_graph(graphs, "sum>div>matmul"))
+    assert {int(s) for c in search_tiling(ir, topk=1000) for n, steps in c.rstep_map.items()
+            if n.name == "mma_8" for s in steps.values()} == {256}

@@ -1,7 +1,8 @@
-"""The derivation of one loop's update rules: references -> search -> proof -> ranking.
+"""The derivation of one loop's update rules: test data -> enumeration -> float replay.
 
-``run`` never raises: every reason an obstacle keeps its pin is a typed refusal
-(``texts``), and an unexpected exception is ``E13``, which names itself.
+``run`` never raises: every reason a conflict keeps its pin is one of the refusals of
+``texts`` (no test, no rule, no rule survives the replay), and an unexpected exception is
+``BUG``, which names itself.
 """
 
 from __future__ import annotations
@@ -9,16 +10,14 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 
-import numpy as np
-
-from ...ir.update_rule import Streaming, repair_of, show, size
-from . import proof as proof_module
+from ...ir.rolling import check_expression
+from ...ir.update_rule import Streaming, repair_of, show, size, update_of
 from . import rank as rank_module
 from . import reference as ref
 from . import search as search_module
-from .texts import E1, E11, E12, Refused, bug
+from .texts import NO_REPLAY, NO_RULE, Refused, bug
 
-BUDGETS = (4, 5)  # 5 only for a hole with no proven emittable rule at 4
+BUDGETS = (4, 5)  # 5 only for an accumulator with no emittable match at 4
 RANK_CASES = ((32, "normal"), (4, "normal"))  # plus the adversarial cases of the graph, at 32
 RANK_N = 32
 
@@ -27,13 +26,10 @@ RANK_N = 32
 class Hole:
     acc: str
     wide: bool
-    leaves: dict  # name -> float32 block
-    target: np.ndarray  # float32 block of F(H ++ T)[acc]
     search: object = None  # search.Result of the last budget tried
-    verdicts: list = field(default_factory=list)  # (expr, loose error, proof.Verdict)
-    proven: list = field(default_factory=list)  # expressions
-    emittable: list = field(default_factory=list)  # proven, of the form a * F + r
-    tried: list = field(default_factory=list)  # (search.Result, verdicts) per budget
+    matches: list = field(default_factory=list)  # updates a * F + r that reproduce the graph
+    emittable: list = field(default_factory=list)  # of those, the ones the assembly can emit
+    tried: list = field(default_factory=list)  # search.Result per budget
 
 
 @dataclass
@@ -41,8 +37,7 @@ class Derivation:
     key: str
     full: str
     loops: tuple
-    cases: list = field(default_factory=list)  # (label, share of rows whose full value moved)
-    adequacy: dict = field(default_factory=dict)  # acc -> discriminating rows
+    cases: list = field(default_factory=list)  # labels of the test cases
     holes: list = field(default_factory=list)  # Hole
     ranked: list = field(default_factory=list)  # rank.Ranked, best first
     rejected: list = field(default_factory=list)  # (combination text, why)
@@ -50,93 +45,127 @@ class Derivation:
     rules: tuple = ()  # ((accumulator, factor expression), ...), in ``loops`` order
     refused: str = ""  # why no rule was derived ("" = derived)
     timings: dict = field(default_factory=dict)
-    budget: int = 0  # the largest budget a hole was searched at
+    budget: int = 0  # the largest budget an accumulator was searched at
     unary: tuple = ()
-    shaped: str = ""  # the shaped sample of the reference set
     seconds: float = 0.0
-    from_store: bool = False  # read back from ``store`` (re-proved), not derived here
-    bug: bool = False  # refused with E13: an unexpected exception (never stored)
-    # ``Recipe.key`` of a refusal that depends on the recipe (E1-E6, E10-E12, E15): it is
-    # kept for that recipe only. "" for a rule and for a refusal read off the flat graph
-    # alone (T5, E7, E8, E9, E14, E16): those hold for the loop structure.
+    from_store: bool = False  # read back from ``store`` (tested again), not derived here
+    bug: bool = False  # refused with BUG: an unexpected exception (never stored)
+    # ``Recipe.key`` of a refusal: it is kept for that recipe only ("" for a rule, which
+    # holds for the loop structure).
     recipe_key: str = ""
     report_text: str = ""  # the report of a derivation read from the store
     references: list = field(default_factory=list, repr=False)  # reference.Case
-    flat: object = field(default=None, repr=False)  # the float32 reference instance
-    kernel: object = field(default=None, repr=False)  # the program-dtype ranking instance
+    flat: object = field(default=None, repr=False)  # the instances of the test data
+    kernel: object = field(default=None, repr=False)  # the program-dtype replay instances
 
     def record(self) -> Streaming:
         return Streaming(self.loops, self.rules, self.key)
 
     def light(self) -> "Derivation":
-        """The derivation without its small-shape instances, references and blocks: what
-        the process keeps per loop structure (the report needs none of them)."""
+        """The derivation without its instances and test data: what the process keeps per
+        loop structure (the report needs none of them)."""
         from dataclasses import replace
 
-        holes = [replace(h, leaves={}, target=None) for h in self.holes]
-        return replace(self, holes=holes, references=[], flat=None, kernel=None)
+        return replace(self, references=[], flat=None, kernel=None)
+
+
+# The unary ops of the IR, by the name the search and the assembly give them.
+def _unary_classes():
+    from ...ir.ops import Exp, RSqrt, Silu, Sqrt
+
+    return {Exp: "exp", Sqrt: "sqrt", RSqrt: "rsqrt", Silu: "silu"}
+
+
+def between(by_name, full_node, acc_node) -> set:
+    """Names of the nodes computed from ``full_node`` that ``acc_node`` reads (strictly
+    between the two)."""
+    below, stack = set(), [full_node]
+    while stack:
+        n = stack.pop()
+        for e in n.outputs:
+            d = e.dst_node
+            if d.name in by_name and d.name not in below:
+                below.add(d.name)
+                stack.append(d)
+    above, stack = set(), [acc_node]
+    while stack:
+        n = stack.pop()
+        for e in n.inputs:
+            s = e.src_node
+            if s.name not in above:
+                above.add(s.name)
+                stack.append(s)
+    return (below & above) - {full_node.name, acc_node.name}
 
 
 def unary_ops(flat_graph, full: str, accs) -> tuple:
     """The unary functions the flat graph applies between the full-extent value and the
     accumulators under it: the search may use those, and + - * /."""
-    from ...ir.ops import Exp
-
+    classes = _unary_classes()
     by_name = {n.name: n for n in flat_graph.nodes}
-    found = []
+    found = set()
     for acc in accs:
-        for name in sorted(proof_module._between(by_name, by_name[full], by_name[acc])):
-            if type(by_name[name]) is Exp and "exp" not in found:
-                found.append("exp")
-    return tuple(found)
+        for name in between(by_name, by_name[full], by_name[acc]):
+            op = classes.get(type(by_name[name]))
+            if op is not None:
+                found.add(op)
+    return tuple(op for op in search_module.UNARY if op in found)
+
+
+_PARTS = (("a", "old", False), ("m", "old", True), ("m'", "new", True), ("r", "tile", False))
 
 
 def hole_blocks(cases, full: str, acc: str):
-    """``(leaves, kinds, target)`` of the hole of ``acc``: float32 blocks over the rows of
-    every case (``a``, ``m``, ``m'``, ``r``) and whether each is wide."""
+    """``(leaves, target, wide, excluded)`` of the hole of ``acc``: field blocks over the rows
+    of every case (``a``, ``m``, ``m'``, ``r``), the new state, whether the accumulator is
+    wide, and per element the residues its test data is computed from a division by zero
+    in (``search`` skips those). ``no_test`` where that is every residue of every element."""
     wide = cases[0].view("old", acc).shape[1] > 1
-    leaves = {
-        "a": ref.block(cases, "old", acc),
-        "m": ref.block(cases, "old", full),
-        "m'": ref.block(cases, "new", full),
-        "r": ref.block(cases, "tile", acc),
-    }
-    kinds = {"a": wide, "m": False, "m'": False, "r": wide}
-    return leaves, kinds, ref.block(cases, "new", acc), wide
+    leaves, excluded = {}, ref.zeros_block(cases, "new", acc)
+    for leaf, part, of_full in _PARTS:
+        name = full if of_full else acc
+        leaves[leaf] = ref.block(cases, part, name)
+        excluded = excluded | ref.zeros_block(cases, part, name)
+    if (excluded == 3).all():
+        raise ref.no_test(full, f"every element of the test data of {acc} is computed from a "
+                          "division by zero in the field")
+    return leaves, ref.block(cases, "new", acc), wide, excluded
 
 
-def _looped(recipe, flat_graph, full: str):
+def emittable(update, full: str) -> bool:
+    """Whether the loop can emit ``update``: the form ``a * F + r`` with a factor the
+    assembly has tile ops for."""
+    factor = repair_of(update)
+    if factor is None:
+        return False
+    try:
+        check_expression(factor, stem=full)
+    except ValueError:
+        return False
+    return True
+
+
+def looped_dim(recipe, flat_graph, full: str):
     looped = recipe.looped(flat_graph, full)
     if looped is None:
         looped = ref.probe_looped(recipe, full)
     if looped is None:
-        raise Refused(E1.format(full=full))
+        raise ref.no_test(full, "the dim it reduces has no symbol: the graph cannot be built "
+                          "again on a prefix of it")
     return looped
 
 
 def run(flat_graph, obstacle, recipe, *, key: str = "", budgets=BUDGETS, rank_cases=None,
         combine=None) -> Derivation:
-    """The derivation for one obstacle of ``flat_graph``; ``recipe`` builds the graph
-    again at other extents (``instantiate.Recipe``)."""
+    """The derivation for one conflict of ``flat_graph``; ``recipe`` builds the graph again
+    at other extents (``instantiate.Recipe``)."""
     d = Derivation(key, obstacle.full, tuple(obstacle.loops))
     t0 = time.perf_counter()
-    graph_alone = True  # until the recipe is first used
     try:
-        # ---- what the proof can read, before anything is built (T5, E7-E9, E14, E16):
-        # read off the flat graph alone, so it holds for every graph of the loop structure
-        for acc in d.loops:
-            proof_module.check_contribution(flat_graph, d.full, acc)
-        for acc in d.loops:
-            proof_module.check_leaves(flat_graph, d.full, acc)
-        for acc in d.loops:
-            proof_module.check_running_divisors(flat_graph, d.full, acc)
-        d.unary = unary_ops(flat_graph, d.full, d.loops)
-        graph_alone = False
         _run(d, flat_graph, recipe, budgets, rank_cases, combine, t0)
     except Refused as e:
         d.refused = str(e)
-        if not graph_alone:
-            d.recipe_key = recipe.key
+        d.recipe_key = recipe.key
     except Exception as e:  # noqa: BLE001 - a bug in the engine keeps the pin and says so
         d.refused, d.bug = bug(e), True
     d.seconds = time.perf_counter() - t0
@@ -145,65 +174,50 @@ def run(flat_graph, obstacle, recipe, *, key: str = "", budgets=BUDGETS, rank_ca
 
 def _run(d, flat_graph, recipe, budgets, rank_cases, combine, t0):
     full, loops = d.full, d.loops
-    # ---- references (E1-E4 instantiation, E15 the loop's own dim, E6 rows, E5 cases,
-    # E10 adequacy)
-    looped = _looped(recipe, flat_graph, full)
+    looped = looped_dim(recipe, flat_graph, full)
     flat = d.flat = ref.Flat(recipe, flat_graph, full, loops, looped, dtype="float32")
-    flat.check_loop()
-    ref.row_dependency(flat)
-    refs = ref.reference_set(flat, check=False)
-    d.references, d.adequacy, d.shaped = refs.cases, refs.adequacy, refs.shaped
-    d.cases = [(c.label, c.moved) for c in refs.cases]
-    ref.check_adequacy(refs.cases, full, loops, refs.rows)
-    d.timings["references"] = time.perf_counter() - t0
+    cases = d.references = ref.reference_set(flat)
+    d.cases = [c.label for c in cases]
+    d.timings["test data"] = time.perf_counter() - t0
+    d.unary = unary_ops(flat_graph, full, loops)
 
     # ---- one hole per accumulator, narrowest first; independent of each other
-    order = sorted(loops, key=lambda a: (refs.cases[0].view("old", a).numel(), a))
+    order = sorted(loops, key=lambda a: (cases[0].view("old", a).size, a))
     holes = {}
     for acc in order:
-        leaves, kinds, target, wide = hole_blocks(refs.cases, full, acc)
-        hole = Hole(acc, wide, leaves, target)
+        leaves, target, wide, excluded = hole_blocks(cases, full, acc)
+        hole = Hole(acc, wide)
         for budget in budgets:
             t1 = time.perf_counter()
-            found = search_module.enumerate_updates(acc, leaves, kinds, target, budget=budget,
-                                                    unary=d.unary)
+            found = search_module.enumerate_factors(acc, leaves, target, budget=budget,
+                                                    unary=d.unary, cases=len(cases),
+                                                    excluded=excluded)
             d.timings[f"search {acc} @{budget}"] = time.perf_counter() - t1
-            t1 = time.perf_counter()
-            verdicts = [(e, err, proof_module.prove(e, flat_graph, full, acc))
-                        for e, err in found.matches]
-            d.timings[f"proof {acc} @{budget}"] = time.perf_counter() - t1
-            hole.tried.append((found, verdicts))
-            hole.search, hole.verdicts = found, verdicts
-            hole.proven = [e for e, _, v in verdicts if v.proved]
-            hole.emittable = [e for e in hole.proven if repair_of(e) is not None]
+            hole.tried.append(found)
+            hole.search = found
+            hole.matches = [update_of(f) for f in found.matches]
+            hole.emittable = [e for e in hole.matches if emittable(e, full)]
             d.budget = max(d.budget, budget)
             if hole.emittable:
                 break
         holes[acc] = hole
         d.holes.append(hole)
         if not hole.emittable:
-            raise Refused(E11.format(acc=acc, budget=hole.search.budget,
-                                     matched=len(hole.search.matches), proved=len(hole.proven)))
+            raise Refused(NO_RULE.format(acc=acc, budget=hole.search.budget))
 
-    # ---- ranking of the combinations, in the program's own dtype
+    # ---- ranking of the combinations, replayed in floating point in the program's dtype
     t1 = time.perf_counter()
-    kernel = d.kernel = ref.Flat(recipe, flat_graph, full, loops, looped, dtype=recipe.dtype,
-                                 small=dict(flat.small))
+    kernel = d.kernel = ref.Flat(recipe, flat_graph, full, loops, looped, dtype=recipe.dtype)
     if rank_cases is None:
         from ...runtime.inputs import adversarial_cases
 
         rank_cases = list(RANK_CASES) + [(RANK_N, c) for c in adversarial_cases(kernel.graph(RANK_N))]
-    reducer = type(flat.node(flat.tile, full)).combine
     d.ranked, rejected = rank_module.rank(kernel, loops, {a: holes[a].emittable for a in loops},
-                                          rank_cases, combine=combine, reducer=reducer)
+                                          rank_cases, combine=combine)
     d.rejected = [(r.text, r.rejected) for r in rejected]
     d.timings["ranking"] = time.perf_counter() - t1
     if not d.ranked:
-        first = rejected[0]
-        case = first.case
-        if first.replays[case].finite:  # rejected for its carried value, not for a value
-            case += f", where the carried {full} is not the flat graph's"
-        raise Refused(E12.format(loops=", ".join(loops), case=case))
+        raise Refused(NO_REPLAY.format(loops=", ".join(loops), case=rejected[0].rejected))
     best = d.ranked[0]
     d.chosen = dict(best.rules)
     d.rules = tuple((acc, best.factors[acc]) for acc in loops)
@@ -219,40 +233,32 @@ def describe(d: Derivation, out=print, *, timings: bool = True) -> None:
         for line in d.report_text.splitlines():
             out(line)
         if timings:
-            out(f"(read from the update store and re-proved, {d.seconds:.2f} s)")
+            out(f"(read from the update store and tested again, {d.seconds:.2f} s)")
         return
     out(f"loop: full-extent value {d.full}; accumulators {list(d.loops)}; key {d.key[:16]}")
     out(f"unary ops read off the flat graph: {list(d.unary)}; binary: + - * /")
     if d.cases:
-        out(f"reference cases (label, share of rows whose full-extent value moved); "
-            f"shaped sample: {d.shaped}")
-        for label, moved in d.cases:
-            out(f"    {label}: {moved:.2f}")
-        out("discriminating rows per hole: "
-            + ", ".join(f"{a} {n}" for a, n in sorted(d.adequacy.items())))
+        out(f"test data: {len(d.cases)} cases ({', '.join(d.cases)}), in the field of the "
+            "first pass's fingerprint")
     for hole in d.holes:
-        for s, verdicts in hole.tried:
-            out(f"\nhole {hole.acc} ({'wide' if hole.wide else 'row'}): leaves {s.leaves}, "
-                f"budget {s.budget} ops")
-            out(f"    candidates formed per level {s.formed} (total {s.visited}), distinct "
-                f"values kept per level {s.kept}, fingerprint collisions {s.collisions}")
-            out(f"    {len(s.matches)} expression(s) pass the loose filter:")
-            for e, err, v in verdicts:
-                verdict = "PROVED  " if v.proved else "rejected"
-                emit = (f"emittable, factor {show(repair_of(e))}" if repair_of(e) is not None
-                        else "not emittable")
-                detail = ("" if v.proved else "  [" + ", ".join(
-                    f"{k.split()[0]} {r}" for k, r in v.results.items()) + (
-                    f" {v.why}" if v.why else "") + "]")
-                out(f"      {verdict} {size(e)} ops  loose err {err:.1e}  {hole.acc}' = "
-                    f"{show(e)}  {emit if v.proved else ''}{detail}".rstrip())
+        for s in hole.tried:
+            out(f"\nhole {hole.acc} ({'wide' if hole.wide else 'row'}): factors over m, m', "
+                f"updates of at most {s.budget} ops")
+            out(f"    factors formed per level {s.formed} (total {s.visited}), distinct "
+                f"values kept per level {s.kept}; sampled {s.elements[0]} of "
+                f"{s.elements[1]} elements")
+            out(f"    {s.sampled} match the sample, {len(s.matches)} every element:")
+            for f in s.matches:
+                e = update_of(f)
+                emit = "emittable" if emittable(e, d.full) else "not emittable"
+                out(f"      {size(e)} ops  {hole.acc}' = {show(e)}  {emit}")
     if d.ranked or d.rejected:
         out(f"\nranking of {len(d.ranked) + len(d.rejected)} combination(s) of emittable "
-            "proven rules (grade, stable, cost, size):")
+            "rules (grade, cost, size):")
         for text, why in d.rejected:
             out(f"  REJECTED ({why}): {text}")
         for i, r in enumerate(d.ranked):
-            out(f"  #{i} grade={r.grade} stable={r.stable} cost={r.cost} size={r.size}  {r.text}")
+            out(f"  #{i} grade={r.grade} cost={r.cost} size={r.size}  {r.text}")
             out("       errors: " + ", ".join(f"{c} {v:.2e}" for c, v in r.errors.items()))
     if d.refused:
         out(f"\nREFUSED: {d.refused}")
@@ -270,3 +276,4 @@ def report(d: Derivation) -> str:
     lines = []
     describe(d, lines.append, timings=False)
     return "\n".join(lines)
+

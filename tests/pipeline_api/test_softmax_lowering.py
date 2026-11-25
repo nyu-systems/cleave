@@ -3,13 +3,15 @@
 ``cl.softmax`` records ``exp(x - max(x)) / sum``, and the flat graph keeps it as written: a
 ``ReduceMax`` and the subtraction ahead of the exp, which ``runtime.inputs.softmax_axis``
 recognizes as the exp of an exact softmax. Where a reduction wants to loop under the max (a
-streaming obstacle), lowering writes the proven update rule on the max (a ``Streaming``
+streaming obstacle), lowering writes the found update rule on the max (a ``Streaming``
 record) or the reason it has none (``ir.streaming_refusals``); a graph that has no tiling
 says that reason in the plan summary. At a split factor, a solo graph of a program split
 over its softmax dim lowers to a partial and a combine built from its loop state, each a
 flat graph with its own max and rule (the pair, its refusals and its plans:
 ``tests/pipeline_api/test_softmax_split.py``).
 """
+
+import re
 
 import pytest
 
@@ -48,6 +50,13 @@ def softmax(x: cl.Tensor["R", "C"]):
     return cl.softmax(x, -1)
 
 
+def mean_shift(x: cl.Tensor["R", "C"]):
+    """A softmax shifted by the row mean: on a prefix the mean is the prefix's, so no update
+    of the row sum reproduces the flat graph."""
+    e = cl.exp(x - x.mean(-1, keepdim=True))
+    return e / cl.sum(e, -1, keepdim=True)
+
+
 def cube(x: cl.Tensor["R", "C"]):
     e = stable_exp(x, -1)
     return (e * e) / cl.sum(e, -1, keepdim=True)
@@ -74,7 +83,7 @@ def _without_derivation(fn, sizes, dtype=cl.f16):
     return ir
 
 
-def test_identity_graph_carries_the_proven_rule_on_its_max():
+def test_identity_graph_carries_the_found_rule_on_its_max():
     _, ir = _lowered(flash, SHAPES)
     (full,) = [n for n in ir.nodes if type(n) is ReduceMax]
     record = full.streaming
@@ -104,10 +113,10 @@ def test_flat_graph_has_the_max_ahead_of_the_exp():
 
 
 @pytest.mark.parametrize("fn, sizes, why", [
-    # the max (two passes), then the row sum under it (the exp it reads changes with the max)
-    (traced, SHORT, ("a finished reduction over the dim", "is computed from reduce_max_")),
-    (softmax, dict(R=64, C=256), ("which is not summed over that dim",)),
-], ids=["traced_256", "softmax_256"])
+    # the max, then the row sum under it: no update of the value matmul under either
+    (traced, SHORT, ("reduce_max_2_5: no update of ", "reduction_2_8: no update of ")),
+    (mean_shift, dict(R=64, C=256), ("reduction_1_1: no update of ",)),
+], ids=["traced_256", "mean_shift_256"])
 def test_a_refused_obstacle_leaves_the_tiling_candidates_as_they_are(fn, sizes, why):
     """A graph whose obstacles are not served gets their reasons, and ``search_tiling``
     lists the candidates of the same graph lowered without any derivation, in the same
@@ -143,14 +152,17 @@ def test_schedule_keeps_looped_plans_and_reports_no_refusal():
 
 def test_refusal_reason_reaches_the_plan_summary():
     """A row longer than a block whose exp is also read where it is not summed (the square
-    of the softmax's numerator): no tiling, and the summary says why the max is not carried."""
+    of the softmax's numerator): the max has its rule, but every loop over the row would
+    hand the exp, computed per iteration, to the product outside it. No tiling, and the
+    summary says why."""
     prog = trace(cube, dict(R=64, C=16384), cl.f16)
     plans = P.schedule(GraphSet.identity(prog), P.ScheduleConfig(topk=4))
     assert not plans and plans.refused  # (fusion="auto": once unforced, once forced)
     for refusal in plans.refused:
         text = str(refusal.error)
-        assert text.startswith(f"{ROW_LIMIT}; it is not carried across a loop: reduce_max_")
-        assert "is also read by mul_" in text and "which is not summed over that dim" in text
+        assert text.startswith("no tiling candidates (") and ROW_LIMIT not in text
+        assert re.search(r"exp_\d+ is computed per iteration of GraphNode_\w+ but also read by "
+                         r"mul_\d+ outside it", text), text
         assert refusal.reason in plans.summary()
 
 
@@ -191,12 +203,14 @@ def test_search_graphs_keep_the_max():
         (ir,) = lower(graph)
         (exp,) = _exps(ir)
         assert softmax_axis(exp) == -1
-        (reason,) = ir.streaming_refusals  # a returned softmax: T4
-        assert "which is not summed over that dim" in reason
+        # a returned softmax has its rule (its looped tilings are refused, not the record)
+        assert ir.streaming_refusals == []
+        (full,) = [n for n in ir.nodes if getattr(n, "streaming", None) is not None]
+        assert type(full) is ReduceMax
 
 
 def test_search_of_attention_records_the_flash_form_only():
-    """The flash form (row sum and value matmul siblings) gets the proven rule; the traced
+    """The flash form (row sum and value matmul siblings) gets the found rule; the traced
     order, whose value matmul reads the finished row sum, keeps its pin with the reason."""
     prog = trace(traced, dict(H=4, SQ=64, SKV=1024, D=64), cl.f16)
     graphs = P.superoptimize(prog, P.SuperoptConfig(max_ops=13, cache=False))
@@ -212,8 +226,8 @@ def test_search_of_attention_records_the_flash_form_only():
                              "solo matmul>div>max>sub>exp>sum>matmul>div"]
     assert found["solo matmul>div>max>sub>exp>sum>matmul>div"] == (True, [])
     recorded, (why, why_sum) = found["solo matmul>div>max>sub>exp>sum>div>matmul"]
-    assert not recorded and "a finished reduction over the dim" in why
-    assert "another reduction over the dim" in why_sum  # the row sum, under the max
+    assert not recorded and why.startswith("reduce_max_") and "no update of " in why
+    assert why_sum.startswith("reduction_") and "no update of " in why_sum  # the row sum
 
 
 def test_search_the_flash_form_split_lowers_to_two_flat_graphs_with_their_own_rules():

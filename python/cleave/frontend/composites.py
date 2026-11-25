@@ -66,7 +66,7 @@ def softmax(x, dim: int = -1):
     its sum records by hand (one program, one fingerprint). The max is an ordinary reduction
     of the searched flat graph. Where a tiling loops over the softmax dim under it, the loop
     carries the max across its iterations and repairs every sum and matmul it accumulates
-    with an update rule that is searched for and proven on the program's own flat graph
+    with an update rule that is searched for and tested on the program's own flat graph
     (``cleave.pipeline.update``, ``cleave.schedule.streaming``). (``cl.exp(x) /
     cl.sum(cl.exp(x), dim, keepdim=True)`` without the max is the plain exp, and overflows
     where its logits do.)

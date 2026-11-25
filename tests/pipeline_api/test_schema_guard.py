@@ -91,12 +91,14 @@ OUTPUT_TILE = {"flash_wide_values/looped": [1, 64, 512]}
 # (A bump that changes none of these eight texts leaves both as they are.) Pinned again at
 # the move to the searched update rules, where every softmax program gained its max, and at
 # 43, where a gemm stopped rebinding its shared and register operands to ``A_ptr`` /
-# ``B_ptr`` (tests/codegen/test_operand_names.py).
-PINNED_SCHEMA = 43
+# ``B_ptr`` (tests/codegen/test_operand_names.py), and at 44, where a returned softmax got
+# its rule from the tests in the field: its first one-tile tiling is now one of the
+# policy's with the record (the text of every tiling pinned at 43 is as it was).
+PINNED_SCHEMA = 44
 PINNED = {
-    'softmax_64x1024/one-tile': ('tile=[2, 1024] rstep=[64, 1024]', 'f9936a0218828a65'),
-    'softmax_mid_4x256x64/one-tile': ('tile=[1, 256, 2] rstep=[2, 256]', '86aa9f6b4d2251bd'),
-    'attention_over_queries_skv1024/one-tile': ('tile=[1, 64, 32] rstep=[32, 1, 64, 32]', '5afdf6676aeee861'),
+    'softmax_64x1024/one-tile': ('tile=[2, 1024] rstep=[1024, 1024]', '51fabee9c3fc4033'),
+    'softmax_mid_4x256x64/one-tile': ('tile=[1, 256, 2] rstep=[256, 256]', '5404768676d36dca'),
+    'attention_over_queries_skv1024/one-tile': ('tile=[1, 64, 32] rstep=[32, 64, 64, 32]', '5afdf6676aeee861'),
     'attention_skv256/one-tile': ('tile=[1, 64, 32] rstep=[32, 256, 256, 256]', '3cf8d3f796b1497d'),
     'flash_skv256/one-tile': ('tile=[1, 64, 32] rstep=[32, 256, 256, 256]', '478b000ea10efe33'),
     'flash_skv256/looped': ('tile=[1, 64, 32] rstep=[32, 32, 32, 32]', 'fccc101cff42d630'),

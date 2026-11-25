@@ -5,13 +5,13 @@ the max is an ordinary reduction. The programs here write it out (``cl.max``, ``
 ``cl.sum``; ``cl.softmax`` records the same), and they are lowered as identity graphs
 without the derivation of ``pipeline.plans.lower``: nothing is derived for them.
 
-:func:`streamed_ir` then classifies every streaming obstacle of the graph
+:func:`streamed_ir` then lists every reduction conflict of the graph
 (``schedule.streaming.obstacles``, what ``pipeline.plans`` asks), CHECKS it against what
-the test expects, and does what lowering does after the search: a classified obstacle gets
-a ``Streaming`` record keyed by the graph itself (the rule is the one the engine proves for
-every program here, ``acc * exp(m - m')``), a refused one its reason in
-``ir.streaming_refusals``. The assembly is then held to the record; whether the record is
-right is the engine's business (``tests/update``).
+the test expects, and does what lowering does after the search: a conflict the test serves
+gets a ``Streaming`` record keyed by the graph itself (the rule is the one the engine finds
+for every program here, ``acc * exp(m - m')``), one it expects refused gets the engine's
+own reason in ``ir.streaming_refusals``. The assembly is then held to the record; whether
+the record is right is the engine's business (``tests/update``).
 """
 
 from __future__ import annotations
@@ -24,6 +24,9 @@ from cleave.pipeline.plans import _lower_structure
 from cleave.pipeline.superopt import GraphSet
 
 FACTOR = ("exp", ("sub", "m", "m'"))  # acc *= exp(m - m'), then the accumulator's own macro
+# the engine's refusal of a conflict that no update of the accumulator form reproduces on
+# its prefixes (``pipeline.update.texts.NO_RULE``)
+NO_RULE = "no update of"
 
 
 def stable_exp(x, dim: int = -1):
@@ -173,29 +176,25 @@ def record(ir, obstacle, factor=FACTOR):
     return full, full.streaming
 
 
-def engine_refusal(ir, obstacle) -> str:
-    """What the engine says of an obstacle the scheduler classifies as streaming before it
-    builds anything (the refusals read off the flat graph alone: T5, E7-E9, E14, E16), or
-    ``""``."""
-    from cleave.pipeline.update import proof
-    from cleave.pipeline.update.texts import Refused
+def engine_refusal(fn, shapes, ir, obstacle, dtype=cl.f16) -> str:
+    """What the engine says of a conflict of ``fn``'s identity graph (lowered to ``ir``):
+    its refusal, or ``""`` where it finds a rule."""
+    from cleave.ir.update_rule import loop_key
+    from cleave.pipeline.update import engine
+    from cleave.pipeline.update.instantiate import Recipe
 
-    try:
-        for check in (proof.check_contribution, proof.check_leaves,
-                      proof.check_running_divisors):
-            for acc in obstacle.loops:
-                check(ir, obstacle.full, acc)
-    except Refused as e:
-        return str(e)
-    return ""
+    (graph,) = list(GraphSet.identity(trace(fn, shapes, dtype)))
+    d = engine.run(ir, obstacle, Recipe.of(graph),
+                   key=loop_key(ir, obstacle.full, obstacle.loops))
+    return d.refused
 
 
 def streamed_ir(fn, shapes, *refused, dtype=cl.f16, factor=FACTOR):
-    """Lower ``fn`` and check its obstacles against ``refused``: one entry per obstacle in
-    graph order, ``None`` for one that is classified as streaming (it gets a record) or a
-    phrase of the reason it is not (it goes to ``ir.streaming_refusals``, as lowering
-    writes it): the scheduler's, or for an obstacle it classifies the engine's
-    (:func:`engine_refusal`). No entry at all: one obstacle, classified."""
+    """Lower ``fn`` and check its conflicts against ``refused``: one entry per conflict in
+    graph order, ``None`` for one the test serves (it gets a record by hand) or a phrase of
+    the reason the engine gives it none (:func:`engine_refusal`; it goes to
+    ``ir.streaming_refusals``, as lowering writes it). No entry at all: one conflict,
+    served."""
     ir = lowered(fn, shapes, dtype)
     found = obstacles_of(ir)
     refused = refused or (None,) * len(found)
@@ -203,10 +202,9 @@ def streamed_ir(fn, shapes, *refused, dtype=cl.f16, factor=FACTOR):
     reasons = []
     for obstacle, want in zip(found, refused):
         if want is None:
-            assert not obstacle.refused, (obstacle.full, obstacle.refused)
             record(ir, obstacle, factor)
         else:
-            why = obstacle.refused or engine_refusal(ir, obstacle)
+            why = engine_refusal(fn, shapes, ir, obstacle, dtype)
             assert want in why, (obstacle.full, why, want)
             reasons.append(f"{obstacle.full}: {why}")
     if found:

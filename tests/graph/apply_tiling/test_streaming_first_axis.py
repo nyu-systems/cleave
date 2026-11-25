@@ -7,8 +7,10 @@ pass had to be taught are served this way: the max in the main tier behind a uni
 that is squeezed out of the stored tile (a batched ``softmax(x, 1)``), and the max inside a
 loop that does not step its dim (attention normalized over the queries: the max is in the
 loop of the value matmul, over the keys). Both programs return a softmax or divide before
-the value matmul, so their obstacle is refused (T4 / T3) and the pin stays. Their kernels
-are validated on a GPU in ``test_streaming_gpu.py``.
+the value matmul: their max has a record, but a tiling that loops its row is refused (the
+exp is computed per iteration and also read outside the loop), and one that holds the row
+whole uses no record (``tiling.records_in_use``). Their kernels are validated on a GPU in
+``test_streaming_gpu.py``.
 """
 
 import re
@@ -28,8 +30,6 @@ from tests import _explicit_softmax as X
 from tests._lowering import lower_to_cuda
 from tests.graph.apply_tiling.test_streaming import _find, _macro_calls
 
-RETURNED = "is also read by"
-
 
 def _accepted(ir, threads=128):
     accept = stream.streaming_accept(ir)
@@ -39,15 +39,16 @@ def _accepted(ir, threads=128):
 
 
 def test_one_tile_in_the_main_tier_behind_a_squeezed_unit_dim():
-    ir = X.streamed_ir(X.softmax_mid, dict(H=4, C=256, R=64), RETURNED)
+    ir = X.streamed_ir(X.softmax_mid, dict(H=4, C=256, R=64))
     (m,) = X.maxes(ir)
-    assert m.flat_axis == 1 and ir.streaming_refusals
+    assert m.flat_axis == 1
     cands, reasons = _accepted(ir)
     assert len(cands) >= 3
     # what is refused are the tilings the tiler refuses for any graph: a unit extent that is
-    # not a batch dim, and a max handed one element of its row per step
-    assert {r.split(" ")[0] for r in reasons} == {"sub_2", m.name}, reasons
-    assert all("unit extent" in r or "one element of the axis it reduces per step" in r
+    # not a batch dim, and a loop over the row, whose exp the division reads outside it
+    e = X.exps(ir)[0].name
+    assert {r.split(" ")[0] for r in reasons} == {"sub_2", e}, reasons
+    assert all("unit extent" in r or f"{e} is computed per iteration of " in r
                for r in reasons), reasons
     whole = []
     for cand in cands:
@@ -91,11 +92,15 @@ def test_one_tile_in_the_main_tier_behind_a_squeezed_unit_dim():
 
 
 def test_one_tile_inside_a_loop_that_does_not_step_the_softmax_axis():
-    ir = X.streamed_ir(X.softmax_over_queries, dict(H=32, SQ=64, SKV=1024, D=64), RETURNED)
+    ir = X.streamed_ir(X.softmax_over_queries, dict(H=32, SQ=64, SKV=1024, D=64))
     (m,) = X.maxes(ir)
     assert m.flat_axis == 1
     cands, reasons = _accepted(ir)
-    assert len(cands) >= 8 and not reasons
+    # every tiling that steps the max and its sum (over the queries) in the loop of the value
+    # matmul (over the keys) is refused: that loop does not step the dim the max reduces
+    assert len(cands) >= 8 and reasons
+    assert all(re.fullmatch(rf"{m.name}: the loop of GraphNode_mma_\d+ carries it but does not "
+                            r"step the dim it reduces", r) for r in reasons), reasons
     looped = 0
     for cand in cands:
         tiled = apply_tiling(cand)

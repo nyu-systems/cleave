@@ -11,7 +11,7 @@ from pathlib import Path
 # now build a different kernel: a kernel-cache hit returns the saved one as it is. (What
 # changed belongs in the commit message. tests/pipeline_api/test_schema_guard.py fails when
 # the generated text of a softmax kernel moves without a bump.)
-SCHEMA = 43
+SCHEMA = 44
 # What "validated" means for a saved kernel. A kernel-cache hit returns without validating,
 # so bump this whenever the comparison or its inputs change: saved kernels are then rebuilt.
 # (The inputs include the adversarial cases a program with an exact softmax is held to,

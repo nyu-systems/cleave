@@ -78,8 +78,10 @@ class DefaultPolicy:
     # divide an axis (``dfs_smem_tile``); ``TCPolicy`` takes dividing steps only.
     PADDED_OUTPUT_TILES = True
 
-    def __init__(self, output_nodes, arch, force_fusion=False, flat_graph=None) -> None:
+    def __init__(self, output_nodes, arch, force_fusion=False, flat_graph=None,
+                 honour_records=True) -> None:
         self.arch = arch
+        self.honour_records = honour_records
         self.ordered_nodes = list(
             filter(
                 lambda n: not n.is_placeholder() and not n.is_output(),
@@ -105,7 +107,7 @@ class DefaultPolicy:
             self.reduction_axis_overlap_pairs,
             self.reduction_axis_overlap_descendants,
         ) = self._build_reduction_axis_overlap_pairs()
-        # TODO(david): a conflict with no proven update rule could instead be resolved by a
+        # TODO(david): a conflict with no update rule could instead be resolved by a
         # nested itGraph (a two pass approach: the ancestor's own loop first); until then
         # it keeps this pin (check this commit when implementing two pass itgraph):
         # A descendant reduction axis that overlaps an ancestor reduction (they sum
@@ -120,17 +122,18 @@ class DefaultPolicy:
         self._reduction_ancestors = reduction_ancestors(self.ordered_nodes)
         # The exception to the pin is a reduction conflict that is served
         # (``schedule.streaming``): the ancestor is carried over the very dim its
-        # descendants reduce, whatever its op, and it carries an update rule proven for each
+        # descendants reduce, whatever its op, and it carries an update rule found for each
         # of them on this graph. The loop then advances the ancestor with the descendants
         # and carries it; nothing is pinned, and the ancestor steps with its descendants
-        # (one group). Tilings that hold the dim whole stay candidates. Empty for a graph
-        # without such a record, and for a policy built without its flat graph.
+        # (one group). Empty for a graph without such a record, for a policy built without
+        # its flat graph, and for one told not to honour the records (``honour_records``:
+        # the tilings the graph has without them, ``pipeline.plans._search``).
         self.streamed = streamed(
             self.ordered_nodes,
             self.reduction_axis_provenance,
             self._reduction_ancestors,
             flat_graph,
-        )
+        ) if honour_records else {}
         self._full_extent_reduction_axis_ids = {}
         for (_anc, desc), axis_pairs in self.reduction_axis_overlap_pairs.items():
             if desc in self.streamed.get(_anc, ()):
@@ -1032,7 +1035,7 @@ class DefaultPolicy:
                 try:
                     # The provenance apply_tiling itself decides on (split views removed).
                     scheduled = scheduled_reductions(self.flat_graph)
-                    carried = carried_reductions(self.flat_graph)
+                    carried = carried_reductions(self.flat_graph) if self.honour_records else {}
                 except NotImplementedError:
                     # A split apply_tiling cannot take apart: it refuses every candidate
                     # of this graph for that reason, whatever is answered here.
@@ -1695,9 +1698,11 @@ class DefaultPolicy:
 
 
 class TCPolicy(DefaultPolicy):
-    def __init__(self, output_nodes, arch, force_fusion=False, flat_graph=None):
+    def __init__(self, output_nodes, arch, force_fusion=False, flat_graph=None,
+                 honour_records=True):
         super().__init__(
-            output_nodes, arch, force_fusion=force_fusion, flat_graph=flat_graph
+            output_nodes, arch, force_fusion=force_fusion, flat_graph=flat_graph,
+            honour_records=honour_records,
         )
         self.wmma = [64, 32, 32]  # M, N, K
 

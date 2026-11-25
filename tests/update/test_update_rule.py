@@ -16,7 +16,6 @@ from cleave.ir.update_rule import (
     SEMANTIC,
     Obstacle,
     Streaming,
-    accumulates,
     loop_key,
     repair_of,
     show,
@@ -106,7 +105,7 @@ def test_the_records_are_plain_hashable_data():
     with pytest.raises(TypeError):
         Streaming(("l",), (("l", FACTOR),))  # a record always says which graph it is for
     obstacle = Obstacle("m", ("l", "acc"))
-    assert obstacle.refused == "" and obstacle == Obstacle("m", ("l", "acc"), "")
+    assert obstacle == Obstacle("m", ("l", "acc")) and hash(obstacle) == hash(Obstacle("m", ("l", "acc")))
 
 
 # ------------------------------------------------------------------ the full-extent reducer
@@ -126,17 +125,6 @@ def test_every_reducer_says_how_it_is_carried():
     assert node.accum_init == -float("inf") and type(node).carry_init == NEG_FLT_MAX
     for cls in (ReduceSum, ReduceMax):
         assert "combine" not in cls._macro_attrs and "carry_init" not in cls._macro_attrs
-
-
-def test_what_accumulates_under_a_carried_value():
-    """A repair rescales what an accumulator holds: a sum or a contraction from zero, by the
-    reducer's combine, not by the class."""
-    assert accumulates(ReduceSum((4, 8), axis=-1, name="s"))
-    assert accumulates(Matmul((4, 2, 8), name="mm"))  # (M, N, K)
-    assert not accumulates(ReduceMax((4, 8), axis=-1, name="m"))
-    started = ReduceSum((4, 8), axis=-1, name="t")
-    started.accum_init = 1.0
-    assert not accumulates(started)
 
 
 # ----------------------------------------------------------------- identity of a structure

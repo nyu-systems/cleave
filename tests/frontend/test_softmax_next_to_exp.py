@@ -5,13 +5,15 @@ other one reads ``x``: two different values, which the search never merges. Ever
 returns has both exps, the softmax's is exact by structure
 (``cleave.runtime.inputs.softmax_axis``), and the program is served wherever a softmax
 that is returned is served: while its row fits one tile (the exp of the softmax is read by
-the division, which is not summed over the row, so its max is not carried across a loop).
+the division, outside the loop of the row sum, so no tiling that loops the row builds).
 Two softmaxes of ``x`` over different axes need a row and a column in one tile.
 
 The sizes below pin which programs have plans with the explicit max.
 
 ``test_search_*`` run the superoptimizer (root conftest marks).
 """
+
+import re
 
 import pytest
 
@@ -22,7 +24,7 @@ import cleave.lang as cl
 from cleave import pipeline as P
 from cleave.frontend import trace
 from cleave.ir.ops import Exp
-from cleave.pipeline.plans import ROW_LIMIT, NO_TILING, lower
+from cleave.pipeline.plans import EVERY_CONFLICT_CARRIED, ROW_LIMIT, NO_TILING, lower
 from cleave.runtime.inputs import adversarial_cases, softmax_axis, why_not_adversarial
 from cleave.runtime.validate import Tolerance, compare_outputs
 from tests._lowering import run_lowered
@@ -119,9 +121,10 @@ def _reasons(plans):
 def test_search_where_a_softmax_next_to_an_exp_of_its_logits_has_plans():
     """Which sizes have plans (the ``cl.softmax`` docstring states the limit). These return their
     softmax, and a softmax that is returned is served while its row is in one tile: its
-    exp is read by the division, which is not summed over the row, so the max is not
-    carried across a loop and the reason says so."""
-    two_passes = ("which is not summed over that dim: that needs two passes over the row")
+    exp is read by the division, outside the loop of the row sum, so every tiling that
+    loops the row is refused, and the reason says so."""
+    outside = re.compile(r"exp_\d+ is computed per iteration of GraphNode_\w+ but also read "
+                         r"by (div|mul)_\d+ outside it")
     # softmax + exp: whole rows in every tile; 4096 columns have a plan, 8192 have none: the
     # one tiling that holds a row of 8192 in one block holds one row, which no kernel has
     plans = _plans(softmax_plus_exp, 64, 4096)
@@ -129,8 +132,8 @@ def test_search_where_a_softmax_next_to_an_exp_of_its_logits_has_plans():
     plans = _plans(softmax_plus_exp, 64, 8192)
     assert len(plans) == 0
     reasons = _reasons(plans)
-    assert all(reason.startswith(f"{NO_TILING}; a reduction is not carried across a loop: ")
-               and two_passes in reason and "a unit extent that is not a batch dim" in reason
+    assert all(reason.startswith(f"{NO_TILING} (") and outside.search(reason)
+               and "a unit extent that is not a batch dim" in reason
                for reason in reasons), reasons
     # ... where the softmax alone still has one; it has none at 16384, where the only
     # tilings that hold a row in one block hold a single row
@@ -139,17 +142,22 @@ def test_search_where_a_softmax_next_to_an_exp_of_its_logits_has_plans():
     plans = _plans(softmax_alone, 64, 16384)
     assert len(plans) == 0
     reasons = _reasons(plans)
-    assert all(reason.startswith(f"{NO_TILING}; a reduction is not carried across a loop: ")
-               and two_passes in reason and "a unit extent that is not a batch dim" in reason
+    assert all(reason.startswith(f"{NO_TILING} (") and outside.search(reason)
+               and "a unit extent that is not a batch dim" in reason
                for reason in reasons), reasons
     # two softmaxes, over the rows and over the columns: the tile is the whole tensor
     for rows, cols in ((16, 32), (64, 128)):
         plans = _plans(dual_softmax, rows, cols)
         assert len(plans) >= 1 and _output_tiles(plans) == {(rows, cols)}, plans.summary()
+    # ... and none at 64 x 256: every tiling that loops a row or a column is refused, and
+    # the policy makes no other (where it makes none at all, the reason says the conflicts
+    # are carried: the row limit is not what stopped it)
     plans = _plans(dual_softmax, 64, 256)
     assert len(plans) == 0, plans.summary()
     reasons = _reasons(plans)
-    assert all(ROW_LIMIT in reason and two_passes in reason for reason in reasons), reasons
+    assert all(ROW_LIMIT not in reason and (
+        outside.search(reason) or reason == f"{NO_TILING}; {EVERY_CONFLICT_CARRIED}")
+        for reason in reasons), reasons
 
 
 def test_search_every_graph_of_two_softmaxes_has_its_whole_tile_plan():

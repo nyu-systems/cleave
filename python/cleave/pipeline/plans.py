@@ -111,7 +111,7 @@ def lower(graph: SearchedGraph, split_factor: int | None = None) -> list:
 
 # Why a solo graph has no pair built from its loop state (``state_pair``), after
 # ``graph {i}: split over {dim}: ``.
-NO_PROVEN_UPDATE = "this graph carries no proven update over that dim"  # P1 (+ ": {refusals}")
+NO_UPDATE_RULE = "this graph carries no update rule over that dim"  # P1 (+ ": {refusals}")
 NO_SPLIT_FACTOR = "the dim has {n} elements, which {f} does not divide"  # P5
 TWO_STATES = ("{n} values are carried across a loop over that dim ({names}); a pair is built "
               "from one")
@@ -129,7 +129,7 @@ def state_pair(graph: SearchedGraph, ir, split_factor: int) -> list:
 
     The partial is the flat graph up to the loop state on a split of that dim: each split
     returns its accumulators and its own full-extent value, float32 at the cut. The combine
-    folds those over the splits with the reducer, applies the proven repair of each
+    folds those over the splits with the reducer, applies the repair of each
     accumulator with ``m := m_i``, ``m' := combine_i m_i``, sums over the splits and runs the
     solo graph's own epilogue. Both are flat graphs with the full-extent reduction in front
     of their sums, so each gets its own derivation.
@@ -160,7 +160,7 @@ def state_pair(graph: SearchedGraph, ir, split_factor: int) -> list:
     served = _served_over(graph, ir, dim)
     if not served:
         refusals = "; ".join(getattr(ir, "streaming_refusals", None) or ())
-        raise LoweringRejected(prefix + NO_PROVEN_UPDATE + (f": {refusals}" if refusals else ""))
+        raise LoweringRejected(prefix + NO_UPDATE_RULE + (f": {refusals}" if refusals else ""))
     if len(served) > 1:
         raise LoweringRejected(prefix + TWO_STATES.format(
             n=len(served), names=", ".join(n.name for n in served)))
@@ -192,7 +192,7 @@ def _served_over(graph: SearchedGraph, ir, dim: str) -> list:
     program's dim ``dim``: the symbol of the searched structure at that dim's place in the
     program's inputs."""
     from ..frontend.tensor import Dim
-    from .update.engine import _looped
+    from .update.engine import looped_dim
     from .update.instantiate import Recipe
 
     recorded = [n for n in ir.nodes if getattr(n, "streaming", None) is not None]
@@ -210,7 +210,7 @@ def _served_over(graph: SearchedGraph, ir, dim: str) -> list:
     served = []
     for node in recorded:
         try:
-            looped = _looped(recipe, ir, node.name)
+            looped = looped_dim(recipe, ir, node.name)
         except Exception:  # noqa: BLE001 - a looped dim that cannot be named is not this one
             continue
         found = set(looped) if isinstance(looped, frozenset) else {looped}
@@ -220,20 +220,20 @@ def _served_over(graph: SearchedGraph, ir, dim: str) -> list:
 
 
 def _derive_updates(ir, recipe) -> None:
-    """Give every streaming obstacle of a freshly lowered flat graph its proven update
-    rule, or the reason it has none.
+    """Give every reduction conflict of a freshly lowered flat graph its update rule, or
+    the reason it has none.
 
-    The obstacles are the scheduler's own (``schedule.streaming.obstacles``, from the
-    reduction-axis provenance the policy pins by). For each one that can be streamed, the
-    rules are derived once per loop structure (``pipeline.update.derive``: references from
-    this very graph, built again at small shapes by its recipe, search, z3 proof, ranking)
-    and written on the full-extent node as a ``Streaming`` record. The policy lets a loop
-    step under a full-extent value only where it finds that record; without one the pin
-    and the refusal stay. Nothing the engine does raises out of here (an unexpected error
-    is ``E13``).
+    The conflicts are the scheduler's own (``schedule.streaming.obstacles``, from the
+    reduction-axis provenance the policy pins by). For each one the rules are derived once
+    per loop structure (``pipeline.update.derive``: test data from this very graph, built
+    again at the first pass's test sizes by its recipe, enumeration, float replay) and
+    written on the full-extent node as a ``Streaming`` record. The policy lets a loop step
+    under a full-extent value only where it finds that record; without one the pin and the
+    refusal stay. Nothing the engine does raises out of here (an unexpected error is
+    ``BUG``).
 
     ``ir.streaming_refusals`` (``["{full}: {reason}", ...]``) exists exactly when the graph
-    has an obstacle; ``ir.derivations`` holds every derivation the engine made for it.
+    has a conflict; ``ir.derivations`` holds every derivation the engine made for it.
     ``recipe`` (``pipeline.update.instantiate.Recipe``) builds ``ir`` again at other extents.
     """
     from ..schedule.streaming import obstacles
@@ -250,15 +250,12 @@ def _derive_updates(ir, recipe) -> None:
 
     ir.streaming_refusals = []
     for ob in found:
-        why = ob.refused
-        if not why:
-            derivation = derive(ir, ob, recipe)
-            ir.derivations = getattr(ir, "derivations", []) + [derivation]
-            why = derivation.refused
-            if not why:
-                next(n for n in ir.nodes if n.name == ob.full).streaming = derivation.record()
-        if why:
-            ir.streaming_refusals.append(f"{ob.full}: {why}")
+        derivation = derive(ir, ob, recipe)
+        ir.derivations = getattr(ir, "derivations", []) + [derivation]
+        if derivation.refused:
+            ir.streaming_refusals.append(f"{ob.full}: {derivation.refused}")
+        else:
+            next(n for n in ir.nodes if n.name == ob.full).streaming = derivation.record()
 
 
 def _lower_structure(graph: SearchedGraph, structure, split_factor: int | None = None) -> list:
@@ -372,6 +369,11 @@ def _search(ir_graph, topk: int, force: bool, hints: dict | None,
     reasons of the others are added to ``refused``, and those of the refused tilings that
     reduce every conflict's ancestor without a record in one step to ``whole``. For any other graph
     nothing changes.
+
+    A record only adds tilings: those of a graph with a served one are the policy's with the
+    records, then, where they leave room under ``topk``, those it makes without them (every
+    conflict pinned) that are not among the first. A tiling of the second kind steps no loop
+    of a record and builds as it would without it (``tiling.records_in_use``).
     """
     from ..schedule import search_tiling
     from ..schedule.streaming import streaming_accept
@@ -387,7 +389,26 @@ def _search(ir_graph, topk: int, force: bool, hints: dict | None,
         user = kw.get("accept")
         kw["accept"] = stable if user is None else (lambda cand: user(cand) and stable(cand))
     try:
-        return list(search_tiling(ir_graph, topk=topk, force_fusion=force, **kw))
+        if stable is None or not _served(ir_graph):
+            return list(search_tiling(ir_graph, topk=topk, force_fusion=force, **kw))
+        # every candidate the first search is asked about; the second asks about the others
+        accept, asked = kw.pop("accept"), set()
+
+        def first(cand):
+            asked.add(describe_tile(cand))
+            return accept(cand)
+
+        tiles = list(search_tiling(ir_graph, topk=topk, force_fusion=force, accept=first, **kw))
+        if len(tiles) < topk:
+            # the policy writes on the graph why a search of it made no tiling (``_no_tiling``):
+            # of two searches, the reasons of both
+            counts = {name: getattr(ir_graph, name, 0) for name in _POLICY_COUNTS}
+            tiles += search_tiling(
+                ir_graph, topk=topk - len(tiles), force_fusion=force, honour_records=False,
+                accept=lambda cand: describe_tile(cand) not in asked and accept(cand), **kw)
+            for name, n in counts.items():
+                setattr(ir_graph, name, n + getattr(ir_graph, name, 0))
+        return tiles
     except ScheduleRejected:
         raise  # the policy's own refusal of the whole graph, with its reason
     except Exception as e:  # noqa: BLE001
@@ -399,6 +420,20 @@ def _search(ir_graph, topk: int, force: bool, hints: dict | None,
             refused.update(stable.reasons)
         if stable is not None and whole is not None:
             whole.update(stable.whole)
+
+
+# What the policy counts on a flat graph it gave no tiling (``DefaultPolicy.get_num_threads``).
+_POLICY_COUNTS = ("gemm_tile_conflicts", "register_operand_conflicts", "row_reduction_conflicts")
+
+
+def _served(ir) -> bool:
+    """Whether a conflict of ``ir`` is served (``tiling.carried_reductions``)."""
+    from ..schedule.tiling import carried_reductions
+
+    try:
+        return bool(carried_reductions(ir))
+    except NotImplementedError:  # a split apply_tiling cannot take apart
+        return False
 
 
 def _conflict_ancestors(ir) -> tuple:

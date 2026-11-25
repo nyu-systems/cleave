@@ -4,9 +4,10 @@ The flat graph keeps the stable softmax as it is written, ``exp(x - max(x)) / su
 a reduction loops under that max, ``apply_tiling`` builds the loop it always built and ends
 with :func:`~cleave.schedule.streaming.assemble`: the max becomes carried state of the loop
 (started at ``-FLT_MAX``, snapshot before it folds in the tile), and every accumulator under
-it is multiplied by the factor of its proven update rule right before its own macro. Where
+it is multiplied by the factor of its update rule right before its own macro. Where
 the row is whole in one tile, the flat graph's own max is right as it stands and nothing is
-assembled. The records are put on the max by ``tests/_explicit_softmax.py``, keyed by the
+assembled: a tiling that steps none of the loops of a record does not use it
+(``tiling.records_in_use``), and schedules the flat graph without it. The records are put on the max by ``tests/_explicit_softmax.py``, keyed by the
 graph itself, as lowering writes them after the search.
 
 Pinned here: the hook and what it leaves alone, the carried tier and its text, the returned
@@ -47,10 +48,6 @@ ROOT = Path(__file__).resolve().parents[3]
 PREFILL = dict(H=32, SQ=4096, SKV=4096, D=64)
 SMALL = dict(H=32, SQ=64, SKV=256, D=64)
 COLUMN = dict(H=4, K=4096, N=256)
-RETURNED = "is also read by"  # T4: a value computed from the max is read next to its sum
-TWO_PASSES = "a finished reduction over the dim"  # T3: the traced order
-# ... whose row sum is a conflict of its own, which the engine refuses (E14)
-SUM_UNDER = "is computed from"
 
 
 # ------------------------------------------------------------------------------- helpers
@@ -353,8 +350,10 @@ def test_one_tile(small):
     tier, owner, node = _find(tiled, m.name)
     assert tier is tiled and owner is None  # the whole row is in the block's tile
     assert stream.sites(tiled) == []
-    # nothing assembled: the record stays on the tiled max, which starts at the identity
-    assert node.streaming is not None and "accum_init" not in vars(node)
+    # nothing assembled: the tiling uses no record (it steps no loop of the max), so the
+    # tiled max has none and starts at the identity; the flat graph keeps its record
+    assert node.streaming is None and "accum_init" not in vars(node)
+    assert small.max.streaming is not None
     for t, _ in graph_tiers(tiled):
         assert not t.lag_nodes and not t.accum_scale
         assert not [n for n in t.nodes if n.name.endswith(("_prev", "_upd0", "_upd1"))]
@@ -372,7 +371,7 @@ def test_one_tile_reads_a_loop_accumulator_through_an_accum_edge():
     """``softmax(q @ k.mT) @ v`` in traced order: with QK^T looped over D the max and the
     shifted scores read an accumulator of that loop, both through an ``AccumEdge``. (The
     traced order keeps its pin: only the tilings that hold the row whole build.)"""
-    a = _attention(X.unscaled_attention, SMALL, TWO_PASSES, SUM_UNDER)
+    a = _attention(X.unscaled_attention, SMALL, X.NO_RULE, X.NO_RULE)
     cands = search_tiling(a.ir, topk=1000)
     built = []
     for cand in cands:
@@ -563,7 +562,7 @@ out = {}
 for name, fn, shapes, refused in (
     ("attention", X.flash_attention, dict(H=32, SQ=64, SKV=256, D=64), ()),
     ("rows", X.flash_rows, dict(R=256, C=4096, D=64), ()),
-    ("softmax", X.softmax_rows, dict(R=64, C=1024), ("is also read by",)),
+    ("softmax", X.softmax_rows, dict(R=64, C=1024), ()),
 ):
     for i, cand in enumerate(search_tiling(X.streamed_ir(fn, shapes, *refused), topk=1000)):
         try:
@@ -582,8 +581,9 @@ def test_text_does_not_depend_on_the_hash_seed(tmp_path):
     nodes by structure: an edit that leaves one of them keyed by a stale hash loses the
     entry, or not, depending on the process hash seed. Every candidate of three graphs --
     an attention whose max reads a float32 tile, one whose max reads fp16 storage, and a
-    returned softmax that keeps its pin -- generates the same text, or is refused alike,
-    under three seeds."""
+    returned softmax, whose every looped tiling is refused (its exp is read next to the
+    row sum, outside the loop) -- generates the same text, or is refused alike, under three
+    seeds."""
     env = dict(os.environ, CUDA_VISIBLE_DEVICES="", CLEAVE_CACHE_ROOT=str(tmp_path))
     env["PYTHONPATH"] = os.pathsep.join(
         [str(ROOT), str(ROOT / "python"), env.get("PYTHONPATH", "")]
@@ -736,7 +736,7 @@ REFUSALS = [
      r"\['nope'\] read\(s\) it but not as accumulator\(s\) of the loop GraphNode_\w+ that "
      r"steps its dim"),
     (_accumulator_without_a_rule,
-     r"accumulator mma_\d+ of GraphNode_\w+ is computed from it but has no proven update rule"),
+     r"accumulator mma_\d+ of GraphNode_\w+ is computed from it but has no update rule"),
     (_accumulator_starts_elsewhere,
      r"accumulator reduction_\w+ starts at 1.0; a repaired accumulator must start at zero"),
     (_already_repaired,

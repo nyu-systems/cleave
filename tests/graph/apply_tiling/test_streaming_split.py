@@ -2,7 +2,7 @@
 
 ``pipeline.plans.state_pair`` builds a split of the flash graph from its loop state: a
 partial that returns each split's accumulators and its own max, and a combine that takes
-the max over the splits and repairs each partial by the proven rule. Both are flat graphs
+the max over the splits and repairs each partial by the found rule. Both are flat graphs
 with a max in front of their sums and each carries the record derived for it, so
 ``apply_tiling`` serves both with the one assembly every streaming obstacle goes through.
 Pinned here is what it builds for them over every tiling of the GQA pair (32 query heads
@@ -149,7 +149,7 @@ def test_search_every_partial_tiling_serves_the_max_it_returns(pair):
 
 def test_search_the_looped_partial_emits_the_loop_of_an_attention_kernel(pair):
     """What the loop does with the max it returns: snapshot, fold in this tile's max, shift
-    the scores by it, the proven factor, each sum repaired right before it accumulates.
+    the scores by it, the found factor, each sum repaired right before it accumulates.
     The hand-derived pass's rolling kernel, with the flat graph's own names."""
     partial, _ = pair
     cand, tiled = next((c, t) for c, t in _tilings(partial)
@@ -237,7 +237,7 @@ def test_search_the_combine_carries_the_max_over_the_splits_in_a_plain_loop(pair
 
 def test_search_the_looped_combine_repairs_the_partials_and_its_own_sums(pair):
     """Per iteration: the running max over the splits loaded so far, each partial weighted
-    by ``exp(m_i - M)`` (the proven factor with ``m := m_i``, ``m' := M``), and the sums
+    by ``exp(m_i - M)`` (the found factor with ``m := m_i``, ``m' := M``), and the sums
     repaired by ``exp(M_prev - M)`` before they accumulate (the combine's own rule): the
     online merge of the partials, found rather than written."""
     _, combine = pair

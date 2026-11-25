@@ -46,6 +46,14 @@ from ._attention import FACTOR, flash, flash_by_hand, lowered, mha, node_of, pic
 from ._attention import traced as traced_order
 
 TOPK = 100000  # every tiling
+# What the pipeline's search also counts for the flash form with its record: the tilings
+# the graph has without it (every conflict pinned, ``plans._search``) step the max alone,
+# and the scaled scores computed in that loop are read outside it.
+OUTSIDE = r"div_\d+ is computed per iteration of GraphNode_reduce_max_\w+ but also read by sub_\d+ outside it"
+
+
+def pinned_refused(reasons) -> bool:
+    return sum(reasons.values()) == 12 and all(re.fullmatch(OUTSIDE, r) for r in reasons)
 # The tiling whose kernel text and GPU validation are pinned below.
 KERNEL = dict(tile=[1, 128, 64], threads=128, d_step=64, kv_step=32)
 
@@ -116,17 +124,13 @@ def test_search_mha_prefill_is_streamed_in_the_flash_form():
     (ir,) = plans_module.lower(traced_graph)
     names = dict(full=node_of(ir, ReduceMax).name, total=node_of(ir, ReduceSum).name,
                  reader=node_of(ir, Matmul, 1).name)
-    why = ("{full}: {reader} reads {total}, a finished reduction over the dim {full} reduces: "
-           "that needs two passes over the row").format(**names)
-    # ... and the row sum is a conflict of its own (the value matmul loops under it), which
-    # the engine refuses before it builds anything: the exp it reads changes with the max
-    (exp,) = [n.name for n in ir.nodes if type(n).__name__ == "Exp"]
-    why_sum = ("{total}: {exp}, which {reader} reads, is computed from {full}, another "
-               "reduction over the dim {total} reduces: it changes from one prefix of the loop "
-               "to the next").format(exp=exp, **names)
+    # two conflicts, the max and the row sum under it, and no update of the value matmul
+    # reproduces either: it reads the finished row sum
+    rule = ("no update of {reader} of the form 'accumulator * factor + tile' within 5 ops "
+            "reproduces the flat graph on its prefixes").format(**names)
+    why, why_sum = f"{names['full']}: {rule}", f"{names['total']}: {rule}"
     assert ir.streaming_refusals == [why, why_sum]
-    (derivation,) = ir.derivations
-    assert derivation.full == names["total"] and not derivation.holes
+    assert [d.full for d in ir.derivations] == [names["full"], names["total"]]
     assert not [n for n in ir.nodes if getattr(n, "streaming", None) is not None]
     text = str(refusal.error)
     assert text.startswith(f"{plans_module.ROW_LIMIT}; it is not carried across a loop: {why}; "
@@ -148,10 +152,10 @@ def test_search_a_short_row_has_one_tile_plans_as_well():
         looped = bool(sites(tiled))
         kinds[plan.graph_index, "looped" if looped else "one tile"] += 1
         if not looped and plan.graph_index == flash_graph.index:
-            # the record is still on the max, and it is the main tier's: nothing to carry
-            (full,) = [n for n in tiled.nodes if getattr(n, "streaming", None) is not None]
+            # the tiling steps no loop of the record and does not use it: the tiled graph
+            # has none, and nothing is carried
+            assert not streaming.recorded(tiled)
             assert not tiled.lag_nodes and not tiled.accum_scale
-            assert full.accum_init == -float("inf")
     assert kinds == {(flash_graph.index, "looped"): 12, (flash_graph.index, "one tile"): 4,
                      (traced_graph.index, "one tile"): 4}
     # a one-tile kernel of either graph is generated (the validator has nothing to object to)
@@ -294,7 +298,7 @@ def test_a_record_lets_the_loop_step_under_its_max():
     assert not hasattr(ir, "streaming_refusals")
     kept, reasons = tilings(ir)
     kinds = Counter("looped" if sites(schedule_kernel(cand)) else "one tile" for cand in kept)
-    assert kinds == {"looped": 12, "one tile": 4} and not reasons
+    assert kinds == {"looped": 12, "one tile": 4} and pinned_refused(reasons)
     # the max steps with the sums it is carried for, one loop counter for the three
     for cand in kept:
         own = {n.name: [int(x) for x in v.values()] for n, v in cand.rstep_map.items()}
@@ -312,7 +316,7 @@ def test_a_policy_without_its_flat_graph_serves_nothing():
 
 @pytest.mark.parametrize("foreign", ["key", "loops", "edited graph"])
 def test_a_record_of_another_graph_is_not_served(foreign):
-    """The record says which graph its rules were proven for. On any other graph --
+    """The record says which graph its rules were found for. On any other graph --
     another key, another loop membership, the graph itself after an edit -- the pin stays,
     and the graph says why."""
     ir = lowered(flash_by_hand, SHORT)
@@ -355,7 +359,7 @@ def test_an_edit_after_the_record_was_served_is_seen_by_apply_tiling():
     full, record = record_by_hand(ir)
     assert {n.name for n in carried_reductions(ir)} == {full.name}  # the memo, served
     kept, reasons = tilings(ir)
-    assert len(kept) == 16 and not reasons
+    assert len(kept) == 16 and pinned_refused(reasons)
     looped = next(cand for cand in kept if sites(schedule_kernel(cand)))
     node_of(ir, Div).const = 2.0
     assert served(ir) == {} and carried_reductions(ir) == {}
@@ -522,11 +526,16 @@ def test_a_carried_max_that_is_out_of_step_with_its_loop_is_refused():
             {full.name: 256, row_sum: 32, value_matmul: 256}, carried_by(row_sum, 32, 256)),
         "only the value matmul stepped": (
             {full.name: 256, row_sum: 256, value_matmul: 32}, carried_by(value_matmul, 32, 256)),
-        "the max stepped alone": (
-            {full.name: 32, row_sum: 256, value_matmul: 256}, needed_whole(first, 32)),
+        "the max and the row sum stepped, the value matmul whole": (
+            {full.name: 32, row_sum: 32, value_matmul: 256}, needed_whole(value_matmul, 32)),
     }
     for label, (steps, text) in out_of_step.items():
         assert verdicts(ir, with_steps(base, **steps)) == (text, text), label
+    # the max stepped alone steps no loop of the record, which it does not use: it is what it
+    # is without it, a loop of the max whose scaled scores are read outside it
+    alone = {full.name: 32, row_sum: 256, value_matmul: 256}
+    said, twin = verdicts(ir, with_steps(base, **alone))
+    assert re.fullmatch(OUTSIDE, said) and twin is None
     # the flat graph was not touched by any of the refused candidates
     assert full.streaming is record and not hasattr(ir, "streaming_refusals")
 
@@ -598,7 +607,7 @@ def test_a_returned_max_leaves_its_loop_as_carried_state(monkeypatch):
     assert sorted(type(e.dst_node).__name__ for e in full.outputs) == ["OutputNode", "Sub"]
     kept, reasons = tilings(ir)
     kinds = Counter("looped" if sites(schedule_kernel(cand)) else "one tile" for cand in kept)
-    assert kinds == {"looped": 12, "one tile": 4} and not reasons
+    assert kinds == {"looped": 12, "one tile": 4} and pinned_refused(reasons)
     cand = looped_candidate(ir)
     tier = loop_tier(schedule_kernel(cand))
     assert [n.name for n in tier.accum_nodes][-1] == full.name  # after the loop's own
@@ -643,7 +652,7 @@ def test_codegen_refuses_an_update_rule_that_was_not_assembled(monkeypatch):
     # ... and so is a tiling that holds the row whole, whose record is not consumed
     kept, _ = tilings(ir)
     whole = next(c for c in kept if not sites(schedule_kernel(c)))
-    assert recorded_node(schedule_kernel(whole)).streaming is not None
+    assert not streaming.recorded(schedule_kernel(whole))  # it steps no loop of the record
     code, _ = build_candidate(whole)
     assert "ukernel_rescale" not in code
 

@@ -326,12 +326,12 @@ def test_search_qknorm_builds_no_split_and_its_docstring_quotes_why(monkeypatch,
     """demo/qknorm.py parses ``--split SKV`` and runs unsplit; its docstring quotes the
     reason no pair is built from the loop state. That is the refusal its graphs get: the
     flash form normalizes the queries on the way to the loop state from no split input
-    (P2), the traced order carries no update over the keys (P1, with its two-pass reason,
-    next to the reasons of the norms' own conflicts).
+    (P2), the traced order carries no update over the keys (P1, with the engine's reason for
+    its max, next to those of the norms' own conflicts).
     (Small shapes; the real search, no GPU.)"""
     from cleave import pipeline as P
     from cleave.core.errors import LoweringRejected
-    from cleave.pipeline.plans import NO_PROVEN_UPDATE, lower
+    from cleave.pipeline.plans import NO_UPDATE_RULE, lower
 
     p2 = "kn_mul_op on the way to the loop state reads no split input"
     doc = " ".join((DEMO / "qknorm.py").read_text().split('"""')[1].split())
@@ -352,11 +352,12 @@ def test_search_qknorm_builds_no_split_and_its_docstring_quotes_why(monkeypatch,
     flash, text = why["matmul>div"]
     assert text == f"graph {flash}: split over SKV: {p2}"
     traced, text = why["div>matmul"]
-    assert text.startswith(f"graph {traced}: split over SKV: {NO_PROVEN_UPDATE}: ")
-    # every conflict says why: the max (two passes), and the norms' sums of squares, which
-    # the score matmul contracts under (the rsqrt between is not read by the proof)
-    assert "; reduce_max_" in text and "a finished reduction over the dim" in text
-    assert "two passes over the row" in text and " (RSqrt) lies between " in text
+    assert text.startswith(f"graph {traced}: split over SKV: {NO_UPDATE_RULE}: ")
+    # every conflict says why: the norms' sums of squares, which the score matmul contracts
+    # under (a norm is a mean: on a prefix, the prefix's), the max, and the row sum under it
+    reasons = text.split(f"{NO_UPDATE_RULE}: ", 1)[1].split("; ")
+    assert len(reasons) == 4 and sum(r.startswith("reduce_max_") for r in reasons) == 1
+    assert all(": no update of " in r for r in reasons), reasons
 
 
 def test_demo_cli_overrides(monkeypatch):

@@ -12,8 +12,11 @@ again: it is re-instantiated, never re-implemented.
 
 ``symbols`` maps each symbol (a structure proxy, or a program dim name) to the program's
 extent (None where the program has none: the split factor and the extent of one split).
-``looped`` names the symbol(s) the full-extent value reduces; several symbols tied by a
-contraction are resized together (a ``frozenset``).
+``sizes`` maps each symbol to the extent the first pass tests at: a structure proxy IS that
+extent (``DimensionSymbolizer``, 4 x a prime per dim group, 1 for a broadcast dim), a
+program dim name gets the proxy the symbolizer gives it. ``looped`` names the symbol(s) the
+full-extent value reduces; several symbols tied by a contraction are resized together (a
+``frozenset``).
 
 ``key`` is a digest of everything ``at`` and ``looped`` read (the kind, the dtype, the
 symbols with their extents, and the structure or the program the graph is built from).
@@ -34,6 +37,7 @@ from typing import Any, Callable
 class Recipe:
     kind: str
     symbols: dict  # symbol -> the program's extent (None: not a dim of the program)
+    sizes: dict  # symbol -> the extent the first pass tests at
     dtype: str  # the dtype the program's own graph is lowered in
     build: Callable = field(repr=False)  # (sizes, dtype) -> Graph
     find_looped: Callable = field(repr=False)  # (flat_graph, full) -> symbol | frozenset | None
@@ -83,13 +87,14 @@ class Recipe:
                                        ranks=[len(_tensor_dims(op["output_tensors"][0]))
                                               for op in inputs])
 
-        return cls("searched", dict(g.symbol_map), g.dtype, build, find, g, g.structure)
+        return cls("searched", dict(g.symbol_map), {s: int(s) for s in g.symbol_map}, g.dtype,
+                   build, find, g, g.structure)
 
     @classmethod
     def identity(cls, g) -> "Recipe":
         from ...frontend.tensor import Dim
 
-        program = g.program  # (a graph made without one builds nothing: E1 / E2)
+        program = g.program  # (a graph made without one builds nothing: no test)
         symbols = {name: int(extent) for name, extent in getattr(program, "sizes", {}).items()}
 
         def build(sizes, dtype):
@@ -107,7 +112,9 @@ class Recipe:
                                        ranks=[len(s.dims) for s in getattr(program, "inputs", ())])
 
         made_of = program.fingerprint() if program is not None else g.structure
-        return cls("identity", symbols, g.dtype, build, find, g, made_of)
+        sizes = _first_pass_sizes(program) if program is not None else {}
+        sizes = {name: sizes.get(name, 1 if extent == 1 else 8) for name, extent in symbols.items()}
+        return cls("identity", symbols, sizes, g.dtype, build, find, g, made_of)
 
     @classmethod
     def partial(cls, g, full: str, accs: tuple, *, solo=None, split_factor=None) -> "Recipe":
@@ -130,8 +137,8 @@ class Recipe:
             sizes[looped] = f * int(sizes.pop(inner))
             return lower_partial(g, full_op, acc_ops, f, symbol_map=sizes, dtype=dtype)
 
-        return cls("partial", symbols, g.dtype, build, lambda flat_graph, name: inner, g,
-                   [g.structure, full, list(accs)])
+        return cls("partial", symbols, {s: int(s) for s in symbols}, g.dtype, build,
+                   lambda flat_graph, name: inner, g, [g.structure, full, list(accs)])
 
     @classmethod
     def combine(cls, g, full: str, rules: tuple, split_pos: int, out_dtype: str, *, solo=None,
@@ -153,7 +160,8 @@ class Recipe:
             base = _one_graph(g.structure, {**sizes, looped: 4}, dtype)
             return combine_graph(base, full, rules, f, split_pos, dtype)
 
-        return cls("combine", symbols, out_dtype, build, lambda flat_graph, name: factor, g,
+        return cls("combine", symbols, {s: int(s) for s in symbols}, out_dtype, build,
+                   lambda flat_graph, name: factor, g,
                    [g.structure, full, [[a, f] for a, f in rules], int(split_pos)])
 
 
@@ -162,6 +170,27 @@ class Recipe:
 
 def _tensor_dims(t) -> list:
     return list(t["dim"][: int(t.get("num_dims", len(t["dim"])))])
+
+
+def _first_pass_sizes(program) -> dict:
+    """Per dim name of ``program``, the extent the first pass fingerprints it at: the proxy
+    the native symbolizer gives the dim of the input it first appears in."""
+    import cleave.superoptimizer as csopt
+
+    from ...frontend.tensor import Dim
+
+    try:
+        symbolic, _ = csopt.create_symbolic_tile_graph(program.to_tile_graph())
+        structure = symbolic.get_graph_structure()
+    except Exception:  # noqa: BLE001 - a program the tile graph refuses has no proxies
+        return {}
+    inputs = [op for op in structure if op["op_type"] == "kn_input_op"]
+    sizes = {}
+    for spec, op in zip(getattr(program, "inputs", ()), inputs):
+        for d, proxy in zip(spec.dims, _tensor_dims(op["output_tensors"][0])):
+            if isinstance(d, Dim):
+                sizes.setdefault(d.name, int(proxy))
+    return sizes
 
 
 def _one_graph(structure, symbol_map, dtype):

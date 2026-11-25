@@ -1,7 +1,7 @@
-"""Ranking of proven, emittable update rules: accuracy, stability, cost.
+"""Ranking of the emittable update rules that reproduce the flat graph: accuracy, cost.
 
-A proof is over the reals; two rules that are the same real function can differ by orders
-of magnitude in floating point (``a * exp(m - m')`` against ``a * exp(m) / exp(m')``), so
+The test is exact, in a finite field; two rules that agree there can differ by orders of
+magnitude in floating point (``a * exp(m - m')`` against ``a * exp(m) / exp(m')``), so
 every combination of the holes' rules is replayed as the kernel runs it:
 
   * the flat graph re-instantiated in the program's dtype (a float16 operand is rounded
@@ -14,18 +14,19 @@ every combination of the holes' rules is replayed as the kernel runs it:
     adversarial case of the graph at 32 (``runtime.inputs.adversarial_cases``).
 
 A combination is REJECTED when, on any case, a subterm of a factor, a carried accumulator
-(after any iteration) or an output is non-finite, or the carried full-extent value at the
-end is not the flat graph's (``reference.folds_to``: bit for bit for a max, within float32
-reassociation for a sum). The rest are ordered by the key
-``(grade, not stable, cost, size, text)``, smallest first:
+(after any iteration) or an output is non-finite, the carried full-extent value at the end
+is not the flat graph's (``reference.folds_to``: within float32 rounding), or an output is
+more than ``OFF`` times its resolution (``rho`` below, or one ulp of the dtype the program
+computes in where that is coarser) off the flat graph's: that is no rounding, it is another
+value. (The field the rules are found in cannot see everything
+a float can: an ``exp`` reads its argument's residue mod Q, and the residue of an ``exp`` is
+always 0, so an ``exp`` of an ``exp`` does not depend on the inner one there. The replay
+sees it.) The rest are ordered by the key ``(grade, cost, size, text)``, smallest first:
 
   grade   accuracy at the output's resolution: with ``rho = ulp(output dtype) + n_tiles *
           2^-23`` and ``f = max(best error on the case, rho)``, an error ``v`` has grade
           ``max(0, ceil(log4(max(v, f) / f)) - 1)``; the combination's is its largest.
           Grade 0 = within 4x of what the output can resolve.
-  stable  every ``exp`` argument provably ``<= 0`` under what the reducer gives (``m <=
-          m'`` for a max; nothing for a sum, so no ``exp`` of the carried value is), no
-          division by and no subtraction of a value that uses ``a`` or ``r``
   cost    distinct op nodes of the factors taken together (what the loop pays per iteration)
   size    sum of the tree sizes of the updates
   text    the updates' texts in accumulator-name order (the deterministic tie-break)
@@ -39,11 +40,22 @@ import itertools
 import math
 from dataclasses import dataclass
 
-from ...ir.update_rule import repair_of, show, size, subterms, uses
+from ...ir.update_rule import repair_of, show, size, subterms
 from ...runtime.reference import values
 from .reference import Flat, combine_of, folds_to
 
 ULP = {"float16": 2.0 ** -10, "bfloat16": 2.0 ** -7, "float32": 2.0 ** -23}
+# An output this many resolutions off the flat graph's is another value (grade 3 and up).
+OFF = 64
+
+
+def _silu(x):
+    return x * x.sigmoid()
+
+
+# The search's unary ops (``search.UNARY``) in floating point.
+UNARY = {"exp": lambda x: x.exp(), "sqrt": lambda x: x.sqrt(), "rsqrt": lambda x: x.rsqrt(),
+         "silu": _silu}
 
 
 def evaluate(expr, env, memo=None):
@@ -57,8 +69,8 @@ def evaluate(expr, env, memo=None):
         return memo[expr]
     op, *args = expr
     vals = [evaluate(a, env, memo) for a in args]
-    if op == "exp":
-        out = torch.exp(vals[0])
+    if op in UNARY:
+        out = UNARY[op](vals[0])
     else:
         x, y = vals
         if x.dim() < y.dim():
@@ -109,8 +121,7 @@ def replay(kernel: Flat, factors: dict, n: int, distribution: str, *, seed: int 
             if not why and not bool(torch.isfinite(new[acc]).all()):
                 why = f"non-finite {acc} after tile {k}"
         state = new
-    reducer = type(kernel.node(t, kernel.full)).combine
-    same_value = folds_to(reducer, state[kernel.full], ref_env[kernel.full].float(),
+    same_value = folds_to(state[kernel.full], ref_env[kernel.full].float(),
                           lambda: kernel.magnitude(inputs, 0, n), n)
     _, outputs = values(kernel.graph(n), inputs, given=state)
     worst = 0.0
@@ -139,22 +150,6 @@ def grade(v: float, best: float, rho: float) -> int:
     return max(0, math.ceil(math.log(max(v, f) / f) / math.log(4.0)) - 1)
 
 
-def structurally_stable(update, combine: str) -> bool:
-    from .proof import nonpositive_exp_args
-
-    def bad(e):
-        if isinstance(e, str):
-            return False
-        op = e[0]
-        if op == "div" and (uses(e[2], "a") or uses(e[2], "r")):
-            return True  # division by an accumulator or a tile result
-        if op == "sub" and any(uses(x, "a") or uses(x, "r") for x in e[1:]):
-            return True  # subtraction of accumulators cancels
-        return any(bad(x) for x in e[1:])
-
-    return not bad(update) and nonpositive_exp_args(update, combine)
-
-
 @dataclass
 class Ranked:
     rules: dict  # accumulator -> update expression
@@ -163,7 +158,6 @@ class Ranked:
     rejected: str = ""  # "" = ranked; else "<why> on <case>"
     case: str = ""  # the first case it was rejected on
     grade: int = 0
-    stable: bool = False
     cost: int = 0
     size: int = 0
     text: str = ""
@@ -174,7 +168,7 @@ class Ranked:
 
     @property
     def key(self) -> tuple:
-        return (self.grade, not self.stable, self.cost, self.size, self.text)
+        return (self.grade, self.cost, self.size, self.text)
 
 
 def order(rows: list, rho: float) -> list:
@@ -188,23 +182,28 @@ def order(rows: list, rho: float) -> list:
     return sorted(kept, key=lambda r: r.key), [r for r in rows if r.rejected]
 
 
-def rank(kernel: Flat, loops: tuple, choices: dict, cases: list, *, combine=None,
-         reducer: str):
+def rank(kernel: Flat, loops: tuple, choices: dict, cases: list, *, combine=None):
     """Every combination of the holes' rules, ``(ranked best first, rejected)``.
 
-    ``choices``: accumulator -> proven updates; only those the assembly can emit
-    (``repair_of`` is not None) take part. ``cases``: ``(n, distribution)``."""
+    ``choices``: accumulator -> updates that reproduce the flat graph; only those the
+    assembly can emit (``repair_of`` is not None) take part. ``cases``: ``(n, distribution)``."""
     emittable = {acc: [u for u in choices[acc] if repair_of(u) is not None] for acc in loops}
+    rho = resolution(kernel, cases)
+    # what an output can be off by rounding: at the coarser of its own dtype and the one the
+    # program computes in (a combine returns float32 of float16 values)
+    off = OFF * max(rho, ULP.get(kernel.dtype, ULP["float32"]))
     rows = []
     for combo in itertools.product(*(emittable[acc] for acc in loops)):
         rules = dict(zip(loops, combo))
         factors = {acc: repair_of(u) for acc, u in rules.items()}
         replays = {f"{d}@{n}": replay(kernel, factors, n, d, combine=combine) for n, d in cases}
+        for r in replays.values():
+            if not r.why and r.error > off:
+                r.why = f"an output {r.error:.1e} off the flat graph's, {OFF}x its resolution"
         case = next((c for c, r in replays.items() if r.why), "")
         rows.append(Ranked(
             rules, factors, replays, f"{replays[case].why} on {case}" if case else "", case,
-            stable=all(structurally_stable(u, reducer) for u in rules.values()),
             cost=len(subterms(*factors.values())),
             size=sum(size(u) for u in rules.values()),
             text="; ".join(f"{acc}' = {show(rules[acc])}" for acc in sorted(rules))))
-    return order(rows, resolution(kernel, cases))
+    return order(rows, rho)

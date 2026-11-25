@@ -77,7 +77,7 @@ def node_of(ir, cls, nth: int = 0):
 
 
 def record_by_hand(ir, factor=FACTOR):
-    """A ``Streaming`` record for the (one) streaming obstacle of ``ir``, written by hand
+    """A ``Streaming`` record for the (one) reduction conflict of ``ir``, written by hand
     with the same ``factor`` for every accumulator and the key of ``ir`` itself: what
     ``pipeline.plans.lower`` writes after the search, for the tests of the hooks that only
     read it. Returns ``(full-extent node, record)``; the record is on the node."""
@@ -87,7 +87,6 @@ def record_by_hand(ir, factor=FACTOR):
 
     nodes, red = scheduled_reductions(ir)
     (obstacle,) = obstacles(nodes, red, reduction_ancestors(nodes))
-    assert not obstacle.refused, obstacle.refused
     full = next(n for n in ir.nodes if n.name == obstacle.full)
     full.streaming = Streaming(obstacle.loops, tuple((a, factor) for a in obstacle.loops),
                                loop_key(ir, obstacle.full, obstacle.loops))

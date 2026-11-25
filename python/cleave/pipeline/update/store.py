@@ -6,28 +6,23 @@ One JSON file per loop structure, under ``cache.root() / "update"``, at the dige
 
 (``cache.digest`` mixes in ``SCHEMA`` and ``build_id()``). ``ENGINE_DIGEST`` is a digest of
 the engine's own sources (``ir/update_rule.py`` and every module of ``pipeline/update``);
-``SETTINGS`` the budgets, the loose filter, the reference-set constants and the z3 version.
-Content: ``{"key", "recipe", "full", "loops", "rules", "refused", "report"}``; written
+``SETTINGS`` the budgets, the test data's steps, draws and sample, the ranking cases and the
+field. Content: ``{"key", "recipe", "full", "loops", "rules", "refused", "report"}``; written
 atomically.
 
-The loop structure's entry (``recipe`` "") holds a rule, or a refusal read off the flat
-graph alone (T5, E7, E8, E9, E14, E16). A refusal that depends on the recipe (the extents, the
-symbols, the data of the references: E1-E6, E10-E12, E15) is stored for that recipe only,
-under the record key and ``Recipe.key``: another program of the same loop structure
-derives its own.
+The loop structure's entry (``recipe`` "") holds a rule; a refusal is stored for the recipe
+it was found with (under the record key and ``Recipe.key``): another program of the same
+loop structure derives its own.
 
 A stored rule is never trusted. On load every factor ``F`` must be one the engine could
-have chosen for the graph at hand: an expression of the search's ops over ``m`` and ``m'``
-alone that ``repair_of`` reads back from ``update_of(F)``, that the assembly can emit
-(``rolling.check_expression``), that is structurally stable under the full-extent value's
-reducer (``rank.structurally_stable``: the ranking's replays are not stored, and an unstable
-factor such as ``exp(m) / exp(m')`` overflows where they would have rejected it), and that is
-proved again (``proof.prove(update_of(F), ...)``). A factor that fails any of these, or makes
-any of them raise, a key or recipe that differs from the stored one, or an unreadable file is
-a miss: the caller derives and overwrites. (So a rule the ranking chose although it is not
-structurally stable is derived again in every process: every rule under a sum, whose
-reducer gives no order of ``m`` and ``m'``.) A stored refusal is returned as it is
-(it only keeps a pin). ``E13`` is never stored.
+have chosen: an expression of the search's ops over ``m`` and ``m'`` alone that
+``repair_of`` reads back from ``update_of(F)``, that the assembly can emit, whose update
+reproduces the flat graph at hand on its own test data (``reference``, every element, as
+``search.agrees`` compares them), and
+whose combination survives the float replay (``rank``). A factor that fails any of these,
+or makes any of them raise, a key or recipe that differs from the stored one, or an
+unreadable file is a miss: the caller derives and overwrites. A stored refusal is returned
+as it is (it only keeps a pin). ``BUG`` is never stored.
 """
 
 from __future__ import annotations
@@ -37,6 +32,7 @@ import json
 import os
 import tempfile
 from pathlib import Path
+
 
 from ...ir.update_rule import repair_of, update_of
 
@@ -64,14 +60,11 @@ ENGINE_DIGEST = engine_digest()
 
 def settings() -> list:
     """Everything outside the sources that a derivation depends on."""
-    import z3
+    from . import engine, field, reference, search
 
-    from . import engine, reference, search
-
-    return [list(engine.BUDGETS), search.LOOSE_RTOL, reference.TILE, reference.N,
-            list(reference.PREFIXES), list(reference.SEEDS_NORMAL), list(reference.TRY_SEEDS),
-            [list(s) for s in reference.SHAPINGS], [list(c) for c in engine.RANK_CASES],
-            engine.RANK_N, z3.get_version_string()]
+    return [list(engine.BUDGETS), reference.TILE, list(reference.STEPS), list(reference.DRAWS),
+            search.ROWS_PER_CASE, search.SAMPLE_COLS, [list(c) for c in engine.RANK_CASES],
+            engine.RANK_N, field.P, field.Q]
 
 
 def entry_key(record_key: str, recipe_key: str = "") -> str:
@@ -95,8 +88,8 @@ def _tuples(x):
 
 
 def save(d) -> Path | None:
-    """Write the derivation ``d`` (not an ``E13``). Returns the path, or None when the
-    store cannot be written (the derivation is still served)."""
+    """Write the derivation ``d`` (not a ``BUG``). Returns the path, or None when the store
+    cannot be written (the derivation is still served)."""
     from .engine import report
 
     if d.bug:
@@ -118,40 +111,50 @@ def save(d) -> Path | None:
 
 def well_formed(factor) -> bool:
     """Whether ``factor`` is an expression of the search's ops over ``m`` and ``m'`` alone
-    (``search.BINARY`` and the unary ``exp``; no constant, no other leaf)."""
-    from .search import BINARY
+    (``search.BINARY`` and ``search.UNARY``; no constant, no other leaf)."""
+    from .search import BINARY, UNARY
 
     if isinstance(factor, str):
         return factor in ("m", "m'")
     if not isinstance(factor, tuple) or not factor:
         return False
     op, *args = factor
-    arity = 1 if op == "exp" else 2 if op in BINARY else None
+    arity = 1 if op in UNARY else 2 if op in BINARY else None
     return arity == len(args) and all(well_formed(a) for a in args)
 
 
-def _trusted(factor, flat_graph, full: str, acc: str, reducer: str, prove) -> bool:
-    """Whether a stored factor is one the engine could have chosen for ``flat_graph``."""
-    from ...ir.rolling import check_expression
-    from .rank import structurally_stable
+def retest(flat_graph, obstacle, recipe, rules) -> bool:
+    """Whether the stored ``rules`` (``((acc, factor), ...)``) are ones the engine could
+    have chosen for ``flat_graph``: emittable, reproducing its test data on every element,
+    and surviving the float replay together."""
+    from ...runtime.inputs import adversarial_cases
+    from . import engine, rank
+    from . import reference as ref
+    from .search import agrees
 
-    update = update_of(factor)
-    if not well_formed(factor) or repair_of(update) != factor:
-        return False
-    try:
-        check_expression(factor, stem=full)
-    except ValueError:
-        return False
-    if not structurally_stable(update, reducer):
-        return False
-    return prove(update, flat_graph, full, acc).proved
+    full, loops = obstacle.full, tuple(obstacle.loops)
+    for _, factor in rules:
+        update = update_of(factor)
+        if not well_formed(factor) or repair_of(update) != factor \
+                or not engine.emittable(update, full):
+            return False
+    looped = engine.looped_dim(recipe, flat_graph, full)
+    cases = ref.reference_set(ref.Flat(recipe, flat_graph, full, loops, looped))
+    for acc, factor in rules:
+        leaves, target, _, excluded = engine.hole_blocks(cases, full, acc)
+        if not agrees(update_of(factor), leaves, target, excluded):
+            return False
+    kernel = ref.Flat(recipe, flat_graph, full, loops, looped, dtype=recipe.dtype)
+    rank_cases = list(engine.RANK_CASES) + [
+        (engine.RANK_N, c) for c in adversarial_cases(kernel.graph(engine.RANK_N))]
+    ranked, _ = rank.rank(kernel, loops, {acc: [update_of(f)] for acc, f in rules}, rank_cases)
+    return bool(ranked)
 
 
-def load(record_key: str, flat_graph, obstacle, recipe_key: str = ""):
+def load(record_key: str, flat_graph, obstacle, recipe, recipe_key: str = ""):
     """The stored derivation of ``record_key`` (with ``recipe_key``: that recipe's stored
-    refusal) with every rule checked and proved again on ``flat_graph``; None on a miss."""
+    refusal), every rule tested again on ``flat_graph``; None on a miss."""
     from .engine import Derivation
-    from .proof import prove
 
     try:
         entry = json.loads(path_of(record_key, recipe_key).read_text())
@@ -172,11 +175,9 @@ def load(record_key: str, flat_graph, obstacle, recipe_key: str = ""):
     if tuple(acc for acc, _ in rules) != tuple(obstacle.loops):
         return None
     try:
-        reducer = type(next(n for n in flat_graph.nodes if n.name == obstacle.full)).combine
-        for acc, factor in rules:
-            if not _trusted(factor, flat_graph, obstacle.full, acc, reducer, prove):
-                return None
-    except Exception:  # noqa: BLE001 - a malformed stored factor is a miss, not an E13
+        if not retest(flat_graph, obstacle, recipe, rules):
+            return None
+    except Exception:  # noqa: BLE001 - a malformed stored factor is a miss, not a bug
         return None
     d.rules = rules
     d.chosen = {acc: update_of(factor) for acc, factor in rules}

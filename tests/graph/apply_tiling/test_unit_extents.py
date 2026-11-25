@@ -375,9 +375,9 @@ def test_the_softmax_accept_filter_schedules_as_the_build_does(monkeypatch):
     from cleave.schedule.streaming import streaming_accept
     from tests import _explicit_softmax as X
 
-    # exp(x - max(x)) / sum: its divide reads the exp next to the sum, so the max is not
-    # carried (T4): every tiling that is served holds a row whole
-    ir = X.streamed_ir(X.softmax_rows, dict(R=64, C=1024), "two passes")
+    # exp(x - max(x)) / sum: its divide reads the exp next to the sum, outside the sum's
+    # loop: every tiling that loops the row is refused, every one that is served holds it whole
+    ir = X.streamed_ir(X.softmax_rows, dict(R=64, C=1024))
     accept = streaming_accept(ir)
     cands = search_tiling(ir, topk=1000)
     kept = [accept(c) for c in cands]

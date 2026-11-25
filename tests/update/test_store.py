@@ -1,6 +1,6 @@
-"""The derivation store: one entry per loop structure on disk, every
-stored rule proved again on load, a stored refusal trusted, the key moving with the engine.
-CPU only; every test has a cache root of its own.
+"""The derivation store: one entry per loop structure on disk, every stored rule tested again
+on load (exactly, on the graph's own test data, and in the float replay), a stored refusal
+trusted, the key moving with the engine. CPU only; every test has a cache root of its own.
 """
 
 import json
@@ -13,19 +13,18 @@ from pathlib import Path
 import pytest
 
 pytest.importorskip("torch")
-pytest.importorskip("z3")
 
 import cleave
 import cleave.lang as cl
+from cleave.ir.ops import ReduceMax
 from cleave.ir.update_rule import loop_key
 from cleave.pipeline import cache, plans
 from cleave.pipeline import update as update_package
-from cleave.pipeline.update import engine, proof, store, texts
+from cleave.pipeline.update import engine, reference, store, texts
 from cleave.pipeline.update.instantiate import Recipe
 
 from ._attention import FACTOR
 from ._programs import _max, flash_rows, identity, lowered, the_obstacle
-from .test_refusals import column_weighted
 
 ROOT = Path(__file__).resolve().parents[2]
 SHAPES = dict(R=16, C=64, D=8)
@@ -39,10 +38,10 @@ def fresh(tmp_path, monkeypatch):
         yield tmp_path
 
 
-def setting(fn=flash_rows, shapes=SHAPES):
+def setting(fn=flash_rows, shapes=SHAPES, cls=None):
     graph = identity(fn, shapes)
     ir = lowered(graph)
-    return ir, the_obstacle(ir), Recipe.of(graph)
+    return ir, the_obstacle(ir, cls), Recipe.of(graph)
 
 
 def derive_again(ir, ob, recipe, monkeypatch):
@@ -57,19 +56,19 @@ def no_search(monkeypatch):
     monkeypatch.setattr(engine, "run", run)
 
 
-def proofs(monkeypatch):
+def retests(monkeypatch):
     calls = []
-    real = proof.prove
+    real = store.retest
 
-    def counted(*args, **kwargs):
-        calls.append(args[0])
-        return real(*args, **kwargs)
+    def counted(flat_graph, obstacle, recipe, rules):
+        calls.append(rules)
+        return real(flat_graph, obstacle, recipe, rules)
 
-    monkeypatch.setattr(proof, "prove", counted)
+    monkeypatch.setattr(store, "retest", counted)
     return calls
 
 
-def test_a_derivation_is_stored_and_read_back_with_every_rule_proved_again(fresh, monkeypatch):
+def test_a_derivation_is_stored_and_read_back_with_every_rule_tested_again(fresh, monkeypatch):
     ir, ob, recipe = setting()
     first = update_package.derive(ir, ob, recipe)
     assert not first.refused and not first.from_store
@@ -84,10 +83,10 @@ def test_a_derivation_is_stored_and_read_back_with_every_rule_proved_again(fresh
     assert update_package.derive(ir, ob, recipe) is first  # the in-process memo
 
     no_search(monkeypatch)
-    calls = proofs(monkeypatch)
+    calls = retests(monkeypatch)
     again = derive_again(ir, ob, recipe, monkeypatch)
     assert again.from_store and again.rules == first.rules and again.record() == first.record()
-    assert calls == [("add", "r", ("mul", "a", FACTOR))] * len(ob.loops)
+    assert calls == [first.rules]
     assert engine.report(again) == entry["report"]
 
 
@@ -95,7 +94,7 @@ _CHILD = r"""
 import json
 import cleave
 from cleave.pipeline import update
-from cleave.pipeline.update import engine, proof
+from cleave.pipeline.update import engine, store
 from cleave.pipeline.update.instantiate import Recipe
 from tests.update._programs import flash_rows, identity, lowered, the_obstacle
 from tests.update.test_store import SHAPES
@@ -105,17 +104,17 @@ def run(*args, **kwargs):
 
 engine.run = run
 calls = []
-real = proof.prove
-def counted(*args, **kwargs):
-    calls.append(args[0])
-    return real(*args, **kwargs)
-proof.prove = counted
+real = store.retest
+def counted(*args):
+    calls.append(1)
+    return real(*args)
+store.retest = counted
 graph = identity(flash_rows, SHAPES)
 ir = lowered(graph)
 ob = the_obstacle(ir)
 d = update.derive(ir, ob, Recipe.of(graph))
 print("RESULT " + json.dumps({"from_store": d.from_store, "rules": d.rules, "refused": d.refused,
-                              "proofs": len(calls)}))
+                              "retests": len(calls)}))
 """
 
 
@@ -131,44 +130,35 @@ def test_a_second_process_derives_nothing(fresh):
     (line,) = [x for x in out.stdout.splitlines() if x.startswith("RESULT ")]
     got = json.loads(line[len("RESULT "):])
     assert got == {"from_store": True, "rules": json.loads(json.dumps(first.rules)),
-                   "refused": "", "proofs": len(ob.loops)}
-
-
-def test_a_tampered_rule_is_proved_wrong_and_derived_again(fresh, monkeypatch):
-    ir, ob, recipe = setting()
-    first = update_package.derive(ir, ob, recipe)
-    path = store.path_of(first.key)
-    entry = json.loads(path.read_text())
-    entry["rules"][0][1] = ["exp", ["sub", "m'", "m"]]
-    path.write_text(json.dumps(entry))
-    again = derive_again(ir, ob, recipe, monkeypatch)
-    assert not again.from_store and again.rules == first.rules
-    assert json.loads(path.read_text())["rules"] == json.loads(json.dumps(first.rules))  # overwritten
+                   "refused": "", "retests": 1}
 
 
 E = ["exp", ["sub", "m", "m'"]]
 
 
 @pytest.mark.parametrize("factor", [
-    ["sub", ["add", "a", E], "a"],  # proved over the reals, but reads the accumulator
-    ["div", ["exp", "m"], ["exp", "m'"]],  # proved, emittable, but overflows: never ranked
+    ["exp", ["sub", "m'", "m"]],  # well formed and emittable, but reproduces nothing
+    ["sub", ["add", "a", E], "a"],  # reads the accumulator: no factor
+    ["div", ["exp", "m"], ["exp", "m'"]],  # reproduces the graph, but overflows: never ranked
     5,  # malformed: no expression at all
     "x",  # malformed: a leaf the factor cannot read
-    ["sqrt", "m"],  # an op the search never forms
+    ["sqrt", "m"],  # an op of the search, but no rule of this graph
+    ["log", "m"],  # an op the search never forms
     ["exp", ["sub", "m", "m'"], "m"],  # the wrong arity
-], ids=["reads_a", "unstable", "int", "unknown_leaf", "unknown_op", "arity"])
+], ids=["wrong", "reads_a", "unstable", "int", "unknown_leaf", "other_op", "unknown_op",
+        "arity"])
 def test_a_stored_factor_the_engine_would_not_choose_is_derived_again(fresh, monkeypatch,
                                                                       factor):
-    """Re-proving is not enough: a factor that reads ``a``, that the ranking would have
-    rejected, or that is not an expression at all is a miss -- derived again and
-    overwritten -- never the record, and never an E13 that pins the loop structure."""
+    """A factor that reproduces nothing, that reads ``a``, that the replay rejects or that
+    is not an expression at all is a miss -- derived again and overwritten -- never the
+    record, and never a BUG that pins the loop structure."""
     ir, ob, recipe = setting()
     first = update_package.derive(ir, ob, recipe)
     path = store.path_of(first.key)
     entry = json.loads(path.read_text())
     entry["rules"][0][1] = factor
     path.write_text(json.dumps(entry))
-    assert store.load(first.key, ir, ob) is None
+    assert store.load(first.key, ir, ob, recipe) is None
     runs = []
     real = engine.run
 
@@ -209,16 +199,22 @@ def test_an_entry_that_is_not_this_graphs_is_a_miss(fresh, monkeypatch, damage):
     assert json.loads(path.read_text())["key"] == first.key
 
 
+def traced_rows(x: cl.Tensor["R", "C"], v: cl.Tensor["C", "D"]):
+    """The traced order: the value matmul reads the normalized exp."""
+    e = cl.exp(x - _max(x))
+    return (e / cl.sum(e, -1, keepdim=True)) @ v
+
+
 def test_a_stored_refusal_is_returned_without_a_search(fresh, monkeypatch):
-    ir, ob, recipe = setting(column_weighted, dict(M=8, K=64, N=16))
+    ir, ob, recipe = setting(traced_rows, cls=ReduceMax)
     first = update_package.derive(ir, ob, recipe)
-    assert first.refused.endswith("do not lead its accumulators")
-    # E6 is read off the references: it is kept for this recipe, not for the loop structure
+    assert first.refused.startswith("no update of ")
+    # a refusal is kept for this recipe, not for the loop structure
     assert first.recipe_key == recipe.key and not store.path_of(first.key).exists()
     entry = json.loads(store.path_of(first.key, recipe.key).read_text())
     assert entry["refused"] == first.refused and entry["recipe"] == recipe.key
     no_search(monkeypatch)
-    calls = proofs(monkeypatch)
+    calls = retests(monkeypatch)
     again = derive_again(ir, ob, recipe, monkeypatch)
     assert again.from_store and again.refused == first.refused and not again.rules
     assert calls == []
@@ -231,59 +227,29 @@ def literal_rows(x: cl.Tensor["R", 64], v: cl.Tensor[64, "D"]):
     return (e @ v) / cl.sum(e, -1, keepdim=True)
 
 
-def rsqrt_literal(x: cl.Tensor["R", 64], v: cl.Tensor[64, "D"]):
-    p = cl.rsqrt(cl.exp(x - _max(x)))
-    return (p @ v) / cl.sum(p, -1, keepdim=True)
-
-
 def test_a_refusal_of_one_recipe_is_not_another_programs(fresh, monkeypatch):
-    """E1 is a fact about ``literal_rows``' recipe, not about the loop structure it shares
-    with ``flash_rows``: neither the memo nor the store hands it to ``flash_rows``, which
-    derives its own rule. A rule is the loop structure's: ``literal_rows`` then gets it,
-    proved again on its own graph."""
+    """"No test" is a fact about ``literal_rows``' recipe, not about the loop structure it
+    shares with ``flash_rows``: neither the memo nor the store hands it to ``flash_rows``,
+    which derives its own rule. That rule is the loop structure's, but it cannot be tested
+    again on ``literal_rows``' graph (there is no prefix of a literal dim): ``literal_rows``
+    keeps its refusal."""
     lit_ir, lit_ob, lit = setting(literal_rows, dict(R=16, D=8))
     ir, ob, recipe = setting()
     key = loop_key(ir, ob.full, ob.loops)
     assert loop_key(lit_ir, lit_ob.full, lit_ob.loops) == key and lit.key != recipe.key
-    e1 = texts.E1.format(full=ob.full)
     refusal = update_package.derive(lit_ir, lit_ob, lit)
-    assert refusal.refused == e1 and refusal.recipe_key == lit.key
+    assert refusal.refused == texts.NO_TEST.format(
+        full=ob.full, why="the dim it reduces has no symbol: the graph cannot be built "
+        "again on a prefix of it")
+    assert refusal.recipe_key == lit.key
     assert store.path_of(key, lit.key).exists() and not store.path_of(key).exists()
 
     d = update_package.derive(ir, ob, recipe)  # one process
     assert not d.refused and not d.from_store and d.rules == tuple((a, FACTOR) for a in ob.loops)
 
-    store.path_of(key).unlink()  # a second process, whose store holds the refusal alone
-    monkeypatch.setattr(update_package, "_DERIVED", {})
+    monkeypatch.setattr(update_package, "_DERIVED", {})  # a second: the rule is looked up first
     again = update_package.derive(lit_ir, lit_ob, lit)
-    assert again.from_store and again.refused == e1
-    mine = update_package.derive(ir, ob, recipe)
-    assert not mine.from_store and mine.rules == d.rules
-
-    monkeypatch.setattr(update_package, "_DERIVED", {})  # a third: the rule is looked up first
-    no_search(monkeypatch)
-    calls = proofs(monkeypatch)
-    shared = update_package.derive(lit_ir, lit_ob, lit)
-    assert shared.from_store and not shared.refused and shared.rules == d.rules
-    assert len(calls) == len(ob.loops)  # proved on literal_rows' graph
-
-
-def test_a_refusal_of_the_flat_graph_alone_holds_for_the_loop_structure(fresh, monkeypatch):
-    """E7 is read off the flat graph before the recipe is used: it is the loop structure's,
-    and another program of that structure gets it without a search."""
-    from .test_refusals import rsqrt_on_the_path
-
-    ir, ob, recipe = setting(rsqrt_on_the_path)
-    first = update_package.derive(ir, ob, recipe)
-    assert first.refused.endswith("only elementwise add, sub, mul, div and exp are read there")
-    assert first.recipe_key == ""
-    assert json.loads(store.path_of(first.key).read_text())["recipe"] == ""
-    lit_ir, lit_ob, lit = setting(rsqrt_literal, dict(R=16, D=8))
-    assert loop_key(lit_ir, lit_ob.full, lit_ob.loops) == first.key and lit.key != recipe.key
-    no_search(monkeypatch)
-    assert update_package.derive(lit_ir, lit_ob, lit) is first  # the memo
-    again = derive_again(lit_ir, lit_ob, lit, monkeypatch)
-    assert again.from_store and again.refused == first.refused
+    assert again.from_store and again.refused == refusal.refused  # ... and cannot be tested
 
 
 def test_each_loop_structure_has_an_entry_of_its_own(fresh, monkeypatch):
@@ -311,7 +277,7 @@ def test_the_key_moves_with_the_engine_sources_the_settings_and_the_build(tmp_pa
         shutil.copy(p, copy)
         copies.append(copy)
     assert store.engine_digest(copies) == store.ENGINE_DIGEST
-    assert {p.name for p in copies} >= {"update_rule.py", "engine.py", "search.py", "proof.py",
+    assert {p.name for p in copies} == {"update_rule.py", "engine.py", "field.py", "search.py",
                                         "rank.py", "reference.py", "instantiate.py", "store.py",
                                         "texts.py", "__init__.py"}
     copies[3].write_text(copies[3].read_text() + "\n# one more line\n")
@@ -326,20 +292,17 @@ def test_the_key_moves_with_the_engine_sources_the_settings_and_the_build(tmp_pa
     assert store.path_of(key) != here
     monkeypatch.undo()
 
-    from cleave.pipeline.update import search
-
-    monkeypatch.setattr(search, "LOOSE_RTOL", 3e-2)
+    monkeypatch.setattr(reference, "DRAWS", (1, 2, 3))
     assert store.path_of(key) != here
 
 
 def test_the_process_keeps_a_light_derivation(fresh):
-    """What ``derive`` keeps per loop structure has no small-shape instances, references or
-    blocks; the report reads none of them."""
+    """What ``derive`` keeps per loop structure has no instances or test data; the report
+    reads none of them."""
     ir, ob, recipe = setting()
     d = update_package.derive(ir, ob, recipe)
     assert d.flat is None and d.kernel is None and d.references == []
-    assert d.holes and all(h.leaves == {} and h.target is None for h in d.holes)
-    assert all(h.search is not None and h.verdicts for h in d.holes)
+    assert d.holes and all(h.search is not None and h.tried for h in d.holes)
     full = engine.run(ir, ob, recipe, key=d.key)
     assert full.flat is not None and engine.report(full) == engine.report(d)
 

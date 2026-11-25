@@ -1,12 +1,11 @@
 """Searched update rules: the plain data the scheduler, the engine and the assembly share.
 
 A reduction that wants to loop over a dim can sit under a value that needs the whole dim --
-the row max of ``exp(x - max(x))`` -- which is itself a reduction over that dim and feeds
-back into the loop. Such a pair is an :class:`Obstacle`. Where an update rule was found and
-proven for every reduction that loops under the full-extent value
-(``cleave.pipeline.update``), the full-extent node of the flat graph carries a
-:class:`Streaming` record, and the loop is built with the value carried across its
-iterations (``cleave.schedule.streaming``).
+a reduction over that dim that feeds back into the loop (a row max, a row sum). Such a pair
+is an :class:`Obstacle`, a reduction conflict. Where an update rule was found for every
+reduction that loops under the full-extent value (``cleave.pipeline.update``), the
+full-extent node of the flat graph carries a :class:`Streaming` record, and the loop is
+built with the value carried across its iterations (``cleave.schedule.streaming``).
 
 Everything here is data, hashing and expression helpers; nothing above ``ir`` is imported.
 
@@ -27,15 +26,15 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class Obstacle:
-    """One full-extent value and the reductions that want to loop under it.
+    """One reduction conflict: a full-extent value and the reductions that want to loop
+    under it.
 
     It is also the carried-state proposal: the state of the loop is ``loops`` (the
     accumulators) plus ``full``. Nothing else is state.
     """
 
-    full: str  # name of the full-extent reduction (the ancestor: the row max of a softmax)
+    full: str  # name of the full-extent reduction (the conflict's ancestor)
     loops: tuple  # names of the reductions that want to loop under it, in graph order
-    refused: str = ""  # why the overlap is NOT a streaming obstacle ("" = it is one)
 
 
 @dataclass(frozen=True)
@@ -52,17 +51,6 @@ class Streaming:
     loops: tuple
     rules: tuple
     key: str
-
-
-def accumulates(node) -> bool:
-    """Whether ``node`` sums what it reads, from zero: a reduction whose class combines by
-    ``add`` (``combine``), or a contraction (the looped sum of products), with no start
-    value of its own. A repair rescales what such an accumulator holds; nothing else is
-    modelled by the proof (a max of the rescaled value is not)."""
-    from .ops import Matmul
-
-    combine = "add" if isinstance(node, Matmul) else getattr(type(node), "combine", None)
-    return combine == "add" and getattr(node, "accum_init", None) is None
 
 
 # ---------------------------------------------------------------------------- expressions

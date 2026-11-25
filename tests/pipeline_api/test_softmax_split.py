@@ -6,10 +6,10 @@ graph over the softmax dim: the max is an opaque reduction it neither moves nor 
 unsplit search) and the ``GraphSet`` keeps the split that was asked for (``state_split``).
 ``schedule`` builds the split of each solo graph from its loop state instead
 (``pipeline.plans.state_pair``): a partial that returns the accumulators and the max of
-its own split, a combine that applies the proven repair and runs the solo graph's
+its own split, a combine that applies the found repair and runs the solo graph's
 epilogue. Where no pair is built the refusal says why, in its own words:
 
-  P1  this graph carries no proven update over that dim[: {its streaming refusals}]
+  P1  this graph carries no update rule over that dim[: {its streaming refusals}]
   P2  {op_type} on the way to the loop state reads no split input
   P3  no symbolic split factor for the looped dim
   P4  {acc} {dims} is not the full-extent value {rows} with at most one trailing axis
@@ -38,7 +38,7 @@ from cleave.frontend import trace
 from cleave.ir.graph_utils import boundary_signature
 from cleave.lower.state_split import SplitRefused, combine_graph
 from cleave.pipeline.plans import (
-    NO_PROVEN_UPDATE,
+    NO_UPDATE_RULE,
     NO_SPLIT_DIM,
     NO_SPLIT_FACTOR,
     SEVERAL_DIMS,
@@ -48,16 +48,14 @@ from cleave.pipeline.plans import (
     lower,
 )
 from cleave.pipeline.superopt import GraphSet, SearchedGraph, state_split_dims
+from cleave.pipeline.update.texts import NO_RULE
 from cleave.runtime.reference import output_order, output_roles, placeholder_order
 
 FACTOR = ("exp", ("sub", "m", "m'"))
-T3 = ("reduce_max_2_5: mma_10 reads reduction_2_8, a finished reduction over the dim "
-      "reduce_max_2_5 reduces: that needs two passes over the row")
-# ... and the traced order's row sum, a conflict of its own, refused by the engine
-E14 = ("reduction_2_8: exp_7, which mma_10 reads, is computed from reduce_max_2_5, another "
-       "reduction over the dim reduction_2_8 reduces: it changes from one prefix of the loop "
-       "to the next")
-TRACED = f"{T3}; {E14}"
+# the traced order: no update of its value matmul reproduces the flat graph, under the max
+# nor under the row sum (a conflict of its own)
+TRACED = (f"reduce_max_2_5: {NO_RULE.format(acc='mma_10', budget=5)}; "
+          f"reduction_2_8: {NO_RULE.format(acc='mma_10', budget=5)}")
 
 
 def attention(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
@@ -171,7 +169,7 @@ def test_search_the_flash_graph_lowers_to_a_pair_built_from_its_loop_state():
 
 def test_search_every_factor_of_the_flash_graph_has_partial_and_combine_plans():
     """``schedule``: per factor the flash graph's partial and combine plans; the traced
-    graph has none, and says why (P1 with its T3 and E14 reasons) once per factor."""
+    graph has none, and says why (P1 with the engine's reasons) once per factor."""
     graphs = _graphs(split=cl.Split("SKV", (4, 8)))
     plans = P.schedule(graphs, P.ScheduleConfig(topk=2, split_k=(4, 8)))
     flash, traced = _flash(graphs), _traced(graphs)
@@ -185,8 +183,8 @@ def test_search_every_factor_of_the_flash_graph_has_partial_and_combine_plans():
     split = [r for r in plans.refused if r.variant != "solo"]
     assert sorted((r.graph_index, r.variant, r.role) for r in split) == [
         (traced.index, f"split-k={f}", "partial") for f in (4, 8)]
-    why = f"graph {traced.index}: split over SKV: {NO_PROVEN_UPDATE}: {TRACED}"
-    assert NO_PROVEN_UPDATE == "this graph carries no proven update over that dim"
+    why = f"graph {traced.index}: split over SKV: {NO_UPDATE_RULE}: {TRACED}"
+    assert NO_UPDATE_RULE == "this graph carries no update rule over that dim"
     for refusal in split:
         assert isinstance(refusal.error, LoweringRejected) and str(refusal.error) == why
     assert "LoweringRejected: graph" in plans.summary()
@@ -251,7 +249,7 @@ def test_search_no_part_of_the_split_is_dropped_without_a_reason():
     assert split == sorted(
         [(g.index, "split", f"graph {g.index}: split over SKV: {unsplit}") for g in graphs]
         + [(traced.index, "split-k=4",
-            f"graph {traced.index}: split over SKV: {NO_PROVEN_UPDATE}: {TRACED}")])
+            f"graph {traced.index}: split over SKV: {NO_UPDATE_RULE}: {TRACED}")])
 
 
 def test_search_a_program_without_such_a_max_is_split_by_the_search():
@@ -271,12 +269,12 @@ def test_search_p1_a_graph_whose_max_carries_nothing_over_the_dim():
     """A max over the split dim that nothing loops under: no obstacle, so no refusal of
     one to quote."""
     (graph,) = _graphs(centered, (("R", 64), ("C", 256)), ("C",))
-    assert _refused(graph, 4) == f"graph 0: split over C: {NO_PROVEN_UPDATE}"
+    assert _refused(graph, 4) == f"graph 0: split over C: {NO_UPDATE_RULE}"
 
 
 def test_search_p1_the_traced_graph_says_why_its_max_is_not_carried():
     assert _refused(_traced(_graphs()), 4) == (
-        f"graph {_traced(_graphs()).index}: split over SKV: {NO_PROVEN_UPDATE}: {TRACED}")
+        f"graph {_traced(_graphs()).index}: split over SKV: {NO_UPDATE_RULE}: {TRACED}")
 
 
 def test_search_p2_an_op_on_the_way_to_the_state_that_no_split_reaches():
@@ -370,4 +368,4 @@ def test_search_two_carried_maxes_over_the_dim():
         "2 values are carried across a loop over that dim (a, b); a pair is built from one")
     reasons = {_refused(g, 4).split(": ", 2)[2] for g in graphs if g is not both}
     assert any("an input of the program; the combine reads only" in r for r in reasons)
-    assert any(r.startswith(NO_PROVEN_UPDATE) for r in reasons)
+    assert any(r.startswith(NO_UPDATE_RULE) for r in reasons)

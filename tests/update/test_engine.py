@@ -2,7 +2,7 @@
 
 ``test_search_*`` run the superoptimizer first (marked ``search``). The derivations here
 are made by ``engine.run`` itself (no in-process memo, no store), so every list below is
-what the search, the proof and the ranking produce now.
+what the search, the tests in the field and the ranking produce now.
 """
 
 import json
@@ -14,10 +14,9 @@ from pathlib import Path
 import pytest
 
 pytest.importorskip("torch")
-pytest.importorskip("z3")
 
 from cleave.ir.ops import ReduceMax
-from cleave.ir.update_rule import repair_of, show
+from cleave.ir.update_rule import show
 from cleave.pipeline import plans
 from cleave.pipeline.update import engine
 
@@ -44,9 +43,8 @@ def mha(budgets=(4,)):
 
 
 def listed(d):
-    """Per hole: ``[(update text, proved, emittable)]`` of every match of its last search."""
-    return {h.acc: [(show(e), v.proved, repair_of(e) is not None) for e, _, v in h.verdicts]
-            for h in d.holes}
+    """Per hole: ``[(update text, emittable)]`` of every match of its last search."""
+    return {h.acc: [(show(e), e in h.emittable) for e in h.matches] for h in d.holes}
 
 
 def test_search_mha_prefill_has_one_right_update_per_hole_at_budget_4():
@@ -55,48 +53,67 @@ def test_search_mha_prefill_has_one_right_update_per_hole_at_budget_4():
     assert d.budget == 4 and [h.search.budget for h in d.holes] == [4, 4]
     assert [h.acc for h in d.holes] == ["reduction_2_8", "mma_9"]  # narrowest first
     assert [h.wide for h in d.holes] == [False, True]
-    assert listed(d) == {acc: [(CANONICAL, True, True)] for acc in d.loops}
+    assert listed(d) == {acc: [(CANONICAL, True)] for acc in d.loops}
     assert len(d.ranked) == 1 and not d.rejected
     (best,) = d.ranked
-    assert (best.grade, best.stable, best.cost, best.size) == (0, True, 2, 8)
+    assert (best.grade, best.cost, best.size) == (0, 2, 8)
     assert {a: show(u) for a, u in d.chosen.items()} == {a: CANONICAL for a in d.loops}
     assert d.rules == tuple((acc, FACTOR) for acc in d.loops)
     assert d.record().rules == d.rules and d.record().key == d.key
-    # every reference row the design counts, and the cases it names
-    assert d.adequacy == {"mma_9": 23, "reduction_2_8": 20}
-    assert d.shaped == "shaped seed=0 ramp x16"
-    labels = [label for label, _ in d.cases]
-    assert labels[:4] == ["first seed=1", "normal seed=1 prefix=4", "normal seed=1 prefix=8",
-                          "normal seed=1 prefix=12"]
-    assert len(labels) == 11 and labels[-1] == "shaped seed=0 ramp x16 prefix=12"
+    # the test data: every step of every draw, at the first pass's own test sizes
+    assert d.cases == [f"draw {s} prefix {p}" for s in (1, 2) for p in (0, 4, 8, 12)]
+    (row, wide) = d.holes
+    assert row.search.elements[1] == 8 * 20 * 28 and wide.search.elements[1] == 8 * 20 * 28 * 44
     assert list(best.errors) == ["normal@32", "normal@4", "large_logits@32", "increasing@32",
                                  "decreasing@32", "last_spike@32", "constant@32", "offset@32"]
     assert best.errors["normal@4"] == 0.0
 
 
 def test_search_mha_prefill_lists_at_budget_5_and_the_ranking_rejects_three():
-    """The four matches per hole at budget 5, all proved, two of them emittable; of the four
-    combinations of emittable rules the three with ``exp(m) / exp(m')`` are non-finite on
-    ``offset @ 32`` (``0 / 0``), and the winner is the canonical pair."""
+    """At budget 5 a second factor reproduces the flat graph exactly, ``exp(m) / exp(m')``:
+    the same field element. Of the four combinations the three that use it are non-finite
+    on ``large_logits @ 32`` (``exp(m')`` overflows at the first tile), and the winner is the
+    canonical pair."""
     d = mha((5,))
     assert not d.refused, d.refused
-    want = [(CANONICAL, True, True),
-            ("(r + ((a * exp(m)) / exp(m')))", True, False),
-            ("(r + (a * (exp(m) / exp(m'))))", True, True),
-            ("(r + (exp(m) * (a / exp(m'))))", True, False)]
+    want = [(CANONICAL, True), ("(r + (a * (exp(m) / exp(m'))))", True)]
     assert listed(d) == {acc: want for acc in d.loops}
-    for h in d.holes:
-        assert [show(e) for e in h.emittable] == [want[0][0], want[2][0]]
     assert len(d.rejected) == 3 and len(d.ranked) == 1
     for text, why in d.rejected:
         assert "(exp(m) / exp(m'))" in text and why.startswith("non-finite") \
-            and why.endswith("on offset@32")
+            and why.endswith("on large_logits@32")
     (best,) = d.ranked
     assert best.text == "; ".join(f"{a}' = {CANONICAL}" for a in sorted(d.loops))
     assert d.rules == tuple((acc, FACTOR) for acc in d.loops)
-    # a rule the assembly cannot emit is listed, proved, and never ranked
-    ranked_rules = [show(u) for r in d.ranked for u in r.rules.values()]
-    assert "(r + ((a * exp(m)) / exp(m')))" not in ranked_rules
+
+
+def test_search_no_repair_is_never_a_rule():
+    """``a + r`` (the factor 1, ``m / m``) reproduces a row only where its max does not
+    move; random field values always move it."""
+    from cleave.pipeline.update.search import evaluate
+
+    from cleave.pipeline.update.reference import reference_set
+
+    ir, ob, recipe, key = _mha_setting()
+    d = engine.run(ir, ob, recipe, key=key, budgets=(4,))
+    cases = reference_set(d.flat)
+    for acc in d.loops:
+        leaves, target, _, _ = engine.hole_blocks(cases, d.full, acc)
+        no_repair = evaluate(("add", "r", ("mul", "a", ("div", "m", "m"))), leaves)
+        assert (no_repair != target).any()
+
+
+def _mha_setting():
+    from cleave.ir.update_rule import loop_key
+    from cleave.pipeline.update.instantiate import Recipe
+
+    from ._programs import lowered, the_obstacle
+
+    _, graphs = searched(attention, MHA, 11)
+    graph = flash(graphs)
+    ir = lowered(graph)
+    ob = the_obstacle(ir)
+    return ir, ob, Recipe.of(graph), loop_key(ir, ob.full, ob.loops)
 
 
 def test_search_two_derivations_in_one_process_are_equal():
@@ -149,38 +166,32 @@ def test_search_two_derivations_in_two_processes_are_equal(tmp_path):
 
 
 def test_search_qknorm_flash_form_gets_a_record_and_the_traced_form_its_reason():
-    """RMS-normalized keys move the max little: the reference set's shaped sample is chosen
-    for the rows it discriminates, and the flash form gets the same rule as MHA. The sums of
-    squares of the two norms are conflicts as well (the score matmul contracts the normed
-    dim under them); the engine refuses them before it builds anything, for the ``rsqrt``
-    between, which the proof does not read (E7), and they keep their pins."""
+    """The flash form gets the same rule as MHA. The sums of squares of the two norms are
+    conflicts as well (the score matmul contracts the normed dim under them): no update of
+    the form ``a * F + r`` reproduces what is contracted under an ``rsqrt`` of a running
+    sum, so they keep their pins; in the traced order no conflict gets a rule."""
     _, graphs = searched(qknorm, QKNORM, None)
     (ir,) = plans.lower(flash(graphs))
     (other,) = plans.lower(traced(graphs))
     (full,) = [n for n in ir.nodes if getattr(n, "streaming", None) is not None]
     record = full.streaming
+    assert type(full) is ReduceMax
     assert record.rules == tuple((acc, FACTOR) for acc in record.loops) and len(record.loops) == 2
-    norms = [why for why in ir.streaming_refusals if " (RSqrt) lies between " in why]
-    assert len(norms) == 2 and norms == ir.streaming_refusals
+    assert len(ir.streaming_refusals) == 2
+    assert all(" no update of " in why for why in ir.streaming_refusals)
     (d,) = [d for d in ir.derivations if not d.refused]
     assert d.full == full.name and d.rules == record.rules
-    assert all(not d.holes for d in ir.derivations if d.refused)  # nothing was searched
-    # the traced order: the value matmul reads the finished row sum (T3)
     assert not [n for n in other.nodes if getattr(n, "streaming", None) is not None]
-    (why,) = [w for w in other.streaming_refusals if w.startswith("reduce_max_")]
-    assert why.endswith(", a finished reduction over the dim reduce_max_2_19 reduces: that "
-                        "needs two passes over the row") and " reads reduction_2_22" in why
-    rest = [w for w in other.streaming_refusals if w != why]
-    assert len(rest) == 3 and all(" (RSqrt) lies between " in w or ", another reduction "
-                                  "over the dim reduction_2_22 reduces" in w for w in rest)
-    assert all(d.refused and not d.holes for d in other.derivations)
+    assert len(other.streaming_refusals) == 4
+    assert all(" no update of " in why for why in other.streaming_refusals)
 
 
-def test_search_qknorm_reference_set_is_adequate():
+def test_search_qknorm_tests_at_the_first_pass_sizes():
+    """The rows of the test data are the first pass's own: its query heads are a multiple of
+    its kv heads, and a row of every case is a test."""
     _, graphs = searched(qknorm, QKNORM, None)
     d = derivation(flash(graphs), cls=ReduceMax)  # the norms' sums are conflicts too
     assert not d.refused, d.refused
-    assert d.shaped == "shaped seed=9 none x1"
-    assert d.adequacy == {"mma_23": 8, "reduction_2_22": 9}
-    assert d.references[0].rows == 4
-    assert listed(d) == {acc: [(CANONICAL, True, True)] for acc in d.loops}
+    assert d.rules == tuple((acc, FACTOR) for acc in d.loops)
+    assert all(d.flat.sizes[s] == s for s in d.flat.sizes)
+    assert len(d.cases) == 8

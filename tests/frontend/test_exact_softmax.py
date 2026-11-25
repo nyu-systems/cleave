@@ -3,7 +3,7 @@
 ``cl.softmax`` records ``reduce_max, sub, exp, reduce_sum, div``: the max written out, the
 same program as ``cl.exp(x - cl.max(x))`` divided by its sum by hand. The max is an opaque
 reduction of the searched graph; where a tiling loops over the softmax row under it, the
-loop carries the max with a searched and proven update rule (the online softmax), and a
+loop carries the max with a searched and tested update rule (the online softmax), and a
 tile that holds the row whole takes the flat graph's own max. A softmax that is returned
 itself stays limited to rows that fit one block.
 
@@ -238,7 +238,7 @@ def test_search_a_max_written_by_hand_is_carried_across_a_loop(tmp_path, monkeyp
     assert {p.graph.summary() for p in plans} == {"solo matmul>div>max>sub>exp>sum>matmul>div"}
     (refusal,) = plans.refused
     assert str(refusal.error).startswith(f"{ROW_LIMIT}; it is not carried across a loop: ")
-    assert "a finished reduction over the dim" in str(refusal.error)
+    assert ": no update of mma_" in str(refusal.error)
 
 
 def attention_weights(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"]):
@@ -252,11 +252,11 @@ def attention_weights_by_hand(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "S
 
 
 def test_search_a_returned_softmax_is_not_promised_a_row_of_any_length(tmp_path, monkeypatch):
-    """Attention weights over 4096 keys: the softmax is the output, so nothing sums it and
-    no loop can carry it. Written with a max by hand or with ``cl.softmax`` (one program)
-    it has no plan, and the refusal names the reason after the row limit: the exp, computed
-    from the max for every key, is also read by the division, which is not summed over the
-    keys. ``compile`` ends on that report."""
+    """Attention weights over 4096 keys: the softmax is the output. Its max has a rule, but
+    no loop over the keys can be built: the exp, computed in every iteration, is also read
+    by the division outside the loop. Written with a max by hand or with ``cl.softmax`` (one
+    program) it has no plan, the refusal names that reason, and ``compile`` ends on that
+    report."""
     from cleave.core.errors import CleaveError
     from cleave.pipeline.plans import ROW_LIMIT
 
@@ -270,17 +270,17 @@ def test_search_a_returned_softmax_is_not_promised_a_row_of_any_length(tmp_path,
     assert not plans and plans.refused
     assert len(ROW_LIMIT) <= 160  # a refusal's reason is one line of that many characters
     assert "cl.softmax" not in ROW_LIMIT and "a row of any length" not in ROW_LIMIT
+    outside = (r"exp_\d+ is computed per iteration of GraphNode_\w+ but also read by div_\d+ "
+               r"outside it")
     for refusal in plans.refused:
         text = str(refusal.error)
-        assert text.startswith(f"{ROW_LIMIT}; it is not carried across a loop: "), text
-        assert re.search(r"exp_\d+, computed from reduce_max_\d+_\d+ for every element of the "
-                         r"looped dim, is also read by div_\d+, which is not summed over that "
-                         r"dim", text), text
+        assert text.startswith("no tiling candidates (") and ROW_LIMIT not in text, text
+        assert re.search(outside, text), text
     with pytest.raises(CleaveError) as e:
         P.compile(attention_weights_by_hand, shapes=shapes, dtype=cl.f16, split=False,
                   preset="fast", schedule=P.ScheduleConfig(topk=2),
                   tolerance=tolerance_for("softmax"))
-    assert ROW_LIMIT in e.value.report.summary()
+    assert re.search(outside, e.value.report.summary())
 
 
 def test_search_long_rows_schedule_with_rolling_plans(tmp_path, monkeypatch):

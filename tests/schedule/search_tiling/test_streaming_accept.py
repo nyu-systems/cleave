@@ -2,9 +2,9 @@
 
 For a graph with a streaming obstacle, served or not, the policy proposes tilings the build
 has to refuse: where the obstacle is served it drops the pin and steps the max with its
-sums (a tiling the assembly cannot serve is refused); where it is not, it still steps the
-max on its own while the sums are pinned, and the scores would be needed per iteration and
-whole at once. ``streaming_accept`` drops those before the top-k cut, by running the build
+sums (a tiling the assembly cannot serve is refused), next to the tilings it would make
+without the record; where it is not, it still steps the max on its own while the sums are
+pinned, and the scores would be needed per iteration and whole at once. ``streaming_accept`` drops those before the top-k cut, by running the build
 itself, and ``pipeline.plans`` installs it for every lowered graph that has a record or a
 list of reasons (``streaming_refusals``).
 """
@@ -33,16 +33,14 @@ from tests import _explicit_softmax as X
 from tests._graphs import mha_bhsd_graph
 
 SMALL = dict(H=32, SQ=64, SKV=256, D=64)
-TWO_PASSES = "two passes"
-# the traced order's row sum: a conflict of its own, which the engine refuses (E14)
-SUM_UNDER = "is computed from"
 
 
 @pytest.fixture(scope="module")
 def traced():
-    """Traced-order attention at S_KV=256: both conflicts are refused (the max T3, the row
-    sum E14); only the tilings that hold the row whole build."""
-    return X.streamed_ir(X.traced_attention, SMALL, TWO_PASSES, SUM_UNDER)
+    """Traced-order attention at S_KV=256: both conflicts are refused (no update of the
+    accumulator form reproduces the flat graph); only the tilings that hold the row whole
+    build."""
+    return X.streamed_ir(X.traced_attention, SMALL, X.NO_RULE, X.NO_RULE)
 
 
 @pytest.fixture(scope="module")
@@ -181,16 +179,18 @@ def _no_tiling(planset, head):
 
 
 def test_no_candidate_left_says_why(monkeypatch):
-    """A returned softmax at 16384 columns: its obstacle is refused (T4), so the row has to
-    be in one block, and the only tilings that hold it there have one row, which no kernel
-    has (a unit extent). That is the reason, not the row limit: the report names why the max
-    is not carried, then the tilings the filter dropped."""
+    """A returned softmax at 16384 columns: its max has a record, but every tiling that
+    loops the row is refused (the exp is read by the division, outside the loop), so the row
+    has to be in one block, and the only tilings that hold it there have one row, which no
+    kernel has (a unit extent). That is the reason, not the row limit: the report names the
+    tilings the filter dropped, and why."""
     shapes = dict(R=64, C=16384)
-    ir = X.streamed_ir(X.softmax_rows, shapes, "is also read by")
-    (why,) = ir.streaming_refusals
+    ir = X.streamed_ir(X.softmax_rows, shapes)
+    assert not ir.streaming_refusals
     planset = _scheduled(monkeypatch, X.softmax_rows, shapes, ir, topk=16, fusion="off")
-    counted = _no_tiling(planset, f"{plans.NO_TILING}; a reduction is not carried across a loop: {why} (")
+    counted = _no_tiling(planset, f"{plans.NO_TILING} (")
     assert UNIT_EXTENT in counted and plans.ROW_LIMIT not in str(planset.refused[0].error)
+    assert "is computed per iteration of GraphNode_" in counted, counted
 
 
 def two_outputs(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
@@ -204,9 +204,9 @@ def two_outputs(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
 def test_the_row_limit_where_every_tiling_the_filter_dropped_steps_the_max(monkeypatch):
     """The traced order next to ``exp(s) @ v`` at S_KV=256: the policy steps the max with
     the second matmul in every tiling it makes (32, 64, 128 of 256) and none holds the row
-    in one block, so the row limit is the reason, then why the max is not carried (T3),
-    then what the filter dropped."""
-    ir = X.streamed_ir(two_outputs, dict(H=2, SQ=64, SKV=256, D=64), TWO_PASSES, SUM_UNDER)
+    in one block, so the row limit is the reason, then why the max is not carried (no update
+    reproduces the flat graph), then what the filter dropped."""
+    ir = X.streamed_ir(two_outputs, dict(H=2, SQ=64, SKV=256, D=64), X.NO_RULE, X.NO_RULE)
     why = "; ".join(ir.streaming_refusals)
     planset = _scheduled(monkeypatch, two_outputs, dict(H=2, SQ=64, SKV=256, D=64), ir,
                          topk=16, fusion="off")
@@ -218,8 +218,9 @@ def test_the_row_limit_where_every_tiling_the_filter_dropped_steps_the_max(monke
     # served: the max is carried, it needs no row in one block; every tiling would have a
     # unit dim, and before that a value matmul reading one row of the exp's registers
     (X.flash_attention, dict(H=2, SQ=1, SKV=256, D=64), (), REGISTER_OPERAND_CONFLICT),
-    # not served (T4), and the row of 64 fits; the one tiling that holds it has one row
-    (X.softmax_rows, dict(R=1, C=64), ("is also read by",), UNIT_DIM),
+    # served, and the row of 64 fits; the one tiling that holds it has one row, and every
+    # one that loops it is refused (its exp is read outside the loop)
+    (X.softmax_rows, dict(R=1, C=64), (), UNIT_DIM),
 ], ids=["carried_max_one_query", "returned_softmax_one_row"])
 def test_a_row_that_fits_is_not_called_longer(monkeypatch, fn, shapes, refused, reason):
     """Every tiling was refused for another reason than the row: the report gives those

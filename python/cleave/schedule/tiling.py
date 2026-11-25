@@ -943,15 +943,31 @@ def _held_axis_tokens(ordered_nodes, rstep_map, red_tokens, ancestors=None, carr
     return held
 
 
+def records_in_use(carried, rstep_map) -> dict:
+    """The entries of ``carried`` (``streaming.streamed``) that a candidate uses: those
+    with a loop the candidate steps. A tiling that holds every loop of a record whole
+    reads the value finished, as it would without the record, which it does not consult.
+    """
+
+    def steps(node):
+        return node in rstep_map and (
+            _get_rstep_for_axis(node, rstep_map[node]) < node.raxis[0].dom.extent
+        )
+
+    return {full: loops for full, loops in (carried or {}).items()
+            if any(steps(node) for node in loops)}
+
+
 def _refuse_carried_out_of_step(ordered_nodes, rstep_map, carried):
     """A carried full-extent value steps with the loop that carries it, or not at all.
 
     The loop of its descendants has one counter. A max that is stepped differently from
     a descendant that iterates would be taken over the wrong slices; a max that is not
     stepped while a descendant iterates would be the max of one slice, used as if it
-    were the max of the row.
+    were the max of the row. A record none of whose loops the tiling steps is not in use
+    (``records_in_use``).
     """
-    for full, loops in (carried or {}).items():
+    for full, loops in records_in_use(carried, rstep_map).items():
         full = next((n for n in ordered_nodes if n == full), None)
         if full is None or full not in rstep_map:
             continue
@@ -1723,6 +1739,14 @@ def apply_tiling(cand: List) -> List[Graph]:
 
     # remove the split ops and extract the split extent if applicable
     split_extent, flat_graph = _extract_split_extent(cand.flat_graph)
+    # A served record that this tiling does not use is dropped off the clone it schedules,
+    # which then builds as it would without it (``records_in_use``).
+    carried = _scheduled_axes(cand.flat_graph).carried
+    if carried:
+        in_use = records_in_use(carried, cand.rstep_map)
+        for node in flat_graph.nodes:
+            if node in carried and node not in in_use:
+                node.streaming = None
 
     # extract flat graph info and initialize the main graph
     graphs = {"main": flat_graph}
@@ -2060,7 +2084,7 @@ def apply_tiling(cand: List) -> List[Graph]:
     _normalize_main_reduction_axes(graphs["main"])
 
     if any(getattr(n, "streaming", None) is not None for n in ordered_nodes):
-        # A full-extent value with a proven update rule (``schedule.streaming``): where its
+        # A full-extent value with an update rule (``schedule.streaming``): where its
         # dim ended up looped, it becomes carried state and each accumulator under it gets
         # its repair -- if the rule was derived for this candidate's flat graph. Here, where
         # the tiers are final; lazy: the assembly is not even imported for a graph without one.

@@ -13,7 +13,7 @@ scheduler proposes for it (``cleave.ir.update_rule.Obstacle``), whatever the red
 
   combine   the solo graph with its loop state substituted: the full-extent value becomes
             ``M = combine_i m_i`` over the split axis (its own reducer), each accumulator becomes
-            ``sum_i repair(acc_i, m_i, M)`` with the PROVEN repair (the factor of the
+            ``sum_i repair(acc_i, m_i, M)`` with the searched repair (the factor of the
             ``Streaming`` record with ``m := m_i``, ``m' := M``), and everything behind the
             accumulators is the solo graph's own (the final divide). Built at the IR level.
 
@@ -204,7 +204,7 @@ def split_position(solo, full: str, partial) -> int:
 
 def combine_graph(solo, full: str, rules: tuple, split_factor: int, split_pos: int,
                   out_dtype: str):
-    """The combine of a split pair, from the solo flat graph ``solo`` and the proven repair.
+    """The combine of a split pair, from the solo flat graph ``solo`` and the searched repair.
 
     ``rules``: ``((accumulator, factor expression), ...)`` of the ``Streaming`` record, in
     boundary order. ``split_pos``: where the split axis sits in the state tensors (after

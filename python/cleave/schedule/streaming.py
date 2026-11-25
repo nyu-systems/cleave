@@ -4,45 +4,25 @@ A reduction over a dim whose operand is computed from another reduction over tha
 cannot simply be looped: every iteration would need the finished value of the other one
 (the row max of ``exp(x - max(x)) / sum(...)``, the sum of ``exp(x - sum(x))``, the sum of
 squares of an RMS norm in front of a contraction over the normed dim). The policy pins such
-a reduction to its full extent, and a row longer than one tile has no tiling. Which op the
-ancestor is plays no part in finding the pair: it is the overlap of their reduced dims.
+a reduction to its full extent, and a row longer than one tile has no tiling.
 
-Every such pair is a *conflict* (:func:`obstacles`, one ``Obstacle`` per ancestor). It can
-be streamed when all of this holds:
+Every such pair is a *conflict* (:func:`obstacles`, one ``Obstacle`` per ancestor: the
+ancestor and the reductions under it that reduce a dim it reduces). Which op the ancestor
+or its descendants are plays no part: it is the overlap of their reduced dims. Every
+conflict goes to the update search (``cleave.pipeline.update``), which tests candidate
+updates against the program itself; one it finds no rule for keeps its pin.
 
-  0. the ancestor's class declares how it is carried (``combine``, ``carry_init``): its
-     value over a prefix of the dim and its value over the next tile combine to its value
-     over both;
-  1. it reduces one axis;
-  2. it and every descendant reduction it overlaps reduce the same tensor dim (one axis
-     each, of one extent, the descendant's over at least the ancestor's provenance), so
-     one loop counter steps all of them;
-  3. no overlapped descendant is itself an ancestor of another one over that dim (that
-     needs two passes: the traced order ``(exp / sum) @ v``);
-  4. nothing computed from the ancestor on the way to the descendants is read elsewhere;
-  5. every overlapped descendant accumulates by addition from zero
-     (``update_rule.accumulates``): the repair multiplies what such an accumulator holds,
-     and nothing else is modelled by the proof (a max of the scaled value is not).
-
-A conflict that fails condition k is refused with its text (``Obstacle.refused``) and keeps
-its pin; the tests call those texts T0 to T5 (T3: two passes over the row, T4: a value of
-the ancestor read elsewhere, T5: ``pipeline.update.texts.T5``). The update search may refuse
-it as well (``pipeline.update.texts``). A step map in which the carried value does not
-step with the loop that carries it is refused as well
-(``tiling._refuse_carried_out_of_step``): stepped by another step than a descendant that
-iterates (C1 in the tests), or stepped while a descendant that reads its finished value is
-not (C2).
-
-It is *served* where, in addition, an update rule was found and PROVEN for every
-overlapped descendant (``cleave.pipeline.update``): the full-extent node carries a
-``Streaming`` record (``cleave.ir.update_rule``) whose key is the key of the very graph it
-sits on (:func:`streamed`). Then the policy lets the descendants step (no pin), steps the
-full-extent value with them, and ``apply_tiling`` builds the one loop it always built; the
-tilings that hold the dim whole stay candidates too. :func:`assemble`, called at the tail of
-``apply_tiling``, makes the full-extent value carried state (starting at its class's
-``carry_init``) and puts the proven repair in front of each accumulator through the
+It is *served* where an update rule was found for every descendant: the full-extent node
+carries a ``Streaming`` record (``cleave.ir.update_rule``) whose key is the key of the very
+graph it sits on (:func:`streamed`). Then the policy lets the descendants step (no pin),
+steps the full-extent value with them, and ``apply_tiling`` builds the one loop it always
+built; the tilings that hold the dim whole stay candidates too. :func:`assemble`, called at
+the tail of ``apply_tiling``, makes the full-extent value carried state (starting at its
+class's ``carry_init``) and puts the repair in front of each accumulator through the
 loop-carried mechanism (``GraphNode.carry``, ``Graph.lag_nodes``, ``Graph.accum_scale``).
-Every other conflict keeps its pin and its refusal.
+A tiling that cannot carry it is dropped (``StreamingRefused``, and
+``tiling._refuse_carried_out_of_step``: a carried value stepped differently from a
+descendant that iterates, or stepped while one that reads its finished value is not).
 
 A graph without a record never gets past the first line of :func:`streamed`: the policy and
 the assembly are inert for it.
@@ -59,7 +39,7 @@ from ..ir.graph import AccumEdge, ComputeOpNode, Graph, Iterator
 from ..ir.graph_utils import edit_graph, graph_tiers, tmap_by_name
 from ..ir.ops import Copy, Exp, Matmul, wire_input
 from ..ir.rolling import STAT_DTYPE, build_expression, check_expression
-from ..ir.update_rule import Obstacle, Streaming, accumulates, loop_key
+from ..ir.update_rule import Obstacle, Streaming, loop_key
 
 __all__ = [
     "FOREIGN_RECORD", "Obstacle", "Site", "Streaming", "StreamingRefused", "assemble",
@@ -77,19 +57,11 @@ class StreamingRefused(ScheduleRejected):
 # ----------------------------------------------------------------------------- detection
 
 
-def _axis_tokens(red_tokens, node):
-    tokens = red_tokens.get(node)
-    return tokens[0] if tokens else set()
-
-
 def obstacles(ordered_nodes, red_tokens, ancestors) -> list:
-    """Every reduction conflict of a flat graph, classified, whatever its ops.
-
-    A conflict is an ancestor reduction and the descendant reductions that reduce a dim it
-    reduces: the overlap the policy pins by (``DefaultPolicy._build_reduction_axis_overlap_
-    pairs``, any axis of the ancestor against any axis of the descendant). Each one is an
-    ``Obstacle``; ``Obstacle.refused`` says why it cannot be streamed (it then keeps its
-    pin, as every conflict did before). ``red_tokens`` is ``build_reduction_axis_provenance``,
+    """Every reduction conflict of a flat graph, whatever its ops: per ancestor reduction,
+    the descendant reductions that reduce a dim it reduces -- the overlap the policy pins by
+    (``DefaultPolicy._build_reduction_axis_overlap_pairs``, any axis of the ancestor against
+    any axis of the descendant). ``red_tokens`` is ``build_reduction_axis_provenance``,
     ``ancestors`` is ``tiling.reduction_ancestors``; both are what the policy already has.
     """
     reductions = [n for n in ordered_nodes if n in red_tokens and len(n.raxis) > 0]
@@ -103,83 +75,9 @@ def obstacles(ordered_nodes, red_tokens, ancestors) -> list:
             if d is not full and full in ancestors.get(d, ()) and any(
                 a & t for a in axes for t in red_tokens[d] if t)
         ]
-        if not loops:
-            continue
-        tokens = _axis_tokens(red_tokens, full)
-        refused = _not_carried(full)
-        if not refused and len(full.raxis) != 1:
-            refused = f"{full.name} reduces {len(full.raxis)} axes; one is carried"
-        for d in loops:
-            if refused:
-                break
-            # A contraction ties the dim of its other operand to the same axis (the rows of
-            # V under the keys of the scores), so the descendant's axis may run over more
-            # source dims than the max's: it has to run over ALL of the max's.
-            if len(d.raxis) != 1 or not tokens <= _axis_tokens(red_tokens, d) \
-                    or int(d.raxis[0].dom.extent) != int(full.raxis[0].dom.extent):
-                refused = (f"{d.name} does not reduce the whole dim {full.name} reduces "
-                           "along one axis of the same extent; one loop counter cannot "
-                           "step both")
-        for d in loops:
-            if refused:
-                break
-            inner = [a for a in loops if a is not d and a in ancestors.get(d, ())]
-            if inner:
-                refused = (f"{d.name} reads {inner[0].name}, a finished reduction over the "
-                           f"dim {full.name} reduces: that needs two passes over the row")
-        if not refused:
-            refused = _read_outside(full, loops, ancestors)
-        for d in loops:
-            if refused:
-                break
-            refused = _not_a_sum(full, d)
-        found.append(Obstacle(full.name, tuple(d.name for d in loops), refused))
+        if loops:
+            found.append(Obstacle(full.name, tuple(d.name for d in loops)))
     return found
-
-
-def _not_carried(full) -> str:
-    """Why the value of ``full`` cannot be carried across a loop, or ``""``: its class
-    declares how its value over a prefix and its value over the next tile combine
-    (``combine``) and where the carried value starts (``carry_init``)."""
-    if getattr(type(full), "combine", None) is not None:
-        return ""
-    return (f"{full.name} is a {type(full).__name__}: it declares no combine of its value "
-            "over a prefix and over the next tile, so it cannot be carried across a loop")
-
-
-def _not_a_sum(full, d) -> str:
-    """Why ``d`` cannot accumulate under a carried ``full``, or ``""``
-    (``update_rule.accumulates``)."""
-    if accumulates(d):
-        return ""
-    return (f"{d.name} is a {type(d).__name__}: the reductions that loop under {full.name} "
-            "must be sums or matmuls that start at zero")
-
-
-def _read_outside(full, loops, ancestors) -> str:
-    """Why a value computed from ``full`` on the way to ``loops`` cannot stay inside their
-    loop, or ``""``: it has a reader that is not on the way to any of them. That reader
-    would need every per-iteration value at once (a softmax that is returned itself: the
-    exp is divided by its own finished sum). Readers of ``full`` itself are allowed: the
-    finished max may be returned."""
-    inside = set()
-    for d in loops:
-        inside.update(n.name for n in ancestors.get(d, ()))
-        inside.add(d.name)
-    stack, seen = [full], set()
-    while stack:
-        n = stack.pop()
-        for e in n.outputs:
-            reader = e.dst_node
-            if n is not full and reader.name not in inside:
-                return (f"{n.name}, computed from {full.name} for every element of the "
-                        f"looped dim, is also read by {reader.name}, which is not summed "
-                        "over that dim: that needs two passes over the row")
-            if reader.name in inside and id(reader) not in seen and not any(
-                    reader is d for d in loops):
-                seen.add(id(reader))
-                stack.append(reader)
-    return ""
 
 
 def _honoured(record, flat_graph, full: str, loops: tuple) -> bool:
@@ -189,9 +87,8 @@ def _honoured(record, flat_graph, full: str, loops: tuple) -> bool:
 
 
 def streamed(ordered_nodes, red_tokens, ancestors, flat_graph=None) -> dict:
-    """``{full-extent node: [looped descendants]}`` for the obstacles of a flat graph that
-    are served: classified as streaming AND carrying a proven rule for every descendant,
-    derived for this very graph.
+    """``{full-extent node: [looped descendants]}`` for the conflicts of a flat graph that
+    are served: carrying a rule for every descendant, derived for this very graph.
 
     ``ordered_nodes`` are the op nodes of ``flat_graph`` (or of a clone of it); the record
     is honoured only where its loops are the obstacle's and its key is
@@ -206,7 +103,7 @@ def streamed(ordered_nodes, red_tokens, ancestors, flat_graph=None) -> dict:
     served = {}
     for ob in obstacles(ordered_nodes, red_tokens, ancestors):
         record = getattr(by_name[ob.full], "streaming", None)
-        if ob.refused or record is None:
+        if record is None:
             continue
         if not _honoured(record, flat_graph, ob.full, ob.loops):
             refusals = getattr(flat_graph, "streaming_refusals", None)
@@ -366,6 +263,8 @@ def _locate(tier, owner, full, record, flat_graph=None):
     if owner is None:
         return None
     where = owner.name
+    if not hasattr(full, "position_in"):
+        raise _refused(full, "the loop carries the value of a reduction of one operand")
     edge = full.inputs[0]
     operand = _stored_tile(tier, edge)
     # The tile is over the dims of the value the max reads in this tier. That is not the
@@ -405,7 +304,7 @@ def _locate(tier, owner, full, record, flat_graph=None):
     for acc in under:
         if acc.name not in rules:
             raise _refused(full, f"accumulator {acc.name} of {where} is computed from it but "
-                                 "has no proven update rule")
+                                 "has no update rule")
         if getattr(acc, "accum_init", None) is not None:
             raise _refused(full, f"accumulator {acc.name} starts at {acc.accum_init}; a "
                                  "repaired accumulator must start at zero")
@@ -539,6 +438,12 @@ def assemble(tiled: Graph, flat_graph=None) -> Graph:
         record = full.streaming
         site = _locate(tier, owner, full, record, flat_graph)
         if site is None:
+            if any(full is n for n in tier.accum_nodes):
+                # ``carry_early`` registered it from its step, but the loop does not step
+                # its dim (the tile holds that dim whole): carried, it would fold slices of
+                # other values across the iterations.
+                raise _refused(full, f"the loop of {owner.name} carries it but does not step "
+                                     "the dim it reduces")
             continue
         if not _honoured(record, flat_graph, full.name, record.loops):
             raise _refused(full, FOREIGN_RECORD)

@@ -20,11 +20,13 @@ rolling kernels that were wrong:
 Every candidate goes through the default build. Anything but a ``ScheduleRejected``
 propagates: a refused tiling is a result, a crash is a bug.
 
-Who refuses is pinned per case as a histogram of reasons. The classification refuses the
-last three (T5, T3, T3): no record is ever written for them, the pins stay. The first
-three are classified as streaming obstacles: there the engine finds no rule
-(``tests/update``), and the assembly refuses even a record put on them by hand -- the
-refusals below are the assembly's, on records that a bug in the engine would have to write.
+Who refuses is pinned per case as a histogram of reasons. For the last three the engine
+finds no rule (no update of the accumulator form reproduces the flat graph on the prefixes
+of the dim): no record is written for them, the pins stay. The first three get a record
+by hand (the engine gives them none either: ``tests/update``), and the assembly refuses
+every tiling that uses it -- the refusals below are the assembly's, on records that a bug
+in the engine would have to write. A tiling that holds every loop of a record whole does
+not use it (``tiling.records_in_use``): it builds as it would without the record.
 """
 
 import re
@@ -44,9 +46,6 @@ from cleave.schedule import apply_tiling, search_tiling
 from cleave.schedule.tiling import schedule_kernel
 
 from tests import _explicit_softmax as X
-
-# the traced order's row sum: a conflict of its own, which the engine refuses (E14)
-SUM_UNDER = "is computed from"
 
 OUTSIDE = (ScheduleRejected,
            r"\w+ is computed per iteration of GraphNode_\w+ but also read by \w+ outside it")
@@ -89,12 +88,12 @@ CASES = {
     "self_weighted": (X.self_weighted, dict(K=4096, N=128), (None,), 0,
                       [(ONE_DIM_TWO_AXES, 8), (ALSO_ITS_TRAILING_DIM, 4)]),
     "max_normalized": (X.max_normalized, dict(R=256, C=4096, D=64),
-                       ("must be sums or matmuls that start at zero",), 0, []),
-    "sum_next_to_exp": (X.sum_next_to_exp, dict(R=256, C=4096), ("two passes", SUM_UNDER), 14,
+                       (X.NO_RULE,), 0, []),
+    "sum_next_to_exp": (X.sum_next_to_exp, dict(R=256, C=4096), (X.NO_RULE, X.NO_RULE), 14,
                         [(UNIT_ROW, 7)]),
     # (64 query rows: no 256-thread tiling, TCPolicy._register_operand_layout_conflict)
     "unscaled_attention": (X.unscaled_attention, dict(H=32, SQ=64, SKV=256, D=64),
-                           ("two passes", SUM_UNDER), 4, [(OUTSIDE, 12)]),
+                           (X.NO_RULE, X.NO_RULE), 4, [(OUTSIDE, 12)]),
 }
 
 
@@ -161,9 +160,9 @@ def test_no_looped_kernel(name, force):
 
 
 def test_search_the_engine_gives_the_trailing_axis_no_rule():
-    """What keeps a wrong record off ``column_weighted``, which the classification lets
-    through: the engine, run by lowering on the searched graphs, proves no update for the
-    value matmul (its rows are not the max's), so the max keeps its pin with that reason.
+    """What keeps a wrong record off ``column_weighted``: the engine, run by lowering on
+    the searched graphs, finds no update of the value matmul that reproduces the flat graph
+    (its rows are not the max's), so the max keeps its pin with that reason.
     (The shared sum of ``two_softmaxes`` is refused by the assembly whatever the engine
     says: ``test_shared_sum_is_never_repaired_twice``.)"""
     import cleave.lang as cl
@@ -182,7 +181,7 @@ def test_search_the_engine_gives_the_trailing_axis_no_rule():
 
 
 def test_shared_sum_is_never_repaired_twice():
-    """The two records, each proven on its own, keep one factor per accumulator: the shared
+    """The two records, each put on by hand, keep one factor per accumulator: the shared
     sum is refused in every tiling that loops it, whichever max is looked at first."""
     ir = X.streamed_ir(X.two_softmaxes, dict(R=256, C=4096), None, None)
     first, second = X.obstacles_of(ir)
@@ -199,15 +198,15 @@ def test_shared_sum_is_never_repaired_twice():
     assert {s.full for _, sites, _ in kernels for s in sites} <= {first.full}
 
 
-def test_max_of_the_shifted_exp_is_never_repaired(monkeypatch):
-    """Without the classification's refusal (T5 taken away), the record reaches the
-    assembly, which sees an accumulator that starts at ``-inf`` and refuses to repair it."""
-    monkeypatch.setattr(stream, "_not_a_sum", lambda full, d: "")
+def test_max_of_the_shifted_exp_is_never_repaired():
+    """A record put on by hand (the engine finds none) reaches the assembly, which sees an
+    accumulator that starts at ``-inf`` and refuses to repair it: no kernel carries the
+    max, and every tiling that loops it is refused for that reason."""
     fn, shapes, _, _, _ = CASES["max_normalized"]
     ir = X.streamed_ir(fn, shapes)
     outer, inner = (n.name for n in X.maxes(ir))
     kernels, reasons = _census(search_tiling(ir, topk=1000))
-    assert not kernels
+    assert all(sites == [] for _, sites, _ in kernels)
     starts = (stream.StreamingRefused,
               rf"{outer}: accumulator {inner} starts at -inf; a repaired accumulator must "
               r"start at zero")

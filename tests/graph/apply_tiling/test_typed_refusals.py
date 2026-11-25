@@ -806,15 +806,16 @@ def test_group_members_on_different_axes_are_not_started_together():
 
 
 def normalized_and_plain(x: cl.Tensor["R", "C"], w: cl.Tensor["C", "D"]):
-    """softmax(x) @ w + exp(x) @ w: both matmuls contract the columns of exp(x); the first
-    one behind the row sum that normalizes them."""
+    """(e - mean(e)) @ w + e @ w for e = exp(x): both matmuls contract the columns of e; the
+    first one behind the row sum of the mean that centers them, which no update of the form
+    ``a * F + r`` repairs (it would need the sum of ``w``), so that conflict keeps its pin."""
     e = cl.exp(x)
-    return (e / cl.sum(e, -1, keepdim=True)) @ w + e @ w
+    return (e - e.mean(-1, keepdim=True)) @ w + e @ w
 
 
 def test_a_sibling_pinned_to_its_whole_axis_is_not_moved_and_moves_nobody():
-    """The full-extent exclusion. ``softmax(x) @ w`` contracts the axis its own ancestor,
-    the row sum, reduces, so the policy pins it to the whole axis
+    """The full-extent exclusion. ``(e - mean(e)) @ w`` contracts the axis its own ancestor,
+    the row sum, reduces, and has no update rule, so the policy pins it to the whole axis
     (``_full_extent_reduction_axis_ids``). ``exp(x) @ w`` next to it contracts the same
     axis of the same ``exp``, is in its group, and is not behind the sum. The pinned one
     stays at its extent; the other is not pulled up to it and keeps its own first step."""
