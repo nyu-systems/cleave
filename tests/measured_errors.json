@@ -1109,6 +1109,16 @@
    "validated": 108
   }
  ],
+ "test:sum_shifted": [
+  {
+   "abs": 0.0001220703125,
+   "absolute": false,
+   "dtype": "float16",
+   "rel": 0.0008810572908259928,
+   "seeds": 3,
+   "validated": 60
+  }
+ ],
  "test:swiglu_graph": [
   {
    "abs": 32.0,
