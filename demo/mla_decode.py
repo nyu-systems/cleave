@@ -2,7 +2,7 @@
 K and V, and the rope parts add a second Q K^T term. Scale is 1/sqrt(128) (the nope head dim).
 
 The softmax is exact (see demo/mha_decode.py): the loop over S_KV carries the max and
-repairs its row sum and its value accumulator by the proven factor ``exp(m - m')`` at every
+repairs its row sum and its value accumulator by the found factor ``exp(m - m')`` at every
 iteration. The value accumulator of a block is 64 x 512 (256 elements a thread at 128
 threads), so that repair is a pass over it per iteration; the best kernel takes about
 280 us on an H100. (A form that repaired only when the max moved took 190 us, but no such

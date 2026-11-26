@@ -244,13 +244,14 @@ def tilings(ir):
 
 
 def test_a_graph_without_a_record_is_scheduled_as_before(monkeypatch):
-    """No record: nothing is served, nothing is classified, no filter is installed."""
+    """No record: nothing is served, its conflicts are not even listed, no filter is
+    installed."""
     ir = lowered(flash_by_hand, SHORT)
 
-    def classify(*args, **kwargs):
-        raise AssertionError("a graph without a record was classified")
+    def listed(*args, **kwargs):
+        raise AssertionError("the conflicts of a graph without a record were listed")
 
-    monkeypatch.setattr(streaming, "obstacles", classify)
+    monkeypatch.setattr(streaming, "obstacles", listed)
     assert served(ir) == {} and carried_reductions(ir) == {}
     assert not hasattr(ir, "streaming_refusals")
     assert streaming.streaming_accept(ir) is None

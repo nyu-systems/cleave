@@ -3,7 +3,7 @@
 ``cl.softmax`` is the exact softmax, exp(s - max(s)) / sum, and records its max: an ordinary
 reduction of the searched graph. A tile that holds a whole S_KV row takes the row max in
 place; where a tiling loops over the row, the loop carries the max and repairs what it has
-accumulated with an update rule that is searched for and proven on the program's own graph
+accumulated with an update rule that is searched for and tested on the program's own graph
 (the online softmax of FlashAttention, found rather than written). At S_KV=4096 every plan
 is of the second kind; ``--SKV 256`` has both. The kernels are validated on adversarial
 logits as well (x100, increasing / decreasing along the keys, a spike on the last key,
@@ -13,7 +13,7 @@ Split over the keys (the split-KV of FlashDecoding): the search does not split a
 max reduces the split dim, so the split is built from the loop state of the flash graph.
 Each partial returns, for its own slice of the keys, the accumulators and the max they are
 relative to (float32 at the cut); the combine takes the max over the splits, repairs each
-partial by the proven update rule (``acc_i * exp(m_i - max_i m_i)``), sums over the splits
+partial by the found update rule (``acc_i * exp(m_i - max_i m_i)``), sums over the splits
 and divides. Each stage gets its own derivation, so each loops where a tiling lets it: the
 partial over the keys of its split, the combine over the splits. The traced-order graph has
 no such pair (it needs two passes over the row), and the report says so. The tolerance is

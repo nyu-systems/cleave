@@ -186,8 +186,8 @@ def test_a_graph_without_a_record_never_reaches_the_assembly(monkeypatch):
 
 
 def test_the_engine_is_not_even_imported_for_a_graph_without_a_record(tmp_path):
-    """Tiling a graph is the scheduler's business: neither the update search nor its solver
-    is loaded for it, with or without a max in the graph."""
+    """Tiling a graph is the scheduler's business: the update search is not loaded for it,
+    with or without a max in the graph."""
     script = (
         "import sys\n"
         "from cleave.schedule import apply_tiling, search_tiling\n"
@@ -202,7 +202,7 @@ def test_the_engine_is_not_even_imported_for_a_graph_without_a_record(tmp_path):
         "            apply_tiling(c)\n"
         "        except Exception as e:\n"
         "            assert type(e).__name__ == 'ScheduleRejected', e\n"
-        "loaded = [m for m in ('cleave.pipeline.update', 'z3') if m in sys.modules]\n"
+        "loaded = [m for m in ('cleave.pipeline.update',) if m in sys.modules]\n"
         "assert not loaded, loaded\n"
     )
     env = dict(os.environ, CUDA_VISIBLE_DEVICES="", CLEAVE_CACHE_ROOT=str(tmp_path))

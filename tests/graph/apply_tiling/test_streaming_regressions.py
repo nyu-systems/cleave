@@ -74,7 +74,7 @@ UNIT_ROW = (ScheduleRejected,
             r"sub_\d+ indexes N dims but its tile \(N, N\) is stored with N: a unit extent that "
             r"is not a batch dim is squeezed out of the tile")
 
-# name -> (program, shapes, expectation per obstacle (None: classified, gets a record),
+# name -> (program, shapes, expectation per obstacle (None: gets a record by hand),
 #          kernels built (all one tile), refusals as [(who, count)])
 CASES = {
     "two_softmaxes": (X.two_softmaxes, dict(R=256, C=4096), (None, None), 1,

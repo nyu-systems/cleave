@@ -2,7 +2,7 @@
 
 For every program of the design's list the recipe re-instantiates the flat graph with a
 signature equal to the program's (without dtypes in float32, with them in the program's
-dtype) and the obstacle derives a rule; a graph that cannot be built again says why (E1-E4).
+dtype) and the obstacle derives a rule; a graph that cannot be built again says why (no test).
 CPU only; ``test_search_*`` run the superoptimizer first.
 """
 
