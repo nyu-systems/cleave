@@ -38,8 +38,11 @@ class Settings:
     progress_log: bool = False
     test_seed: Optional[int] = None
     cache_root: Optional[Path] = None
-    # Append one JSON line per validated kernel (its measured error) to this file.
+    # Append one JSON line per validated kernel (its measured error) to this file ...
     validation_log: Optional[Path] = None
+    # ... under this label: whoever runs the kernels says what they are (an operator, a
+    # test). Empty when nobody did.
+    validation_context: str = ""
 
     @classmethod
     def from_env(cls, env: Optional[Mapping[str, str]] = None) -> "Settings":
@@ -53,4 +56,5 @@ class Settings:
             test_seed=None if seed is None else int(seed) & 0xFFFFFFFF,
             cache_root=get_cleave_cache_root(env),
             validation_log=Path(log).expanduser() if log else None,
+            validation_context=env.get("CLEAVE_VALIDATION_CONTEXT", ""),
         )

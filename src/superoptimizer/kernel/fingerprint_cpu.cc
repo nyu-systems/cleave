@@ -645,6 +645,38 @@ void compute_declared_input_fingerprint(Graph const &host,
             store.get_buffer(input.output_tensors[0]));
 }
 
+void fingerprint_graph(Graph const &g) {
+  int input_id = 0;
+  for (auto const &op : g.operators) {
+    if (op->op_type == cleave_superoptimizer::type::KN_INPUT_OP) {
+      auto *input = static_cast<KNInputOp *>(op);
+      if (input->declaration) {
+        compute_declared_input_fingerprint(g, *input);
+      } else {
+        input->fingerprint(input_id);
+      }
+      input_id++;
+    } else {
+      op->fingerprint();
+    }
+  }
+}
+
+std::vector<std::vector<cleave_superoptimizer::type::FingerprintType>>
+    output_fingerprints(Graph const &g) {
+  fingerprint_graph(g);
+  std::vector<std::vector<cleave_superoptimizer::type::FingerprintType>> out;
+  for (KNOperator const *op : g.operators) {
+    if (op->op_type == cleave_superoptimizer::type::KN_OUTPUT_OP) {
+      DTensor const &t = op->input_tensors[0];
+      FingerprintType const *src = get_store().get_buffer(t);
+      out.emplace_back(src, src + t.num_elements());
+    }
+  }
+  clear_thread_fingerprints();
+  return out;
+}
+
 cleave_superoptimizer::type::FingerprintType *
     CpuFingerprintEngine::Store::get_buffer(DTensor const &tensor) {
   auto &buffer = fingerprints[tensor.guid];

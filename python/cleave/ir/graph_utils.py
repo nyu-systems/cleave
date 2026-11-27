@@ -78,3 +78,130 @@ def unlock_graph(graph):
     for node in graph.nodes:
         if isinstance(node, GraphNode):
             unlock_graph(node.graph)
+
+
+def graph_tiers(graph):
+    """``graph`` and every loop tier nested in it, outermost first, as ``(tier, owner)``.
+
+    ``owner`` is the ``GraphNode`` that holds the tier (``None`` for ``graph`` itself).
+    """
+    from .graph import GraphNode
+
+    tiers = [(graph, None)]
+    for tier, _ in tiers:
+        tiers.extend((n.graph, n) for n in tier.nodes if isinstance(n, GraphNode))
+    return tiers
+
+
+def boundary_order(nodes):
+    """``nodes`` sorted by their ``Boundary.index``; None when none of them carries one.
+
+    For a partial's outputs or a combine's placeholders this is the order of the tensors
+    crossing the cut. A hand-built graph has no records and gets None: its caller falls
+    back to whatever it did before the record existed. Records on only some of the nodes,
+    or one index used twice, mean a rewrite added a tensor without saying which one it
+    is; that is an error here, not a reason to guess.
+    """
+    nodes = list(nodes)
+    records = [getattr(node, "boundary", None) for node in nodes]
+    if all(record is None for record in records):
+        return None
+    names = [node.name for node in nodes]
+    if any(record is None for record in records):
+        raise ValueError(
+            f"boundary records on only some of {names}: "
+            f"{[None if r is None else tuple(r) for r in records]}"
+        )
+    indices = [record.index for record in records]
+    if len(set(indices)) != len(indices):
+        raise ValueError(f"boundary index used twice among {names}: {indices}")
+    return [node for _, node in sorted(zip(indices, nodes), key=lambda pair: pair[0])]
+
+
+def boundary_signature(nodes):
+    """``((index, role, logical shape, dtype), ...)`` by index, or None without records.
+
+    Two sides of a cut -- a partial's outputs and a combine's placeholders -- carry the
+    same tensors exactly when their signatures are equal.
+    """
+    ordered = boundary_order(nodes)
+    if ordered is None:
+        return None
+    return tuple(
+        (
+            node.boundary.index,
+            node.boundary.role,
+            tuple(int(extent) for extent in node.get_shape(0)),
+            str(node.get_dtype(0)),
+        )
+        for node in ordered
+    )
+
+
+# Every dict-typed ``Graph`` field is in exactly one of these two lists (a test checks it).
+# Node-keyed dicts have to be rebuilt after a structural edit (see ``rekey_graph``);
+# name-keyed ones need nothing.
+_NODE_KEYED_FIELDS = ("tmap", "tinfo_map", "tlayout_map", "accum_scale", "accumulation")
+_NAME_KEYED_FIELDS = ("binding", "smap", "pass_configs", "stored_layouts")
+
+
+def rekey_graph(graph):
+    """Rebuild every node-keyed dict of every tier from its own items, in place.
+
+    ``GraphNode`` hashes its inner node list and ``OutputNode`` the node it reads, so a
+    structural edit of a tier (a node added to a loop, an output rewired) moves the hash
+    of the ``GraphNode`` that owns the tier and of every ``GraphNode`` around it. A dict
+    filled before the edit then still *holds* those keys but can no longer *find* them.
+    Iterating a dict does not hash, so the stale dict can be read out in full and
+    refilled under the current hashes: nothing is lost, and no entry has to be looked up
+    while it is unfindable.
+    """
+    for tier, _ in graph_tiers(graph):
+        for name in _NODE_KEYED_FIELDS:
+            value = getattr(tier, name)
+            for mapping in value if isinstance(value, list) else [value]:
+                if not isinstance(mapping, dict) or not mapping:
+                    continue
+                items = list(mapping.items())
+                mapping.clear()
+                mapping.update(items)
+                # One node stored twice (once under a hash it no longer has) collapses,
+                # the later entry winning. Two DIFFERENT nodes must never collapse.
+                assert len(mapping) == len({id(k) for k, _ in items}), (
+                    f"rekey_graph: two distinct `{name}` keys became equal after the edit"
+                )
+
+
+class edit_graph:
+    """``with edit_graph(tiled):`` -- the one way to change a graph after ``lock_graph``.
+
+    ``apply_tiling`` returns a locked graph: its node-keyed dicts may hold keys whose
+    hash depends on the structure (see :func:`rekey_graph`), and ``GraphNode.__hash__``
+    refuses to run on an unlocked graph for that reason. A post-tiling rewrite therefore
+    works inside this block: the graph is unlocked on entry, and on exit it is locked
+    again and every node-keyed dict is rebuilt, so the caller gets back a graph that
+    satisfies the contract ``apply_tiling`` established.
+
+    Inside the block: look nodes up by *name* (``tmap_by_name``), never through a
+    node-keyed dict -- a key whose hash has moved is unfindable until the block exits.
+    Compute nodes and placeholders hash by name and are always safe to insert.
+    """
+
+    def __init__(self, graph):
+        self.graph = graph
+
+    def __enter__(self):
+        assert self.graph.locked, "edit_graph expects a locked (tiled) graph."
+        unlock_graph(self.graph)
+        return self.graph
+
+    def __exit__(self, exc_type, exc, tb):
+        lock_graph(self.graph)
+        if exc_type is None:
+            rekey_graph(self.graph)
+        return False
+
+
+def tmap_by_name(graph):
+    """``{node.name: Iterator}`` of one tier; safe to read while the graph is being edited."""
+    return {node.name: it for node, it in graph.tmap.items()}

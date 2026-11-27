@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Sequence
 
-from ..core.errors import SuperoptError
+from ..core.errors import SpecError, SuperoptError
 from . import cache
 from .config import SuperoptConfig
 
@@ -62,24 +62,43 @@ class SearchedGraph:
 
 
 class GraphSet(Sequence):
+    """The searched graphs of a program.
+
+    ``state_split``: the split the program asked for (``SuperoptConfig.split``) where a max
+    of the program reduces one of its dims. The search returns no valid split graph for a
+    flat graph with such a max in it, so it runs unsplit; a split of such a program is built
+    from the loop state of its solo graphs (``pipeline.plans._schedule_once``). ``()`` for
+    every other program, whose split graphs come from the search as they always did. Not
+    given, it is read off the graphs (``state_split_of``), so a set rebuilt from some of the
+    graphs of another -- a list, a slice, a comprehension -- keeps the split they carry.
+    """
+
     def __init__(self, graphs, program=None, config: SuperoptConfig | None = None, *,
                  max_ops: int | None = None, checkpoint: str | None = None,
-                 from_cache: bool = False, seconds: float = 0.0, parts: tuple = ()):
+                 from_cache: bool = False, seconds: float = 0.0, parts: tuple = (),
+                 state_split: tuple | None = None):
         self.graphs = list(graphs)
         self.parts = tuple(parts)  # per-output search: one GraphSet per output, in output order
         self.program, self.config, self.max_ops = program, config, max_ops
         self.checkpoint, self.from_cache, self.seconds = checkpoint, from_cache, seconds
+        self.state_split = tuple(state_split_of(self.graphs, program) if state_split is None
+                                 else state_split)
 
     def __len__(self):
         return len(self.graphs)
 
     def __getitem__(self, i):
+        if isinstance(i, slice):  # a part of the set is a set: it keeps what the set says
+            return self._with(self.graphs[i])
         return self.graphs[i]
 
     def filter(self, fn: Callable[[SearchedGraph], bool]) -> "GraphSet":
-        return GraphSet([g for g in self.graphs if fn(g)], self.program, self.config,
-                        max_ops=self.max_ops, checkpoint=self.checkpoint,
-                        from_cache=self.from_cache, seconds=self.seconds, parts=self.parts)
+        return self._with([g for g in self.graphs if fn(g)])
+
+    def _with(self, graphs) -> "GraphSet":
+        return GraphSet(graphs, self.program, self.config, max_ops=self.max_ops,
+                        checkpoint=self.checkpoint, from_cache=self.from_cache,
+                        seconds=self.seconds, parts=self.parts, state_split=self.state_split)
 
     @property
     def dtype(self) -> str:
@@ -97,16 +116,168 @@ class GraphSet(Sequence):
         return "\n".join([head] + [f"  {g.index}: {g.summary()}" for g in self])
 
 
+def state_split_of(graphs, program) -> tuple:
+    """The split to build from the loop state of ``graphs``: the split their search was
+    asked for, where every one is solo and a dim of it is one the search cannot split
+    (``state_split_dims``; what ``superoptimize`` records as ``GraphSet.state_split``);
+    ``()`` otherwise."""
+    splits = {tuple(g.split) for g in graphs}
+    if program is None or len(splits) != 1 or any(g.is_split or g.invalid_split for g in graphs):
+        return ()
+    (split,) = splits
+    return split if split and state_split_dims(program, split) else ()
+
+
+# The reductions the superoptimizer cannot split: it combines the partials of a split by
+# summing them, and these have no sum-combine. A split over a dim one of them reduces is
+# built from the loop state of the solo graph instead (``pipeline.plans.state_pair``), with
+# the reducer's own combine and the searched update rule. (A sum the search splits itself.)
+UNSPLIT_BY_SEARCH = ("reduce_max",)
+
+
+def state_split_dims(program, split) -> tuple[str, ...]:
+    """The dims of ``split`` that a record of ``program`` the search cannot split reduces
+    (``UNSPLIT_BY_SEARCH``: the softmax dim of ``cl.softmax``), in the order ``split``
+    names them."""
+    from ..frontend.tensor import Dim, split_names
+
+    names = split_names(split)
+    records = getattr(program, "_records", ())
+    values = getattr(program, "_values", {})
+    reduced = set()
+    for r in records:
+        if r.kind in UNSPLIT_BY_SEARCH:
+            dim = values[r.args[0]].dims[r.attr("dim")]
+            if isinstance(dim, Dim):
+                reduced.add(dim.name)
+    return tuple(n for n in names if n in reduced)
+
+
+def _unread_inputs(program) -> list[str]:
+    """The names of the inputs of ``program`` that no op and no output reads. An ``equals=``
+    input is none of them: the search may read it through its definition (the forward
+    output ``o`` of an attention backward, which the program itself does not read)."""
+    records = getattr(program, "_records", ())
+    read = {a for r in records if r.kind != "input" for a in r.args if isinstance(a, int)}
+    ids = [r.out for r in records if r.kind == "input"]
+    return [spec.name for spec, i in zip(program.inputs, ids)
+            if i not in read and getattr(spec, "equals", None) is None]
+
+
+def _returned_inputs(program) -> list[tuple[str, str]]:
+    """``(output name, input name)`` for every output of ``program`` that is an input."""
+    names = {r.out: r.attr("name") for r in getattr(program, "_records", ()) if r.kind == "input"}
+    return [(o.name, names[o.tensor.id]) for o in getattr(program, "outputs", ())
+            if o.tensor.id in names]
+
+
+def _returned_values_causes(program) -> list[str]:
+    """Outputs the search cannot reach as the program writes them.
+
+    The search counts as outputs the tensors nothing reads, and adds no op twice to the same
+    operands (an op is only added after every op with a smaller operand list). So a graph
+    has an output that another op also reads, or two outputs of one value, only where it
+    computes that value a second time in another form: ``x @ w`` returned next to
+    ``exp(x @ w)``, or returned twice, has no graph.
+    """
+    records = [r for r in getattr(program, "_records", ()) if r.kind != "output"]
+    by_out = {r.out: r for r in records}
+    keys = {}
+
+    def key(vid):
+        # one value per structure: two records of one op on equal operands are one value
+        if vid not in keys:
+            r = by_out.get(vid)
+            if r is None or r.kind == "input":
+                keys[vid] = ("input", vid)
+            else:
+                keys[vid] = (r.kind, tuple(key(a) if isinstance(a, int) else ("scalar", a)
+                                           for a in r.args), repr(r.attrs))
+        return keys[vid]
+
+    outputs = list(getattr(program, "outputs", ()))
+    read = {key(a) for r in records if r.kind != "input" for a in r.args if isinstance(a, int)}
+    causes, seen = [], {}
+    for o in outputs:
+        if by_out.get(o.tensor.id) is None or by_out[o.tensor.id].kind == "input":
+            continue
+        k = key(o.tensor.id)
+        if k in seen:
+            causes.append(f"outputs {seen[k]!r} and {o.name!r} are one value, and the search "
+                          "adds no op twice to the same operands, so it finds them only where "
+                          "it computes that value a second time in another form")
+        else:
+            seen[k] = o.name
+        if k in read:
+            causes.append(f"the value of output {o.name!r} is also read by another op, and the "
+                          "search counts as outputs only the tensors nothing reads and adds no "
+                          "op twice to the same operands, so it finds that output only where "
+                          "it computes it a second time in another form")
+    return causes
+
+
+def _no_graph(program, max_ops: int) -> str:
+    """Why the search returned no graph, as far as the program shows it."""
+    from ..frontend.tensor import Dim, extent
+
+    causes = []
+    values = getattr(program, "_values", [])
+    for r in getattr(program, "_records", ()):
+        if r.kind in ("reduce_sum", "reduce_max"):
+            dim = values[r.args[0]].dims[r.attr("dim")]
+            if extent(dim) == 1:
+                label = f"dim {dim.name}" if isinstance(dim, Dim) else f"axis {r.attr('dim')}"
+                causes.append(f"its {r.kind.removeprefix('reduce_')} over {label} reduces one "
+                              "element, and the search builds no reduction over a dim of one "
+                              "element")
+    causes += _returned_values_causes(program)
+    own = getattr(program, "op_count", 0)
+    if max_ops < own:
+        causes.append(f"max_ops={max_ops} is less than the program's own {own} ops (inputs "
+                      "and compute ops), so the search cannot reach its own graph")
+    return (f"{getattr(program, 'name', 'program')}: the search found no graph equal to the "
+            f"program within max_ops={max_ops}" + "".join(f"; {c}" for c in causes))
+
+
 def superoptimize(program, config: SuperoptConfig | None = None) -> GraphSet:
+    """Search the graphs equal to ``program``.
+
+    Raises ``SpecError`` for a program with an input that nothing reads (the search counts
+    every tensor that nothing reads as an output, so none of its graphs can equal the
+    program) or with an output that is an input (no op writes it), and ``SuperoptError``
+    when the search fails or finds no graph (with the cause where the program shows it: a
+    reduction over a dim of one element, a ``max_ops`` below the program's own size).
+    """
     import cleave.superoptimizer as csopt
     from ..lower.split import Rejected, _contains_split_ops, _renumber_graph, cut_split_graph
 
     config = config or SuperoptConfig()
+    program.can_split(config.split)  # SpecError on a bad split dim, whatever the search runs
+    name = getattr(program, "name", "program")
+    unread = _unread_inputs(program)
+    if unread:
+        what = (f"input {unread[0]!r} is" if len(unread) == 1
+                else f"inputs {', '.join(map(repr, unread))} are")
+        raise SpecError(
+            f"{name}: {what} read by no op; the search counts a tensor that nothing reads as "
+            "an output, so none of its graphs can equal the program (drop the input or read it)")
+    returned = _returned_inputs(program)
+    if returned:
+        raise SpecError(
+            f"{name}: " + ", ".join(f"output {o!r} is input {i!r}" for o, i in returned)
+            + "; no op writes such an output, so no kernel computes it (return a computed "
+            "value)")
     if config.resolve_per_output(program):
         return _superoptimize_per_output(program, config)
-    max_ops = config.resolve_max_ops(program)
+    # A split over a dim a reduction the search cannot split reduces (``UNSPLIT_BY_SEARCH``):
+    # the search would return no valid split graph, so it runs unsplit, on the budget and
+    # with the cache entry of the unsplit search, and the result says which split was asked
+    # for (all of it: the refusals of ``schedule`` name every dim that is not split).
+    state_split = config.split if state_split_dims(program, config.split) else ()
+    searched = config.replace(split=()) if state_split else config
+    max_ops = searched.resolve_max_ops(program)
     t0 = time.perf_counter()
-    tile_graph = program.to_tile_graph(split=config.split)  # SpecError on a bad split dim
+    tile_graph = program.to_tile_graph(split=searched.split)  # SpecError on a bad split dim
     try:
         symbolic, symbol_map = csopt.create_symbolic_tile_graph(tile_graph)
         search_cfg = symbolic.setup_search_config()
@@ -115,7 +286,7 @@ def superoptimize(program, config: SuperoptConfig | None = None) -> GraphSet:
             search_cfg.search_thread = int(config.threads)
         ckpt, from_cache = "", False
         if config.cache:
-            key = cache.superopt_key(program, max_ops, config.split, config.concat_matmul)
+            key = cache.superopt_key(program, max_ops, searched.split, config.concat_matmul)
             ckpt = str(cache.checkpoint_path(key))
             from_cache = _checkpoint_valid(symbolic, ckpt, config.concat_matmul, search_cfg)
         found = symbolic.search_tile_graph(ckpt, config.concat_matmul, False, search_cfg)
@@ -127,6 +298,8 @@ def superoptimize(program, config: SuperoptConfig | None = None) -> GraphSet:
         structures = [_renumber_graph(g.get_graph_structure()) for g in found]
     except Exception as e:  # noqa: BLE001
         raise SuperoptError(f"superoptimizer search failed: {type(e).__name__}: {e}") from e
+    if not structures:
+        raise SuperoptError(_no_graph(program, max_ops))
     graphs = []
     for i, s in enumerate(structures):
         cut = cut_split_graph(s) if _contains_split_ops(s) else None
@@ -135,7 +308,8 @@ def superoptimize(program, config: SuperoptConfig | None = None) -> GraphSet:
                                     program, config.split, invalid_split=rejected is not None,
                                     split_rejection=rejected))
     return GraphSet(graphs, program, config, max_ops=max_ops, checkpoint=ckpt or None,
-                    from_cache=from_cache, seconds=time.perf_counter() - t0)
+                    from_cache=from_cache, seconds=time.perf_counter() - t0,
+                    state_split=state_split)
 
 
 def _checkpoint_valid(symbolic, ckpt: str, concat: bool, search_cfg) -> bool:

@@ -58,6 +58,28 @@ Dims symbolic_inputs(std::vector<int> const &gaps) {
   return {dims.at(q.guid), dims.at(k.guid), dims.at(v.guid)};
 }
 
+// max(x, 1) and nothing else: x's reduced dim is tied to no other dim by
+// any grouping rule. It must still get a symbol of its own (it used to get
+// none, and building the symbolic graph aborted the process).
+bool lone_reduction_has_symbols() {
+  kn::Graph g;
+  DTensor x = g.new_input({64, 1024});
+  DTensor m = g.reduce_max(x, 1);
+  g.mark_output(m, /*infer_output_reducibility=*/false);
+  std::unordered_map<size_t, std::vector<int>> dims;
+  std::unique_ptr<kn::Graph> symbolic(g.create_symbolic_graph(&dims));
+  std::vector<int> const &s = dims.at(x.guid);
+  bool ok = s.size() == 2 && s[0] != s[1] && s[0] > 1 && s[1] > 1;
+  if (!ok) {
+    std::cerr << "lone reduction: x gets [";
+    for (int d : s) {
+      std::cerr << " " << d;
+    }
+    std::cerr << " ]" << std::endl;
+  }
+  return ok;
+}
+
 void show(char const *what, Dims const &dims) {
   std::cerr << what << ":";
   for (auto const &tensor : dims) {
@@ -114,5 +136,10 @@ int main() {
   }
   std::cout << (ok ? "PASS" : "FAIL") << ": symbolic dims of "
             << patterns.size() << " builds against the first" << std::endl;
+  bool const lone = lone_reduction_has_symbols();
+  std::cout << (lone ? "PASS" : "FAIL")
+            << ": the reduced dim of an input only a reduction reads"
+            << std::endl;
+  ok = ok && lone;
   return ok ? 0 : 1;
 }

@@ -320,12 +320,15 @@ def compile_and_validate_over_workloads(
                     tensor.fill_(float("nan"))
                 try:
                     launch(candidate.kernel, (*inputs, *outputs))
-                    measured = compare_outputs(outputs, reference, tolerance)
+                    # Named by its workload, in a failure and in the validation log: the
+                    # key says which inputs a measured error belongs to (an adversarial
+                    # workload's ends in "@<distribution>").
+                    measured = compare_outputs(outputs, reference, tolerance, what=key)
                 except Exception as error:  # noqa: BLE001
                     first = str(error).strip().splitlines()
                     candidate.failure = (
                         f"{key}: {type(error).__name__}"
-                        + (f": {first[0][:160]}" if first else "")
+                        + (f": {first[0].removeprefix(f'{key}: ')[:160]}" if first else "")
                     )
                     errors.append((candidate.label, error))
                     # What a failed candidate reports is the comparison that failed it,

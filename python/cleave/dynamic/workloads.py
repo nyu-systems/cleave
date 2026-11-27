@@ -335,9 +335,11 @@ def _spread(axes, keep=3):
 
 # Adversarial softmax workloads, apart from the captured ``WORKLOADS``: ``(distribution, axes)``
 # per operator, the axes drawn from its captured ones (see ``reference.apply_distribution``).
-# Nothing validates on these by default; ask for them (``keyed_workloads(adversarial=True)``,
-# ``cleave.compile(fn, adversarial=True)``) once an operator's softmax is stabilized.
-ADVERSARIAL_DISTRIBUTIONS = ("large_logits", "increasing")
+# Every operator validates on these after its captured workloads
+# (``keyed_workloads(adversarial=True)``): the softmax of every paged layer is exact, so a
+# correct kernel holds at any logit scale. They are never timed: the latency gate, the
+# autotune timing and the split/single dispatch calibration see the captured workloads only.
+ADVERSARIAL_DISTRIBUTIONS = ("large_logits", "large_scale", "increasing", "dominant_last")
 ADVERSARIAL_WORKLOADS = {
     name: tuple((distribution, axes) for distribution in ADVERSARIAL_DISTRIBUTIONS
                 for axes in _spread(captured))
@@ -450,7 +452,23 @@ def case(operator, axes, dims, page_size=1, scale=None, distribution="normal"):
     return inputs, expected(*inputs)
 
 
-def cases(operator, dims, page_size=1, scale=None):
-    """(inputs, expected outputs) for each captured workload, built one at a time."""
+def cases(operator, dims, page_size=1, scale=None, adversarial=False, keyed=False):
+    """(inputs, expected outputs) for each captured workload, built one at a time; with
+    ``adversarial`` the operator's adversarial workloads follow them. ``keyed`` leads each
+    with its key, as ``registry.keyed_workloads`` does: ``wl_<axes>``, and
+    ``wl_<axes>@<distribution>`` for an adversarial one."""
+    def one(axes, distribution="normal"):
+        built = case(operator, axes, dims, page_size=page_size, scale=scale,
+                     distribution=distribution)
+        if not keyed:
+            return built
+        from ..runtime.autotune import workload_key
+
+        key = workload_key(axes)
+        return (key if distribution == "normal" else f"{key}@{distribution}", *built)
+
     for axes in WORKLOADS[operator]:
-        yield case(operator, axes, dims, page_size=page_size, scale=scale)
+        yield one(axes)
+    if adversarial:
+        for distribution, axes in ADVERSARIAL_WORKLOADS[operator]:
+            yield one(axes, distribution)

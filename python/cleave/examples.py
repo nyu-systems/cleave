@@ -18,7 +18,7 @@ import multiprocessing
 import sys
 import time
 
-from .core.errors import CleaveError
+from .core.errors import CleaveError, SpecError
 from .pipeline import compile as _compile
 from .pipeline import resolve_configs
 from .pipeline.config import PRESETS, EvalConfig, ScheduleConfig, SuperoptConfig, get_preset
@@ -194,6 +194,12 @@ def main(fn_or_factory, shapes: dict | None = None, dtype=None, presets: dict | 
                           cache_kernels=not args.no_cache, progress=progress)
     except CleaveError as e:
         if getattr(e, "report", None) is None:
+            if isinstance(e, SpecError) and not args.verbose:
+                # What the demo declares does not fit what was asked for, flags included
+                # (``--split`` on a demo whose one Tolerance does not cover the shift a
+                # split partial of its softmax returns): the message says what to
+                # declare, and the traceback (``-v``) adds nothing to it.
+                raise SystemExit(f"{name}: {e}") from None
             raise
         _print_report(e.report, True)
         raise SystemExit(f"{name}: {e}") from None

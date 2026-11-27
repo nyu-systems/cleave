@@ -353,6 +353,12 @@ cdef class CyKNGraph:
     def reduce_max(self, DTensor input, int dim):
         return self._wrap(self.p_kgraph.reduce_max(_cptr(input), dim))
 
+    def output_fingerprints(self):
+        """The fingerprint of every output of the graph, in output order: a list of flat
+        lists of ints, as the probabilistic verifier computes it (input k's elements are a
+        hash of k and their index; every op in the finite field of the fingerprint)."""
+        return [list(v) for v in output_fingerprints(self.p_kgraph[0])]
+
     def get_input_dtensors(self):
         cdef size_t i
         cdef CppKNOperator* op

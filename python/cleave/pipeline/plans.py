@@ -94,12 +94,176 @@ class PlanSet(Sequence):
 
 
 def lower(graph: SearchedGraph, split_factor: int | None = None) -> list:
-    """``[graph]`` for solo, ``[partial, combine]`` for a split graph at ``split_factor``."""
+    """``[ir]`` for a solo graph; ``[partial, combine]`` at ``split_factor`` for a split
+    graph the search returned, and for a solo graph whose program asked for a split over
+    a dim the search cannot split (``SearchedGraph.split``, ``superopt.state_split_dims``):
+    that pair is built from the loop state of the solo graph (:func:`state_pair`)."""
+    if graph.is_split:
+        return _lower_structure(graph, graph.structure, split_factor)
+    from .update.instantiate import Recipe
+
+    (ir,) = _lower_structure(graph, graph.structure)
+    _derive_updates(ir, Recipe.of(graph))
+    if split_factor is None:
+        return [ir]
+    return state_pair(graph, ir, split_factor)
+
+
+# Why a solo graph has no pair built from its loop state (``state_pair``), after
+# ``graph {i}: split over {dim}: ``.
+NO_UPDATE_RULE = "this graph carries no update rule over that dim"  # P1 (+ ": {refusals}")
+NO_SPLIT_FACTOR = "the dim has {n} elements, which {f} does not divide"  # P5
+TWO_STATES = ("{n} values are carried across a loop over that dim ({names}); a pair is built "
+              "from one")
+NO_SPLIT_DIM = ("a solo graph is split from its loop state only over a dim that a reduction "
+                "the search cannot split reduces; none is asked for")
+SEVERAL_DIMS = "a pair is built from the loop state over one dim at a time"
+UNSEARCHED = "the graph was not searched; a pair is built on the symbolic dims of a searched graph"
+
+
+def state_pair(graph: SearchedGraph, ir, split_factor: int) -> list:
+    """``[partial, combine]``: the split of solo graph ``graph`` (lowered to ``ir``, with
+    its records derived) over the dim of ``graph.split`` the search cannot split
+    (``superopt.state_split_dims``), built from the loop state of the conflict served over
+    that dim (``lower.state_split``), whatever its reducer.
+
+    The partial is the flat graph up to the loop state on a split of that dim: each split
+    returns its accumulators and its own full-extent value, float32 at the cut. The combine
+    folds those over the splits with the reducer, applies the repair of each
+    accumulator with ``m := m_i``, ``m' := combine_i m_i``, sums over the splits and runs the
+    solo graph's own epilogue. Both are flat graphs with the full-extent reduction in front
+    of their sums, so each gets its own derivation.
+
+    ``LoweringRejected("graph {i}: split over {dim}: {reason}")`` when no pair is built.
+    """
+    from ..frontend.tensor import split_names
+    from ..ir.graph_utils import boundary_signature
+    from ..lower.state_split import (SplitRefused, combine_graph, lower_partial, op_indices,
+                                     split_position)
+    from ..runtime.reference import output_order, placeholder_order
+    from .superopt import state_split_dims
+    from .update.instantiate import Recipe
+
+    dims = state_split_dims(graph.program, graph.split)
+    if len(dims) != 1:
+        names = ",".join(dims or split_names(graph.split)) or "no dim"
+        why = SEVERAL_DIMS if len(dims) > 1 else NO_SPLIT_DIM
+        raise LoweringRejected(f"graph {graph.index}: split over {names}: {why}")
+    (dim,) = dims
+    prefix = f"graph {graph.index}: split over {dim}: "
+    f = int(split_factor)
+    extent = int(graph.program.sizes[dim])  # a dim of the program's inputs (``can_split``)
+    if f < 1 or extent % f:
+        raise LoweringRejected(prefix + NO_SPLIT_FACTOR.format(n=extent, f=f))
+    if graph.symbol_map is None:
+        raise LoweringRejected(prefix + UNSEARCHED)
+    served = _served_over(graph, ir, dim)
+    if not served:
+        refusals = "; ".join(getattr(ir, "streaming_refusals", None) or ())
+        raise LoweringRejected(prefix + NO_UPDATE_RULE + (f": {refusals}" if refusals else ""))
+    if len(served) > 1:
+        raise LoweringRejected(prefix + TWO_STATES.format(
+            n=len(served), names=", ".join(n.name for n in served)))
+    (node,) = served
+    full, record = node.name, node.streaming
+    accs, rules = tuple(record.loops), tuple(record.rules)
+    try:
+        full_op, acc_ops = op_indices(ir, full, accs)
+        partial = lower_partial(graph, full_op, acc_ops, f)
+        split_pos = split_position(ir, full, partial)
+        combine = combine_graph(ir, full, rules, f, split_pos, out_dtype=graph.dtype)
+    except SplitRefused as e:
+        raise LoweringRejected(prefix + str(e)) from e
+    except Exception as e:  # noqa: BLE001 - a lowering error names itself, as for any graph
+        raise LoweringRejected(prefix + f"{type(e).__name__}: {e}") from e
+    crossing = boundary_signature(output_order(partial))
+    if crossing != boundary_signature(placeholder_order(combine)):
+        raise LoweringRejected(  # a bug of the construction: never handed to the build
+            prefix + f"the partial returns {crossing} but the combine reads "
+            f"{boundary_signature(placeholder_order(combine))}")
+    _derive_updates(partial, Recipe.partial(graph, full, accs, solo=ir, split_factor=f))
+    _derive_updates(combine, Recipe.combine(graph, full, rules, split_pos, graph.dtype, solo=ir,
+                                            split_factor=f))
+    return [partial, combine]
+
+
+def _served_over(graph: SearchedGraph, ir, dim: str) -> list:
+    """The nodes of ``ir`` whose streaming obstacle is served (a record) and loops over the
+    program's dim ``dim``: the symbol of the searched structure at that dim's place in the
+    program's inputs."""
+    from ..frontend.tensor import Dim
+    from .update.engine import looped_dim
+    from .update.instantiate import Recipe
+
+    recorded = [n for n in ir.nodes if getattr(n, "streaming", None) is not None]
+    if not recorded:
+        return []
+    inputs = [op for op in graph.structure if op["op_type"] == "kn_input_op"]
+    wanted = set()
+    for spec, op in zip(graph.program.inputs, inputs):
+        t = op["output_tensors"][0]
+        symbols = t["dim"][: int(t.get("num_dims", len(t["dim"])))]
+        if len(symbols) == len(spec.dims):
+            wanted |= {s for d, s in zip(spec.dims, symbols)
+                       if isinstance(d, Dim) and d.name == dim}
+    recipe = Recipe.searched(graph)
+    served = []
+    for node in recorded:
+        try:
+            looped = looped_dim(recipe, ir, node.name)
+        except Exception:  # noqa: BLE001 - a looped dim that cannot be named is not this one
+            continue
+        found = set(looped) if isinstance(looped, frozenset) else {looped}
+        if found & wanted:
+            served.append(node)
+    return served
+
+
+def _derive_updates(ir, recipe) -> None:
+    """Give every reduction conflict of a freshly lowered flat graph its update rule, or
+    the reason it has none.
+
+    The conflicts are the scheduler's own (``schedule.streaming.obstacles``, from the
+    reduction-axis provenance the policy pins by). For each one the rules are derived once
+    per loop structure (``pipeline.update.derive``: test data from this very graph, built
+    again at the first pass's test sizes by its recipe, enumeration, float replay) and
+    written on the full-extent node as a ``Streaming`` record. The policy lets a loop step
+    under a full-extent value only where it finds that record; without one the pin and the
+    refusal stay. Nothing the engine does raises out of here (an unexpected error is
+    ``BUG``).
+
+    ``ir.streaming_refusals`` (``["{full}: {reason}", ...]``) exists exactly when the graph
+    has a conflict; ``ir.derivations`` holds every derivation the engine made for it.
+    ``recipe`` (``pipeline.update.instantiate.Recipe``) builds ``ir`` again at other extents.
+    """
+    from ..schedule.streaming import obstacles
+    from ..schedule.tiling import reduction_ancestors, scheduled_reductions
+
+    try:
+        nodes, red = scheduled_reductions(ir)
+    except NotImplementedError:
+        return
+    found = obstacles(nodes, red, reduction_ancestors(nodes))
+    if not found:
+        return
+    from .update import derive
+
+    ir.streaming_refusals = []
+    for ob in found:
+        derivation = derive(ir, ob, recipe)
+        ir.derivations = getattr(ir, "derivations", []) + [derivation]
+        if derivation.refused:
+            ir.streaming_refusals.append(f"{ob.full}: {derivation.refused}")
+        else:
+            next(n for n in ir.nodes if n.name == ob.full).streaming = derivation.record()
+
+
+def _lower_structure(graph: SearchedGraph, structure, split_factor: int | None = None) -> list:
     from ..lower.process import to_bundles
 
     dtype = graph.dtype
     try:
-        bundles = to_bundles([graph.structure], symbol_map=graph.symbol_map,
+        bundles = to_bundles([structure], symbol_map=graph.symbol_map,
                              split_factors=None if split_factor is None else [split_factor],
                              dtype=dtype, out_dtype=dtype)
     except Exception as e:  # noqa: BLE001
@@ -113,29 +277,56 @@ def lower(graph: SearchedGraph, split_factor: int | None = None) -> list:
     return bundle
 
 
-def bind_inputs(ir_graph, graph: SearchedGraph) -> tuple[str | None, ...] | None:
-    """Placeholder name for each Program input, by input identity; None for an unread input.
+def bind_inputs(ir_graph, program) -> tuple[str | None, ...] | None:
+    """Placeholder name for each Program input; None for an input the graph does not read.
 
-    The k-th ``kn_input_op`` of the structure is Program input k, and its tensor's guid names
-    the lowered placeholder (``input_<guid>``). Shapes cannot decide: same-shaped inputs would
-    bind in placeholder (first-use) order. None (unbindable) if a placeholder is not a
-    structure input or the input counts differ.
+    Paired by the position lowering recorded on each graph input (``input_index``: the
+    structure declares its inputs in the program's order, and an input no output reads
+    keeps its position but has no placeholder -- a per-output search, or the merge of
+    several, leaves such inputs). ``ir_graph.nodes`` is a topological order, so two inputs
+    of one shape may come the other way round there; a graph without the record is only
+    bound where the shapes leave no choice, and only when it reads every input.
+
+    A recorded input is bound when the graph declares it with the program's shape give
+    or take unit axes: lowering declares an input written in keepdim form next to a
+    reduced value (``rowsum(x) / y`` with ``y`` of shape ``(R, 1)``) the way its consumer
+    reads it, ``(R,)``. Those are the same elements in the same order, and
+    ``Kernel.__call__`` views each input as its placeholder's shape.
     """
     from ..ir.graph import PlaceHolderNode
-    from ..lower.convert import input_name
 
-    program = graph.program
     if program is None or not hasattr(program, "inputs"):
         return None
-    guids = [op["output_tensors"][0]["guid"] for op in graph.structure
-             if op["op_type"] == "kn_input_op"]
-    if len(guids) != len(program.inputs):
+    phs = [n for n in ir_graph.nodes if isinstance(n, PlaceHolderNode)]
+    want = [tuple(int(s) for s in spec.shape) for spec in program.inputs]
+    declared = [getattr(n, "input_index", None) for n in phs]
+    if (None not in declared and len(set(declared)) == len(declared)
+            and set(declared) <= set(range(len(want)))):
+        by_index = dict(zip(declared, phs))
+        if all(_without_units(_shape(n)) == _without_units(want[i])
+               for i, n in by_index.items()):
+            return tuple(by_index[i].name if i in by_index else None for i in range(len(want)))
+    if len(phs) != len(want):
         return None
-    names = {n.name: n for n in ir_graph.nodes if isinstance(n, PlaceHolderNode)}
-    bound = tuple(PlaceHolderNode.full_name(input_name(g)) for g in guids)
-    if not set(names) <= set(bound):
-        return None
-    return tuple(b if b in names else None for b in bound)
+    ph_shapes = [_shape(n) for n in phs]
+    taken, names = set(), []
+    for shape in want:
+        hits = [i for i, s in enumerate(ph_shapes) if s == shape and i not in taken]
+        if len(hits) != 1:
+            return None
+        taken.add(hits[0])
+        names.append(phs[hits[0]].name)
+    return tuple(names)
+
+
+def _shape(node) -> tuple[int, ...]:
+    return tuple(int(s) for s in node.get_shape(0))
+
+
+def _without_units(shape) -> tuple[int, ...]:
+    """``shape`` without its unit axes: equal for two layouts of the same elements in the
+    same order."""
+    return tuple(s for s in shape if s != 1)
 
 
 def describe_tile(t) -> str:
@@ -156,11 +347,36 @@ def describe_tile(t) -> str:
     return text
 
 
-MAX_ROW_LIMIT = "a max over a row longer than one block needs online softmax, which is not implemented"
+# Why a graph with a reduction conflict has no tiling at all: the ancestor of a conflict
+# (``schedule.streaming.obstacles``, whatever its op) is carried by a loop wherever the
+# conflict is served, and held whole otherwise; a graph with a conflict that is not served
+# says why after this text (``_schedule_once``). Only where it is true: not when the filter
+# of a graph with a conflict refused a tiling that held every such dim in one block (then the
+# dim was not longer, and the filter's reasons are the reason).
+ROW_LIMIT = ("a reduction that another one over its dim depends on needs that whole dim in "
+             "one block, and this dim is longer")
+NO_TILING = "no tiling candidates"
+EVERY_CONFLICT_CARRIED = ("every reduction that another one over its dim depends on is "
+                          "carried across its loop")
 
 
-def _search(ir_graph, topk: int, force: bool, hints: dict | None):
+def _search(ir_graph, topk: int, force: bool, hints: dict | None,
+            refused: Counter | None = None, whole: Counter | None = None):
+    """The top ``topk`` tilings of one lowered graph.
+
+    A graph with a streaming obstacle, served or not, keeps only the tilings the build
+    schedules (``schedule.streaming.streaming_accept``), decided before the top-k cut; the
+    reasons of the others are added to ``refused``, and those of the refused tilings that
+    reduce every conflict's ancestor without a record in one step to ``whole``. For any other graph
+    nothing changes.
+
+    A record only adds tilings: those of a graph with a served one are the policy's with the
+    records, then, where they leave room under ``topk``, those it makes without them (every
+    conflict pinned) that are not among the first. A tiling of the second kind steps no loop
+    of a record and builds as it would without it (``tiling.records_in_use``).
+    """
     from ..schedule import search_tiling
+    from ..schedule.streaming import streaming_accept
 
     kw = dict(hints or {})
     if kw:
@@ -168,10 +384,118 @@ def _search(ir_graph, topk: int, force: bool, hints: dict | None):
         unknown = [k for k in kw if k not in accepted]
         if unknown:
             raise ScheduleRejected(f"search_tiling does not accept hints {unknown}")
+    stable = streaming_accept(ir_graph)
+    if stable is not None:
+        user = kw.get("accept")
+        kw["accept"] = stable if user is None else (lambda cand: user(cand) and stable(cand))
     try:
-        return list(search_tiling(ir_graph, topk=topk, force_fusion=force, **kw))
+        if stable is None or not _served(ir_graph):
+            return list(search_tiling(ir_graph, topk=topk, force_fusion=force, **kw))
+        # every candidate the first search is asked about; the second asks about the others
+        accept, asked = kw.pop("accept"), set()
+
+        def first(cand):
+            asked.add(describe_tile(cand))
+            return accept(cand)
+
+        tiles = list(search_tiling(ir_graph, topk=topk, force_fusion=force, accept=first, **kw))
+        if len(tiles) < topk:
+            # the policy writes on the graph why a search of it made no tiling (``_no_tiling``):
+            # of two searches, the reasons of both
+            counts = {name: getattr(ir_graph, name, 0) for name in _POLICY_COUNTS}
+            tiles += search_tiling(
+                ir_graph, topk=topk - len(tiles), force_fusion=force, honour_records=False,
+                accept=lambda cand: describe_tile(cand) not in asked and accept(cand), **kw)
+            for name, n in counts.items():
+                setattr(ir_graph, name, n + getattr(ir_graph, name, 0))
+        return tiles
+    except ScheduleRejected:
+        raise  # the policy's own refusal of the whole graph, with its reason
     except Exception as e:  # noqa: BLE001
+        # Not a refused candidate: the filter drops those itself. Whatever else it or the
+        # search raises is a bug, and names itself in the refusal of the whole graph.
         raise ScheduleRejected(f"{type(e).__name__}: {e}") from e
+    finally:
+        if stable is not None and refused is not None:
+            refused.update(stable.reasons)
+        if stable is not None and whole is not None:
+            whole.update(stable.whole)
+
+
+# What the policy counts on a flat graph it gave no tiling (``DefaultPolicy.get_num_threads``).
+_POLICY_COUNTS = ("gemm_tile_conflicts", "register_operand_conflicts", "row_reduction_conflicts")
+
+
+def _served(ir) -> bool:
+    """Whether a conflict of ``ir`` is served (``tiling.carried_reductions``)."""
+    from ..schedule.tiling import carried_reductions
+
+    try:
+        return bool(carried_reductions(ir))
+    except NotImplementedError:  # a split apply_tiling cannot take apart
+        return False
+
+
+def _conflict_ancestors(ir) -> tuple:
+    """``(ancestors, held)``: the names of the ancestors of the reduction conflicts of
+    ``ir`` (``schedule.streaming.obstacles``), and of those held whole -- carried by no
+    loop, because they have no honoured, served record (``tiling.carried_reductions``)."""
+    from ..schedule.streaming import obstacles
+    from ..schedule.tiling import carried_reductions, reduction_ancestors, scheduled_reductions
+
+    try:
+        nodes, red = scheduled_reductions(ir)
+    except NotImplementedError:
+        return [], []
+    fulls = [ob.full for ob in obstacles(nodes, red, reduction_ancestors(nodes))]
+    carried = {n.name for n in carried_reductions(ir)} if fulls else set()
+    return fulls, [name for name in fulls if name not in carried]
+
+
+def _no_tiling(g, ir, reasons: Counter, whole: Counter) -> str:
+    """Why lowered graph ``ir`` of searched graph ``g`` has no tiling.
+
+    The row limit only where the ancestor of a conflict of ``ir`` is held whole (no loop
+    carries it) and no tiling the policy made held the dim of every such ancestor in one
+    step (``whole`` is empty): the policy made none, or the filter refused only tilings that
+    step such an ancestor. Then, for a conflict that is not served, why it is not carried
+    across a loop instead. A graph whose every conflict is carried has no row limit: where
+    the policy made no tiling at all, that is not the conflict's doing, and the text says
+    so. Otherwise the
+    graph has no tiling for the reasons the filter counted (``reasons``), whatever its
+    conflicts, and for those of the policy: tilings it gave no thread count
+    (``GEMM_TILE_CONFLICT``, ``REGISTER_OPERAND_CONFLICT``, ``ROW_REDUCTION_CONFLICT``),
+    whose row it did not get to judge.
+    """
+    from ..schedule.policy.default import (
+        GEMM_TILE_CONFLICT, REGISTER_OPERAND_CONFLICT, ROW_REDUCTION_CONFLICT,
+    )
+
+    unstreamed = "; ".join(getattr(ir, "streaming_refusals", None) or ())
+    # Tilings the policy made and then gave no thread count: it says how many on the graph.
+    by_reason = Counter({
+        GEMM_TILE_CONFLICT: getattr(ir, "gemm_tile_conflicts", 0),
+        REGISTER_OPERAND_CONFLICT: getattr(ir, "register_operand_conflicts", 0),
+        ROW_REDUCTION_CONFLICT: getattr(ir, "row_reduction_conflicts", 0),
+    })
+    conflicts = sum(by_reason.values())
+    if conflicts:
+        reasons = reasons + by_reason
+    fulls, held = _conflict_ancestors(ir)
+    if held and not whole and not conflicts:
+        why = ROW_LIMIT
+        if unstreamed:
+            why += f"; it is not carried across a loop: {unstreamed}"
+    else:
+        why = NO_TILING
+        if unstreamed:
+            why += f"; a reduction is not carried across a loop: {unstreamed}"
+        elif fulls and not held and not reasons:  # nothing else says why: not the conflict
+            why += f"; {EVERY_CONFLICT_CARRIED}"
+    if reasons:  # every tiling was refused by the conflict filter: say why
+        why += f" ({sum(reasons.values())} refused: " + "; ".join(
+            f"{n}x {reason}" for reason, n in reasons.most_common()) + ")"
+    return why
 
 
 def _schedule_once(graphs: GraphSet, config: ScheduleConfig, force: bool):
@@ -180,19 +504,21 @@ def _schedule_once(graphs: GraphSet, config: ScheduleConfig, force: bool):
     topk, hints = config.topk, config.hints
 
     def add(g, variant, role, ir, factor, inputs=None):
+        reasons, whole = Counter(), Counter()
         try:
-            tiles = _search(ir, topk, force, hints)
+            tiles = _search(ir, topk, force, hints, reasons, whole)
         except ScheduleRejected as e:
             refused.append(Refusal(g.index, variant, role, e))
             return
         if not tiles:
-            why = MAX_ROW_LIMIT if "max" in g.ops else "no tiling candidates"
-            refused.append(Refusal(g.index, variant, role, ScheduleRejected(why)))
+            refused.append(Refusal(g.index, variant, role,
+                                   ScheduleRejected(_no_tiling(g, ir, reasons, whole))))
         for rank, t in enumerate(tiles):
             label = f"g{g.index} {variant} {role} #{rank} {describe_tile(t)}"
             plans.append(Plan(g.index, variant, role, t, label, rank, factor, g, inputs))
 
     combined = set()
+    state_split = getattr(graphs, "state_split", ())
     for g in graphs:
         if g.invalid_split:
             why = f" ({g.split_rejection})" if g.split_rejection else ""
@@ -204,8 +530,10 @@ def _schedule_once(graphs: GraphSet, config: ScheduleConfig, force: bool):
                 (ir,) = lower(g)
             except LoweringRejected as e:
                 refused.append(Refusal(g.index, "solo", "main", e))
-                continue
-            add(g, "solo", "main", ir, None, bind_inputs(ir, g))
+            else:
+                add(g, "solo", "main", ir, None, bind_inputs(ir, program))
+            if state_split:
+                _state_split_plans(g, graphs, config, add, refused)
             continue
         if not config.split_k:
             refused.append(Refusal(g.index, "split", "partial",
@@ -218,11 +546,42 @@ def _schedule_once(graphs: GraphSet, config: ScheduleConfig, force: bool):
             except LoweringRejected as e:
                 refused.append(Refusal(g.index, variant, "partial", e))
                 continue
-            add(g, variant, "partial", partial, f, bind_inputs(partial, g))
+            add(g, variant, "partial", partial, f, bind_inputs(partial, program))
             if f not in combined:  # the combine is searched once per factor
                 combined.add(f)
                 add(g, variant, "combine", combine, f)
     return plans, refused
+
+
+def _state_split_plans(g, graphs, config, add, refused) -> None:
+    """The split plans of solo graph ``g`` of a ``GraphSet`` with ``state_split``: per
+    factor of ``config.split_k`` the partial and the combine built from its loop state
+    (``lower(g, f)``), or the reason there is no pair (``Refusal(..., "partial", ...)``,
+    as for a searched split graph that has no cut). A split that names no factor is refused
+    once. No part of the split is dropped silently: a dim of it that no such reduction
+    reduces is not split (the search ran unsplit), and one refusal per solo graph says so."""
+    from ..frontend.tensor import split_names
+    from .superopt import state_split_dims
+
+    carried = state_split_dims(graphs.program, graphs.state_split)
+    others = [d for d in split_names(graphs.state_split) if d not in carried]
+    head = f"graph {g.index}: split over {','.join(carried)}: "
+    if others:
+        refused.append(Refusal(g.index, "split", "partial", LoweringRejected(
+            head + f"the search ran unsplit, so {','.join(others)} is not split")))
+    if not config.split_k:
+        refused.append(Refusal(g.index, "split", "partial",
+                               LoweringRejected(head + "ScheduleConfig.split_k is empty")))
+        return
+    for f in config.split_k:
+        variant = f"split-k={f}"
+        try:
+            partial, combine = lower(g, f)
+        except LoweringRejected as e:
+            refused.append(Refusal(g.index, variant, "partial", e))
+            continue
+        add(g, variant, "partial", partial, f, bind_inputs(partial, graphs.program))
+        add(g, variant, "combine", combine, f)  # one combine per solo graph and factor
 
 
 def schedule(graphs: GraphSet | Sequence[SearchedGraph], config: ScheduleConfig | None = None) -> PlanSet:

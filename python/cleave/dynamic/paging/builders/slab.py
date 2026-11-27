@@ -7,9 +7,10 @@ from ....ir.ops import RowGather
 from ....ir.graph_utils import gather_all_nodes, lock_graph
 from ..stages import (
     LOG2E,
+    _accumulators,
+    _declare_rolling,
     _decode_epilogue,
     _decode_grid,
-    _exp,
     _gqa_body,
     _index_input,
     _int32,
@@ -34,7 +35,7 @@ def _build_paged_decode_slab(spec, dense, split: int | None = None) -> Graph:
         assert isinstance(split, int) and split > 1, f"split={split!r} is not a split"
 
     # --- the loop tier: score one slab, accumulate ---------------------------------
-    score_mma, exp, rowsum, value_mma = _gqa_body(spec, dense, mq, lambda: _exp(dense, mq))
+    score_mma, exp, rowsum, value_mma, rolling = _gqa_body(spec, dense, mq)
     # The caches are the matmuls' own operands: there is no gather between them and the
     # tile, only the slab slice that `_slab_tensor_maps` writes.
     ph_q = score_mma.inputs[0].src_node
@@ -50,6 +51,7 @@ def _build_paged_decode_slab(spec, dense, split: int | None = None) -> Graph:
     _name_inputs(spec, ph_q, ph_k, ph_v, ph_idx)
 
     inner = Graph(nodes=[ph_idx] + gather_all_nodes(rowsum, value_mma))
+    _declare_rolling(inner, rolling, rowsum, value_mma)
     inner.extent = 1
     # Pipelined for TMA, not for latency: a copy is only lowered to a bulk transfer when
     # it sits inside a pipelined producer/consumer loop.
@@ -82,8 +84,7 @@ def _build_paged_decode_slab(spec, dense, split: int | None = None) -> Graph:
     lock_graph(inner)
 
     loop_node = GraphNode(name="GraphNode_0", graph=inner)
-    rowsum_id = inner.accum_nodes.index(rowsum)
-    value_id = inner.accum_nodes.index(value_mma)
+    accumulators = _accumulators(loop_node, rowsum, value_mma, rolling)
     inner_q = inner.binding[ph_q.name]
     inner_idx = inner.binding[ph_idx.name]
     inner_k = inner.binding[ph_k.name]
@@ -106,9 +107,7 @@ def _build_paged_decode_slab(spec, dense, split: int | None = None) -> Graph:
     q_tile.source_args = (ph_q.name,)
     inner_q.producer_op = q_tile
 
-    div, log2, store_d, store_o, outputs = _decode_epilogue(
-        spec, dense, loop_node, rowsum, rowsum_id, value_mma, value_id, split
-    )
+    div, lse, stores, outputs = _decode_epilogue(spec, dense, loop_node, *accumulators, split)
     ph_indptr = _index_input(spec.indptr_input)
     ph_last = _index_input(spec.last_page_len_input)
 
@@ -176,12 +175,12 @@ def _build_paged_decode_slab(spec, dense, split: int | None = None) -> Graph:
             exp=exp,
             rowsum=rowsum,
             value_mma=value_mma,
+            rolling=rolling,
             div=div,
-            log2=log2,
+            lse=lse,
             outputs=outputs,
             split=split,
-            store_d=store_d,
-            store_o=store_o,
+            stores=stores,
         ),
     )
     return _run_passes(main, inner, inner_idx)

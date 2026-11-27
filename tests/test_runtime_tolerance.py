@@ -32,11 +32,8 @@ def _validate(outputs, reference, **kwargs):
 
 
 def test_there_is_no_default_tolerance():
-    """A kernel nobody declared a bound for is an error at every entry point.
-
-    (Until Step 0 of the numerical-stability pass this test pinned the opposite: a loose
-    0.5/0.5 default that every undeclared operator fell back to.)
-    """
+    """A kernel nobody declared a bound for is an error at every entry point: there is no
+    default bound an undeclared operator could fall back to."""
     assert not hasattr(validate, "DEFAULT_TOLERANCE")
     tensor = torch.zeros(4, device="cuda")
     with pytest.raises(TypeError, match="tolerance"):

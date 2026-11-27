@@ -6,7 +6,7 @@ import tvm
 from tvm import te
 
 from ..graph import ComputeOpNode
-from .base import const_literal, const_token, mgroup_row, mgroup_slot
+from .base import NEG_FLT_MAX, const_literal, const_token, mgroup_row, mgroup_slot
 
 
 def _resolve_binary_operand_layout(
@@ -69,7 +69,14 @@ def _init_elementwise(op, dims, name, dtype, out_dtype, n_batch_dims):
 
 
 class BinaryElementwise(ComputeOpNode):
-    """``C = A <token> B`` (or ``A <token> const``), with B optionally broadcast on one axis."""
+    """``C = A <token> B`` (or ``A <token> const``), with B optionally broadcast on one axis.
+
+    ``broadcast == 0`` with exactly two non-batch dims: B is ``(*batch, M)``, indexed by the
+    first non-batch index. With MORE than two non-batch dims B is A without its last axis
+    (``B = A.shape[:-1]``), indexed by all but the last index -- the weight of a split
+    combine, ``o[s, r, d] * w[s, r]``, where the split axis must stay a loop index of the
+    tile. For two non-batch dims the two readings coincide, so no existing node changes.
+    """
 
     kind = ""  # macro-name stem and default node name
     token = ""  # infix operator in the macro body
@@ -111,9 +118,16 @@ class BinaryElementwise(ComputeOpNode):
     def _te_const(self, a, c):
         return type(self).py_op(a, c)
 
+    def _lead(self) -> bool:
+        """``broadcast == 0`` over more than two non-batch dims: B lacks only A's last axis."""
+        return self.broadcast == 0 and len(self.dims) - self.n_batch_dims > 2
+
     def create_prim_func(self, dims, in_dtype, out_dtype):
         nb = self.n_batch_dims
+        lead = self._lead()
         b_shape = (*self.batch_dims, dims[self.broadcast + nb]) if self.broadcast != -1 else dims
+        if lead:
+            b_shape = dims[:-1]
         A = te.placeholder(dims, name="A", dtype=in_dtype)
         B = te.placeholder(b_shape, name="B", dtype=in_dtype) if self.const is None else None
 
@@ -122,6 +136,8 @@ class BinaryElementwise(ComputeOpNode):
             if B is None:
                 return self._te_const(a, tvm.tirx.const(self.const, dtype=out_dtype))
             b_idx = (*args[:nb], args[self.broadcast + nb]) if self.broadcast != -1 else args
+            if lead:
+                b_idx = args[:-1]
             return type(self).py_op(a, B[b_idx].astype(out_dtype))
 
         C = te.compute(dims, gen_lambda, name="C")
@@ -138,6 +154,8 @@ class BinaryElementwise(ComputeOpNode):
         _idxs = [f"i{d}" for d in range(len(self.dims) - self.n_batch_dims)]
         _idxs_str = ", ".join(_idxs)
         b_sub = _idxs_str if self.broadcast == -1 else _idxs[self.broadcast]
+        if self._lead():
+            b_sub = ", ".join(_idxs[:-1])
         tensor_rhs = self.const is None
         move_a_to_smem, move_b_to_smem = _resolve_binary_operand_layout(
             self.resolve_operand_layout,
@@ -290,6 +308,61 @@ class Log2(UnaryElementwise):
     kind, _te, _tl = "log2", te.log2, "T.log2({a})"
 
 
+class Exp2(UnaryElementwise):
+    """Base-2 exponential: the base the paged softmax works in (``exp2`` is one instruction
+    where ``exp`` is a call). Its rescale factor ``alpha = exp2(m_prev - m)`` is built from
+    this class so that it uses the same base as ``P = exp2(s - m)``."""
+
+    kind, _te, _tl = "exp2", tvm.tirx.exp2, "T.exp2({a})"
+
+
+class Lse2(ComputeOpNode):
+    """``B = log2(A) + M``: the base-2 log-sum-exp of a softmax whose exp was shifted.
+
+    ``A`` is the row sum ``l = sum_j exp2(s_j - m)`` and ``M`` the shift ``m`` (the row max
+    of the scores, in the log2 domain), so ``log2(sum_j exp2(s_j)) = log2(l) + m``. ``l`` is
+    read as it is: a row with no live key has ``l = 0`` and ``m`` at its finite start value,
+    which gives the ``-inf`` the operator defines.
+    """
+
+    kind = "lse2"
+    _macro_attrs = ("dims", "n_batch_dims")
+
+    def __init__(
+        self,
+        dims: tuple[int],
+        name: str = None,
+        dtype: str = "float32",
+        out_dtype: str = "float32",
+        n_batch_dims: int = None,
+    ):
+        _init_elementwise(
+            self, dims, self.kind if name is None else name, dtype, out_dtype, n_batch_dims
+        )
+
+    def create_prim_func(self, dims, in_dtype, out_dtype):
+        A = te.placeholder(dims, name="A", dtype=in_dtype)
+        M = te.placeholder(dims, name="M", dtype=in_dtype)
+        B = te.compute(
+            dims,
+            lambda *i: te.log2(A[i].astype(out_dtype)) + M[i].astype(out_dtype),
+            name="B",
+        )
+        return te.create_prim_func([A, M, B])
+
+    def gen_macro(self, **kwargs) -> str:
+        _idxs_str = ", ".join(f"i{d}" for d in range(len(self.dims) - self.n_batch_dims))
+        macro_str = f"""\
+        @T.macro
+        def {self.get_macro_name(**kwargs)}(A, M, B):
+            for {_idxs_str} in T.Parallel(*B.shape):
+                B[{_idxs_str}] = T.log2(A[{_idxs_str}]) + M[{_idxs_str}]"""
+        return self._format_code(macro_str)
+
+    def get_macro_name(self, **kwargs) -> str:
+        return f"ukernel_{self.kind}_{len(self.dims) - self.n_batch_dims}dims_{kwargs['mem_scope']}"
+
+
 class Copy(UnaryElementwise):
     """Store a tile as it is, casting to the destination dtype.
 
@@ -306,6 +379,24 @@ class Copy(UnaryElementwise):
     _te = lambda x: x  # noqa: E731
 
 
+def _kv_mask(scalar_args) -> str:
+    """The columns of a KV tile inside the request's window (macro indices m0, m1)."""
+    tile_base, valid_len = scalar_args[:2]
+    return f"{tile_base} + m1 < {valid_len}"
+
+
+def _causal_mask(scalar_args, row_group: int) -> str:
+    """``_kv_mask`` and the end-aligned causal bound of the row.
+
+    ``diag`` is the bound for this query tile's first row: (kv_len - q_len) + q_tile_base,
+    so row m0 may attend up to column diag + m0. When the row axis fuses a head group,
+    every head of one token shares a row.
+    """
+    tile_base, valid_len, diag = scalar_args[:3]
+    row = mgroup_row("m0", row_group)
+    return f"({tile_base} + m1 < {valid_len}) & ({tile_base} + m1 <= {diag} + {row})"
+
+
 class MaskedExp(ComputeOpNode):
     # A fused ``M = tokens * row_group`` row axis only changes a body that reads the row
     # index, which the non-causal mask does not; the causal subclass overrides this.
@@ -313,7 +404,7 @@ class MaskedExp(ComputeOpNode):
     # Number of leading `scalar_args` the body binds by position, before the optional
     # runtime scale.
     _n_mask_args = 2
-    _macro_attrs = ("dims", "n_batch_dims", "scale", "scalar_args", "row_group")
+    _macro_attrs = ("dims", "n_batch_dims", "scale", "scalar_args", "row_group", "shift")
 
     def __init__(
         self,
@@ -321,6 +412,7 @@ class MaskedExp(ComputeOpNode):
         scale: float | None,
         scalar_args: tuple[str, ...] = ("tile_base", "valid_len"),
         row_group: int = 1,
+        shift: bool = False,
         name: str = "maskedexp",
         dtype: str = "float32",
         out_dtype: str = "float32",
@@ -332,15 +424,25 @@ class MaskedExp(ComputeOpNode):
         # what lets the kernel accept the operator's declared ``sm_scale`` input. The
         # value then arrives in the log2 domain and the exponential is base-2.
         self.scale = None if scale is None else float(scale)
+        # ``shift=True`` is the exact softmax: the operand is a ``MaskedScore`` -- already
+        # scaled, in the log2 domain -- and a second input ``M`` holds its running row max,
+        # so the body is ``exp2(A - M[row])`` and takes no scale of its own. A masked
+        # entry stays the literal 0 through the same predicate either way.
+        self.shift = bool(shift)
+        assert not self.shift or self.scale is None, (
+            f"{type(self).__name__}(shift=True) reads a score that is already scaled, in "
+            f"the log2 domain; a baked-in scale={scale} would be applied twice"
+        )
         self.row_group = int(row_group)
         assert self.row_group >= 1, f"row_group must be positive, got {row_group}"
         assert self.row_group == 1 or self._uses_row_group, (
             f"{type(self).__name__}'s mask does not read the row index, so a "
             "row_group would name an attribute its body cannot depend on"
         )
-        assert len(scalar_args) == self._n_mask_args + (0 if self.scale is not None else 1), (
+        runtime_scale = self.scale is None and not self.shift
+        assert len(scalar_args) == self._n_mask_args + (1 if runtime_scale else 0), (
             f"{type(self).__name__} takes {self._n_mask_args} mask scalars"
-            + ("" if self.scale is not None else " plus the runtime scale")
+            + (" plus the runtime scale" if runtime_scale else "")
             + f", got {scalar_args}"
         )
         self.scalar_args = tuple(scalar_args)
@@ -360,6 +462,15 @@ class MaskedExp(ComputeOpNode):
 
     def create_prim_func(self, dims, in_dtype, out_dtype):
         A = te.placeholder(dims, name="A", dtype=in_dtype)
+        if self.shift:
+            # The row max: the operand's shape without its last (softmax) axis.
+            M = te.placeholder(dims[:-1], name="M", dtype=in_dtype)
+            B = te.compute(
+                dims,
+                lambda *i: te.exp(A[i].astype(out_dtype) - M[i[:-1]].astype(out_dtype)),
+                name="B",
+            )
+            return te.create_prim_func([A, M, B])
         # The te function is a rank/dtype stand-in only; a runtime scale has no value
         # here, and 1.0 keeps the expression well formed.
         scale = 1.0 if self.scale is None else self.scale
@@ -373,26 +484,34 @@ class MaskedExp(ComputeOpNode):
         return te.create_prim_func([A, B])
 
     def _exp_expr(self, access: str) -> str:
+        if self.shift:
+            return f"T.exp2({access} - M[m0])"
         if self.scale is None:
             return f"T.exp2({access} * {self.scalar_args[-1]})"
         return f"T.exp({access} * {self.scale})"
 
+    def _operands(self) -> str:
+        return "A, M" if self.shift else "A"
+
     def _name_prefix(self, kind: str) -> str:
-        scale_name = "rt2" if self.scale is None else const_token(self.scale)
-        prefix = f"ukernel_{kind}_scale_{scale_name}"
+        if self.shift:
+            # shift2: the operand is shifted by its row max, base 2; there is no scale.
+            prefix = f"ukernel_{kind}_shift2"
+        else:
+            scale_name = "rt2" if self.scale is None else const_token(self.scale)
+            prefix = f"ukernel_{kind}_scale_{scale_name}"
         prefix += f"_mgrp{self.row_group}" if self.row_group != 1 else ""
         prefix += f"_{len(self.dims) - self.n_batch_dims}dims"
         return prefix
 
     def gen_macro(self, **kwargs) -> str:
-        tile_base, valid_len = self.scalar_args[:2]
         params = ", ".join(self.scalar_args)
         macro_str = f"""\
         @T.macro
-        def {self.get_macro_name(**kwargs)}(A, {params}, B):
+        def {self.get_macro_name(**kwargs)}({self._operands()}, {params}, B):
             for m0, m1 in T.Parallel(*B.shape):
                 B[m0, m1] = T.if_then_else(
-                    {tile_base} + m1 < {valid_len}, {self._exp_expr("A[m0, m1]")}, 0.0
+                    {_kv_mask(self.scalar_args)}, {self._exp_expr("A[m0, m1]")}, 0.0
                 )"""
         return self._format_code(macro_str)
 
@@ -410,6 +529,7 @@ class CausalMaskedExp(MaskedExp):
         scale: float | None,
         scalar_args: tuple[str, ...] = ("tile_base", "valid_len", "diag"),
         row_group: int = 1,
+        shift: bool = False,
         name: str = "causal_maskedexp",
         dtype: str = "float32",
         out_dtype: str = "float32",
@@ -420,6 +540,7 @@ class CausalMaskedExp(MaskedExp):
             scale,
             scalar_args=scalar_args,
             row_group=row_group,
+            shift=shift,
             name=name,
             dtype=dtype,
             out_dtype=out_dtype,
@@ -427,19 +548,13 @@ class CausalMaskedExp(MaskedExp):
         )
 
     def gen_macro(self, **kwargs) -> str:
-        tile_base, valid_len, diag = self.scalar_args[:3]
         params = ", ".join(self.scalar_args)
-        # ``diag`` is the end-aligned causal bound for this query tile's first row:
-        # (kv_len - q_len) + q_tile_base, so row m0 may attend up to column diag + m0.
-        # When the row axis fuses a head group, every head of one token shares a row.
-        row = mgroup_row("m0", self.row_group)
         macro_str = f"""\
         @T.macro
-        def {self.get_macro_name(**kwargs)}(A, {params}, B):
+        def {self.get_macro_name(**kwargs)}({self._operands()}, {params}, B):
             for m0, m1 in T.Parallel(*B.shape):
                 B[m0, m1] = T.if_then_else(
-                    ({tile_base} + m1 < {valid_len})
-                    & ({tile_base} + m1 <= {diag} + {row}),
+                    {_causal_mask(self.scalar_args, self.row_group)},
                     {self._exp_expr("A[m0, m1]")},
                     0.0,
                 )"""
@@ -447,6 +562,112 @@ class CausalMaskedExp(MaskedExp):
 
     def get_macro_name(self, **kwargs) -> str:
         return f"{self._name_prefix('causal_maskedexp')}_{kwargs['mem_scope']}"
+
+
+class MaskedScore(ComputeOpNode):
+    """The operand of a shifted ``MaskedExp``: ``A * scale`` where the mask keeps the
+    column, the most negative finite float32 where it does not.
+
+    The exact paged softmax takes its running max over this tile, so the max is taken
+    *after* scaling: the scale is a runtime scalar of unknown sign, and
+    ``max(s) * scale == max(s * scale)`` only for a positive one. A masked entry is the
+    finite ``NEG_FLT_MAX`` rather than ``-inf``: it is also where the carried max starts, so
+    a row with nothing live keeps a finite max and ``exp2(m_prev - m)`` never sees
+    ``(-inf) - (-inf)``. The predicate is the one the exp uses, so a column is masked in
+    both or in neither. ``scalar_args`` are the mask scalars and then the scale.
+    """
+
+    _uses_row_group = False
+    _n_mask_args = 2
+    _macro_attrs = ("dims", "n_batch_dims", "scalar_args", "row_group")
+    kind = "maskedscore"
+
+    def __init__(
+        self,
+        dims: tuple[int],
+        scalar_args: tuple[str, ...] = ("tile_base", "valid_len", "scale2"),
+        row_group: int = 1,
+        name: str = None,
+        dtype: str = "float32",
+        out_dtype: str = "float32",
+        n_batch_dims: int = None,
+    ):
+        self.row_group = int(row_group)
+        assert self.row_group >= 1, f"row_group must be positive, got {row_group}"
+        assert self.row_group == 1 or self._uses_row_group, (
+            f"{type(self).__name__}'s mask does not read the row index, so a "
+            "row_group would name an attribute its body cannot depend on"
+        )
+        assert len(scalar_args) == self._n_mask_args + 1, (
+            f"{type(self).__name__} takes {self._n_mask_args} mask scalars plus the "
+            f"runtime scale, got {scalar_args}"
+        )
+        assert out_dtype == "float32", (
+            f"a masked score is {NEG_FLT_MAX}, a float32 value; {out_dtype} cannot hold it"
+        )
+        self.scalar_args = tuple(scalar_args)
+        _init_elementwise(
+            self, dims, self.kind if name is None else name, dtype, out_dtype, n_batch_dims
+        )
+
+    def create_prim_func(self, dims, in_dtype, out_dtype):
+        # A rank/dtype stand-in, as for MaskedExp: the runtime scale has no value here.
+        A = te.placeholder(dims, name="A", dtype=in_dtype)
+        B = te.compute(dims, lambda *i: A[i].astype(out_dtype), name="B")
+        return te.create_prim_func([A, B])
+
+    def _mask(self) -> str:
+        return _kv_mask(self.scalar_args)
+
+    def gen_macro(self, **kwargs) -> str:
+        params = ", ".join(self.scalar_args)
+        macro_str = f"""\
+        @T.macro
+        def {self.get_macro_name(**kwargs)}(A, {params}, B):
+            for m0, m1 in T.Parallel(*B.shape):
+                B[m0, m1] = T.if_then_else(
+                    {self._mask()},
+                    A[m0, m1] * {self.scalar_args[-1]},
+                    {const_literal(NEG_FLT_MAX)},
+                )"""
+        return self._format_code(macro_str)
+
+    def get_macro_name(self, **kwargs) -> str:
+        prefix = f"ukernel_{self.kind}_scale_rt2"
+        prefix += f"_mgrp{self.row_group}" if self.row_group != 1 else ""
+        prefix += f"_{len(self.dims) - self.n_batch_dims}dims"
+        return f"{prefix}_{kwargs['mem_scope']}"
+
+
+class CausalMaskedScore(MaskedScore):
+    """``MaskedScore`` under the causal mask of ``CausalMaskedExp``."""
+
+    _uses_row_group = True
+    _n_mask_args = 3
+    kind = "causal_maskedscore"
+
+    def __init__(
+        self,
+        dims: tuple[int],
+        scalar_args: tuple[str, ...] = ("tile_base", "valid_len", "diag", "scale2"),
+        row_group: int = 1,
+        name: str = None,
+        dtype: str = "float32",
+        out_dtype: str = "float32",
+        n_batch_dims: int = None,
+    ):
+        super().__init__(
+            dims,
+            scalar_args=scalar_args,
+            row_group=row_group,
+            name=name,
+            dtype=dtype,
+            out_dtype=out_dtype,
+            n_batch_dims=n_batch_dims,
+        )
+
+    def _mask(self) -> str:
+        return _causal_mask(self.scalar_args, self.row_group)
 
 
 class MaskedDiv(Div):
@@ -598,3 +819,66 @@ class MaskedLog2(Log2):
         prefix += f"_{len(self.dims) - self.n_batch_dims}dims"
         return f"{prefix}_{kwargs['mem_scope']}"
 
+
+class MaskedLse2(Lse2):
+    """``Lse2`` written the way ``MaskedLog2`` writes: only the rows below ``n_rows``,
+    through the same destination indexing (``row_group``, ``fuse_dst``)."""
+
+    _macro_attrs = ("dims", "n_batch_dims", "scalar_args", "row_group", "fuse_dst")
+
+    def __init__(
+        self,
+        dims: tuple[int],
+        scalar_args: tuple[str, ...] = ("n_rows",),
+        row_group: int = 1,
+        fuse_dst: bool = True,
+        name: str = "maskedlse2",
+        dtype: str = "float32",
+        out_dtype: str = "float32",
+        n_batch_dims: int = None,
+    ):
+        assert (
+            len(scalar_args) == 1
+        ), f"MaskedLse2 takes a single row-count scalar, got {scalar_args}"
+        super().__init__(
+            dims,
+            name=name,
+            dtype=dtype,
+            out_dtype=out_dtype,
+            n_batch_dims=n_batch_dims,
+        )
+        # See MaskedDiv: the source row axis is fused, the destination is not.
+        self.row_group = int(row_group)
+        self.fuse_dst = bool(fuse_dst)
+        assert self.row_group >= 1, f"row_group must be positive, got {row_group}"
+        assert self.fuse_dst or self.row_group > 1, (
+            "fuse_dst only means something for a fused row axis"
+        )
+        self.scalar_args = tuple(scalar_args)
+
+    def gen_macro(self, **kwargs) -> str:
+        _idxs = [f"i{d}" for d in range(len(self.dims) - self.n_batch_dims)]
+        _idxs_str = ", ".join(_idxs)
+        n_rows = self.scalar_args[0]
+        if self.row_group == 1:
+            loop_src, row, dst = "B", _idxs[0], f"B[{_idxs_str}]"
+        else:
+            loop_src = "A"
+            row = mgroup_row(_idxs[0], self.row_group)
+            slot = mgroup_slot(_idxs[0], self.row_group)
+            head = [row, slot] if self.fuse_dst else [slot]
+            dst = f"B[{', '.join(head + _idxs[1:])}]"
+        macro_str = f"""\
+        @T.macro
+        def {self.get_macro_name(**kwargs)}(A, M, {n_rows}, B):
+            for {_idxs_str} in T.Parallel(*{loop_src}.shape):
+                if {row} < {n_rows}:
+                    {dst} = T.log2(A[{_idxs_str}]) + M[{_idxs_str}]"""
+        return self._format_code(macro_str)
+
+    def get_macro_name(self, **kwargs) -> str:
+        prefix = "ukernel_masked_lse2"
+        prefix += f"_mgrp{self.row_group}" if self.row_group != 1 else ""
+        prefix += "" if self.fuse_dst else "_dst2"
+        prefix += f"_{len(self.dims) - self.n_batch_dims}dims"
+        return f"{prefix}_{kwargs['mem_scope']}"

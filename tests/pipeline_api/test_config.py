@@ -50,15 +50,20 @@ def test_config_normalization_and_replace():
     assert EvalConfig().max_parallel == 8
 
 
-# Hand-set budgets in demo/*.py (13 = engine default where the demo sets none).
+# The auto rule on the programs of demo/*.py (13 = engine default where the rule gives
+# less). ``cl.softmax`` records its max and the subtraction (two ops more than the request of
+# the hand-derived pass), and the rule follows. A program split over a dim its max reduces
+# is searched unsplit (``pipeline.superopt``), at the budget of ``split=()``: the first row
+# of attention is the budget the decode demos search at.
 DEMO_MAX_OPS = [
     (P.matmul, dict(M=128, N=128, K=4096), (), 13),
     (P.matmul, dict(M=128, N=128, K=4096), ("K",), 13),
     (P.rmsnorm_matmul, dict(M=128, N=6144, K=4096), ("K",), 13),
-    (P.attention, dict(HQ=32, SQ=64, HKV=32, SKV=4096, D=64), ("SKV",), 14),  # mha/gqa/mqa decode
-    (P.attention, dict(HQ=32, SQ=4096, HKV=32, SKV=4096, D=64), ("SKV",), 14),  # prefill split
-    (P.qknorm, dict(HQ=64, SQ=4096, HKV=8, SKV=4096, D=128), (), 26),
-    (P.qknorm, dict(HQ=64, SQ=4096, HKV=8, SKV=4096, D=128), ("SKV",), 28),
+    (P.attention, dict(HQ=32, SQ=64, HKV=32, SKV=4096, D=64), (), 13),  # decode, --split none
+    (P.attention, dict(HQ=32, SQ=64, HKV=32, SKV=4096, D=64), ("SKV",), 15),  # mha/gqa/mqa decode
+    (P.attention, dict(HQ=32, SQ=4096, HKV=32, SKV=4096, D=64), ("SKV",), 15),  # prefill split
+    (P.qknorm, dict(HQ=64, SQ=4096, HKV=8, SKV=4096, D=128), (), 27),
+    (P.qknorm, dict(HQ=64, SQ=4096, HKV=8, SKV=4096, D=128), ("SKV",), 29),
 ]
 
 
@@ -70,7 +75,7 @@ def test_auto_max_ops_reproduces_demo_budgets(fn, shapes, split, expected):
 
 
 def test_auto_max_ops_floor():
-    # Demos that hand-set budgets below the engine default (prefill unsplit 12,
+    # Demos that hand-set budgets below the engine default (prefill unsplit 11,
     # matmul_matmul_split 5/8) get the default floor of 13 instead: a superset search.
     assert auto_max_ops(3, 1, False) == 13
     assert auto_max_ops(24, 1, True) == 28
@@ -100,9 +105,7 @@ def test_cache_schema_retires_kernels_built_before_a_scheduler_fix(monkeypatch):
 
     prog = trace(P.matmul, dict(M=128, N=128, K=4096), cl.f16)
     cfgs = resolve_configs(prog)
-    # 1: a reduction absorbed into another's loop was sliced with that loop's counter, and
-    # demo/mha_prefill.py's saved winner was such a kernel.
-    assert cache.SCHEMA >= 2
+    assert cache.SCHEMA >= 43
     key = _kernel_key(prog, *cfgs)
     monkeypatch.setattr(cache, "SCHEMA", 1)
     assert _kernel_key(prog, *cfgs) != key
@@ -169,9 +172,17 @@ def test_kernel_cache_key_covers_validation():
     assert key(declared) == key(ev.replace(tolerance=cl.Tolerance(rtol=1e-3)))
     assert key(declared) != key(ev.replace(tolerance=cl.Tolerance(rtol=2e-3)))
     assert key(declared) != key(ev.replace(tolerance=cl.Tolerance(rtol=1e-3, atol=1e-6)))
+    # ... declared by boundary role too: every bound of it is in the key
+    by_role = ev.replace(tolerance={"": cl.Tolerance(rtol=1e-3), "shift": cl.Tolerance(rtol=1e-6)})
+    assert key(by_role) != key(declared)
+    assert key(by_role) == key(ev.replace(tolerance=dict(by_role.tolerance)))
+    assert key(by_role) != key(ev.replace(tolerance={**by_role.tolerance,
+                                                     "shift": cl.Tolerance(rtol=2e-6)}))
     assert key(declared) != key(declared.replace(distributions=("normal", "large_logits")))
     assert key(declared) == key(declared.replace(max_parallel=2, timeout_s=5.0))
-    assert cache.VALIDATION >= 2  # 1: elementwise assert_close with a 0.5/0.5 default
+    # 1: elementwise assert_close with a 0.5/0.5 default. 3: the partial of a program
+    # split over the softmax axis of an input was held to no adversarial case.
+    assert cache.VALIDATION >= 7
     before = key(declared)
     cache.VALIDATION += 1
     try:
@@ -243,6 +254,60 @@ def test_a_per_output_tolerance_must_fit_every_plan(monkeypatch):
         with pytest.raises(SpecError, match=message):
             build(plans, tolerance)
     assert len(ran) == 3  # nothing ran for the refused declarations
+
+
+def test_a_tolerance_by_role_gives_the_shift_its_own_bound(monkeypatch):
+    """The split partial of an exact softmax returns its float32 shift next to its float16
+    sums. One ``Tolerance`` is the bound of the outputs a program or its cut defines, so a
+    program with such plans declares its tolerance by boundary role; ``build()`` refuses
+    anything that leaves an output of some plan without a bound, before any candidate runs."""
+    import cleave.runtime.evaluate as evaluate_mod
+    import cleave.runtime.reference as reference_mod
+    from cleave.ir.graph import Boundary
+
+    def out(index, role=""):
+        return types.SimpleNamespace(boundary=Boundary(index, role))
+
+    one, three = object(), object()
+    outputs = {id(one): [out(0)], id(three): [out(2, "shift"), out(0), out(1)]}
+    monkeypatch.setattr(reference_mod, "output_order", lambda graph: outputs[id(graph)])
+    ran = []
+    monkeypatch.setattr(evaluate_mod, "run_candidates",
+                        lambda tiles, dtype, **kw: ran.append(kw["tolerance"]) or
+                        [types.SimpleNamespace(code=None) for _ in tiles])
+
+    def plan(graph, role):
+        return types.SimpleNamespace(tile=types.SimpleNamespace(flat_graph=graph), role=role,
+                                     label=f"g0 {role}", program=None)
+
+    solo, partial, combine = plan(one, "main"), plan(three, "partial"), plan(one, "combine")
+    t, shift = cl.Tolerance(rtol=5e-3), cl.Tolerance(rtol=2e-6)
+
+    def build(plans, tolerance):
+        return build_mod.build(plans, config=EvalConfig(tolerance=tolerance))
+
+    by_role = {"": t, "shift": shift}
+    assert len(build([solo, partial, combine], by_role)) == 3
+    assert len(build([solo, combine], by_role)) == 2  # an entry no plan needs is no error
+    assert len(build([solo, combine], t)) == 2  # no plan returns a shift: one bound is enough
+    assert len(build([partial], (shift, t, t))) == 1  # one per output, by position
+    assert ran == [by_role, by_role, t, (shift, t, t)]
+    for plans, tolerance, message in (
+            ([solo, partial, combine], t,
+             r"build\(\): plan 'g0 partial' \(partial\): one Tolerance covers the outputs a "
+             r"program or its cut defines, and this kernel also returns outputs of role "
+             r"\['shift'\]"),
+            ([solo, partial], {"": t},
+             r"plan 'g0 partial' \(partial\): no validation tolerance declared for the outputs "
+             r"of role \['shift'\]"),
+            ([solo, partial], {"shift": shift},
+             r"plan 'g0 main' \(main\): no validation tolerance declared for the outputs of "
+             r"role \[''\]"),
+            ([solo], {"": 5e-3}, "maps each boundary role"),
+            ([solo, partial], (t,), "A per-output tolerance must fit every plan")):
+        with pytest.raises(SpecError, match=message):
+            build(plans, tolerance)
+    assert len(ran) == 4  # nothing ran for the refused declarations
 
 
 def test_compile_takes_the_tolerance_from_jit_options_or_the_keyword(monkeypatch):

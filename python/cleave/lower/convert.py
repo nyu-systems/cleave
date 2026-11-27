@@ -6,6 +6,8 @@ is a rewrite pass over the ops that runs before conversion.
 
 from __future__ import annotations
 
+import itertools
+import math
 from collections import Counter
 from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -14,7 +16,7 @@ import tvm
 from tvm import te
 
 from ..core.schema import KernelGraph, KGOp, KGTensor, parse_op_type
-from ..ir.graph import Graph, OutputNode, PlaceHolderNode
+from ..ir.graph import Boundary, Graph, OutputNode, PlaceHolderNode
 from ..ir.ops import (Add, Div, Exp, Matmul, ReduceMax, Mul, ReduceSum, RSqrt, Silu, SplitView,
                    Sqrt, Sub)
 from ..ir.ops.base import wire_input
@@ -24,20 +26,88 @@ _MAX_AXIS = 4
 IndexedOps = List[Tuple[int, KGOp]]  # (index in the source structure, op); names use the index
 
 
-def _infer_broadcast_index(dims: Tuple[int, ...], other_shape: Tuple[int, ...]) -> int:
-    if tuple(dims) == tuple(other_shape):
-        return -1
+def _broadcast_fits(dims: Tuple[int, ...], other_shape: Tuple[int, ...]) -> Tuple[int, ...]:
+    """The ``broadcast`` values under which a binary op on ``dims`` reads ``other_shape``.
+
+    -1: the same shape. 0: ``dims`` without its last axis (the operand spans the
+    second-to-last and is broadcast along the last). 1: ``dims`` without its second-to-last.
+    Value shapes only, so equal trailing extents give ``(0, 1)`` and the structure has to
+    choose. Empty: the op cannot read that operand at all.
+    """
+    dims, other_shape = tuple(dims), tuple(other_shape)
+    if dims == other_shape:
+        return (-1,)
     if len(dims) < 2:
-        return -1
-    batch_dims = dims[:-2]
-    m_dim, n_dim = dims[-2], dims[-1]
-    # B is a row vector ``[..., M]`` / ``[..., M, 1]`` or a column vector ``[..., N]`` /
-    # ``[..., 1, N]`` (a keepdim input such as a log-sum-exp keeps its unit axis).
-    if tuple(other_shape) in (batch_dims + (m_dim,), batch_dims + (m_dim, 1)):
+        return ()
+    return tuple(i for i in (0, 1) if other_shape == dims[:-2] + (dims[i - 2],))
+
+
+def _keepdim_broadcast(dims: Tuple[int, ...], other_shape: Tuple[int, ...]) -> Optional[int]:
+    """The ``broadcast`` under which a binary op on ``dims`` reads an operand that keeps the
+    axis it is broadcast along as a unit, else None: ``[..., M, 1]`` is read along the last
+    axis (0), ``[..., 1, N]`` along the second-to-last (1).
+
+    Only an input is read so (``_Ctx.broadcast_index``): it is declared the way the op reads
+    it, ``[..., M]`` or ``[..., N]``, which holds the same elements in the same order. A
+    log-sum-exp ``L`` of shape ``(H, SQ, 1)`` subtracted from scores ``(H, SQ, SKV)`` is one.
+    """
+    dims, other_shape = tuple(dims), tuple(other_shape)
+    if len(dims) < 2 or len(other_shape) != len(dims) or other_shape == dims:
+        return None
+    batch, (m, n) = dims[:-2], dims[-2:]
+    if other_shape == batch + (m, 1):
         return 0
-    if tuple(other_shape) in (batch_dims + (n_dim,), batch_dims + (1, n_dim)):
+    if other_shape == batch + (1, n):
         return 1
-    return -1
+    return None
+
+
+def _broadcast_from_symbols(lhs: Tuple[int, ...], rhs: Tuple[int, ...], rank: int) -> Optional[int]:
+    """The broadcast index read off the raw dims of the two structure tensors, else None.
+
+    Before ``symbol_map`` two axes of one extent are still different symbols, and a
+    reduction leaves its axis behind as a literal ``1``: the axis the operand does not span.
+    ``rank`` is the rank of the lhs *value*, which has dropped the axes reduced before it
+    (a split combine divides ``(1, BH, SQ, D)`` by ``(1, BH, SQ, 1)``: values of rank 3 and 2).
+
+    The dims both tensors list as ``1`` are the candidates for those dropped axes. A value
+    axis of extent 1 is written the same way (one head: ``(1, 1, SQ, D)`` by
+    ``(1, 1, SQ, 1)``), so there can be more candidates than dropped axes, and the dims do
+    not say which of them the value still has. Every choice is read; they have to agree.
+    """
+    lhs, rhs = tuple(lhs), tuple(rhs)
+    if len(lhs) > rank and len(lhs) == len(rhs):
+        units = [i for i in range(len(lhs)) if lhs[i] == rhs[i] == 1]
+        dropped = len(lhs) - rank
+        if len(units) < dropped:
+            return None
+        readings = set()
+        for gone in itertools.combinations(units, dropped):
+            kept = [i for i in range(len(lhs)) if i not in gone]
+            readings.add(_broadcast_from_aligned(tuple(lhs[i] for i in kept),
+                                                 tuple(rhs[i] for i in kept), rank))
+        return readings.pop() if len(readings) == 1 else None
+    return _broadcast_from_aligned(lhs, rhs, rank)
+
+
+def _broadcast_from_aligned(lhs: Tuple[int, ...], rhs: Tuple[int, ...], rank: int) -> Optional[int]:
+    """``_broadcast_from_symbols`` for dims that list the axes of the lhs value, one each."""
+    if len(lhs) != rank or rank < 2:
+        return None
+    if len(rhs) == len(lhs):  # keepdim form
+        if rhs[:-2] != lhs[:-2]:
+            return None
+        keeps_m, keeps_n = rhs[-2] == lhs[-2], rhs[-1] == lhs[-1]
+        if keeps_m and not keeps_n and rhs[-1] == 1:
+            return 0
+        if keeps_n and not keeps_m and rhs[-2] == 1:
+            return 1
+        return None
+    if len(rhs) == len(lhs) - 1 and rhs[:-1] == lhs[:-2]:
+        spans_m, spans_n = rhs[-1] == lhs[-2], rhs[-1] == lhs[-1]
+        if spans_m != spans_n:
+            return 0 if spans_m else 1
+    return None
 
 
 def _infer_matmul_config(
@@ -186,6 +256,19 @@ def _dims(t: KGTensor) -> Tuple[int, ...]:
     return t.dims or t.dim_padding  # num_dims <= 0 keeps every dim
 
 
+def _live_ops(ops: IndexedOps) -> set:
+    """Indices of the ops that some output reads, directly or through other ops."""
+    producer = {t.guid: idx for idx, op in ops for t in op.outputs}
+    reads = {idx: [t.guid for t in op.inputs] for idx, op in ops}
+    live, stack = set(), [idx for idx, op in ops if op.kind == "output"]
+    while stack:
+        idx = stack.pop()
+        if idx not in live:
+            live.add(idx)
+            stack += [producer[guid] for guid in reads[idx] if guid in producer]
+    return live
+
+
 class _Ctx:
     """Conversion state: producer node, known shape and metadata dtype per tensor guid."""
 
@@ -199,6 +282,27 @@ class _Ctx:
         self.dtypes: Dict[int, str] = {}
         self.consumers: Dict[int, List[str]] = {}
         self.outputs: List[OutputNode] = []
+        # guid -> (structure rank, structure axis behind each value axis), where a value
+        # has dropped axes its structure tensor keeps as unit dims: a reduction's output
+        # and what shape-preserving ops make of it. Absent: the value has every axis.
+        self.kept: Dict[int, Tuple[int, Tuple[int, ...]]] = {}
+        # Inputs: the operand shape each consumer declares (name, shape), and the guids of
+        # those a binary op takes with unit axes dropped (``broadcast_index``).
+        self.read_as: Dict[int, List[Tuple[str, Tuple[int, ...]]]] = {}
+        self.reshaped: set = set()
+        # Input op -> its position among the structure's input ops: the program's order
+        # of its inputs, which the graph rebuilt from the outputs forgets. Every input op
+        # is counted, also one no output reads: it is not converted and gets no
+        # placeholder, and the inputs declared after it keep their place. This is the one
+        # definition of that position; both records of it (``Boundary.index``, which
+        # pairs split stages, and ``input_index``, which binds a program's inputs) are
+        # written from it in ``placeholder``.
+        self.input_position: Dict[int, int] = {
+            idx: position
+            for position, idx in enumerate(
+                idx for idx, op in ops if op.kind == "input" and op.outputs
+            )
+        }
         for _, op in ops:
             for t in op.inputs:
                 if t.dtype is not None:
@@ -270,12 +374,17 @@ class _Ctx:
             return len(out_dims) - 1
         return None
 
-    def placeholder(self, t: KGTensor) -> PlaceHolderNode:
+    def placeholder(self, t: KGTensor, position: Optional[int] = None) -> PlaceHolderNode:
+        """The placeholder for ``t``; ``position`` (``input_position``) when an input op
+        declares it: the node's ``boundary`` index and its ``input_index``."""
         node = PlaceHolderNode(name=input_name(t.guid))
         shape = self.shape(t)
         dtype = self.dtype if t.dtype is None else str(t.dtype)
         node.set_shape(shape)
         node.set_dtype(tvm.DataType(dtype))
+        node.boundary = None if position is None else Boundary(position)
+        if position is not None:
+            node.input_index = position
         self.nodes[t.guid] = (node, 0)
         self.shapes[t.guid] = shape
         self.dtypes[t.guid] = dtype
@@ -289,11 +398,164 @@ class _Ctx:
             wire_input(src, node, dst_id, src_id=src_id)
             if isinstance(src, PlaceHolderNode) and dst_id < len(node.input_buffers):
                 self.shapes[t.guid] = tuple(src.get_shape(src_id))
+                declared = tuple(int(d) for d in node.input_buffers[dst_id].shape)
+                self.read_as.setdefault(t.guid, []).append((node.name, declared))
 
     def register(self, node, outputs: Sequence[KGTensor]) -> None:
         for i, t in enumerate(outputs):
             self.nodes[t.guid] = (node, i)
             self.shapes[t.guid] = tuple(node.get_shape(i))
+
+    def extents(self, t: KGTensor) -> tuple:
+        """The dims of the structure tensor ``t`` as extents (None for an unknown symbol)."""
+        dims = tuple(int(v) for v in _dims(t))
+        return tuple(self.symbol_map.get(v) for v in dims) if self.symbol_map else dims
+
+    def kept_axes(self, t: KGTensor) -> Tuple[int, Tuple[int, ...], bool]:
+        """``(rank, axes, keepdim)``: the structure axis behind each axis of the value of
+        ``t``, and whether its structure tensor still lists the dropped axes (as units).
+
+        The identity unless a reduction was recorded for ``t`` and the structure dims of
+        ``t`` agree with the record: a rewritten split structure numbers axes its own way.
+        """
+        shape = tuple(self.known_shape(t))
+        identity = (len(shape), tuple(range(len(shape))), False)
+        if t.guid not in self.kept:
+            return identity
+        rank, axes = self.kept[t.guid]
+        dims = self.extents(t)
+        if len(axes) != len(shape):
+            return identity
+        if dims == shape:
+            return rank, axes, False
+        if len(dims) == rank and all(
+                dims[a] == (shape[axes.index(a)] if a in axes else 1) for a in range(rank)):
+            return rank, axes, True
+        return identity
+
+    def forward_kept(self, src: KGTensor, op: KGOp) -> None:
+        """A shape-preserving op keeps the meaning of its input's axes."""
+        if src.guid in self.kept:
+            for t in op.outputs:
+                self.kept[t.guid] = self.kept[src.guid]
+
+    def value_axis(self, idx: int, op: KGOp, t: KGTensor) -> int:
+        """``op.axis`` (an axis of the structure tensor ``t``) as an axis of its value.
+
+        The two differ once a reduction has run: the structure keeps the reduced axis as
+        a unit dim, the value drops it, so ``sum(sum(x, 0), 1)`` reduces value axis 0.
+        """
+        _, axes, keepdim = self.kept_axes(t)
+        if not keepdim:
+            return op.axis
+        if op.axis not in axes:
+            raise ValueError(f"{op.op_type} at index {idx}: axis {op.axis} of "
+                             f"{tuple(_dims(t))} was already reduced away")
+        return axes.index(op.axis)
+
+    def positions(self, t: KGTensor) -> Optional[Tuple[int, ...]]:
+        """Where each axis of the value of ``t`` sits in the dims of ``t``, if the dims say.
+
+        They do for a value that has every axis its tensor lists, and for one whose record
+        of reduced axes the dims confirm (they keep those axes as units). The tensors of
+        one op are aligned position by position when they have the same rank, so with both
+        answers known the dims say exactly along which axes the program broadcasts.
+        """
+        _, axes, keepdim = self.kept_axes(t)
+        if keepdim:
+            return axes
+        shape = tuple(self.known_shape(t))
+        return tuple(range(len(shape))) if self.extents(t) == shape else None
+
+    def is_input(self, t: KGTensor) -> bool:
+        """A graph input: it takes the shape its consumer declares (``wire_input``)."""
+        return t.guid not in self.nodes or isinstance(self.producer(t.guid), PlaceHolderNode)
+
+    def broadcast_index(self, idx: int, op: KGOp, lhs: KGTensor, rhs: KGTensor) -> int:
+        """``broadcast`` of the binary op ``lhs <op> rhs`` (see ``_broadcast_fits``).
+
+        The value shapes say which indices can read ``rhs``; the structure says which one
+        the program means, and the two must agree. Where both tensors list the same axes
+        and the dims confirm what each value has kept of them, the reading is exact: the
+        program broadcasts ``rhs`` along the axes where its extent is 1 and the lhs's is
+        not, and an operand that fits an index only because two extents happen to be equal
+        is refused, not misread. Elsewhere the symbolic dims of the two tensors choose, and
+        between two fitting indices the axis the producer of ``rhs`` reduced; never which
+        shape test runs first.
+        """
+        ls, rs = tuple(self.known_shape(lhs)), tuple(self.known_shape(rhs))
+        where = f"{op.op_type} at index {idx}"
+        dims = f"dims {tuple(_dims(lhs))} and {tuple(_dims(rhs))}"
+        rule = ("a binary op keeps the shape of its first operand and broadcasts the second "
+                "along one of its last two axes")
+        fits = _broadcast_fits(ls, rs)
+        lext, rext = self.extents(lhs), self.extents(rhs)
+        lpos, rpos = self.positions(lhs), self.positions(rhs)
+        if len(lext) == len(rext) and lpos is not None and rpos is not None:
+            for ours, theirs in zip(lext, rext):
+                if theirs not in (ours, 1):  # the result would not have the lhs's shape
+                    raise ValueError(f"{where}: the operand {rs} has extent {theirs} where "
+                                     f"the first operand {ls} has {ours} ({dims}); {rule}")
+            # axes of the lhs value along which the program broadcasts the operand
+            along = [lpos.index(p) for p in range(len(lext)) if rext[p] == 1 != lext[p]]
+            if along:
+                index = {len(ls) - 1: 0, len(ls) - 2: 1}.get(along[0])
+                if len(along) > 1 or len(ls) < 2 or index is None:
+                    axes = ("axis " if len(along) == 1 else "axes ") + ", ".join(map(str, along))
+                    raise ValueError(f"{where}: the operand {rs} is broadcast along {axes} of "
+                                     f"the first operand {ls} ({dims}); {rule}")
+                if index not in fits:
+                    if self.is_input(rhs) and _keepdim_broadcast(ls, rs) == index:
+                        # declared the way the op reads it, without the unit axis
+                        self.reshaped.add(rhs.guid)
+                        return index
+                    reads = ls[:along[0]] + ls[along[0] + 1:]
+                    raise ValueError(f"{where}: the operand {rs} is broadcast along axis "
+                                     f"{along[0]} of the first operand {ls}, which reads an "
+                                     f"operand of shape {reads} there ({dims})")
+                return index
+            # No broadcast: both values hold the same elements, give or take unit axes.
+            if fits == (0, 1):  # two unit axes it may lack: the one the operand has dropped
+                return 1 if lpos[-2] not in rpos and lpos[-1] in rpos else 0
+            if fits:
+                return fits[0]
+            if not self.is_input(rhs):
+                raise ValueError(f"{where}: the operand {rs} and the first operand {ls} hold "
+                                 f"the same elements with different unit axes ({dims})")
+            self.reshaped.add(rhs.guid)  # an input: wiring declares it like the first operand
+            return -1
+        if not fits:
+            if self.is_input(rhs) and math.prod(rs) == math.prod(ls):
+                self.reshaped.add(rhs.guid)  # declared with the shape of the first operand
+                return -1
+            keepdim = _keepdim_broadcast(ls, rs) if self.is_input(rhs) else None
+            if keepdim is not None:
+                self.reshaped.add(rhs.guid)  # declared the way the op reads it
+                return keepdim
+            raise ValueError(f"{where}: an operand of shape {rs} is neither the shape {ls} of "
+                             f"the first operand nor that shape without one of its last two "
+                             f"axes ({dims})")
+        if fits == (-1,):
+            return -1
+        index = _broadcast_from_symbols(tuple(_dims(lhs)), tuple(_dims(rhs)), len(ls))
+        if index is not None and index not in fits:
+            raise ValueError(f"{where}: by its dims the operand {rs} is broadcast along axis "
+                             f"{len(ls) - 1 - index} of {ls}, where its shape does not fit ({dims})")
+        if index is None and len(fits) > 1:
+            (lrank, laxes, _), (rrank, raxes, _) = self.kept_axes(lhs), self.kept_axes(rhs)
+            if lrank == rrank and set(raxes) <= set(laxes):
+                spans = tuple(laxes.index(a) for a in raxes)  # axes of the lhs value
+                batch = tuple(range(len(ls) - 2))
+                index = {batch + (len(ls) - 2,): 0, batch + (len(ls) - 1,): 1}.get(spans)
+        if index is None:
+            # One index reads the operand, or the trailing axes hold one element each (both
+            # indices then read the same value): there is nothing to choose.
+            if len(fits) > 1 and ls[-1] != 1:
+                raise ValueError(
+                    f"{where}: cannot tell which axis of {ls} the operand {rs} is broadcast "
+                    f"along (equal extents; {dims}, and the operand's producer, do not say)")
+            index = fits[0]
+        return index
 
 
 def input_name(guid: int) -> str:
@@ -306,8 +568,10 @@ Rule = Callable[[_Ctx, int, KGOp], Built]
 
 
 def _input(ctx: _Ctx, idx: int, op: KGOp) -> Built:
+    # The k-th input op is input k of the graph. A graph is rebuilt in discovery order
+    # from its outputs below, so this is the only place the declaration order is known.
     if op.outputs:
-        ctx.placeholder(op.outputs[0])
+        ctx.placeholder(op.outputs[0], ctx.input_position[idx]).op_index = idx
     return None, ()
 
 
@@ -316,7 +580,10 @@ def _output(ctx: _Ctx, idx: int, op: KGOp) -> Built:
         guid = op.inputs[0].guid
         if guid not in ctx.nodes:
             raise ValueError(f"Output tensor guid {guid} has no producer.")
-        ctx.outputs.append(OutputNode(ctx.producer(guid), dtype=ctx.dtypes.get(guid, ctx.out_dtype)))
+        node = OutputNode(ctx.producer(guid), dtype=ctx.dtypes.get(guid, ctx.out_dtype))
+        node.boundary = Boundary(len(ctx.outputs))  # the k-th output op is output k
+        node.op_index = idx
+        ctx.outputs.append(node)
     return None, ()
 
 
@@ -352,9 +619,47 @@ def _split(ctx: _Ctx, idx: int, op: KGOp) -> Built:
 
 def _matmul(ctx: _Ctx, idx: int, op: KGOp) -> Built:
     a, b = op.inputs[0], op.inputs[1]
+    for which, t in (("first", a), ("second", b)):
+        # The config below reads a value of rank 1 as a vector and the last two axes of any
+        # other as its matrix axes. A reduction drops its axis from the value, so a batched
+        # vector would be read as a matrix whose rows are its last batch axis.
+        rank, axes, keepdim = ctx.kept_axes(t)
+        if keepdim and len(axes) >= 2 and not {rank - 2, rank - 1} <= set(axes):
+            raise ValueError(
+                f"{op.op_type} at index {idx}: the {which} operand {tuple(ctx.known_shape(t))} "
+                f"has lost a matrix axis to a reduction (dims {tuple(_dims(t))}); only a "
+                "vector without batch axes can stand in for a matrix")
+    shapes = {"first": tuple(ctx.known_shape(a)), "second": tuple(ctx.known_shape(b))}
+    for (which, shape), (_, other) in zip(shapes.items(), reversed(shapes.items())):
+        # A vector stands in for a one-row or one-column matrix. Next to a batched matrix it
+        # would be that row for every batch entry, which the config below declares as a
+        # vector per batch entry: an operand of B times its size, which nothing can run.
+        if len(shape) == 1 and len(other) > 2:
+            raise ValueError(
+                f"{op.op_type} at index {idx}: the {which} operand is a vector {shape} and "
+                f"the other a batched matrix {other} (dims {tuple(_dims(a))} and "
+                f"{tuple(_dims(b))}); only a matmul without batch axes takes a vector")
     dims, ta, tb, a_batch, b_batch = _infer_matmul_config(
-        ctx.known_shape(a), ctx.known_shape(b), ctx.shape(op.outputs[0]),
+        shapes["first"], shapes["second"], ctx.shape(op.outputs[0]),
         bool(op.attrs.get("trans_A", False)), bool(op.attrs.get("trans_B", False)))
+    batch_entries = math.prod(int(extent) for extent in dims[:-3])  # of the output
+    for (which, shape), t in zip(shapes.items(), (a, b)):
+        # The op declares both operands with the batch axes of its output. An input takes
+        # the declared shape (unit extents where it has no batch axis); a computed value
+        # keeps its own, and one that has fewer axes lost a batch axis to a reduction.
+        # While it still has every batch entry of the output -- the output has one entry
+        # along each axis the value lacks, because the other operand lost it too or is
+        # broadcast over it -- the declared shape is the stored one with unit axes, which
+        # every tile squeezes. Where the output has more entries, the value is read once
+        # per entry and is tiled as the matmul reads it, not as it is stored: no tiling of
+        # such a graph builds.
+        if (len(shape) >= 2 and len(shape) != len(dims) - 1 and not ctx.is_input(t)
+                and math.prod(shape[:-2]) != batch_entries):
+            raise ValueError(
+                f"{op.op_type} at index {idx}: the {which} operand {shape} is computed "
+                f"without the batch axes of its matmul, whose output is {tuple(dims[:-1])} "
+                f"(dims {tuple(_dims(t))}); only an input is read over batch axes it does "
+                "not have")
     node = Matmul(dims, input_batch_dims_A=a_batch, input_batch_dims_B=b_batch, name=f"mma_{idx}",
                   transpose_A=ta, transpose_B=tb, warp_policy="rows", dtype=ctx.dtype,
                   out_dtype=ctx.accum_dtype)
@@ -365,10 +670,14 @@ def _reduction(cls) -> Rule:
     def rule(ctx: _Ctx, idx: int, op: KGOp) -> Built:
         t, axis = op.inputs[0], op.axis
         shape = ctx.known_shape(t)
+        value_axis = ctx.value_axis(idx, op, t)
         # Named by the pinned macro stem (cls.kind): node names reach generated kernels.
-        node = cls(shape, axis=-1 if axis == len(shape) - 1 else axis,
+        node = cls(shape, axis=-1 if value_axis == len(shape) - 1 else value_axis,
                    name=f"{cls.kind}_{axis}_{idx}", dtype=ctx.in_dtype(t.guid),
                    out_dtype=ctx.accum_dtype)
+        rank, axes, _ = ctx.kept_axes(t)
+        for out in op.outputs:
+            ctx.kept[out.guid] = (rank, axes[:node.axis] + axes[node.axis + 1:])
         return node, op.inputs
     return rule
 
@@ -379,6 +688,7 @@ def _unary(cls) -> Rule:
         shape = ctx.known_shape(t)
         node = cls(shape, name=f"{op.kind}_{idx}", dtype=ctx.in_dtype(t.guid),
                    out_dtype=ctx.out_dtype_of(op), n_batch_dims=ctx.batch_dims(t.guid, shape))
+        ctx.forward_kept(t, op)
         return node, op.inputs
     return rule
 
@@ -390,6 +700,7 @@ def _rsqrt(ctx: _Ctx, idx: int, op: KGOp) -> Built:
     # dims typed as the fused Sqrt's input buffer shape
     node = RSqrt(tuple(te.placeholder(shape).shape), name=f"rsqrt_{idx}", dtype=ctx.accum_dtype,
                  out_dtype=ctx.out_dtype_of(op), n_batch_dims=nbd)
+    ctx.forward_kept(t, op)
     return node, op.inputs
 
 
@@ -413,6 +724,7 @@ def _scalar(cls) -> Rule:
                 dtype = ctx.accum_dtype
         node = cls(shape, const=float(op.attrs["scalar"]), name=f"{op.kind}_{idx}", dtype=dtype,
                    out_dtype=out_dtype, n_batch_dims=ctx.batch_dims(t.guid, shape), **kw)
+        ctx.forward_kept(t, op)
         return node, op.inputs
     return rule
 
@@ -427,11 +739,19 @@ def _binary(cls, out_is_in_dtype: bool = False, silu_first: bool = False) -> Rul
                     ctx.producer(ins[0].guid), Silu):
                 ins = [ins[1], ins[0]]
         lhs, rhs = ins[0], ins[1]
-        ls, rs = ctx.known_shape(lhs), ctx.known_shape(rhs)
+        ls = ctx.known_shape(lhs)
         dtype = ctx.common_dtype(lhs.guid, rhs.guid)
-        node = cls(ls, broadcast=_infer_broadcast_index(ls, rs), name=f"{op.kind}_{idx}",
+        broadcast, n_batch_dims = ctx.broadcast_index(idx, op, lhs, rhs), ctx.batch_dims(lhs.guid, ls)
+        if broadcast != -1 and n_batch_dims is not None:
+            # every axis but the last is a batch axis of the lhs (see ``_Ctx.batch_dims``),
+            # and a binary op broadcasts along a non-batch axis only
+            raise ValueError(
+                f"{op.op_type} at index {idx}: an operand of shape {tuple(ctx.known_shape(rhs))} "
+                f"cannot be broadcast over {tuple(ls)}, a value with {n_batch_dims} batch axes")
+        node = cls(ls, broadcast=broadcast, name=f"{op.kind}_{idx}",
                    dtype=dtype, out_dtype=dtype if out_is_in_dtype else ctx.out_dtype_of(op),
-                   n_batch_dims=ctx.batch_dims(lhs.guid, ls))
+                   n_batch_dims=n_batch_dims)
+        ctx.forward_kept(lhs, op)  # the result has the lhs's shape
         return node, ins
     return rule
 
@@ -514,13 +834,30 @@ def to_ir(
     if fuse_rsqrt:
         ops = fuse_rsqrt_ops(ops)
     ctx = _Ctx(ops, dtype, accum_dtype, out_dtype, symbol_map, fuse_rsqrt)
+    live = _live_ops(ops)
     for idx, op in ops:
+        if idx not in live:
+            # No output reads it, so there is nothing to build -- and an op that is built is
+            # wired: it would hand its shape to the inputs it reads and could refuse the graph.
+            continue
         node, inputs = _rule(op, idx)(ctx, idx, op)
         if node is not None:
+            # Which op of the structure the node was lowered from (for a fused rsqrt, the
+            # div): what builds another structure from this graph's nodes reads it
+            # (``lower.state_split``) instead of parsing the node's name.
+            node.op_index = idx
             ctx.wire(node, inputs)
             ctx.register(node, op.outputs)
     if not ctx.outputs:
         raise ValueError("No output nodes found in graph structure.")
+    for guid in sorted(ctx.reshaped):
+        # ``wire_input`` gives an input the shape of the last consumer wired; that is only a
+        # reshape of the input if every consumer reads it the same way.
+        (name, shape), *others = ctx.read_as[guid]
+        other = next(((n, s) for n, s in others if s != shape), None)
+        if other is not None:
+            raise ValueError(f"input {guid} is read as {shape} by {name} and as {other[1]} by "
+                             f"{other[0]}; an input has one layout")
     nodes = gather_all_nodes(*ctx.outputs)
     # The outputs in the structure's order (the Program's): the kernel returns them in this
     # order. The traversal above finds them in another one when a later output is reached

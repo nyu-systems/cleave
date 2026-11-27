@@ -8,9 +8,9 @@ from ....ir.ops import (
     Add,
     Div,
     IndexGather,
-    Log2,
+    Lse2,
     MaskedDiv,
-    MaskedLog2,
+    MaskedLse2,
     Matmul,
     PagedGather,
     ReduceSum,
@@ -22,9 +22,11 @@ from ..stages import (
     DENOM_FLOOR,
     LOG2E,
     _accum_edge,
+    _accumulators,
     _connect,
-    _exp,
+    _declare_rolling,
     _index_input,
+    _online_softmax,
     _output,
     _partial_stores,
     _passthrough,
@@ -36,14 +38,14 @@ from ..stages import (
 from ..tensor_maps import _mla_tensor_maps
 
 
-def _mla_loop_tier(spec, dense, exp):
+def _mla_loop_tier(spec, dense, causal: bool = False, **mask):
     """The nodes inside the KV loop, shared by both MLA layers.
 
-    Only the softmax mask differs between them, so ``exp`` is passed in: the decode layer
+    Only the softmax mask differs between them (``causal``, ``mask``): the decode layer
     masks the tail of the request's KV window, the prefill layer also masks the diagonal.
     Everything else -- the shared page-table window, the two gathers, the two score
-    matmuls and their sum, the (M, N) denominator accumulator, and the value matmul reading
-    the *same* gathered ckv tile -- is identical.
+    matmuls and their sum, the exact softmax of that sum, the (M, N) denominator
+    accumulator, and the value matmul reading the *same* gathered ckv tile -- is identical.
     """
     mq, bn = dense.query_rows, dense.kv_tile
     ckv, kpe = dense.head_dim_ckv, dense.head_dim_kpe
@@ -98,8 +100,9 @@ def _mla_loop_tier(spec, dense, exp):
     )
     # The denominator is accumulated as a whole (M, N) tile and folded to a row vector once,
     # after the loop, rather than folded every iteration. A row fold is cross-lane work and
-    # MLA runs the most iterations of any of these operators, so paying it once per block
-    # instead of once per tile is worth the registers the tile costs.
+    # MLA runs the most iterations of any of these operators. The exact softmax needs one
+    # such fold per tile whatever happens here -- the row max -- so the sum does not add a
+    # second: the tile is rescaled where it lies, a register multiply per element.
     psum = Accumulate(
         (mq, bn), dtype=dense.accum_dtype, out_dtype=dense.accum_dtype, name="psum_0"
     )
@@ -116,7 +119,10 @@ def _mla_loop_tier(spec, dense, exp):
     _connect(gather_kpe, pe_mma, 0, 1)
     _connect(ckv_mma, add, 0, 0)
     _connect(pe_mma, add, 0, 1)
-    _connect(add, exp, 0, 0)
+    # The softmax is of the summed score: masked and scaled, its running row max taken,
+    # and the exp relative to that max.
+    rolling = _online_softmax(dense, mq, add, causal, **mask)
+    exp = rolling.exp
     _connect(exp, psum, 0, 0)
     _connect(exp, value_mma, 0, 0)
     # The compressed cache is also the value tensor: MLA has no separate V, so the value
@@ -147,6 +153,7 @@ def _mla_loop_tier(spec, dense, exp):
         pe_mma=pe_mma,
         add=add,
         exp=exp,
+        rolling=rolling,
         psum=psum,
         value_mma=value_mma,
         ph_qn=ph_qn,
@@ -173,8 +180,11 @@ def _mla_window_scalars(spec, dense, split: bool = False) -> dict:
     }
 
 
-def _fold_denominator(dense, loop_node, psum, psum_id, rows: int):
-    """Fold the accumulated (M, N) denominator to a row vector, once, after the loop."""
+def _fold_denominator(dense, loop_node, psum, rows: int):
+    """Fold the accumulated (M, N) denominator to a row vector, once, after the loop.
+
+    ``psum`` is ``(accumulator, index in the loop tier)``.
+    """
     rowsum = ReduceSum(
         (rows, dense.kv_tile),
         axis=-1,
@@ -182,13 +192,20 @@ def _fold_denominator(dense, loop_node, psum, psum_id, rows: int):
         out_dtype=dense.accum_dtype,
         name="rowsum_0",
     )
-    _accum_edge(loop_node, rowsum, psum_id, 0, psum)
+    _accum_edge(loop_node, rowsum, psum[1], 0, psum[0])
     return rowsum
 
 
-def _mla_normalise(spec, dense, loop_node, rowsum, value_mma, value_id, rows, **masked):
-    """The divide by the folded denominator and its log2; row-predicated with ``masked``."""
-    div_cls, log2_cls = (MaskedDiv, MaskedLog2) if masked else (Div, Log2)
+def _mla_normalise(spec, dense, loop_node, rowsum, value, row_max, rows, **masked):
+    """The divide by the folded denominator and the lse ``log2(l) + m``; row-predicated
+    with ``masked``.
+
+    ``value``/``row_max`` are ``(accumulator, index in the loop tier)``; ``rowsum`` is the
+    folded denominator, a node of the outer tier. It is read unfloored by the lse, as in
+    ``stages._normalise``: a row with nothing live has a zero sum and the max at its finite
+    start, which is the -inf the operator defines.
+    """
+    div_cls, lse_cls = (MaskedDiv, MaskedLse2) if masked else (Div, Lse2)
     div = div_cls(
         (rows, dense.head_dim_ckv),
         broadcast=0,
@@ -199,22 +216,23 @@ def _mla_normalise(spec, dense, loop_node, rowsum, value_mma, value_id, rows, **
         n_batch_dims=0,
         **masked,
     )
-    _accum_edge(loop_node, div, value_id, 0, value_mma)
+    _accum_edge(loop_node, div, value[1], 0, value[0])
     _connect(rowsum, div, 0, 1)
     outputs = [_output(div, dense.out_dtype, 0)]
-    log2 = None
+    lse = None
     if spec.emit_lse:
-        log2 = log2_cls(
+        lse = lse_cls(
             (rows,),
             dtype=dense.accum_dtype,
             out_dtype=dense.accum_dtype,
-            name="log2_0",
+            name="lse_0",
             n_batch_dims=0,
             **masked,
         )
-        _connect(rowsum, log2, 0, 0)
-        outputs.append(_output(log2, dense.accum_dtype, 1))
-    return div, log2, outputs
+        _connect(rowsum, lse, 0, 0)
+        _accum_edge(loop_node, lse, row_max[1], 1, row_max[0])
+        outputs.append(_output(lse, dense.accum_dtype, 1))
+    return div, lse, outputs
 
 
 def _build_mla_paged_decode(spec, dense, split: int | None = None) -> Graph:
@@ -222,7 +240,8 @@ def _build_mla_paged_decode(spec, dense, split: int | None = None) -> Graph:
 
     With ``split``, the partial half of the split-KV form (see ``_build_paged_decode``):
     the grid is ``(request, split)``, each block walks its own range of the request's KV
-    tiles, and the epilogue stores the folded denominator and the value accumulator raw.
+    tiles, and the epilogue stores the folded denominator, the value accumulator and the
+    running max both are relative to, all raw.
     The page-table window is refilled on the block's first tile as well as at every
     window boundary, since a split may start in the middle of a window; codegen re-seeds
     the look-ahead from the fresh window on the same iteration, so nothing else changes.
@@ -234,17 +253,18 @@ def _build_mla_paged_decode(spec, dense, split: int | None = None) -> Graph:
     if split is not None:
         assert isinstance(split, int) and split > 1, f"split={split!r} is not a split"
 
-    made = _mla_loop_tier(spec, dense, _exp(dense, mq))
+    made = _mla_loop_tier(spec, dense)
     idx_window, gather_ckv, gather_kpe = (
         made["idx_window"],
         made["gather_ckv"],
         made["gather_kpe"],
     )
-    psum, value_mma = made["psum"], made["value_mma"]
+    psum, value_mma, rolling = made["psum"], made["value_mma"], made["rolling"]
     ph_qn, ph_qp = made["ph_qn"], made["ph_qp"]
     ph_ckv, ph_kpe, ph_idx = made["ph_ckv"], made["ph_kpe"], made["ph_idx"]
 
     inner = Graph(nodes=gather_all_nodes(psum, value_mma))
+    _declare_rolling(inner, rolling, psum, value_mma)
     inner.extent = 1
     inner.loop_kind = "serial"
     inner.window_nodes = [idx_window]
@@ -292,8 +312,7 @@ def _build_mla_paged_decode(spec, dense, split: int | None = None) -> Graph:
     lock_graph(inner)
 
     loop_node = GraphNode(name="GraphNode_0", graph=inner)
-    psum_id = inner.accum_nodes.index(psum)
-    value_id = inner.accum_nodes.index(value_mma)
+    psum_acc, value_acc, max_acc = _accumulators(loop_node, psum, value_mma, rolling)
     inner_qn = inner.binding[ph_qn.name]
     inner_qp = inner.binding[ph_qp.name]
     inner_idx = inner.binding[ph_idx.name]
@@ -319,17 +338,21 @@ def _build_mla_paged_decode(spec, dense, split: int | None = None) -> Graph:
         binding.producer_op = tile
 
     # --- the epilogue: fold the accumulated denominator, then normalise -------------
-    rowsum = _fold_denominator(dense, loop_node, psum, psum_id, mq)
-    store_d = store_o = None
+    rowsum = _fold_denominator(dense, loop_node, psum_acc, mq)
+    stores = None
     if split is None:
-        div, log2, outputs = _mla_normalise(spec, dense, loop_node, rowsum, value_mma, value_id, mq)
+        div, lse, outputs = _mla_normalise(
+            spec, dense, loop_node, rowsum, value_acc, max_acc, mq
+        )
     else:
-        # The folded denominator and the raw value accumulator, for the combine to sum.
-        div = log2 = None
-        store_d, store_o = _partial_stores(mq, ckv, dense.accum_dtype)
+        # The folded denominator, the raw value accumulator and the running max they are
+        # relative to, for the combine to weigh and sum.
+        div = lse = None
+        stores = store_d, store_o, store_m = _partial_stores(mq, ckv, dense.accum_dtype)
         _connect(rowsum, store_d, 0, 0)
-        _accum_edge(loop_node, store_o, value_id, 0, value_mma)
-        outputs = [_output(store_d, dense.accum_dtype, 0), _output(store_o, dense.accum_dtype, 1)]
+        _accum_edge(loop_node, store_o, value_acc[1], 0, value_acc[0])
+        _accum_edge(loop_node, store_m, max_acc[1], 0, max_acc[0])
+        outputs = [_output(store, dense.accum_dtype, i) for i, store in enumerate(stores)]
 
     ph_indptr = _index_input(spec.indptr_input)
     main = Graph(
@@ -375,7 +398,7 @@ def _build_mla_paged_decode(spec, dense, split: int | None = None) -> Graph:
         loop_node=loop_node,
         rowsum=rowsum,
         div=div,
-        log2=log2,
+        lse=lse,
         outputs=outputs,
         indptrs=[ph_indptr],
         q_shape_lead=batch,
@@ -384,8 +407,7 @@ def _build_mla_paged_decode(spec, dense, split: int | None = None) -> Graph:
         out_offset=lambda i, *_: (f"{i}", "0", "0"),
         lse_offset=lambda i, *_: (f"{i}", "0"),
         split=split,
-        store_d=store_d,
-        store_o=store_o,
+        stores=stores,
     )
     return _run_passes(main, inner, inner_idx)
 
@@ -405,12 +427,14 @@ def _build_mla_paged_prefill_causal(spec, dense) -> Graph:
     heads = spec.num_qo_heads
     btok = mq // heads
 
-    made = _mla_loop_tier(spec, dense, _exp(dense, mq, causal=True, row_group=heads))
+    made = _mla_loop_tier(spec, dense, causal=True, row_group=heads)
     idx_window, psum, value_mma = made["idx_window"], made["psum"], made["value_mma"]
+    rolling = made["rolling"]
     ph_qn, ph_qp = made["ph_qn"], made["ph_qp"]
     ph_ckv, ph_kpe, ph_idx = made["ph_ckv"], made["ph_kpe"], made["ph_idx"]
 
     inner = Graph(nodes=gather_all_nodes(psum, value_mma))
+    _declare_rolling(inner, rolling, psum, value_mma)
     inner.extent = 1
     inner.loop_kind = "serial"
     inner.loop_trip = f"T.ceildiv(valid_len, {bn})"
@@ -438,8 +462,7 @@ def _build_mla_paged_prefill_causal(spec, dense) -> Graph:
     lock_graph(inner)
 
     loop_node = GraphNode(name="GraphNode_0", graph=inner)
-    psum_id = inner.accum_nodes.index(psum)
-    value_id = inner.accum_nodes.index(value_mma)
+    psum_acc, value_acc, max_acc = _accumulators(loop_node, psum, value_mma, rolling)
     # The two query tensors are copied in as regions by the outer tier rather than tiled
     # here, so nothing below reads their loop-tier bindings -- but they still have to exist,
     # or the region would have nothing to copy into.
@@ -449,11 +472,11 @@ def _build_mla_paged_prefill_causal(spec, dense) -> Graph:
         )
     inner_idx = inner.binding[ph_idx.name]
 
-    rowsum = _fold_denominator(dense, loop_node, psum, psum_id, mq)
+    rowsum = _fold_denominator(dense, loop_node, psum_acc, mq)
     # The epilogue is row-predicated: the last tile of a request holds fewer than `mq` rows
     # and the rows past it belong to the next request, so they must not be written.
-    div, log2, outputs = _mla_normalise(
-        spec, dense, loop_node, rowsum, value_mma, value_id, mq,
+    div, lse, outputs = _mla_normalise(
+        spec, dense, loop_node, rowsum, value_acc, max_acc, mq,
         scalar_args=("n_rows",), row_group=heads, fuse_dst=False,
     )
 
@@ -507,7 +530,7 @@ def _build_mla_paged_prefill_causal(spec, dense) -> Graph:
         loop_node=loop_node,
         rowsum=rowsum,
         div=div,
-        log2=log2,
+        lse=lse,
         outputs=outputs,
         indptrs=[ph_qo, ph_kv],
         q_shape_lead=tokens,

@@ -13,6 +13,7 @@ and codegen died on ``KeyError`` (every regrouped LoRA plan of ``demo/lora.py`` 
 from cleave.ir.graph import GraphNode
 from cleave.runtime.compile import build_candidate_code
 from cleave.schedule import apply_tiling, search_tiling
+from cleave.schedule import tiling
 
 from tests import _graphs as g
 
@@ -31,18 +32,26 @@ def test_placeholder_hash_outlives_a_change_of_consumers():
     assert tiles[x] == "tile"
 
 
-def test_shared_placeholder_has_one_reachable_tile():
+def test_shared_placeholder_has_one_reachable_tile(monkeypatch):
     candidates = list(search_tiling(g.lora_graph(*DIMS), topk=1000))[::8]
 
+    # The map is assigned while ``X @ W`` is merged into the loop, whatever the two steps
+    # are. Most of these tilings step ``X @ W`` and ``X @ A`` differently, and such a loop
+    # is refused once it is complete (its trip count is not the number of tiles of ``X``).
+    # That refusal is lifted here, so that every one of them still goes through the merge.
     n_shared = 0
-    for cand in candidates:
-        label = f"tile={list(cand.output_tile)} rstep={cand.rstep_map}"
-        loops = [n for n in apply_tiling(cand).nodes if isinstance(n, GraphNode)]
-        for loop in loops:
-            keys = list(loop.graph.tmap)
-            assert len({id(k) for k in keys}) == len(keys), f"{label}: a node has two tiles"
-            assert all(k in loop.graph.tmap for k in keys), f"{label}: a tile cannot be looked up"
-            n_shared += any(k.is_placeholder() and len(k.outputs) > 1 for k in keys)
+    with monkeypatch.context() as patch:
+        patch.setattr(tiling, "_refuse_loops_that_miscount_their_tiles", lambda main: None)
+        for cand in candidates:
+            label = f"tile={list(cand.output_tile)} rstep={cand.rstep_map}"
+            loops = [n for n in apply_tiling(cand).nodes if isinstance(n, GraphNode)]
+            for loop in loops:
+                keys = list(loop.graph.tmap)
+                assert len({id(k) for k in keys}) == len(keys), f"{label}: a node has two tiles"
+                assert all(k in loop.graph.tmap for k in keys), (
+                    f"{label}: a tile cannot be looked up"
+                )
+                n_shared += any(k.is_placeholder() and len(k.outputs) > 1 for k in keys)
     assert n_shared, "no loop shares a placeholder between two consumers; the case tests nothing"
 
     # ... and codegen, which looks every placeholder's tile up, builds the kernel.

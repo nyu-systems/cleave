@@ -161,8 +161,12 @@ def stage_as_layer(graph: Graph, spec) -> Graph:
     it stages P through shared for the value matmul (``stage_fragment_operands_in_shared``),
     which then never reads its A operand from registers. Marked here, the search judges
     that gemm as the layer emits it: ``TCPolicy._register_operand_layout_conflict`` refuses
-    only a register A operand. Returns ``graph``, marked in place.
+    only a register A operand. The graph itself is marked as a layer's dense body
+    (``paged_layer``: the layer's kind): the gemms the layer emits are not the candidate's,
+    so ``TCPolicy._gemm_tile_conflict`` does not judge them. Returns ``graph``, marked in
+    place.
     """
+    graph.paged_layer = spec.kind
     if spec.kind in REGISTER_P_KINDS:
         return graph
     for node in graph.nodes:

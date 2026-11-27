@@ -66,6 +66,12 @@ public:
   // order the graph defines them (operator order).
   explicit DimensionGrouper(std::vector<type::GuidType> const &tensor_guids);
   void touch(DimensionID d);
+  // A dimension that no grouping rule mentioned becomes a group of its own
+  // (broadcast when its extent is 1); a dimension that has a group keeps it.
+  // Called for every dim of every input after all rules ran: the reduced dim
+  // of an input that only a reduction reads (a program that is just
+  // cl.max(x) or cl.sum(x)) is tied to nothing, yet needs a symbol.
+  void group_alone(DimensionID d, int extent);
   void merge(DimensionID d1, DimensionID d2);
   DimensionID find(DimensionID d);
   void mark_broadcast(DimensionID d);

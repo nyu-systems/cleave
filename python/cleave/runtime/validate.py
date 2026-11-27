@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 import contextlib
 from dataclasses import dataclass
 import json
@@ -16,6 +17,7 @@ from .reference import (
     build_inputs_and_reference,
     order_inputs_for_kernel,
     reconcile_output_layout,
+    with_hand_off,
 )
 from .timer import mean_launch_ms
 
@@ -32,7 +34,8 @@ class Tolerance:
     zeros is a legitimate value that cannot be reproduced bit for bit (a log-sum-exp of 0).
 
     There is no default bound anywhere: every operator declares its own, from a measured
-    error (see :func:`compare_outputs`). A sequence of tolerances declares one per output.
+    error (see :func:`compare_outputs`). A sequence of tolerances declares one per output; a
+    mapping declares one per boundary role (:func:`tolerances_of`).
     """
 
     rtol: float
@@ -80,6 +83,53 @@ def require_tolerance(tolerance, what="this kernel"):
             "tolerance=Tolerance(rtol=..., atol=...) (one, or one per output), set from the "
             "operator's measured error"
         )
+    return tolerance
+
+
+def tolerances_of(tolerance, roles):
+    """The declaration ``tolerance`` as it applies to one kernel, whose outputs carry
+    ``roles``: what to hand to :func:`compare_outputs` for that kernel.
+
+    ``roles`` is the boundary role of each output in the order the kernel returns them
+    (``cleave.runtime.reference.output_roles``): ``""`` for an output the program or its
+    cut defines, a name for a tensor a rewrite added to the cut. Today that is ``"shift"``,
+    the max a split partial of an exact softmax returns next to its sums: a float32
+    statistic, with an error of its own, next to sums computed at the precision of the
+    program's dtype (they cross the cut in float32 too, so as not to overflow). ``None``
+    when the outputs are not known (a kernel without a graph).
+
+    * A mapping from role to ``Tolerance`` declares one bound per role, whatever the plan:
+      each output takes the bound of its role. A role without an entry is an error, like a
+      kernel without a tolerance: there is no default bound.
+    * One ``Tolerance`` covers the outputs that carry no role. A kernel with an output that
+      does has no bound for it, which is an error too: the program declares its tolerance
+      by role.
+    * A sequence is one bound per output, by position, and is returned as it is.
+    """
+    if tolerance is None or roles is None and not isinstance(tolerance, Mapping):
+        return tolerance
+    if isinstance(tolerance, Mapping):
+        wrong = {role: bound for role, bound in tolerance.items()
+                 if not isinstance(role, str) or not isinstance(bound, Tolerance)}
+        if wrong:
+            raise SpecError("a tolerance keyed by role maps each boundary role (a string) to "
+                            f"one Tolerance, got {wrong!r}")
+        if roles is None:
+            raise SpecError("a tolerance keyed by role needs the roles of the kernel's "
+                            "outputs, and this kernel comes without its graph")
+        missing = sorted({role for role in roles if role not in tolerance})
+        if missing:
+            raise SpecError(
+                f"no validation tolerance declared for the outputs of role {missing} (the "
+                f"declaration has {sorted(tolerance)}); there is no default bound")
+        return tuple(tolerance[role] for role in roles)
+    named = sorted({role for role in roles if role})
+    if named and isinstance(tolerance, Tolerance):
+        raise SpecError(
+            f"one Tolerance covers the outputs a program or its cut defines, and this kernel "
+            f"also returns outputs of role {named} (a split partial returns its float32 "
+            "shift): declare the tolerance by role, tolerance={'': Tolerance(...), "
+            + ", ".join(f"{role!r}: Tolerance(...)" for role in named) + "}")
     return tolerance
 
 
@@ -171,13 +221,14 @@ def _compare_one(index, actual, reference, tol):
     )
 
 
-def _log_validation(what, actual, tolerances, results):
-    path = Settings.from_env().validation_log
+def _log_validation(what, actual, tolerances, results, roles=None):
+    settings = Settings.from_env()
+    path = settings.validation_log
     if path is None:
         return
+    roles = roles or ("",) * len(actual)
     record = {
-        "context": os.environ.get("CLEAVE_VALIDATION_CONTEXT")
-        or os.environ.get("PYTEST_CURRENT_TEST", ""),
+        "context": settings.validation_context,
         "what": what,
         "kind": next((kind for _, kind, _ in results if kind), None),
         "outputs": [
@@ -186,8 +237,10 @@ def _log_validation(what, actual, tolerances, results):
                 "rtol": tol.rtol, "atol": tol.atol, "kind": kind,
                 "rel": None if measured is None else measured.rel,
                 "abs": None if measured is None else measured.abs,
+                # the boundary role of an output that has one (a split partial's shift)
+                **({"role": role} if role else {}),
             }
-            for act, tol, (measured, kind, _) in zip(actual, tolerances, results)
+            for act, tol, (measured, kind, _), role in zip(actual, tolerances, results, roles)
         ],
     }
     line = (json.dumps(record, separators=(",", ":")) + "\n").encode()
@@ -200,7 +253,7 @@ def _log_validation(what, actual, tolerances, results):
         os.close(fd)
 
 
-def compare_outputs(actual, reference, tolerance, *, what: str = ""):
+def compare_outputs(actual, reference, tolerance, *, what: str = "", roles=None):
     """Hold every kernel output to its reference; the one comparison every validation uses.
 
     Returns one :class:`MeasuredError` per output. Raises ``OutputMismatch`` when a finite
@@ -208,7 +261,8 @@ def compare_outputs(actual, reference, tolerance, *, what: str = ""):
     ``NonFiniteOutput`` for any NaN, an infinity the reference does not have, or a
     non-finite reference entry that is not reproduced exactly; non-finite entries take no
     part in the row scale. ``tolerance`` is one ``Tolerance`` or one per output. ``what``
-    names the kernel in the message and in the ``CLEAVE_VALIDATION_LOG`` record.
+    names the kernel in the message and in the ``CLEAVE_VALIDATION_LOG`` record; ``roles``
+    (the boundary role of each output, when known) only goes into that record.
     """
     actual, reference = list(actual), list(reference)
     prefix = f"{what}: " if what else ""
@@ -222,7 +276,7 @@ def compare_outputs(actual, reference, tolerance, *, what: str = ""):
         _compare_one(i, act, ref, tol)
         for i, (act, ref, tol) in enumerate(zip(actual, reference, tolerances))
     ]
-    _log_validation(what, actual, tolerances, results)
+    _log_validation(what, actual, tolerances, results, roles)
     measured = tuple(m for m, _, _ in results)
     for kind, error_cls in (("non_finite", NonFiniteOutput), ("mismatch", OutputMismatch)):
         messages = [message for _, k, message in results if k == kind]
@@ -375,23 +429,34 @@ def _as_list(reference):
     return list(reference) if isinstance(reference, (tuple, list)) else [reference]
 
 
-def _validate_kernel_outputs(kernel, inputs, reference, *, tolerance, what: str = ""):
+def _validate_kernel_outputs(
+    kernel, inputs, reference, *, tolerance, what: str = "", stored_layouts=None, roles=None,
+):
     """Run ``kernel(*inputs)`` and hold it to ``reference``; the measured error per output.
 
     Shared comparison core: reconciles each reference to the kernel's physical output
     shape and compares with :func:`compare_outputs` at the operator's declared
-    ``tolerance`` (there is no default). Must run inside a ``_gpu_exec_guard``.
+    ``tolerance`` (there is no default). ``stored_layouts`` is the layout ``apply_tiling``
+    recorded for each output, in the kernel's output order; without it (a hand-written
+    kernel) the layout is recovered from the extents. ``roles``: see ``compare_outputs``.
+    Must run inside a ``_gpu_exec_guard``.
     """
     import torch
 
     require_tolerance(tolerance)
     actual = _as_list(launch(kernel, inputs))
     if len(actual) == len(reference):
+        layouts = [None] * len(actual) if stored_layouts is None else list(stored_layouts)
+        if len(layouts) != len(actual):
+            raise ValueError(
+                f"{len(layouts)} stored layouts were recorded for a kernel that returns "
+                f"{len(actual)} outputs"
+            )
         reference = [
-            reconcile_output_layout(ref, act.shape)
-            for ref, act in zip(reference, actual)
+            reconcile_output_layout(ref, act.shape, layout)
+            for ref, act, layout in zip(reference, actual, layouts)
         ]
-    measured = compare_outputs(actual, reference, tolerance, what=what)
+    measured = compare_outputs(actual, reference, tolerance, what=what, roles=roles)
     del actual, reference
     torch.cuda.empty_cache()
     torch.cuda.ipc_collect()
@@ -401,7 +466,7 @@ def _validate_kernel_outputs(kernel, inputs, reference, *, tolerance, what: str 
 def _check_kernel(
     kernel, *, graph=None, dtype=None, reference_cache_dir=None,
     tolerance=None, benchmark: BenchOptions | None = None, distributions=("normal",),
-    derive=None,
+    derive=None, stored_layouts=None, roles=None,
 ):
     """Validate ``kernel`` against the graph reference, then optionally time it.
 
@@ -409,7 +474,10 @@ def _check_kernel(
     ``graph`` + ``dtype`` (standalone mode: build the reference in-process, one case per
     name in ``distributions``, declared inputs recomputed by ``derive``) must be provided.
     A missing ``tolerance`` is an error.
+    ``stored_layouts``: how the kernel stores each output (``_validate_kernel_outputs``).
     Timing happens under the same GPU lock hold as validation, on the first case's inputs.
+    A kernel that stores an output transposed (a split partial) is timed together with the
+    copy that hands its outputs over in the logical layout (``reference.with_hand_off``).
     Returns ``(measured error per output, mean latency in ms or None)``.
     """
     with _stage("validate"):
@@ -421,21 +489,23 @@ def _check_kernel(
             else:
                 cases, _ = _reference_cases(graph, dtype, distributions, derive)
 
-            measured, timing_inputs = None, None
+            measured, timing_inputs, logical_shapes = None, None, None
             for distribution, inputs_by_name, reference in cases:
                 inputs = order_inputs_for_kernel(inputs_by_name, kernel)
                 if timing_inputs is None:
                     timing_inputs = inputs
+                    logical_shapes = [tuple(ref.shape) for ref in reference]
                 measured = worst(measured, _validate_kernel_outputs(
                     kernel, inputs, reference, tolerance=tolerance,
                     what="" if distribution == "normal" else f"{distribution} inputs",
+                    stored_layouts=stored_layouts, roles=roles,
                 ))
         if benchmark is None:
             return measured, None
         with _stage("bench"):
             return measured, benchmark_compiled_kernel(
-                kernel, timing_inputs, warmup_iters=benchmark.warmup,
-                profile_iters=benchmark.iters,
+                with_hand_off(kernel, stored_layouts, logical_shapes), timing_inputs,
+                warmup_iters=benchmark.warmup, profile_iters=benchmark.iters,
             )
 
 

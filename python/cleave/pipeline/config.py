@@ -78,13 +78,19 @@ class EvalConfig(_Replace):
     iters: int = 1000
     # The operator's declared bound: a cleave.lang.Tolerance for every output, or one per
     # output when every plan has that many (a split partial has more outputs than its combine
-    # and the solo plans, so a split program declares one). There is no default; building
-    # kernels without one is an error.
+    # and the solo plans, so a split program declares one), or a mapping from boundary role
+    # to Tolerance: {"": ..., "shift": ...} for a program with an exact softmax and split
+    # plans, whose partials return their float32 shift next to their sums
+    # (cleave.runtime.validate.tolerances_of). There is no default; building kernels without
+    # one is an error.
     tolerance: Any = None
     max_parallel: int = 8
     timeout_s: float | None = None  # None -> Settings.compile_timeout_secs
     # Input distributions every candidate is validated on (cleave.runtime.inputs.DISTRIBUTIONS);
-    # it is timed on the first.
+    # it is timed on the first. A program whose softmax is exact is held to its adversarial
+    # cases as well, whether they are listed here or not (cleave.pipeline.build). Not read
+    # for a paged program: its inputs are its workloads (cleave.pipeline.dynamic), and the
+    # adversarial ones are the registry's, for a registry operator on its registry workloads.
     distributions: tuple[str, ...] = ("normal",)
 
     def __post_init__(self):

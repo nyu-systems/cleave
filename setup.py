@@ -85,6 +85,16 @@ def _z3_paths():
 class build_ext(_build_ext):
     def run(self):
         self._build_superoptimizer()
+        # The extension links the static library just built. setuptools relinks an
+        # extension only when one of its sources or ``depends`` is newer than it, and it
+        # knows core.pyx and the headers core.pyx includes: a change to a .cc alone rebuilt
+        # the archive and kept the old extension (``build_ext --inplace``, a wheel built in
+        # a tree that has a build/ directory). Named here, not on the Extension: cythonize
+        # copies every ``depends`` file when setup.py is loaded, before the archive exists.
+        archive = str(SUPEROPTIMIZER_BUILD_DIR / "libcleave_superoptimizer.a")
+        for ext in self.extensions:
+            if archive not in ext.depends:
+                ext.depends.append(archive)
         super().run()
 
     def _build_superoptimizer(self):

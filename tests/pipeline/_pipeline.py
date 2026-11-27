@@ -76,9 +76,9 @@ def _build_code(cand, mla_decode_pass):
     # Mirrors cleave.runtime.compile.build_candidate_code.
     from cleave.codegen import passes
     from cleave.codegen import TilelangCodeGen
-    from cleave.schedule import apply_tiling
+    from cleave.schedule.tiling import schedule_kernel
 
-    g = apply_tiling(cand)
+    g = schedule_kernel(cand)
     g = passes.annotate_args(g, is_main=True)
     g = passes.annotate_tinfo(g, is_main=True)
     g = passes.annotate_tc_layout(g)

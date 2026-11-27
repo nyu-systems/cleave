@@ -58,11 +58,23 @@ def rms_norm(x, dim: int = -1, eps: float = 0.0):
     return x * rsqrt(ms)
 
 
-def softmax(x, dim: int = -1, shift: float | None = None):
-    """``shift=None``: the exact ``exp(x - max(x)) / sum(...)``. A constant
-    ``shift`` is the fixed-shift ``exp(x + shift) / sum(exp(x + shift))`` (no max op)."""
-    if shift is None:
-        e = exp(x - max(x, dim, keepdim=True))
-    else:
-        e = exp(x + shift) if shift else exp(x)
+def softmax(x, dim: int = -1):
+    """The exact softmax, ``exp(x - max(x)) / sum(...)`` over ``dim``.
+
+    Traced and eager alike it is the max written out: it records ``reduce_max, sub, exp,
+    reduce_sum, div``, exactly what ``cl.exp(x - cl.max(x, dim, keepdim=True))`` divided by
+    its sum records by hand (one program, one fingerprint). The max is an ordinary reduction
+    of the searched flat graph. Where a tiling loops over the softmax dim under it, the loop
+    carries the max across its iterations and repairs every sum and matmul it accumulates
+    with an update rule that is searched for and tested on the program's own flat graph
+    (``cleave.pipeline.update``, ``cleave.schedule.streaming``). (``cl.exp(x) /
+    cl.sum(cl.exp(x), dim, keepdim=True)`` without the max is the plain exp, and overflows
+    where its logits do.)
+
+    A row of any length is served where the softmax feeds a sum or a matmul over that row
+    (attention's ``softmax(...) @ v``). A softmax that is returned itself -- a standalone
+    softmax, attention weights, a softmax next to another ``exp`` of its logits -- is served
+    while its row fits one block, and so is a second softmax of ``x`` over another axis, which
+    needs a row and a column in one block."""
+    e = exp(x - max(x, dim, keepdim=True))
     return e / sum(e, dim, keepdim=True)

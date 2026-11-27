@@ -6,6 +6,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
+from ..ir.graph_utils import boundary_order
 from .convert import to_ir
 from .split import (
     _CUT_CACHE_SIZE,
@@ -20,15 +21,24 @@ from .split import (
 )
 
 
+def _normalized_split_position(rank: int) -> int:
+    """Where the split dim of a rank-``rank`` split tensor sits after normalisation.
+
+    The cut puts it first; ``_normalize_split_graph_layouts`` moves it in front of the
+    last two dims of a tensor of rank four or more and leaves lower ranks alone.
+    """
+    return rank - 3 if rank > 3 else 0
+
+
 def _normalize_split_graph_layouts(graph_bundle):
     if len(graph_bundle) != 2:
         return graph_bundle
 
     def _normalize_split_tensor_shape(tensor: Dict) -> None:
         dims = _tensor_dims(tensor)
-        if len(dims) <= 3:
+        position = _normalized_split_position(len(dims))
+        if position == 0:
             return
-        position = len(dims) - 3
         normalized_dims = dims[1:]
         normalized_dims.insert(position, dims[0])
         dim_capacity = max(len(tensor.get("dim", [])), len(normalized_dims))
@@ -79,8 +89,11 @@ def _align_split_boundary_inputs(graph_bundle):
         return graph_bundle
 
     symbolic_first_graph = to_ir(graph_bundle[0])
+    # In boundary order: the combine's k-th input op is the partial's k-th output op,
+    # whatever order the lowered graph lists its outputs in.
     boundary_shapes = [
-        tuple(node.get_shape()) for node in symbolic_first_graph.nodes if node.is_output()
+        tuple(node.get_shape())
+        for node in boundary_order(n for n in symbolic_first_graph.nodes if n.is_output())
     ]
     combine_graph = deepcopy(graph_bundle[1])
     input_ops = [op for op in combine_graph if op.get("op_type") == "kn_input_op"]
@@ -103,16 +116,24 @@ def _align_split_boundary_inputs(graph_bundle):
         guid = tensor.get("guid")
         if guid is None:
             continue
-        for split_pos in range(len(raw_shape)):
-            candidate_shape = list(raw_shape[1:])
-            candidate_shape.insert(split_pos, raw_shape[0])
-            if tuple(candidate_shape) == tuple(shape) or (
-                len(candidate_shape) == len(shape) + 1
-                and candidate_shape[-1] == 1
-                and tuple(candidate_shape[:-1]) == tuple(shape)
-            ):
-                split_axis_by_guid[guid] = split_pos
-                break
+        # The split position is known, not searched for: it is where the normalisation
+        # put it in the partial. Matching extents instead takes the first position that
+        # fits, which is the wrong one as soon as the split extent equals a dim before
+        # it, and leaves the reduction on axis 0 when nothing fits.
+        split_pos = _normalized_split_position(len(raw_shape))
+        candidate_shape = list(raw_shape[1:])
+        candidate_shape.insert(split_pos, raw_shape[0])
+        if tuple(candidate_shape) != tuple(shape) and not (
+            len(candidate_shape) == len(shape) + 1
+            and candidate_shape[-1] == 1
+            and tuple(candidate_shape[:-1]) == tuple(shape)
+        ):
+            raise ValueError(
+                f"Split boundary mismatch: combine input {guid} has dims {tuple(raw_shape)}, "
+                f"which with the split dim at position {split_pos} is "
+                f"{tuple(candidate_shape)}, but the partial stores that tensor as {tuple(shape)}"
+            )
+        split_axis_by_guid[guid] = split_pos
 
     for op in combine_graph:
         input_split_axis = next(

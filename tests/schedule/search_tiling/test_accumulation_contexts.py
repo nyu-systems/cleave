@@ -344,10 +344,12 @@ def test_merge_refuses_sibling_over_another_axis(monkeypatch):
             apply_tiling(cand)
 
 
-def test_merge_refuses_same_step_over_shorter_axis():
+def test_merge_keeps_same_step_over_shorter_axis_apart():
     # a @ b (K1 = 128) and c @ d (K2 = 256) share no node and no input. With the same
     # step they used to be merged into one loop of K2 / step iterations: a @ b read
-    # past K1 (NaN in the output). Different trip counts are refused.
+    # past K1 (NaN in the output). Different trip counts never share a loop: each sum
+    # gets a loop of its own (tests/graph/apply_tiling/test_unrelated_reductions.py
+    # validates such kernels on a GPU).
     graph = _lower(sum_mm())
     seen = 0
     for cand in search_tiling(graph, topk=10000):
@@ -359,6 +361,6 @@ def test_merge_refuses_same_step_over_shorter_axis():
         if len({s for s, _ in steps}) != 1 or any(s >= e for s, e in steps):
             continue  # different steps, or one of them does not loop
         seen += 1
-        with pytest.raises(ScheduleRejected, match="steps of"):
-            apply_tiling(cand)
+        loops = [n for n in apply_tiling(cand).nodes if isinstance(n, GraphNode)]
+        assert sorted(int(n.graph.extent) for n in loops) == sorted(e // s for s, e in steps)
     assert seen

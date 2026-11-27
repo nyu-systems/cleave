@@ -10,6 +10,7 @@ from ..ir.graph import (
     PlaceHolderNode,
 )
 from ..ir.ops.base import const_literal
+from ..ir.ops.reduction import Rescale
 from ..ir.graph_utils import find_topo_sort
 from ..schedule.policy.hint import INTER
 from .tensor_codegen import (
@@ -21,7 +22,7 @@ from .tensor_codegen import (
 )
 from .buffer import BASE_INDENT, CodeBuffer
 from .macros import qualify_name
-from .operands import HOISTED_SUFFIX, emit_alloc, hoisted_nodes, kept_extents, tc_layout
+from .operands import HOISTED_SUFFIX, emit_alloc, hoisted_nodes, kept_extents, stored_extents, tc_layout
 
 
 def _bind_node(graph, arg, is_main):
@@ -105,6 +106,87 @@ def _arg_dtype(graph, arg, is_main) -> str:
     if is_main and arg in inter_nodes(graph):
         return INTER_DTYPE
     return arg.get_dtype(0)
+
+
+def emission_order(graph) -> List[Node]:
+    """The order one tier's nodes are emitted in.
+
+    Dataflow order (``find_topo_sort``) for a graph that declares no lag node and no
+    rescaled accumulator: the same list, so the same text. With them, two orderings no
+    edge expresses are added. A lag node is emitted before the accumulator it snapshots
+    (it reads the value the *previous* iteration left, so its own input edge is not a
+    dependency), and a rescale factor is emitted before the accumulator it multiplies.
+    """
+    if not graph.lag_nodes and not graph.accum_scale:
+        return _work_behind_loops(find_topo_sort(graph.nodes))
+    lag_ids = {id(n) for n in graph.lag_nodes}
+    lags_of = {}
+    for lag in graph.lag_nodes:
+        lags_of.setdefault(id(lag.inputs[0].src_node), []).append(lag)
+    factor_of = {id(acc): factor for acc, factor in graph.accum_scale.items()}
+
+    def deps(node):
+        if id(node) in lag_ids:
+            return []
+        found = [e.src_node for e in node.inputs] + lags_of.get(id(node), [])
+        factor = factor_of.get(id(node))
+        return found if factor is None else found + [factor]
+
+    order, state = [], {}  # state: 1 = on the stack, 2 = emitted
+
+    def visit(node):
+        seen = state.get(id(node))
+        if seen == 2:
+            return
+        assert seen is None, (
+            f"{node.name} would have to be emitted before itself: a lag node or a rescale "
+            "factor depends on the accumulator it is ordered in front of."
+        )
+        state[id(node)] = 1
+        for dep in deps(node):
+            visit(dep)
+        state[id(node)] = 2
+        order.append(node)
+
+    for node in graph.nodes:
+        visit(node)
+    return _work_behind_loops(order)
+
+
+def _work_behind_loops(order: List[Node]) -> List[Node]:
+    """``order`` with every compute node that no loop reads moved behind the last loop.
+
+    Dataflow leaves a node that neither feeds a loop nor reads one free to be emitted on
+    either side of it: the value sum of a split combine whose step is the whole split
+    axis, next to the loop of the row sum. TileLang (0.1.13) cannot take it in front. It
+    lowers a tier with a pipelined loop by splitting the block's threads at the loop into
+    a group that loads and a group that computes, and runs whatever stands in front of
+    the loop on both, without the thread offset it gives the computing group behind the
+    split (in the lowered CUDA the fragment is filled at ``threadIdx.x * 8`` in front and
+    stored at ``threadIdx.x * 8 - 1024`` behind). That kernel does not return: it spins
+    on the GPU until it is killed. Behind the loop the same statement belongs to the
+    computing group alone. A tier without such a node keeps its order, and so its text.
+    """
+    loops = [i for i, node in enumerate(order) if isinstance(node, GraphNode)]
+    if not loops:
+        return order
+    read_by_a_loop, stack = set(), [order[i] for i in loops]
+    while stack:
+        for edge in stack.pop().inputs:
+            if id(edge.src_node) not in read_by_a_loop:
+                read_by_a_loop.add(id(edge.src_node))
+                stack.append(edge.src_node)
+    moved = set()
+    for node in order[: loops[-1]]:
+        if isinstance(node, ComputeOpNode) and id(node) not in read_by_a_loop:
+            moved.add(id(node))
+        elif isinstance(node, OutputNode) and id(node.inputs[0].src_node) in moved:
+            moved.add(id(node))  # the store of a moved node goes with it
+    if not moved:
+        return order
+    front = [node for node in order[: loops[-1] + 1] if id(node) not in moved]
+    behind = [node for node in order[: loops[-1]] if id(node) in moved]
+    return front + behind + order[loops[-1] + 1 :]
 
 
 class KernelEmitter:
@@ -558,6 +640,9 @@ class KernelEmitter:
                 dtype=node.get_dtype(0),
             )
         )
+        if (src_scope, scope) == ("g", "r") and tc_layout(graph, node):
+            # gen_copy took the slice through a shared buffer in the tensor-core layout
+            self._loaded_through[(id(graph), tname)] = src_name + "_intermediate"
 
     def _emit_compute(self, graph, node, buf, is_main_iter, name_prefix):
         tname, scope = graph.tinfo_map[node]
@@ -574,7 +659,7 @@ class KernelEmitter:
                 buf,
                 graph,
                 node,
-                kept_extents(graph.tmap[node].tile_size),
+                stored_extents(graph.tmap[node].tile_size),
                 INTER_DTYPE if inter else node.out_dtype,
             )
         staged = set(getattr(node, "stage_fragment_operands_in_shared", ()))
@@ -592,11 +677,27 @@ class KernelEmitter:
             clear=not accumulates,
             name_prefix=name_prefix,
         )
+        if graph.accum_scale and node in graph.accum_scale:
+            buf.block(self._emit_rescale(graph, node, name_prefix))
         buf.block(_call(func_name, call_args))
         if inter:
             tile = kept_extents(graph.tmap[node].tile_size)
             width = inter_blocked_width(graph.tmap[node])
             buf.block(gen_atomic_add(tname, _inter_dst(graph, node), width, len(tile)))
+
+    def _emit_rescale(self, graph, node, name_prefix) -> str:
+        """``acc *= factor`` on the accumulator's own buffer, right before it accumulates."""
+        factor = graph.accum_scale[node]
+        tname, scope = graph.tinfo_map[node]
+        fname, fscope = graph.tinfo_map[factor]
+        op = Rescale(
+            rank=len(kept_extents(graph.tmap[node].tile_size)),
+            lead=len(kept_extents(graph.tmap[factor].tile_size)),
+        )
+        func_name = self.emit_op_node(
+            op, mem_scope=fscope + scope, clear=False, name_prefix=name_prefix
+        )
+        return _call(func_name, [fname, tname])
 
     def _emit_subgraph(self, graph, node, buf, is_main_iter, name_prefix):
         sub = node.graph
@@ -698,7 +799,7 @@ class KernelEmitter:
         self._emit_window_block(graph, name_prefix, buf)
         self._emit_prefetch_block(graph, name_prefix, buf)
         hoisted = self._emit_hoisted_block(graph, name_prefix, buf)
-        for node in find_topo_sort(graph.nodes):
+        for node in emission_order(graph):
             if node in graph.prefetch_nodes or node in graph.window_nodes:
                 continue
             if node in hoisted:

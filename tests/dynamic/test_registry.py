@@ -62,6 +62,12 @@ def test_every_operator_is_complete(name):
     # The adversarial softmax workloads live apart from the captured ones.
     assert op.adversarial == ADVERSARIAL_WORKLOADS[name]
     assert {axes for _, axes in op.adversarial} <= set(op.workloads)
+    # ... and every operator validates on them: all four distributions, three workloads
+    # each. There is no per-operator switch -- the softmax of every layer is exact.
+    assert len(op.adversarial) == 12
+    assert {distribution for distribution, _ in op.adversarial} == {
+        "large_logits", "large_scale", "increasing", "dominant_last"}
+    assert not hasattr(op, "exact_softmax")
     if op.is_mla:
         assert op.scale is not None
 

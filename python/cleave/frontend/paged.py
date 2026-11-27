@@ -77,16 +77,19 @@ def paged_gather(cache, pages: PageTable):
     return cache.program._gather(cache, pages)
 
 
-def softmax(x, dim: int = -1, shift: float | None = None, return_lse: bool = False,
-            causal: bool = False):
-    """Softmax over ``dim``; ``return_lse`` also returns the base-2 log-sum-exp. ``causal``
-    masks bottom-right aligned scores (query ``i`` sees keys ``j <= i + kv_len - q_len``)."""
+def softmax(x, dim: int = -1, *, return_lse: bool = False, causal: bool = False):
+    """The exact softmax over ``dim`` (``composites.softmax``; a paged program builds its
+    own, on a running max). ``return_lse`` also returns the base-2 log-sum-exp. ``causal``
+    masks bottom-right aligned scores (query ``i`` sees keys ``j <= i + kv_len - q_len``).
+
+    Both options are keyword-only, so a stray third positional argument is an error
+    rather than being read as ``return_lse``."""
     if isinstance(x, Tensor) and isinstance(x.program, PagedProgram):
         return x.program._softmax(x, dim, return_lse, causal)
     if causal:
         raise SpecError("softmax(causal=True) is only lowerable inside a paged program")
     if not return_lse:
-        return composites.softmax(x, dim, shift)
+        return composites.softmax(x, dim)
     if isinstance(x, Tensor):
         raise SpecError("softmax(return_lse=True) is only lowerable inside a paged program")
     xf = x.float()
@@ -580,7 +583,9 @@ class PagedDecodeWorkloads:
     """Every ``batch`` x ``samples`` log-spaced KV lengths in ``kv_len`` (ragged below).
 
     ``distribution``: ``"normal"``, or an adversarial softmax case (``"large_logits"``,
-    ``"increasing"``; see ``cleave.dynamic.reference.apply_distribution``)."""
+    ``"large_scale"``, ``"increasing"``, ``"dominant_last"``; see
+    ``cleave.dynamic.reference.apply_distribution``). Its workloads are then keyed
+    ``<workload>@<distribution>``, as the registry's adversarial ones are."""
 
     batch: tuple = (1, 7, 64)
     kv_len: tuple = (1, 8192)
@@ -618,7 +623,10 @@ class PagedDecodeWorkloads:
                     "gqa_paged_decode",
                     reference.gqa_paged_decode_inputs(dims, lens, page_size=page),
                     self.distribution)
-                yield workload_key((b, n)), inputs, reference.gqa_paged_decode_reference(
+                key = workload_key((b, n))
+                if self.distribution != "normal":
+                    key = f"{key}@{self.distribution}"
+                yield key, inputs, reference.gqa_paged_decode_reference(
                     dims, lens, page_size=page)(*inputs)
 
         return gen

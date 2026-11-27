@@ -93,6 +93,30 @@ def test_axis_map_dispatch_is_table_driven():
     assert "isinstance" not in src
 
 
+def test_a_binary_operand_broadcast_on_its_leading_axes_maps_axis_for_axis():
+    """``broadcast == 0`` over more than two non-batch dims: B is A without its last axis
+    (the weight of a split combine, ``o[s, r, d] * w[s, r]``), so axis ``k`` of B is axis
+    ``k`` of the product. Read as "B's last axis is the first non-batch one" -- which is
+    the same thing while the tile has two non-batch dims -- its row axis would land on the
+    split axis and its split axis nowhere."""
+    from cleave.ir.ops import Mul, Sub
+
+    def axes(consumer):
+        (a, b) = [len(e.src_node.get_shape(0)) for e in consumer.inputs]
+        return [analysis._map_input_axes_to_consumer_axes(consumer, i, rank)
+                for i, rank in ((0, a), (1, b))]
+
+    lead = Mul((2, 4, 128), broadcast=0, n_batch_dims=0)
+    assert lead._lead()
+    assert axes(lead) == [[{0}, {1}, {2}], [{0}, {1}]]
+    # two non-batch dims, with and without a batch dim: B is (*batch, M), as it always was
+    assert axes(Mul((4, 128), broadcast=0, n_batch_dims=0)) == [[{0}, {1}], [{0}]]
+    assert axes(Mul((2, 4, 128), broadcast=0)) == [[{0}, {1}, {2}], [{0}, {1}]]
+    # the other index is untouched: B is (*batch, N), its last axis the product's last
+    assert axes(Sub((2, 4), broadcast=1, n_batch_dims=0)) == [[{0}, {1}], [{1}]]
+    assert axes(Sub((2, 4, 128), broadcast=1)) == [[{0}, {1}, {2}], [{0}, {2}]]
+
+
 def test_references_are_type_exact():
     assert set(graph_executor.REFERENCES) <= {s.cls for s in OPS.values()}
     src = inspect.getsource(graph_executor._eval_node)

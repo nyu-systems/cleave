@@ -12,8 +12,11 @@ def search_tiling(
     topk: int,
     force_fusion: bool = False,
     accept: Optional[Callable[[TileDict], bool]] = None,
+    honour_records: bool = True,
 ) -> List[Graph]:
-    """The policy's top ``topk`` tilings; ``accept`` drops candidates before truncation."""
+    """The policy's top ``topk`` tilings; ``accept`` drops candidates before truncation.
+    ``honour_records=False``: the tilings of the graph as if no conflict had an update rule
+    (every conflict pinned)."""
     arch = current_target().arch
     is_tensorcore = False
     output_nodes = []
@@ -23,10 +26,12 @@ def search_tiling(
         elif isinstance(node, OutputNode):
             output_nodes.append(node)
     policy = (
-        TCPolicy(output_nodes, arch, force_fusion=force_fusion, flat_graph=main_graph)
+        TCPolicy(output_nodes, arch, force_fusion=force_fusion, flat_graph=main_graph,
+                 honour_records=honour_records)
         if is_tensorcore
         else DefaultPolicy(
-            output_nodes, arch, force_fusion=force_fusion, flat_graph=main_graph
+            output_nodes, arch, force_fusion=force_fusion, flat_graph=main_graph,
+            honour_records=honour_records,
         )
     )
     candidates = policy.emit_config(topk, accept=accept)

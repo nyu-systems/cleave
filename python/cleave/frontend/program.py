@@ -372,8 +372,10 @@ class Program:
         self._lowerable("to_tile_graph")
         flags = self.can_split(split)
         for s in self._unread_inputs():
-            # The C++ symbolizer aborts on a free input no op touches; an unread equals= input
-            # is fine (its definition gives it its dims, and it is no output).
+            # The native search finds no graph for a free input no op touches (it counts a
+            # tensor nothing reads as an output), so the program is refused here, with its
+            # reason; an unread equals= input is fine (its definition gives it its dims, and
+            # it is no output).
             if s.equals is None:
                 raise SpecError(f"{self.name}: input {s.name!r} is not read by any output")
         declared = [s.equals is not None for s in self.inputs]
@@ -405,14 +407,24 @@ class Program:
                 env[r.out] = getattr(graph, r.kind)(*map(val, r.args))
         return graph
 
-    def to_graph_structure(self) -> list[dict]:
-        """The un-optimized program as a ``get_graph_structure()`` list (for to_ir)."""
+    def to_graph_structure(self, sizes: dict | None = None) -> list[dict]:
+        """The un-optimized program as a ``get_graph_structure()`` list (for to_ir).
+
+        ``sizes`` (``{dim name: extent}``) gives named dims other extents than the
+        program's: the same records at other shapes (``cleave.pipeline.update`` builds an
+        un-searched graph again on prefixes of a dim). Literal dims stay as written.
+        """
         self._lowerable("to_graph_structure")
         input_ids = {r.out for r in self._records if r.kind == "input"}
+        sizes = dict(sizes or {})
+
+        def shape(t):
+            return [int(sizes.get(d.name, d.extent)) if isinstance(d, Dim) else int(d)
+                    for d in t.dims]
 
         def desc(i):
             t = self._values[i]
-            d = {"num_dims": t.ndim, "dim": list(t.shape), "guid": i + 1}
+            d = {"num_dims": t.ndim, "dim": shape(t) if sizes else list(t.shape), "guid": i + 1}
             if i in input_ids:
                 d["dtype"] = t.dtype.name
             return d

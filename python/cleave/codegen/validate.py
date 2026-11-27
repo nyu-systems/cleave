@@ -1,5 +1,8 @@
+import math
+
 from ..core.errors import CodegenError
-from ..ir.graph import AccumEdge, ComputeOpNode, GraphNode, OutputNode, PlaceHolderNode
+from ..ir.graph import AccumEdge, ComputeOpNode, GraphNode, Iterator, OutputNode, PlaceHolderNode
+from ..ir.ops.reduction import ReduceSum
 from ..schedule.policy.hint import INTER, INTRA
 
 
@@ -35,9 +38,10 @@ class GraphValidator:
             if isinstance(arg, OutputNode):
                 seen_output = True
             elif graph.scalar_params:
-                # Only load-bearing when scalars are emitted at the input/output boundary;
-                # `annotate_args` appends in topological order, so a legitimate
-                # multi-output graph can interleave and must not be rejected for it.
+                # Only load-bearing when scalars are emitted at the input/output boundary.
+                # `annotate_args` puts a main graph's outputs last; `args` filled any other
+                # way (a hand-built graph launched with an explicit `out_idx`) may still
+                # interleave and is not rejected for it.
                 assert not seen_output, (
                     f"{where}: input {arg.name!r} comes after an output in `args`. The "
                     "emitted signature keeps this order, and scalar params are inserted "
@@ -141,6 +145,8 @@ class GraphValidator:
                     "`smap` entry, so its value one iteration ahead cannot be derived."
                 )
 
+        self._validate_rolling_state(graph, where, is_main)
+
         # --- the else branch has to be an alternative producer of the same tile ---------
         if graph.work_guard is not None or graph.else_nodes:
             assert graph.work_guard is not None, (
@@ -204,6 +210,147 @@ class GraphValidator:
         for node in graph.nodes:
             if isinstance(node, GraphNode):
                 self._validate_graph(node.graph, is_main=False, seen=seen)
+
+    def _validate_rolling_state(self, graph, where, is_main):
+        """Unassembled update rules, lag snapshots, rescaled accumulators and carried values."""
+        tmap = graph.tmap if isinstance(graph.tmap, dict) else {}
+        in_graph = {id(n) for n in graph.nodes}
+        accum = {id(n) for n in graph.accum_nodes}
+        lags = {id(n) for n in graph.lag_nodes}
+        # The carried values: what a lag node of this loop snapshots (``Graph.lag_nodes``).
+        snapshotted = {id(n.inputs[0].src_node) for n in graph.lag_nodes if n.inputs}
+
+        def squeezed(node):
+            it = tmap.get(node)
+            return None if not isinstance(it, Iterator) else [t for t in it.tile_size if t != 1]
+
+        for node in graph.nodes:
+            # A full-extent value whose update rule (``node.streaming``) is still on it was
+            # not assembled. That is right where its dim is whole in the tile it is computed
+            # from, and wrong in a loop that carries it or steps its dim: without the lag
+            # copy and the repairs the sums next to it would be relative to its value over one
+            # slice.
+            if is_main or getattr(node, "streaming", None) is None:
+                continue
+            sliced = False
+            operand = node.inputs[0].src_node
+            it = None if isinstance(operand, GraphNode) else tmap.get(operand)
+            if isinstance(it, Iterator) and hasattr(node, "position_in"):
+                axis = node.position_in(it)
+                sliced = axis is not None and it.tile_size[axis] != it.shape[axis]
+            assert id(node) not in accum and not sliced, (
+                f"{where}: {node.name!r} has an update rule that was not assembled; "
+                "emitting it as a plain reduction would reduce one slice."
+            )
+
+        # --- lag snapshots and rescaled accumulators: state carried across iterations ---
+        assert not ((graph.lag_nodes or graph.accum_scale) and is_main), (
+            f"{where}: `lag_nodes` / `accum_scale` describe state carried across loop "
+            "iterations, and the main graph's body runs once per grid slot."
+        )
+        for node in graph.lag_nodes:
+            assert id(node) in in_graph, f"lag node {node.name!r} is not in `nodes`."
+            assert isinstance(node, ComputeOpNode) and len(node.inputs) == 1, (
+                f"lag node {node.name!r} must be a compute node with exactly one input."
+            )
+            assert id(node) not in accum, (
+                f"lag node {node.name!r} is a per-iteration snapshot, not carried state."
+            )
+            assert node not in graph.prefetch_nodes and node not in graph.window_nodes, (
+                f"lag node {node.name!r} cannot also be prefetched or windowed."
+            )
+            src = node.inputs[0].src_node
+            assert id(src) in accum, (
+                f"lag node {node.name!r} snapshots {src.name!r}, which is not an "
+                "accumulator of this graph: only carried state has a previous value."
+            )
+        for acc, factor in graph.accum_scale.items():
+            assert id(acc) in accum, (
+                f"rescaled node {acc.name!r} is not an accumulator of this graph."
+            )
+            assert id(factor) in in_graph and isinstance(factor, ComputeOpNode), (
+                f"rescale factor {factor.name!r} of {acc.name!r} is not a compute node "
+                "of this graph."
+            )
+            assert id(factor) not in accum and id(factor) not in lags, (
+                f"rescale factor {factor.name!r} of {acc.name!r} must be a per-iteration "
+                "value, not an accumulator or a lag node."
+            )
+            # Through ordinary edges only: a lag node reads the previous value.
+            stack, seen = [factor], set()
+            while stack:
+                node = stack.pop()
+                assert node is not acc, (
+                    f"rescale factor {factor.name!r} is computed from {acc.name!r}, the "
+                    "accumulator it has to be emitted in front of."
+                )
+                if id(node) in seen or id(node) in lags:
+                    continue
+                seen.add(id(node))
+                stack.extend(e.src_node for e in node.inputs if id(e.src_node) in in_graph)
+            assert acc.out_dtype == factor.out_dtype == "float32", (
+                f"rescale of {acc.name!r} by {factor.name!r}: both must be float32, got "
+                f"{acc.out_dtype} and {factor.out_dtype}."
+            )
+            assert getattr(acc, "accum_init", None) is None, (
+                f"rescaled accumulator {acc.name!r} starts at {acc.accum_init}; the first "
+                "iteration multiplies it by a factor of 0, which only leaves a zero as it is."
+            )
+            acc_tile, fac_tile = squeezed(acc), squeezed(factor)
+            if acc_tile is not None and fac_tile is not None:
+                assert fac_tile and acc_tile[: len(fac_tile)] == fac_tile, (
+                    f"rescale factor {factor.name!r} tile {fac_tile} is not a leading "
+                    f"slice of accumulator {acc.name!r} tile {acc_tile}."
+                )
+                # The accumulator's buffer is allocated unsqueezed, the macro indexes the
+                # squeezed rank.
+                assert len(acc_tile) == len(tmap[acc].tile_size), (
+                    f"rescaled accumulator {acc.name!r} has a unit extent in its tile "
+                    f"{tuple(tmap[acc].tile_size)}."
+                )
+
+        # --- carried values -----------------------------------------------------------
+        for node in graph.accum_nodes:
+            init = getattr(node, "accum_init", None)
+            if init is not None and math.isfinite(init) and init != 0:
+                assert node.out_dtype == "float32", (
+                    f"accumulator {node.name!r} starts at {init}, a float32 value, but is "
+                    f"stored as {node.out_dtype}."
+                )
+            readers = [
+                e.dst_node.name
+                for e in node.outputs
+                if id(e.dst_node) in in_graph and id(e.dst_node) not in lags
+            ]
+            assert not readers or id(node) in snapshotted, (
+                f"accumulator {node.name!r} is read by {readers} inside the loop that "
+                "accumulates it. A running value is meaningful before its loop ends only "
+                "as carried state, which a lag node snapshots so that what is accumulated "
+                "under it can be repaired; a plain partial result is not."
+            )
+        if not is_main:
+            for node in graph.nodes:
+                if not isinstance(node, ReduceSum) or id(node) in accum:
+                    continue
+                operand = node.inputs[0].src_node
+                it = None if isinstance(operand, GraphNode) else tmap.get(operand)
+                if not isinstance(it, Iterator):
+                    continue
+                # Found from the axis the node was built with, not from ``axis_arg``:
+                # that is the ``dim`` of the emitted macro, an index into the stored
+                # operand, which has its unit extents squeezed out and the tile here
+                # has not.
+                axis = node.position_in(it)
+                if axis is None:
+                    given, whole = 1, node.dims[node.flat_axis]
+                else:
+                    given, whole = it.tile_size[axis], it.shape[axis]
+                assert given == whole, (
+                    f"{where}: {node.name!r} reduces a slice: the loop gives it "
+                    f"{given} of {whole} elements of the reduced axis "
+                    "per iteration, and it is not an accumulator, so every iteration "
+                    "starts over."
+                )
 
     def _declare_pass_configs(self, graph):
         """Emit the tilelang pass configs this kernel must be compiled under.

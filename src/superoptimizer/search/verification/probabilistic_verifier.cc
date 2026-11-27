@@ -17,23 +17,8 @@ struct ThreadFingerprintScope {
 };
 // Input k's fingerprint is a function of k; a declared input's is its
 // definition's over its sources' (the same in the target and every
-// candidate).
-void fingerprint_graph(kernel::Graph const &g) {
-  int input_id = 0;
-  for (auto const &op : g.operators) {
-    if (op->op_type == type::KNOperatorType::KN_INPUT_OP) {
-      auto *input = static_cast<kernel::KNInputOp *>(op);
-      if (input->declaration) {
-        kernel::compute_declared_input_fingerprint(g, *input);
-      } else {
-        input->fingerprint(input_id);
-      }
-      input_id++;
-    } else {
-      op->fingerprint();
-    }
-  }
-}
+// candidate): kernel::fingerprint_graph.
+using kernel::fingerprint_graph;
 
 } // namespace
 

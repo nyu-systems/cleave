@@ -14,7 +14,9 @@ from cleave.runtime.reference import execute
 
 
 def _softmax(x: cl.Tensor["R", "C"]):
-    return cl.softmax(x, -1)
+    """The max written out by hand (the same program ``cl.softmax`` records)."""
+    e = cl.exp(x - cl.max(x, -1, keepdim=True))
+    return e / cl.sum(e, -1, keepdim=True)
 
 
 def _t(guid, dims):

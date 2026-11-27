@@ -1,8 +1,13 @@
 """The validation input distributions (CPU): ``normal`` and the adversarial softmax cases.
 
-``large_logits`` and ``increasing`` are generators only for now: no operator validates on
-them until its softmax is stabilized (today's fixed-shift references are NaN there), which
-``test_no_operator_validates_on_adversarial_inputs_yet`` pins.
+``large_logits`` and ``increasing`` are shared by the dense programs and the dynamic
+operators. The dense programs have four more (``decreasing``, ``last_spike``, ``constant``,
+``offset``), the dynamic operators two (``large_scale``, ``dominant_last``). A dense program
+is held to its adversarial cases where its softmax is exact, that is where an exp reads
+``x - max(x)`` (``cl.softmax``, or the max written out by hand; the reference of an
+``exp / sum`` without the max is NaN on them); the softmax of every dynamic operator is
+exact.
+``test_adversarial_inputs_are_switched_on_per_path`` pins both.
 """
 
 import inspect
@@ -19,16 +24,38 @@ from cleave.dynamic import reference as dyn
 from cleave.dynamic.workloads import ADVERSARIAL_WORKLOADS, MLA_SM_SCALE, WORKLOADS
 from cleave.ir.graph import OutputNode, PlaceHolderNode
 from cleave.ir.graph_utils import find_topo_sort
-from cleave.ir.ops import Exp
+from cleave.ir.ops import Exp, PermuteView, ReduceMax, ReduceSum, SplitView, Sub
 from cleave.pipeline import EvalConfig
 from cleave.runtime import inputs as rt_inputs
 from cleave.runtime import reference as rt
-from cleave.runtime.inputs import DISTRIBUTIONS, INCREASING_SPAN, LARGE_LOGIT_FACTOR
+from cleave.runtime.inputs import (
+    ADVERSARIAL as DENSE_ADVERSARIAL, DISTRIBUTIONS, INCREASING_SPAN, LARGE_LOGIT_FACTOR,
+    LOGIT_OFFSET, OFFSET, OFFSET_GRID, SHARED_DISTRIBUTIONS, adversarial_cases, logit_inputs,
+    why_not_adversarial,
+)
 
 from tests import _graphs as g
 from tests.frontend import _programs as programs
 
 DTYPE = "float16"
+
+
+def lowered(fn, shapes, dtype=cl.f16):
+    """The identity (un-searched) graph of ``fn`` as ``pipeline.plans.lower`` lowers it:
+    the flat graph the pipeline validates against."""
+    from cleave.frontend import trace
+    from cleave.pipeline.plans import lower
+    from cleave.pipeline.superopt import GraphSet
+
+    (graph,) = list(GraphSet.identity(trace(fn, shapes, dtype)))
+    (ir,) = lower(graph)
+    return ir
+
+
+def _records_a_max(program) -> bool:
+    """Whether ``program`` records a max (``cl.softmax`` does, and so does a softmax with
+    its max written out): what makes its softmax exact."""
+    return any(r.kind == "reduce_max" for r in program.ops)
 
 # name -> (graph, number of score matmuls). The softmax axis is the last axis of the scores.
 ATTENTION = {
@@ -43,7 +70,8 @@ ATTENTION = {
 
 
 def _scores(graph, inputs):
-    """What every ``Exp`` of ``graph`` is fed (its logits), by the reference executor."""
+    """The logits of every ``Exp`` of ``graph``, by the reference executor: what it is fed,
+    or, for the exp of an exact softmax, ``x`` of the ``x - max(x)`` it reads."""
     order = find_topo_sort(graph.nodes)
     placeholders = [n for n in order if isinstance(n, PlaceHolderNode)]
     env = {(p, 0): t for p, t in zip(placeholders, inputs)}
@@ -53,7 +81,12 @@ def _scores(graph, inputs):
             continue
         args = [env[(e.src_node, e.src_id)] for e in sorted(node.inputs, key=lambda e: e.dst_id)]
         if isinstance(node, Exp):
-            found.append(args[0].float())
+            fed = node.inputs[0].src_node
+            if rt_inputs.softmax_axis(node) is not None and fed is not rt_inputs._logits_of(node):
+                (edge,) = [e for e in fed.inputs if e.dst_id == 0]
+                found.append(env[(edge.src_node, edge.src_id)].float())
+            else:
+                found.append(args[0].float())
         env[(node, 0)] = rt._eval_node(node, args)
     assert found
     return found
@@ -98,8 +131,8 @@ def test_adversarial_inputs_rewrite_only_the_score_operands(name):
         assert torch.equal(large[i], want)
         assert torch.isfinite(large[i]).all()
     for before, after in zip(_scores(graph, normal), _scores(graph, large)):
-        # The fixtures' fixed shift is a constant and is not scaled; differences along the
-        # keys cancel it, and those are 100 times larger.
+        # The constant shift the fixtures build in front of their exp is not scaled;
+        # differences along the keys cancel it, and those are 100 times larger.
         steps = before.diff(dim=-1)
         assert torch.allclose(after.diff(dim=-1), LARGE_LOGIT_FACTOR * steps,
                               rtol=2e-2, atol=2e-2 * LARGE_LOGIT_FACTOR * float(steps.abs().max()))
@@ -143,6 +176,428 @@ def test_increasing_follows_the_whole_key_axis_through_a_split():
     assert float(whole.min()) > 0.4 * INCREASING_SPAN and float(whole.max()) > 88.7
 
 
+@pytest.mark.parametrize("name", sorted(ATTENTION))
+def test_decreasing_is_the_increasing_ramp_the_other_way_round(name):
+    build, _ = ATTENTION[name]
+    graph = build()
+    falling, rising = _inputs(graph, "decreasing"), _inputs(graph, "increasing")
+    assert all(torch.isfinite(t).all() for t in falling)
+    for down, up in zip(_scores(graph, falling), _scores(graph, rising)):
+        steps = down.diff(dim=-1)
+        assert (steps <= 0).all(), "logits must never rise along the key axis"
+        # the row max is the first key, and a later tile (16 keys or more) is strictly below
+        assert (down[..., :-16] > down[..., 16:]).all()
+        assert (down[..., :1] >= down).all()
+        if name == "gqa_split_partial":
+            # the ramp runs along the whole key axis: it falls from one split to the next
+            assert (down[:, 1:, :, 0] < down[:, :-1, :, -1]).all()
+            continue
+        assert torch.equal(down, up.flip(-1))
+        span = down[..., 0] - down[..., -1]
+        assert float(span.min()) > 0.4 * INCREASING_SPAN / math.sqrt(2)
+        assert float(span.max()) > 88.7
+
+
+def _whole_key_axis(name, scores):
+    """Scores with the keys of the whole key axis last (a split partial holds them as
+    (split, rows, chunk))."""
+    if name != "gqa_split_partial":
+        return scores
+    return scores.permute(0, 2, 1, 3).flatten(2)
+
+
+@pytest.mark.parametrize("name", sorted(ATTENTION))
+def test_last_spike_puts_one_large_logit_on_the_last_key_of_every_row(name):
+    build, n_scores = ATTENTION[name]
+    graph = build()
+    normal, spiked = _inputs(graph, "normal"), _inputs(graph, "last_spike")
+    assert all(a.dtype == b.dtype and a.shape == b.shape for a, b in zip(normal, spiked))
+    assert all(torch.isfinite(t).all() for t in spiked)
+    for scores in _scores(graph, spiked):
+        scores = _whole_key_axis(name, scores)
+        last, rest = scores[..., -1], scores[..., :-1]
+        # a * 128 with a >= 0.5 (the fixtures' scales differ by up to sqrt(2)): for every
+        # row far above every other key, for most rows past what fp32 exp holds
+        assert float(last.min()) > 0.4 * INCREASING_SPAN / math.sqrt(2)
+        assert float(last.max()) > 88.7
+        assert float((last[..., None] - rest).min()) > 0.25 * INCREASING_SPAN
+        # the other keys score as normal keys do (around the fixtures' constant shift)
+        assert float(rest.max() - rest.min()) < 0.15 * INCREASING_SPAN
+    # per score matmul one query input and one key input are rewritten, nothing else
+    changed = [i for i, (a, b) in enumerate(zip(normal, spiked)) if not torch.equal(a, b)]
+    assert len(changed) == 2 * n_scores
+    assert all(torch.equal(a, b) for a, b in zip(normal, _inputs(graph, "normal")))
+
+
+@pytest.mark.parametrize("name", sorted(ATTENTION))
+def test_constant_makes_every_logit_of_a_row_the_same(name):
+    build, n_scores = ATTENTION[name]
+    graph = build()
+    normal, constant = _inputs(graph, "normal"), _inputs(graph, "constant")
+    for scores in _scores(graph, constant):
+        scores = _whole_key_axis(name, scores)
+        assert (scores == scores[..., :1]).all(), "one logit per row, bit for bit"
+        assert scores[..., 0].unique().numel() > 1, "the rows still differ from each other"
+    # only the keys are rewritten: every key is the first key
+    changed = [i for i, (a, b) in enumerate(zip(normal, constant)) if not torch.equal(a, b)]
+    assert len(changed) == n_scores
+
+
+@pytest.mark.parametrize("name", sorted(ATTENTION))
+def test_offset_moves_every_logit_far_below_zero_and_keeps_them_exact(name):
+    build, n_scores = ATTENTION[name]
+    graph = build()
+    normal, shifted = _inputs(graph, "normal"), _inputs(graph, "offset")
+    assert all(torch.isfinite(t).all() for t in shifted)
+    # per score matmul the query input and the key input are put on the grid, nothing else
+    changed = [i for i, (a, b) in enumerate(zip(normal, shifted)) if not torch.equal(a, b)]
+    assert len(changed) == 2 * n_scores
+    for i in changed:
+        steps = shifted[i].float() / OFFSET_GRID
+        assert (steps == steps.round()).all()
+    for scores in _scores(graph, shifted):
+        # about -1e4 per score matmul (again up to the fixtures' scales): exp of every logit
+        # is 0, so a softmax that does not subtract the max divides 0 by 0
+        assert float(scores.max()) < -0.5 * OFFSET
+        assert (scores.exp() == 0).all()
+        spread = scores.amax(dim=-1) - scores.amin(dim=-1)
+        assert 1.0 < float(spread.min()) and float(spread.max()) < 40.0  # normal-sized
+    # Every operand is on the grid, so each partial sum of a contraction is exact in fp32
+    # and the logits do not depend on the order they are accumulated in: summed back to
+    # front they are the same bits. (The normal inputs are not: there the order shows.)
+    for inputs, same in ((shifted, True), (normal, False)):
+        forward = _scores(graph, inputs)
+        backward = _scores(graph, [t.flip(-1) for t in inputs])
+        assert all(torch.equal(a, b) for a, b in zip(forward, backward)) is same
+
+
+def attention_over_the_queries(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
+                               v: cl.Tensor["H", "SKV", "D"]):
+    """Every key's column of weights sums to 1: the softmax axis is the query axis."""
+    return cl.softmax((q @ k.mT) / q.shape[-1] ** 0.5, dim=-2) @ v
+
+
+def test_a_softmax_over_the_queries_is_shaped_along_the_queries():
+    """The softmax axis of ``cl.softmax(q @ k.mT, dim=-2)`` is the first operand's row
+    axis. The cases were laid along the second operand's rows whatever the softmax axis
+    was, so along the softmax axis the "increasing" logits rose and fell, the "constant"
+    ones differed by 3 to 7 and the spike sat on the last query of one column in fifty,
+    while the build reported every case."""
+    from cleave.runtime.inputs import key_operand, score_matmuls
+
+    shapes = dict(H=2, SQ=96, SKV=8, D=16)
+    graph = lowered(attention_over_the_queries, shapes)
+    (matmul,) = score_matmuls(graph)
+    assert key_operand(graph, matmul) == 0
+    over_keys = lowered(programs.attention, dict(HQ=2, HKV=2, SQ=8, SKV=96, D=16))
+    assert key_operand(over_keys, score_matmuls(over_keys)[0]) == 1
+    assert adversarial_cases(graph) == DENSE_ADVERSARIAL and why_not_adversarial(graph) == ""
+
+    (rising,) = _scores(graph, _inputs(graph, "increasing"))
+    assert tuple(rising.shape) == (2, 96, 8)
+    assert (rising.diff(dim=-2) >= 0).all(), "logits must never fall along the query axis"
+    assert (rising[..., 16:, :] > rising[..., :-16, :]).all()
+    span = rising[..., -1, :] - rising[..., 0, :]
+    assert float(span.min()) > 0.4 * INCREASING_SPAN and float(span.max()) > 88.7
+
+    (falling,) = _scores(graph, _inputs(graph, "decreasing"))
+    assert torch.equal(falling, rising.flip(-2))
+
+    (spiked,) = _scores(graph, _inputs(graph, "last_spike"))
+    last, rest = spiked[..., -1, :], spiked[..., :-1, :]
+    assert float((last[..., None, :] - rest).min()) > 0.25 * INCREASING_SPAN
+    assert float(last.max()) > 88.7
+
+    (constant,) = _scores(graph, _inputs(graph, "constant"))
+    assert (constant == constant[..., :1, :]).all(), "one logit per column, bit for bit"
+    assert constant[..., 0, :].unique().numel() > 1
+
+    normal = _inputs(graph, "normal")
+    (large,) = _scores(graph, _inputs(graph, "large_logits"))
+    (plain,) = _scores(graph, normal)
+    assert float(large.abs().max()) > 50 * float(plain.abs().max())
+    (shifted,) = _scores(graph, _inputs(graph, "offset"))
+    assert float(shifted.max()) < -0.5 * OFFSET and (shifted.exp() == 0).all()
+    # the values are never touched, the queries and the keys in every case but "constant"
+    for case in DENSE_ADVERSARIAL:
+        changed = [i for i, (a, b) in enumerate(zip(normal, _inputs(graph, case)))
+                   if not torch.equal(a, b)]
+        assert len(changed) == (1 if case in ("constant", "large_logits") else 2), case
+
+
+def test_adversarial_cases_are_what_the_inputs_of_a_graph_can_be_shaped_into():
+    for build, _ in ATTENTION.values():
+        assert adversarial_cases(build()) == DENSE_ADVERSARIAL
+    assert DENSE_ADVERSARIAL == tuple(d for d in DISTRIBUTIONS if d != "normal")
+    assert adversarial_cases(g.matmul_graph(8, 8, 16)) == ()  # no softmax, no logits
+    # RMSNorm-ed operands: the logits are bounded whatever the inputs are
+    assert adversarial_cases(g.qknorm_graph(1, 4, 2, 8, 32, 16)) == ()
+
+    def self_attention(x: cl.Tensor["H", "S", "D"]):
+        return cl.softmax((x @ x.mT) / x.shape[-1] ** 0.5) @ x
+
+    from cleave.frontend import trace
+    from cleave.lower import to_ir
+
+    prog = trace(self_attention, dict(H=2, S=24, D=16), cl.f16)
+    graph = to_ir(prog.to_graph_structure(), dtype=DTYPE, out_dtype=DTYPE)
+    # one input is both the queries and the keys: it can be scaled, not ramped
+    assert adversarial_cases(graph) == ("large_logits",)
+    for distribution in DENSE_ADVERSARIAL[1:]:
+        with pytest.raises(SpecError, match="both a query and a key"):
+            _inputs(graph, distribution)
+
+    # every case that is missing has a reason, and a graph that gets them all has none
+    assert why_not_adversarial(g.mha_bhsd_graph(1, 2, 8, 96, 16)) == ""
+    assert "both a query and a key" in why_not_adversarial(graph)
+    assert "neither the result of a score matmul nor an input" in why_not_adversarial(
+        g.matmul_graph(8, 8, 16))
+    assert "not read from an input" in why_not_adversarial(g.qknorm_graph(1, 4, 2, 8, 32, 16))
+
+
+def attention_plus_gate(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
+                        v: cl.Tensor["H", "SKV", "D"], a: cl.Tensor["H", "SQ", "E"],
+                        b: cl.Tensor["H", "D", "E"]):
+    """An exact softmax next to an ``exp`` written by hand, which has a matmul of its own."""
+    return cl.softmax((q @ k.mT) / q.shape[-1] ** 0.5) @ v + cl.exp((a @ b.mT) / 8.0)
+
+
+def attention_plus_exp_of_the_queries(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
+                                      v: cl.Tensor["H", "SKV", "D"], w: cl.Tensor["H", "D", "D"]):
+    """... and one whose plain ``exp`` reads the queries of the softmax."""
+    return cl.softmax((q @ k.mT) / q.shape[-1] ** 0.5) @ v + cl.exp((q @ w.mT) / 8.0)
+
+
+def test_a_plain_exp_next_to_an_exact_softmax_is_not_shaped():
+    """The cases shape the logits of the softmax, not the argument of an ``exp`` that makes
+    no claim: its reference would overflow, and a kernel with a correct softmax would be
+    failed for reproducing the program's own ``inf``."""
+    shapes = dict(H=2, SQ=8, SKV=96, D=16, E=16)
+    graph = lowered(attention_plus_gate, shapes)
+    exps = [n for n in graph.nodes if type(n) is Exp]
+    assert sorted(rt_inputs.softmax_axis(n) is not None for n in exps) == [False, True]
+    (scores,) = rt_inputs.score_matmuls(graph)  # the softmax's own matmul only
+    assert scores.K == 16 and scores.N == 96
+    assert adversarial_cases(graph) == DENSE_ADVERSARIAL and why_not_adversarial(graph) == ""
+    names = [p.name for p in rt.placeholder_order(graph)]
+    normal = dict(zip(names, _inputs(graph, "normal")))
+    for distribution in DENSE_ADVERSARIAL:
+        shaped = dict(zip(names, _inputs(graph, distribution)))
+        same = sorted(n for n in names if torch.equal(shaped[n], normal[n]))
+        assert len(same) >= 3 and len(same) < len(names), (distribution, same)  # v, a, b
+        _, reference, _ = rt.build_inputs_and_reference(
+            graph, DTYPE, seed=7, device="cpu", distribution=distribution)
+        assert all(torch.isfinite(r).all() for r in reference), distribution
+    # the inputs of the plain exp's matmul are the ones left alone, in every case
+    gate = next(n for n in graph.nodes if type(n) is Exp and rt_inputs.softmax_axis(n) is None)
+    assert rt_inputs._plain_exp_fed_by(graph, rt.placeholder_order(graph))[0] is gate
+
+    # the same program with its softmax written as a plain exp / sum: every exp counts
+    # again, as for any graph that makes no claim (an explicit request shapes what it can)
+    plain = lowered(plain_attention_plus_gate, shapes)
+    assert all(rt_inputs.softmax_axis(n) is None for n in plain.nodes)
+    assert len(rt_inputs.score_matmuls(plain)) == 2
+
+
+def plain_attention_plus_gate(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
+                              v: cl.Tensor["H", "SKV", "D"], a: cl.Tensor["H", "SQ", "E"],
+                              b: cl.Tensor["H", "D", "E"]):
+    """:func:`attention_plus_gate` with its softmax written without the max."""
+    e = cl.exp((q @ k.mT) / q.shape[-1] ** 0.5)
+    return (e / cl.sum(e, -1, keepdim=True)) @ v + cl.exp((a @ b.mT) / 8.0)
+
+
+def test_an_input_shared_with_a_plain_exp_gets_no_adversarial_case():
+    graph = lowered(attention_plus_exp_of_the_queries, dict(H=2, SQ=8, SKV=96, D=16))
+    assert len(rt_inputs.score_matmuls(graph)) == 1
+    assert adversarial_cases(graph) == ()
+    why = why_not_adversarial(graph)
+    assert "also feeds" in why and "not stabilized" in why
+    # asked for explicitly it is still shaped, and the reference shows why it is not held
+    # to it: the plain exp overflows
+    _, reference, _ = rt.build_inputs_and_reference(
+        graph, DTYPE, seed=7, device="cpu", distribution="large_logits")
+    assert not all(torch.isfinite(r).all() for r in reference)
+
+
+def softmax_rows(x: cl.Tensor["R", "C"]):
+    return cl.softmax(x, -1)
+
+
+def softmax_columns(x: cl.Tensor["C", "R"]):
+    return cl.softmax(x, 0)
+
+
+def softmax_of_negated_rows(x: cl.Tensor["R", "C"]):
+    return cl.softmax(x * -0.5, -1)
+
+
+def plain_softmax_rows(x: cl.Tensor["R", "C"]):
+    """:func:`softmax_rows` written without the max: a plain exp makes no claim."""
+    e = cl.exp(x)
+    return e / cl.sum(e, -1, keepdim=True)
+
+
+# name -> (program, shapes, softmax axis of the input, the constant between input and exp)
+LOGITS = {
+    "rows": (softmax_rows, dict(R=8, C=96), 1, 1.0),
+    "columns": (softmax_columns, dict(R=8, C=96), 0, 1.0),
+    "negated_rows": (softmax_of_negated_rows, dict(R=8, C=96), 1, -0.5),
+}
+
+
+@pytest.mark.parametrize("name", sorted(LOGITS))
+def test_logits_that_are_an_input_are_shaped_along_their_softmax_axis(name):
+    """A standalone ``cl.softmax(x)`` has no score matmul: its logits are the input (times a
+    constant). The cases write the same rows into it, along the axis the Exp's record names."""
+    fn, shapes, axis, scale = LOGITS[name]
+    graph = lowered(fn, shapes)  # the flat graph the pipeline validates against: annotated
+    ((placeholder, found_axis, sign),) = logit_inputs(graph)
+    assert (found_axis, sign) == (axis, math.copysign(1.0, scale))
+    assert adversarial_cases(graph) == DENSE_ADVERSARIAL
+    span = INCREASING_SPAN * abs(scale)
+
+    def logits(distribution):
+        (inputs,) = [_inputs(graph, distribution)]
+        assert len(inputs) == 1 and inputs[0].dtype == torch.float16
+        assert torch.isfinite(inputs[0]).all()
+        (scores,) = _scores(graph, inputs)
+        return scores.movedim(axis, -1)  # the softmax axis last
+
+    base = logits("normal")
+    large = logits("large_logits")  # the input is rounded to fp16 again after scaling
+    assert torch.allclose(large, LARGE_LOGIT_FACTOR * base, rtol=1e-3, atol=1e-3)
+
+    up, down = logits("increasing"), logits("decreasing")
+    assert (up.diff(dim=-1) >= 0).all() and (up[..., 16:] > up[..., :-16]).all()
+    assert torch.equal(down, up.flip(-1))
+    rise = up[..., -1] - up[..., 0]
+    assert float(rise.min()) > 0.4 * span and float(rise.max()) > 88.7
+
+    spiked = logits("last_spike")
+    last, rest = spiked[..., -1], spiked[..., :-1]
+    assert torch.equal(rest, base[..., :-1]), "every key but the last is the normal one"
+    assert float(last.min()) > 0.4 * span and float(last.max()) > 88.7
+    assert float((last[..., None] - rest).min()) > 0.25 * span
+
+    constant = logits("constant")
+    assert (constant == constant[..., :1]).all()
+    assert constant[..., 0].unique().numel() > 1
+
+    shifted = logits("offset")
+    assert float(shifted.max()) < -0.9 * LOGIT_OFFSET * abs(scale)
+    assert (shifted.exp() == 0).all()
+    spread = shifted.amax(dim=-1) - shifted.amin(dim=-1)
+    assert 1.0 * abs(scale) < float(spread.min()) and float(spread.max()) < 40.0
+
+
+def _viewed_logits_graph(view):
+    """``sum(exp(v - max(v)), -1)`` with ``v = view(x)``, a softmax over the last axis of
+    the view: what the partial of ``cl.softmax(x)`` looks like once the program is split
+    over that axis."""
+    dims = tuple(int(s) for s in view.output_shape)
+    batch = len(dims) - 2
+    full = ReduceMax(dims, axis=-1, name="reduce_max_0", dtype=DTYPE, out_dtype="float32")
+    sub = Sub(dims, broadcast=0, name="sub_0", dtype="float32", out_dtype="float32",
+              n_batch_dims=batch)
+    exp = Exp(dims, name="exp_0", dtype="float32", out_dtype="float32", n_batch_dims=batch)
+    rowsum = ReduceSum(dims, name="rowsum_0", dtype="float32", out_dtype="float32")
+    g._connect(view, full, 0, 0)
+    g._connect(view, sub, 0, 0)
+    g._connect(full, sub, 0, 1)
+    g._connect(sub, exp, 0, 0)
+    g._connect(exp, rowsum, 0, 0)
+    OutputNode(rowsum, dtype=DTYPE)
+    graph = g._finalize(rowsum)
+    assert rt_inputs.softmax_axis(exp) == -1
+    return graph
+
+
+# name -> (input shape, split factor, the input's softmax axis, where the split dim sits)
+SPLIT_LOGITS = {
+    "rows": ((8, 96), 4, 1, 0),
+    "batched_rows": ((3, 8, 96), 4, 2, 1),  # the split dim behind the batch dim
+}
+
+
+@pytest.mark.parametrize("name", sorted(SPLIT_LOGITS))
+def test_logits_read_through_a_split_are_shaped_along_the_whole_softmax_axis(name):
+    """The partial of a program split over its softmax axis reads its logits through the
+    split: ``(split, rows, chunk)``. They are still an input, so the partial is held to
+    every case, and a case is written along the input's whole softmax axis: each split
+    holds the next slice of the ramp, and only the last one the spike.
+
+    It used to have no case at all ("its logits are neither the result of a score matmul
+    nor an input"), while the unsplit graph and the combine of the same program had six.
+    """
+    shape, factor, axis, split_pos = SPLIT_LOGITS[name]
+    graph = _viewed_logits_graph(
+        SplitView(shape, axis=axis, factor=factor, dtype=DTYPE, name="split_x"))
+    ((placeholder, found_axis, sign),) = logit_inputs(graph)
+    assert isinstance(placeholder, PlaceHolderNode)
+    assert tuple(int(s) for s in placeholder.get_shape(0)) == shape
+    assert (found_axis, sign) == (axis, 1.0)
+    assert adversarial_cases(graph) == DENSE_ADVERSARIAL and why_not_adversarial(graph) == ""
+
+    def logits(distribution):
+        (x,) = _inputs(graph, distribution)
+        assert tuple(x.shape) == shape and x.dtype == torch.float16
+        (scores,) = _scores(graph, (x,))
+        assert scores.shape[split_pos] == factor and scores.shape[-1] == shape[axis] // factor
+        # the splits side by side again: (..., rows, the whole softmax axis)
+        whole = scores.movedim(split_pos, -2).flatten(-2)
+        assert torch.equal(whole, x.float())
+        return scores.movedim(split_pos, 0), whole
+
+    base, base_whole = logits("normal")
+    up, up_whole = logits("increasing")
+    assert (up.diff(dim=-1) >= 0).all()
+    assert (up[1:, ..., 0] > up[:-1, ..., -1]).all(), "each split starts above the last one"
+    rise = up_whole[..., -1] - up_whole[..., 0]
+    assert float(rise.min()) > 0.4 * INCREASING_SPAN and float(rise.max()) > 88.7
+    down, down_whole = logits("decreasing")
+    assert torch.equal(down_whole, up_whole.flip(-1))
+
+    spiked, spiked_whole = logits("last_spike")
+    assert torch.equal(spiked[:-1], base[:-1]), "every split but the last is the normal one"
+    assert torch.equal(spiked_whole[..., :-1], base_whole[..., :-1])
+    assert float((spiked_whole[..., -1:] - spiked_whole[..., :-1]).min()) > 0.25 * INCREASING_SPAN
+
+    constant, _ = logits("constant")
+    assert (constant == constant[:1, ..., :1]).all()
+    shifted, _ = logits("offset")
+    assert float(shifted.max()) < -0.9 * LOGIT_OFFSET
+    _, large = logits("large_logits")
+    assert torch.allclose(large, LARGE_LOGIT_FACTOR * base_whole, rtol=1e-3, atol=1e-3)
+
+
+def test_logits_read_through_a_permute_are_shaped_along_the_axis_it_moved():
+    """A view that reindexes the input: the softmax axis of the exp (its last) is the axis
+    of the input the permute put there."""
+    graph = _viewed_logits_graph(PermuteView((96, 8), (1, 0), dtype=DTYPE, name="permute_x"))
+    ((placeholder, axis, sign),) = logit_inputs(graph)
+    assert (axis, sign) == (0, 1.0) and adversarial_cases(graph) == DENSE_ADVERSARIAL
+    (x,) = _inputs(graph, "increasing")
+    assert tuple(x.shape) == (96, 8) and (x.float().diff(dim=0) >= 0).all()
+    (scores,) = _scores(graph, (x,))
+    assert tuple(scores.shape) == (8, 96) and (scores.diff(dim=-1) >= 0).all()
+    assert float((scores[:, -1] - scores[:, 0]).max()) > 88.7
+
+
+def test_a_plain_exp_of_an_input_names_no_softmax_axis():
+    """Without the max nothing says what the exp is summed over: no logit input, and the
+    adversarial cases are an error, as for any graph without logits to shape."""
+    from cleave.lower import to_ir
+
+    prog = programs.matmul.trace(M=8, N=8, K=16)
+    assert logit_inputs(to_ir(prog.to_graph_structure(), dtype=DTYPE, out_dtype=DTYPE)) == []
+    graph = lowered(plain_softmax_rows, dict(R=8, C=96))
+    assert [type(n).__name__ for n in graph.nodes if type(n) is Exp] == ["Exp"]
+    assert logit_inputs(graph) == [] and adversarial_cases(graph) == ()
+    with pytest.raises(SpecError, match="no score matmul"):
+        _inputs(graph, "increasing")
+
+
 def test_lowered_frontend_attention_is_recognized():
     from cleave.lower import to_ir
 
@@ -157,22 +612,36 @@ def test_lowered_frontend_attention_is_recognized():
 
 def test_adversarial_inputs_need_softmax_scores_and_a_known_name():
     matmul = g.matmul_graph(8, 8, 16)
-    for distribution in ("large_logits", "increasing"):
+    for distribution in DENSE_ADVERSARIAL:
         with pytest.raises(SpecError, match="no score matmul"):
             _inputs(matmul, distribution)
     with pytest.raises(SpecError, match="must be drawn from"):
         _inputs(matmul, "uniform")
     # A score operand that is computed (RMSNorm of q and k) cannot be shaped through an input.
-    with pytest.raises(SpecError, match="not read from an input"):
-        _inputs(g.qknorm_graph(1, 4, 2, 8, 32, 16), "increasing")
+    for distribution in DENSE_ADVERSARIAL:
+        with pytest.raises(SpecError, match="not read from an input"):
+            _inputs(g.qknorm_graph(1, 4, 2, 8, 32, 16), distribution)
     assert rt_inputs.check_distributions("normal") == ("normal",)
     assert rt_inputs.check_distributions(list(DISTRIBUTIONS)) == DISTRIBUTIONS
     with pytest.raises(SpecError, match="must be drawn from"):
         rt_inputs.check_distributions(())
 
 
-def test_no_operator_validates_on_adversarial_inputs_yet():
-    """The generators exist; switching one on is a deliberate, per-operator change."""
+def test_adversarial_inputs_are_switched_on_per_path():
+    """The generators exist; switching them on is a deliberate change, made per path.
+
+    Nothing asks for them by default. The paged path is switched on as a whole: the softmax
+    of every dynamic operator is exact, so every validation of a registry operator on the
+    registry's workloads includes its adversarial ones (``compile_dynamic``), with no
+    per-operator flag. Timing asks for the captured workloads only, which is why the
+    factories still default to them. A dense program says so by what it records: the max
+    of the exact softmax, ``exp(x - max(x))`` (what ``cl.softmax`` records, and a softmax
+    with its max written out), and the kernels of such a program are held to every
+    adversarial case its inputs can be shaped into, whatever was asked for. An ``exp / sum``
+    written by hand without the max makes no such claim and is validated on what was asked.
+    """
+    assert all(len(op.adversarial) == 12 for op in OPERATORS.values())
+    assert not any(hasattr(op, "exact_softmax") for op in OPERATORS.values())
     assert EvalConfig().distributions == ("normal",)
     assert EvalConfig(distributions="increasing").distributions == ("increasing",)
     assert inspect.signature(rt.make_inputs).parameters["distribution"].default == "normal"
@@ -183,14 +652,344 @@ def test_no_operator_validates_on_adversarial_inputs_yet():
     assert inspect.signature(resolve_workloads).parameters["adversarial"].default is False
     assert cl.workloads.paged_decode().distribution == "normal"
 
+    from cleave.frontend import trace
+    from cleave.lower import to_ir
+    from cleave.pipeline.build import _reference_fn
+
+    def exact(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
+              v: cl.Tensor["H", "SKV", "D"]):
+        return cl.softmax((q @ k.mT) / q.shape[-1] ** 0.5) @ v
+
+    def by_hand(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
+                v: cl.Tensor["H", "SKV", "D"]):
+        e = cl.exp((q @ k.mT) / q.shape[-1] ** 0.5)
+        return (e / cl.sum(e, -1, keepdim=True)) @ v
+
+    seen = []
+
+    def publish(cache_dir, graph, dtype, distributions):
+        seen.append(distributions)
+        return "published"
+
+    def held_to(program, asked, graph=None):
+        if graph is None:
+            graph = to_ir(program.to_graph_structure(), dtype=DTYPE, out_dtype=DTYPE)
+        assert _reference_fn(asked, publish)("dir", graph, DTYPE) == "published"
+        return seen[-1]
+
+    shapes = dict(H=2, SQ=8, SKV=96, D=16)
+    plain = trace(by_hand, shapes, cl.f16)
+    assert _records_a_max(trace(exact, shapes, cl.f16)) and not _records_a_max(plain)
+    assert held_to(trace(exact, shapes, cl.f16), ("normal",)) == ("normal",) + DENSE_ADVERSARIAL
+    assert held_to(trace(exact, shapes, cl.f16), ("increasing", "normal")) == (
+        "increasing", "normal", "large_logits", "decreasing", "last_spike", "constant", "offset")
+    assert held_to(plain, ("normal",)) == ("normal",)
+    assert held_to(plain, ("normal", "large_logits")) == ("normal", "large_logits")
+    # the demos' attention is ``cl.softmax``: it records the max, and is held to them all
+    demos = programs.attention.trace(HQ=2, HKV=2, SQ=8, SKV=96, D=16)
+    assert _records_a_max(demos)
+    assert held_to(demos, ("normal",)) == ("normal",) + DENSE_ADVERSARIAL
+
+    # a softmax of an input: the logits are the input, and the lowered graph says along
+    # which axis (the Exp's record), so it is held to every case as well
+    alone = trace(softmax_rows, dict(R=4, C=32), cl.f16)
+    assert held_to(alone, ("normal",), lowered(softmax_rows, dict(R=4, C=32))) == (
+        "normal",) + DENSE_ADVERSARIAL
+
+    def exp_of_a_sum(x: cl.Tensor["R", "C"], y: cl.Tensor["R", "C"]):
+        return cl.softmax(x + y)
+
+    # logits that are neither a score matmul nor an input: nothing to shape, nothing added
+    summed = trace(exp_of_a_sum, dict(R=4, C=32), cl.f16)
+    assert held_to(summed, ("normal",), lowered(exp_of_a_sum, dict(R=4, C=32))) == ("normal",)
+
+
+def _stubbed_build(monkeypatch, program, asked=("normal",), tolerance=5e-3):
+    """``pipeline.build`` of ``program``'s identity graph with the workers and the GPU
+    stubbed out: every candidate "passes". Returns ``(BuildSet, published)``, ``published``
+    being the input cases ``build`` had the reference of each flat graph made for."""
+    from cleave import pipeline as P
+    from cleave.pipeline.superopt import GraphSet
+    from cleave.runtime import evaluate, validate
+
+    published = []
+
+    def publish(reference_cache_dir, graph, dtype, distributions=("normal",), derive=None):
+        published.append(tuple(distributions))
+        return [-1], 0
+
+    def run_candidates(candidates, dtype, *, reference_fn=None, **kw):
+        seen = set()
+        for cand in candidates:
+            if id(cand.flat_graph) not in seen:
+                seen.add(id(cand.flat_graph))
+                reference_fn("dir", cand.flat_graph, dtype)
+        return [evaluate.CandidateResult(cand, "ok") for cand in candidates]
+
+    monkeypatch.setattr(validate, "publish_reference", publish)
+    monkeypatch.setattr(evaluate, "run_candidates", run_candidates)
+    plans = P.schedule(GraphSet.identity(program), P.ScheduleConfig(topk=2))
+    assert len(plans) >= 1
+    built = P.build(plans, config=EvalConfig(tolerance=cl.Tolerance(rtol=tolerance),
+                                             distributions=asked))
+    return built, published
+
+
+def test_build_holds_an_exact_program_to_its_adversarial_cases(monkeypatch):
+    """The switch where it takes effect: ``build()`` itself has the references made for the
+    adversarial cases, and says on every result what its kernel was held to."""
+    from cleave import pipeline as P
+    from cleave.frontend import trace
+
+    built, published = _stubbed_build(monkeypatch, trace(softmax_rows, dict(R=64, C=256), cl.f16))
+    assert published == [("normal",) + DENSE_ADVERSARIAL]
+    assert len(built) >= 1 and all(r.cases == ("normal",) + DENSE_ADVERSARIAL for r in built)
+    assert not any(r.cases_note for r in built)
+    report = P.evaluate(built)
+    assert report.to_dict()["validation"]["inputs"] == [
+        {"cases": ["normal", *DENSE_ADVERSARIAL], "kernels": len(built), "note": ""}]
+    validate = dict((stage, text) for stage, text, _ in report.stage_lines())["validate"]
+    assert validate.endswith("inputs: normal, " + ", ".join(DENSE_ADVERSARIAL))
+
+    # what was asked for comes first; the cases are added behind it
+    built, published = _stubbed_build(monkeypatch, trace(softmax_rows, dict(R=64, C=256), cl.f16),
+                                      asked=("increasing", "normal"))
+    assert published == [("increasing", "normal", "large_logits", "decreasing", "last_spike",
+                          "constant", "offset")]
+
+    # a softmax written out by hand makes no claim: what was asked, and nothing said about it
+    def by_hand(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
+                v: cl.Tensor["H", "SKV", "D"]):
+        e = cl.exp((q @ k.mT) / q.shape[-1] ** 0.5)
+        return (e / cl.sum(e, -1, keepdim=True)) @ v
+
+    plain = trace(by_hand, dict(H=32, SQ=64, SKV=256, D=64), cl.f16)
+    assert not _records_a_max(plain)
+    built, published = _stubbed_build(monkeypatch, plain)
+    assert set(published) == {("normal",)} and all(r.cases == ("normal",) for r in built)
+    report = P.evaluate(built)
+    assert "inputs:" not in dict((s, t) for s, t, _ in report.stage_lines())["validate"]
+    assert report.to_dict()["validation"]["inputs"] == [
+        {"cases": ["normal"], "kernels": len(built), "note": ""}]
+
+
+def test_build_says_when_an_exact_program_is_held_to_fewer_cases(monkeypatch):
+    """A graph of an exact program whose logits cannot be shaped is validated on the normal
+    inputs alone. That is a weaker validation than the program's claim, so the result and
+    the report say so, with the reason."""
+    from cleave import pipeline as P
+    from cleave.frontend import trace
+
+    def exp_of_a_sum(x: cl.Tensor["R", "C"], y: cl.Tensor["R", "C"]):
+        return cl.softmax(x + y)
+
+    built, published = _stubbed_build(monkeypatch, trace(exp_of_a_sum, dict(R=64, C=256), cl.f16))
+    assert published == [("normal",)]
+    assert all(r.cases == ("normal",) and "neither the result of a score matmul nor an input"
+               in r.cases_note for r in built)
+    report = P.evaluate(built)
+    validate = dict((stage, text) for stage, text, _ in report.stage_lines())["validate"]
+    assert "inputs: normal [exact softmax not held to every adversarial case: " in validate
+    (entry,) = report.to_dict()["validation"]["inputs"]
+    assert entry["cases"] == ["normal"] and entry["note"] == built[0].cases_note
+
+
+def attention_plus_softmax_of_a_sum(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
+                                    v: cl.Tensor["H", "SKV", "D"], x: cl.Tensor["H", "SQ", "D"],
+                                    y: cl.Tensor["H", "SQ", "D"]):
+    return cl.softmax((q @ k.mT) / q.shape[-1] ** 0.5) @ v + cl.softmax(x + y)
+
+
+def attention_plus_softmax_of_an_input(q: cl.Tensor["H", "SQ", "D"], k: cl.Tensor["H", "SKV", "D"],
+                                       v: cl.Tensor["H", "SKV", "D"], z: cl.Tensor["H", "SQ", "D"]):
+    return cl.softmax((q @ k.mT) / q.shape[-1] ** 0.5) @ v + cl.softmax(z)
+
+
+def test_a_softmax_no_case_shapes_is_named_next_to_the_cases(monkeypatch):
+    """Two exact softmaxes, one whose logits are a score matmul and one whose logits are
+    computed (``x + y``). The cases shape the first; the second sees its normal logits in
+    every one of them, and the note names it: the cases are what the first softmax is held
+    to, not the program."""
+    from cleave import pipeline as P
+    from cleave.frontend import trace
+
+    small = dict(H=2, SQ=8, SKV=96, D=16)
+    graph = lowered(attention_plus_softmax_of_a_sum, small)
+    attention_exp, summed_exp = [n for n in graph.nodes if type(n) is Exp]
+    assert rt_inputs.softmax_axis(attention_exp) == rt_inputs.softmax_axis(summed_exp) == -1
+    assert type(rt_inputs._logits_of(summed_exp)).__name__ == "Add"
+    assert adversarial_cases(graph) == DENSE_ADVERSARIAL
+    note = why_not_adversarial(graph)
+    assert note == (f"the logits of {summed_exp.name!r} are neither the result of a score "
+                    "matmul nor an input: no case shapes them")
+    # ... and it is true: the second softmax reads the same logits in every case
+    normal = _scores(graph, _inputs(graph, "normal"))[1]
+    for case in DENSE_ADVERSARIAL:
+        _, second = _scores(graph, _inputs(graph, case))
+        assert torch.equal(second, normal), case
+    assert float(_scores(graph, _inputs(graph, "large_logits"))[0].abs().max()) > 100.0
+
+    # both softmaxes shaped (a score matmul, a logit input): nothing to say
+    both = lowered(attention_plus_softmax_of_an_input, small)
+    assert adversarial_cases(both) == DENSE_ADVERSARIAL and why_not_adversarial(both) == ""
+
+    shapes = dict(H=4, SQ=64, SKV=256, D=64)
+    built, published = _stubbed_build(
+        monkeypatch, trace(attention_plus_softmax_of_a_sum, shapes, cl.f16))
+    assert set(published) == {("normal",) + DENSE_ADVERSARIAL}
+    assert len(built) >= 1 and all(r.cases == ("normal",) + DENSE_ADVERSARIAL for r in built)
+    assert all("neither the result of a score matmul nor an input: no case shapes them"
+               in r.cases_note for r in built)
+    report = P.evaluate(built)
+    validate = dict((stage, text) for stage, text, _ in report.stage_lines())["validate"]
+    assert ("inputs: normal, " + ", ".join(DENSE_ADVERSARIAL)
+            + " [exact softmax not held to every adversarial case: ") in validate
+    (entry,) = report.to_dict()["validation"]["inputs"]
+    assert entry["cases"] == ["normal", *DENSE_ADVERSARIAL]
+    assert entry["note"] == built[0].cases_note
+
 
 # ----------------------------------------------------------------------------- dynamic
+# logits x100 through the queries and through the scale; increasing along the keys; one
+# dominant key at the end of every request
+ADVERSARIAL = ("large_logits", "large_scale", "increasing", "dominant_last")
+
+
+def test_dynamic_distributions_extend_the_shared_ones():
+    assert SHARED_DISTRIBUTIONS == ("normal", "large_logits", "increasing")
+    assert dyn.DISTRIBUTIONS == SHARED_DISTRIBUTIONS + ("large_scale", "dominant_last")
+    assert DISTRIBUTIONS == SHARED_DISTRIBUTIONS + ("decreasing", "last_spike", "constant", "offset")
+    assert set(ADVERSARIAL) == set(dyn.DISTRIBUTIONS) - {"normal"}
+    # the dense programs know nothing of the two the dynamic operators add ...
+    for name in ("large_scale", "dominant_last"):
+        with pytest.raises(SpecError, match="must be drawn from"):
+            rt_inputs.check_distributions(name)
+    # ... and the dynamic operators nothing of the four the dense programs add
+    for name in ("decreasing", "last_spike", "constant", "offset"):
+        with pytest.raises(SpecError, match="must be one of"):
+            dyn.apply_distribution("gqa_paged_decode", [], name)
+    with pytest.raises(SpecError, match="must be one of"):
+        dyn.apply_distribution("gqa_paged_decode", [], "uniform")
+
+
+def test_the_captured_cases_are_followed_by_the_adversarial_ones_only_on_request():
+    """``workloads.cases`` and ``keyed_workloads`` yield the adversarial table after the
+    captured workloads, and only when asked: timing never sees it."""
+    import importlib
+
+    # the module: ``cleave.dynamic.workloads`` the attribute is the registry's function
+    wl = importlib.import_module("cleave.dynamic.workloads")
+    name = "gqa_paged_decode_h32_kv8_d128_ps1"
+    op = OPERATORS[name]
+    assert inspect.signature(wl.cases).parameters["adversarial"].default is False
+    seen = []
+
+    def fake(operator, axes, dims, page_size=1, scale=None, distribution="normal"):
+        seen.append((distribution, axes))
+        return axes, distribution
+
+    original, wl.case = wl.case, fake
+    try:
+        plain = list(wl.cases(name, op.dims))
+        assert seen == [("normal", axes) for axes in WORKLOADS[name]] and len(plain) == len(seen)
+        del seen[:]
+        both = list(wl.cases(name, op.dims, adversarial=True))
+    finally:
+        wl.case = original
+    captured = [("normal", axes) for axes in WORKLOADS[name]]
+    assert seen == captured + list(ADVERSARIAL_WORKLOADS[name])
+    assert len(both) == len(WORKLOADS[name]) + 12
+    # the registry's keyed factory is the same list, keyed: captured first, never mixed
+    keys = [key for key, *_ in _keys(op, adversarial=True)]
+    assert len(keys) == len(captured) + 12
+    assert not any("@" in key for key in keys[: len(captured)])
+    assert [key.rpartition("@")[2] for key in keys[len(captured):]] == [
+        d for d, _ in ADVERSARIAL_WORKLOADS[name]]
+    assert not any("@" in key for key, *_ in _keys(op, adversarial=False))
+
+
+def test_keyed_cases_lead_with_the_key_the_registry_gives_the_workload():
+    """``workloads.cases(keyed=True)`` names each case as ``keyed_workloads`` does, so the
+    validation of a hand-built kernel is logged under the same workload key as a searched
+    one's -- ``@<distribution>`` marking an adversarial workload in both."""
+    import importlib
+
+    wl = importlib.import_module("cleave.dynamic.workloads")
+    name = "gqa_paged_decode_h32_kv8_d128_ps64"
+    op = OPERATORS[name]
+
+    def fake(operator, axes, dims, page_size=1, scale=None, distribution="normal"):
+        return ("inputs", axes, page_size), ("expected", distribution)
+
+    original, wl.case = wl.case, fake
+    try:
+        keyed = list(wl.cases(name, op.dims, page_size=64, adversarial=True, keyed=True))
+        plain = list(wl.cases(name, op.dims, page_size=64, adversarial=True))
+        captured = list(wl.cases(name, op.dims, page_size=64, keyed=True))
+    finally:
+        wl.case = original
+    assert inspect.signature(wl.cases).parameters["keyed"].default is False
+    keys = [key for key, *_ in _keys(op, adversarial=True)]
+    assert [key for key, *_ in keyed] == keys and len(keys) == len(WORKLOADS[name]) + 12
+    assert [(inputs, expected) for _, inputs, expected in keyed] == plain
+    assert all(len(case) == 2 for case in plain)
+    assert [key for key, *_ in captured] == keys[:-12] and not any("@" in k for k in keys[:-12])
+
+
+def test_a_workload_spec_keys_an_adversarial_distribution_like_the_registry(monkeypatch):
+    """``cl.workloads.paged_decode(distribution=...)``: its workloads carry the same
+    ``@<distribution>`` the registry's adversarial ones do, so a validation on them is
+    told from one on normal inputs wherever the key is read."""
+    import dataclasses
+
+    from cleave.frontend.paged import trace_paged
+    from demo.dynamic.gqa_paged_decode import build
+
+    seen = []
+    monkeypatch.setattr(dyn, "gqa_paged_decode_inputs",
+                        lambda dims, lens, page_size=1: ["inputs", dims])
+
+    def transformed(operator, inputs, distribution):
+        seen.append((operator, distribution))
+        return inputs
+
+    monkeypatch.setattr(dyn, "apply_distribution", transformed)
+    monkeypatch.setattr(dyn, "gqa_paged_decode_reference",
+                        lambda dims, lens, page_size=1: lambda *inputs: ("out", "lse"))
+    fn, hints = build("kv8")
+    attention = trace_paged(fn, hints=hints).attention()
+    spec = cl.workloads.paged_decode(batch=(1, 3), kv_len=(5, 300), samples=2)
+    keys = [key for key, *_ in spec.factory(attention)()]
+    assert keys == ["wl_1_5", "wl_1_300", "wl_3_5", "wl_3_300"]
+    assert seen == [("gqa_paged_decode", "normal")] * 4
+    hard = dataclasses.replace(spec, distribution="dominant_last")
+    assert [key for key, *_ in hard.factory(attention)()] == [
+        f"{key}@dominant_last" for key in keys]
+    assert seen[4:] == [("gqa_paged_decode", "dominant_last")] * 4
+    # a sample of them keeps the keys
+    assert [key for key, *_ in hard.factory(attention, keep=1)()] == ["wl_1_5@dominant_last"]
+
+
+def _keys(op, adversarial):
+    """``op.keyed_workloads`` with the tensors stubbed out: the keys alone, on the CPU."""
+    import dataclasses
+
+    stub = dataclasses.replace(op, reference=lambda axes, distribution="normal": ((), ()))
+    original = OPERATORS[op.name]
+    OPERATORS[op.name] = stub
+    try:
+        return list(keyed_workloads(op.name, adversarial=adversarial)())
+    finally:
+        OPERATORS[op.name] = original
+
+
 def test_adversarial_workloads_are_a_table_of_their_own():
     assert set(ADVERSARIAL_WORKLOADS) == set(WORKLOADS) == set(OPERATORS)
     for name, cases in ADVERSARIAL_WORKLOADS.items():
         captured = WORKLOADS[name]
-        assert {d for d, _ in cases} == {"large_logits", "increasing"}
-        for distribution in ("large_logits", "increasing"):
+        assert {d for d, _ in cases} == set(ADVERSARIAL)
+        assert len(cases) == len(set(cases))
+        for distribution in ADVERSARIAL:
             axes = [a for d, a in cases if d == distribution]
             # the smallest, a middle and the largest captured shape (long KV included)
             assert axes[0] == captured[0] and axes[-1] == captured[-1] and len(axes) == 3
@@ -285,6 +1084,68 @@ def test_dynamic_large_logits_scales_the_queries_only(family):
         # bf16 rounds the scaled queries again: within a few ulp of the largest logit
         assert torch.allclose(_request_logits(family, large, request), LARGE_LOGIT_FACTOR * before,
                               rtol=0.0, atol=2e-2 * LARGE_LOGIT_FACTOR * float(before.abs().max()))
+
+
+@pytest.mark.parametrize("family", FAMILIES)
+def test_dynamic_large_scale_scales_the_softmax_scale_only(family):
+    inputs = _family_inputs(family)
+    large = dyn.apply_distribution(family, inputs, "large_scale")
+    assert all(a is b for a, b in zip(large[:-1], inputs[:-1])), "no tensor is touched"
+    assert large[-1] == pytest.approx(LARGE_LOGIT_FACTOR * inputs[-1], rel=1e-12)
+    assert isinstance(large[-1], float) and inputs[-1] == _family_inputs(family)[-1]
+    for request in (0, 2):
+        # exactly the logits of large_logits, without rounding the queries a second time
+        assert torch.allclose(_request_logits(family, large, request),
+                              LARGE_LOGIT_FACTOR * _request_logits(family, inputs, request),
+                              rtol=1e-6, atol=0.0)
+
+
+@pytest.mark.parametrize("family", FAMILIES)
+def test_dynamic_dominant_last_puts_one_large_logit_at_the_end_of_each_request(family):
+    inputs = _family_inputs(family)
+    saved = [t.clone() if torch.is_tensor(t) else t for t in inputs]
+    spiked = dyn.apply_distribution(family, inputs, "dominant_last")
+    assert all(torch.equal(a, b) if torch.is_tensor(a) else a == b for a, b in zip(inputs, saved))
+    terms = dyn._SCORE_INPUTS[family][0]
+    replaced = {i for pair in terms for i in pair}
+    for i, (before, after) in enumerate(zip(inputs, spiked)):
+        if i not in replaced:
+            assert after is before
+        else:
+            assert after.shape == before.shape and after.dtype == before.dtype
+            assert torch.isfinite(after).all()
+    for request, kv_len in ((0, 5), (2, 37)):
+        logits = _request_logits(family, spiked, request)
+        assert logits.shape[-1] == kv_len
+        last, rest = logits[..., -1], logits[..., :-1]
+        # a * 128 with a >= 0.5: past what fp32 exp holds for most rows, for every row far
+        # above every other key of the request
+        assert float(last.min()) > 0.48 * INCREASING_SPAN
+        assert float(last.max()) > 88.7
+        assert float((last[..., None] - rest).min()) > 0.4 * INCREASING_SPAN
+        assert float(rest.abs().max()) < 0.1 * INCREASING_SPAN
+    # every key but each request's last is the normal one
+    for _, key_at in terms:
+        changed = (spiked[key_at].float() != inputs[key_at].float()).flatten(1).any(dim=1)
+        assert int(changed.sum()) == 2, "one key row per non-empty request"
+
+
+def test_dynamic_dominant_last_is_the_last_live_token_of_a_partly_filled_page():
+    """A slab's last page holds ``kv_last_page_len`` tokens: the dominant key is the last of
+    those, not the last slot of the page."""
+    page, kv_heads, heads, dim = 4, 2, 4, 16
+    pages_per_request, last_len = [2, 0, 3], [3, 0, 1]
+    pool = sum(pages_per_request) + 2
+    table = torch.randperm(pool, generator=torch.Generator().manual_seed(5))[:5].to(torch.int32)
+    inputs = [_bf16(3, heads, dim, seed=0), _bf16(pool, page, kv_heads, dim, seed=1),
+              _bf16(pool, page, kv_heads, dim, seed=2), _indptr(pages_per_request), table,
+              torch.tensor(last_len, dtype=torch.int32), dim ** -0.5]
+    spiked = dyn.apply_distribution("gqa_paged_decode", inputs, "dominant_last")
+    changed = (spiked[1].float() != inputs[1].float()).flatten(2).any(dim=2)  # (page, slot)
+    want = torch.zeros_like(changed)
+    want[int(table[1]), 3 - 1] = True  # request 0: second page, third token
+    want[int(table[4]), 1 - 1] = True  # request 2: third page, first token
+    assert torch.equal(changed, want)
 
 
 @pytest.mark.parametrize("family", FAMILIES)

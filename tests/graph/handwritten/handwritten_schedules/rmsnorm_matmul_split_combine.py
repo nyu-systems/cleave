@@ -188,11 +188,15 @@ def get_handwritten_scheduled_graph(dims):
     graph = passes.annotate_tc_layout(graph)
     graph = passes.annotate_fragment_layout_conflicts(graph)
 
-    for cur_node in gather_all_nodes(*graph.nodes):
-        assert getattr(cur_node, "resolve_operand_layout", None) is None, (
-            cur_node.name,
-            getattr(cur_node, "resolve_operand_layout", None),
-        )
+    # The factor of the multiply is computed from the summed row sums, a fragment TileLang
+    # lays out from a tensor of lower rank than the summed matmul partials: it is staged
+    # through shared memory (it used to be left alone, and no layout served the multiply).
+    staged = {
+        cur_node.name: cur_node.resolve_operand_layout
+        for cur_node in gather_all_nodes(*graph.nodes)
+        if getattr(cur_node, "resolve_operand_layout", None) is not None
+    }
+    assert staged == {node_4.name: "rhs"}, staged
 
     assert graph.tlayout_map[ph_rowsum] == "linear"
     assert graph.tlayout_map[ph_partial] == "linear"

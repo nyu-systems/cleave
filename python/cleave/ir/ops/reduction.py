@@ -3,11 +3,16 @@ from __future__ import annotations
 import tvm
 from tvm import te
 
-from ..graph import ComputeOpNode
+from ..graph import ComputeOpNode, PlaceHolderNode
+from .base import NEG_FLT_MAX, MacroOp
 
 
 class Matmul(ComputeOpNode):
     _macro_attrs = ("transpose_A", "transpose_B", "warp_policy", "dtype")
+    # What the tensor cores multiply for each operand dtype (``tensor_core_format``), and
+    # how many significant bits of an operand that format keeps.
+    TENSOR_CORE_FORMATS = {"float16": "float16", "bfloat16": "bfloat16", "float32": "tf32"}
+    SIGNIFICANT_BITS = {"float16": 11, "bfloat16": 8, "tf32": 11}
 
     def __init__(
         self,
@@ -53,6 +58,23 @@ class Matmul(ComputeOpNode):
         # The tiling policy keys tensor-core tiling on this tag; declaring it here means
         # search_tiling's own set_tag is a no-op instead of a mutation of its input.
         self.set_tag("tensorcore_config", True)
+
+    @property
+    def tensor_core_format(self) -> str:
+        """The format this matmul's operands are multiplied in.
+
+        A matmul is a tensor-core instruction (``T.gemm``), and the instruction decides
+        what it reads of an operand. Operands of 16 bits are multiplied as they are. A
+        ``float32`` operand is multiplied as ``tf32``: TileLang lowers a float32 gemm to
+        the TF32 instruction, which reads the sign, the exponent and the leading 10
+        fraction bits of each operand and drops the other 13. The products are summed in
+        float32, so the result has float32's range and a float16's significand: against
+        the float32 product of the same inputs it is off by about 1e-3 of the row
+        maximum (1.05e-3 measured for a 512 x 1024 x 512 matmul; 4.3e-6 when the
+        operands have no bits to drop). Nothing is cast to half precision, and nothing
+        in the kernel says so either: this property is where it is declared.
+        """
+        return self.TENSOR_CORE_FORMATS.get(self.dtype, self.dtype)
 
     def _validate_input_batch_dims(self, input_batch_dims: tuple[int], input_name: str):
         if len(input_batch_dims) != self.n_batch_dims:
@@ -154,24 +176,30 @@ class Matmul(ComputeOpNode):
             "cols": "T.GemmWarpPolicy.FullCol",
         }[self.warp_policy]
 
+        # A shared or register operand goes to the gemm as it is, never rebound to a name
+        # of the macro's own: a rebinding renames the caller's buffer, and TileLang keys the
+        # shared-memory alignment its op lowering records by buffer name. A staged 128B-swizzle
+        # operand renamed ``A_ptr`` took the 512 bytes a TMA-loaded ``A_ptr`` of another gemm
+        # recorded, instead of the 1024 a wgmma descriptor needs, and was read with the wrong
+        # swizzle (tests/codegen/test_operand_names.py).
+        a_operand = "A_ptr" if a_scope == "g" else "A"
+        b_operand = "B_ptr" if b_scope == "g" else "B"
         macro_str = f"""\
         @T.macro
         def {self.get_macro_name(**kwargs)}(A, B, C):
             {f"A_ptr = T.alloc_shared(A.shape, '{self.dtype}')" if a_scope == "g" else ""}
             {"T.copy(A, A_ptr)" if a_scope == "g" else ""}
-            {"A_ptr = A" if a_scope in ("s", "r") else ""}
 
             {f"B_ptr = T.alloc_shared(B.shape, '{self.dtype}')" if b_scope == "g" else ""}
             {"T.copy(B, B_ptr)" if b_scope == "g" else ""}
-            {"B_ptr = B" if b_scope in ("s", "r") else ""}
 
             C_ptr = C
 
             {"T.clear(C_ptr)" if kwargs["clear"] else ""}
 
             T.gemm(
-                A_ptr,
-                B_ptr,
+                {a_operand},
+                {b_operand},
                 C_ptr,
                 transpose_A={self.transpose_A},
                 transpose_B={self.transpose_B},
@@ -188,13 +216,45 @@ class Matmul(ComputeOpNode):
         return func_name
 
 class ReduceSum(ComputeOpNode):
-    """Sum over ``axis``; ``ReduceMax`` swaps the reducer."""
+    """Sum over ``axis``; ``ReduceMax`` swaps the reducer.
+
+    The reduced axis is held twice, in two index spaces:
+
+    * ``flat_axis`` / ``flat_axis_arg``: the axis the node was built with, over its full
+      ``dims`` (``flat_axis`` counted from the front, ``flat_axis_arg`` as given, so
+      possibly from the end). They never change. Anything that asks *which axis* the node
+      reduces reads these; on a scheduled graph, the place of that axis in the tier tile
+      of the value the node reads is ``node.position_in(tile)`` (the tile numbers the dims
+      of the value it is a tile of, which are not always ``dims``: ``operand_dims``).
+    * ``axis`` / ``axis_arg``: what is emitted. ``axis_arg`` is the ``dim`` given to
+      ``T.reduce_*`` and ``axis`` is in the macro's name. On a flat graph they are the
+      built axis. On a scheduled graph ``axis_arg`` indexes the buffer the input is
+      *stored* in, which has every unit extent of its tile squeezed out
+      (``codegen.operands.kept_extents``): neither ``dims`` nor a tier's
+      ``Iterator.tile_size``, which keeps the unit extents of the dims it carries. An axis
+      built from the front is counted from the front of that buffer, and ``axis`` is the
+      same number; one built from the end is counted from its end, and ``axis`` stays the
+      built axis. ``apply_tiling`` sets both for every reduction it schedules; a reduction
+      added to a scheduled graph afterwards is given them by
+      ``cleave.schedule.tiling.rebase_reduction_axis``.
+    * ``stored_axis``: the reduced axis counted from the front of that stored buffer,
+      however the axis was named. It is set together with the emitted pair and never
+      emitted. Anything that asks *where in the tile* a scheduled reduction reduces ("the
+      leading stored axis") reads this: ``axis`` answers that for an axis built from the
+      front only, since for one built from the end it stays the built axis.
+    """
 
     _macro_attrs = ("axis", "axis_arg", "dtype")
     kind = "reduction"  # macro-name stem, pinned: generated kernels keep it
     _tl_reduce = "T.reduce_sum"
     # Fill value of a loop accumulator before its first iteration (None: T.clear).
     accum_init = None
+    # As a value carried across a loop (``cleave.schedule.streaming``): how its value over a
+    # prefix and over the next tile combine to its value over both (the name of the
+    # reducer: ``pipeline.update.reference.combine_of``), and where the carried value
+    # starts (None: zero, the identity of ``add``; a float32 number otherwise).
+    combine = "add"
+    carry_init = None
 
     @staticmethod
     def _te_reduce(expr, axis):
@@ -214,6 +274,10 @@ class ReduceSum(ComputeOpNode):
         self.axis_arg = axis
         self.axis = axis if axis >= 0 else len(dims) + axis
         assert 0 <= self.axis < len(dims), f"Invalid reduction axis {axis} for {dims}"
+        # The axis as built (see the class docstring): the tiler derives ``axis`` /
+        # ``axis_arg`` from these two, which never change.
+        self.flat_axis, self.flat_axis_arg = self.axis, axis
+        self.stored_axis = self.axis  # a flat graph stores a tensor as it is
         self.output_dims = dims[: self.axis] + dims[self.axis + 1 :]
         input_batch_flags = [False] * len(dims)
         for i in range(max(0, len(dims) - 2)):
@@ -236,6 +300,45 @@ class ReduceSum(ComputeOpNode):
             is_batch_dim=is_batch_dim,
             input_is_batch_dim=input_is_batch_dim,
         )
+
+    def operand_dims(self) -> tuple:
+        """``(dims, rank)``: for each dim of the tensor this node reduces (``self.dims``),
+        which dim of the value it reads that is, in that value's own numbering (``None``
+        where the value has none), and the rank of that value.
+
+        They are the same dims one for one, with one exception. ``apply_tiling`` takes the
+        split views out of a graph, so a reduction that read a ``SplitView`` reads the
+        input behind it: a tensor of one dim less, which has no split dim (the grid walks
+        the splits, a block holds one of them). A ``SplitView`` puts the split dim in
+        front of the last two dims of its output, so the dims in front of it keep their
+        place and the two behind it are one place further back. A tile of that input -- a
+        tier's ``Iterator``, an entry of a candidate's tile maps -- is over the input's
+        dims: asked where dim 2 of ``(f, R, C / f)`` is, it has to be asked for dim 1 of
+        ``(R, C)``.
+
+        A value whose rank differs in any other way is not something ``apply_tiling``
+        builds; its dims are matched from the end, as ``Iterator.position`` matches a
+        tile that records no ``axes``.
+        """
+        rank = len(self.dims)
+        edge = self.inputs[0]
+        src = edge.src_node
+        own = len(src.get_shape(edge.src_id)) if isinstance(src, PlaceHolderNode) else rank
+        if own == rank - 1:
+            split = max(rank - 3, 0)  # ``SplitView.split_pos`` for an output of this rank
+            dims = [d if d < split else None if d == split else d - 1 for d in range(rank)]
+        else:
+            dims = [d - (rank - own) if d >= rank - own else None for d in range(rank)]
+        return dims, own
+
+    def position_in(self, it, dim=None):
+        """Where dim ``dim`` of the tensor this node reduces (the reduced axis, by
+        default) sits in ``it``, the ``Iterator`` of the value it reads in the tier that
+        stores it; ``None`` if the tile does not carry it: it then holds one element.
+        """
+        dims, own = self.operand_dims()
+        dim = dims[self.flat_axis if dim is None else dim]
+        return None if dim is None else it.position(dim, own)
 
     def create_prim_func(self, dims, in_dtype, out_dtype):
         input_shape = dims
@@ -293,9 +396,18 @@ class ReduceMax(ReduceSum):
     kind = "reduce_max"
     _tl_reduce = "T.reduce_max"
     accum_init = -float("inf")
+    # Carried (``ReduceSum.combine``): by max, from a float32 number, not ``-inf``: the first
+    # repair is ``exp(start - m)``, which has to be 0 and not NaN.
+    combine = "max"
+    carry_init = NEG_FLT_MAX
 
-    def __init__(self, dims, axis=-1, name=kind, dtype="float32", out_dtype="float32"):
+    def __init__(self, dims, axis=-1, name=kind, dtype="float32", out_dtype="float32",
+                 accum_init=None):
         super().__init__(dims, axis=axis, name=name, dtype=dtype, out_dtype=out_dtype)
+        # Per instance, so the class default (the identity of max) is untouched. Not a
+        # macro attribute: the fill is emitted where the accumulator is allocated.
+        if accum_init is not None:
+            self.accum_init = accum_init
 
     @staticmethod
     def _te_reduce(expr, axis):
@@ -361,3 +473,88 @@ class Accumulate(ComputeOpNode):
         func_name = f"ukernel_accumulate_{len(self.dims)}dims_{kwargs['mem_scope']}"
         func_name += "_clear" if kwargs["clear"] else ""
         return func_name
+
+
+class AccumulateMax(Accumulate):
+    """Keeps the elementwise maximum of its input, iteration after iteration.
+
+    The running max of a loop whose softmax axis is one element per iteration: a split-KV
+    combine at ``split_step == 1`` reads one split's max per trip, the split axis of that
+    slice is a unit extent the codegen squeezes away, and so there is no axis left for a
+    ``ReduceMax`` to fold. What ``Accumulate`` is to ``ReduceSum``, this is to ``ReduceMax``:
+    the same carried state, with the loop itself as the fold.
+
+    Like every carried value it may be read inside the loop that carries it where a lag
+    node of that loop snapshots it (``Graph.lag_nodes``), and it starts at ``accum_init``:
+    the identity of max by default, a finite value per instance where the loop also forms
+    ``exp(m_prev - m)``.
+    """
+
+    accum_init = -float("inf")
+
+    def __init__(
+        self,
+        dims: tuple[int],
+        n_batch_dims: int = 0,
+        name: str = "accumulate_max",
+        dtype: str = "float32",
+        out_dtype: str = "float32",
+        accum_init: float | None = None,
+    ):
+        super().__init__(
+            dims, n_batch_dims=n_batch_dims, name=name, dtype=dtype, out_dtype=out_dtype
+        )
+        # Per instance, as for ReduceMax: the class default is untouched, and the start
+        # value is no part of the macro (it is the fill of the accumulator's buffer).
+        if accum_init is not None:
+            self.accum_init = accum_init
+
+    def gen_macro(self, **kwargs) -> str:
+        a_scope, b_scope = kwargs["mem_scope"]
+        assert b_scope == "r", "AccumulateMax only supports register accumulation."
+        idx = ", ".join(f"i{d}" for d in range(len(self.dims)))
+        value = f"A[{idx}]" if kwargs["clear"] else f"T.max(B[{idx}], A[{idx}])"
+        macro_str = f"""\
+        @T.macro
+        def {self.get_macro_name(**kwargs)}(A, B):
+            for {idx} in T.Parallel(*B.shape):
+                B[{idx}] = {value}"""
+        return self._format_code(macro_str)
+
+    def get_macro_name(self, **kwargs) -> str:
+        func_name = f"ukernel_accumulate_max_{len(self.dims)}dims_{kwargs['mem_scope']}"
+        func_name += "_clear" if kwargs["clear"] else ""
+        return func_name
+
+
+class Rescale(MacroOp):
+    """``ACC *= S`` in place, ``S`` indexed by the leading ``lead`` axes of ``ACC``.
+
+    The in-place half of a rescaled accumulation (``Graph.accum_scale``): the codegen emits
+    it on the accumulator's own buffer, right before the accumulator's own macro. It is not
+    a node of the dataflow -- it produces no tile of its own -- and one body serves every
+    accumulator class (``ReduceSum``, ``Matmul``, ``Accumulate``), which is why the scale is
+    declared on the graph rather than being a variant of each of them. ``rank`` and ``lead``
+    are tile ranks of accumulator and factor (unit extents already squeezed).
+    """
+
+    _macro_attrs = ("rank", "lead")
+
+    def __init__(self, rank: int, lead: int):
+        assert 1 <= lead <= rank, f"Rescale: factor rank {lead} vs accumulator rank {rank}"
+        self.rank, self.lead = int(rank), int(lead)
+
+    def gen_macro(self, **kwargs) -> str:
+        s_scope, acc_scope = kwargs["mem_scope"]
+        assert s_scope == "r" and acc_scope == "r", "Rescale works on register fragments."
+        idx = [f"i{d}" for d in range(self.rank)]
+        macro_str = f"""\
+        @T.macro
+        def {self.get_macro_name(**kwargs)}(S, ACC):
+            for {", ".join(idx)} in T.Parallel(*ACC.shape):
+                ACC[{", ".join(idx)}] *= S[{", ".join(idx[: self.lead])}]"""
+        return self._format_code(macro_str)
+
+    def get_macro_name(self, **kwargs) -> str:
+        lead = "" if self.lead == self.rank else f"_lead{self.lead}"
+        return f"ukernel_rescale{lead}_{self.rank}dims_{kwargs['mem_scope']}"

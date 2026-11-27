@@ -2,7 +2,9 @@
 
 Inputs are realistic: L = logsumexp(q k^T c) in fp32, o = softmax(q k^T c) v, D = rowsum(dO * o).
 The reference is autograd in fp32 from the fp16 inputs, rounded to fp16; every kernel measured
-<= 9.71e-4 row-normalized (one fp16 ulp of the row max), hence the bound.
+<= 9.71e-4 row-normalized (one fp16 ulp of the row max), hence the bound 1.5e-3. It is the
+operator's declared one (``attention_bwd`` in tests/_tolerances.py), held there below the 5e-3
+the measurement rule gives (``HELD`` in tests/test_tolerance_declarations.py).
 """
 
 import pytest
@@ -14,10 +16,11 @@ from cleave.pipeline import GraphSet, ScheduleConfig, schedule  # noqa: E402
 from cleave.pipeline.build import BuiltKernel  # noqa: E402
 from cleave.pipeline.kernel import Kernel, stages_for  # noqa: E402
 from cleave.runtime.compile import build_candidate_code  # noqa: E402
-from cleave.runtime.validate import Tolerance, compare_outputs  # noqa: E402
+from cleave.runtime.validate import compare_outputs  # noqa: E402
+from tests._tolerances import tolerance_for  # noqa: E402
 from tests.lower import _attention_bwd as A  # noqa: E402
 
-TOL = Tolerance(rtol=1.5e-3)
+TOL = tolerance_for("attention_bwd")
 OUTPUTS = {"dv": ("dv",), "dq": ("dq",), "dk": ("dk",), "dkdv": ("dk", "dv"), "dkdv_o": ("dk", "dv"),
            "dq_o": ("dq",)}
 FUSED = {"fused_o": ("dq", "dk", "dv")}

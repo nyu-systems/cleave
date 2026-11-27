@@ -73,17 +73,13 @@ def split_ukernel_paged_gather_paged_base_head_cibuf_crbuf_ggr(SRC, IDX, base, h
 @T.macro
 def split_ukernel_mma_ssr_transB_clear(A, B, C):
 
-    A_ptr = A
-
-    B_ptr = B
-
     C_ptr = C
 
     T.clear(C_ptr)
 
     T.gemm(
-        A_ptr,
-        B_ptr,
+        A,
+        B,
         C_ptr,
         transpose_A=False,
         transpose_B=True,
@@ -92,9 +88,47 @@ def split_ukernel_mma_ssr_transB_clear(A, B, C):
 
 
 @T.macro
-def split_ukernel_maskedexp_scale_rt2_2dims_rr(A, tile_base, valid_len, scale2, B):
+def split_ukernel_maskedscore_scale_rt2_2dims_rr(A, tile_base, valid_len, scale2, B):
     for m0, m1 in T.Parallel(*B.shape):
-        B[m0, m1] = T.if_then_else(tile_base + m1 < valid_len, T.exp2(A[m0, m1] * scale2), 0.0)
+        B[m0, m1] = T.if_then_else(
+            tile_base + m1 < valid_len,
+            A[m0, m1] * scale2,
+            -3.4028234663852886e38,
+        )
+
+
+@T.macro
+def split_ukernel_copy_1dims_rr(A, B):
+    for i0 in T.Parallel(*B.shape):
+        B[i0] = T.cast(A[i0], B.dtype)
+
+
+@T.macro
+def split_ukernel_reduce_max_axis1_rr(A, B):
+
+    A_ptr = A
+
+    B_ptr = B
+
+    T.reduce_max(A_ptr, B_ptr, dim=-1, clear=False)
+
+
+@T.macro
+def split_ukernel_maskedexp_shift2_2dims_rrr(A, M, tile_base, valid_len, B):
+    for m0, m1 in T.Parallel(*B.shape):
+        B[m0, m1] = T.if_then_else(tile_base + m1 < valid_len, T.exp2(A[m0, m1] - M[m0]), 0.0)
+
+
+@T.macro
+def split_ukernel_sub_1dims_rrr(A, B, C):
+    for i0 in T.Parallel(*C.shape):
+        C[i0] = A[i0] - B[i0]
+
+
+@T.macro
+def split_ukernel_exp2_1dims_rr(A, B):
+    for i0 in T.Parallel(*B.shape):
+        B[i0] = T.exp2(A[i0])
 
 
 @T.macro
@@ -108,22 +142,30 @@ def split_ukernel_reduction_axis1_rr(A, B):
 
 
 @T.macro
+def split_ukernel_rescale_1dims_rr(S, ACC):
+    for i0 in T.Parallel(*ACC.shape):
+        ACC[i0] *= S[i0]
+
+
+@T.macro
 def split_ukernel_mma_ssr(A, B, C):
-
-    A_ptr = A
-
-    B_ptr = B
 
     C_ptr = C
 
     T.gemm(
-        A_ptr,
-        B_ptr,
+        A,
+        B,
         C_ptr,
         transpose_A=False,
         transpose_B=False,
         policy=T.GemmWarpPolicy.FullCol,
     )
+
+
+@T.macro
+def split_ukernel_rescale_lead1_2dims_rr(S, ACC):
+    for i0, i1 in T.Parallel(*ACC.shape):
+        ACC[i0, i1] *= S[i0]
 
 
 @T.macro
@@ -166,6 +208,7 @@ def split_GraphNode_0_iter(
     t_paged_gather_v_pf: T.Tensor((64, 128), "bfloat16"),
     t_rowsum_0: T.Tensor((16), "float32"),
     t_mma_1: T.Tensor((16, 128), "float32"),
+    t_exp_0_max: T.Tensor((16), "float32"),
 ):
     t_paged_gather_k = T.alloc_shared(
         (
@@ -200,6 +243,17 @@ def split_GraphNode_0_iter(
         "float32",
     )
     split_ukernel_mma_ssr_transB_clear(PlaceHolder_QQ, t_paged_gather_k, t_mma_0)
+    t_score_0 = T.alloc_fragment(
+        (
+            16,
+            64,
+        ),
+        "float32",
+    )
+    split_ukernel_maskedscore_scale_rt2_2dims_rr(t_mma_0, tile_base, valid_len, scale2, t_score_0)
+    t_exp_0_max_prev = T.alloc_fragment((16,), "float32")
+    split_ukernel_copy_1dims_rr(t_exp_0_max, t_exp_0_max_prev)
+    split_ukernel_reduce_max_axis1_rr(t_score_0, t_exp_0_max)
     t_exp_0 = T.alloc_fragment(
         (
             16,
@@ -207,7 +261,12 @@ def split_GraphNode_0_iter(
         ),
         "float32",
     )
-    split_ukernel_maskedexp_scale_rt2_2dims_rr(t_mma_0, tile_base, valid_len, scale2, t_exp_0)
+    split_ukernel_maskedexp_shift2_2dims_rrr(t_score_0, t_exp_0_max, tile_base, valid_len, t_exp_0)
+    t_exp_0_max_step = T.alloc_fragment((16,), "float32")
+    split_ukernel_sub_1dims_rrr(t_exp_0_max_prev, t_exp_0_max, t_exp_0_max_step)
+    t_exp_0_alpha = T.alloc_fragment((16,), "float32")
+    split_ukernel_exp2_1dims_rr(t_exp_0_max_step, t_exp_0_alpha)
+    split_ukernel_rescale_1dims_rr(t_exp_0_alpha, t_rowsum_0)
     split_ukernel_reduction_axis1_rr(t_exp_0, t_rowsum_0)
     t_exp_0_cast = T.alloc_shared(
         (
@@ -218,6 +277,7 @@ def split_GraphNode_0_iter(
     )
     T.annotate_layout({t_exp_0_cast: tl.layout.make_swizzled_layout(t_exp_0_cast)})
     T.copy(t_exp_0, t_exp_0_cast)
+    split_ukernel_rescale_lead1_2dims_rr(t_exp_0_alpha, t_mma_1)
     split_ukernel_mma_ssr(t_exp_0_cast, t_paged_gather_v, t_mma_1)
 
 
@@ -238,6 +298,7 @@ def split_GraphNode_0(
     split_end: T.int32,
     t_rowsum_0: T.Tensor((16), "float32"),
     t_mma_1: T.Tensor((16, 128), "float32"),
+    t_exp_0_max: T.Tensor((16), "float32"),
 ):
     PlaceHolder_QQ = T.alloc_shared(
         (
@@ -295,6 +356,7 @@ def split_GraphNode_0(
             t_paged_gather_v_pf=t_paged_gather_v_pf,
             t_rowsum_0=t_rowsum_0,
             t_mma_1=t_mma_1,
+            t_exp_0_max=t_exp_0_max,
         )
 
 
@@ -306,6 +368,7 @@ def split_main_kernel_iter(
     PlaceHolder_KV_INDICES: T.Tensor((n_idx), "int32"),
     OutputNode_0: T.Tensor((4), "float32"),
     OutputNode_1: T.Tensor((4, 128), "float32"),
+    OutputNode_2: T.Tensor((4), "float32"),
     q_row0: T.int32,
     q_head0: T.int32,
     kv_base: T.int32,
@@ -326,6 +389,8 @@ def split_main_kernel_iter(
         "float32",
     )
     T.clear(t_mma_1)
+    t_exp_0_max = T.alloc_fragment((16,), "float32")
+    T.fill(t_exp_0_max, -3.4028234663852886e38)
     split_GraphNode_0(
         PlaceHolder_Q,
         PlaceHolder_K_CACHE,
@@ -342,21 +407,71 @@ def split_main_kernel_iter(
         split_end,
         t_rowsum_0,
         t_mma_1,
+        t_exp_0_max,
     )
     split_ukernel_copy_1dims_rg(t_rowsum_0, OutputNode_0)
     split_ukernel_copy_2dims_rg(t_mma_1, OutputNode_1)
+    split_ukernel_copy_1dims_rg(t_exp_0_max, OutputNode_2)
 
 
 @T.macro
-def combine_ukernel_accumulate_1dims_sr(A, B):
+def combine_ukernel_copy_1dims_rr(A, B):
+    for i0 in T.Parallel(*B.shape):
+        B[i0] = T.cast(A[i0], B.dtype)
+
+
+@T.macro
+def combine_ukernel_accumulate_max_1dims_rr(A, B):
+    for i0 in T.Parallel(*B.shape):
+        B[i0] = T.max(B[i0], A[i0])
+
+
+@T.macro
+def combine_ukernel_sub_1dims_rrr(A, B, C):
+    for i0 in T.Parallel(*C.shape):
+        C[i0] = A[i0] - B[i0]
+
+
+@T.macro
+def combine_ukernel_exp2_1dims_rr(A, B):
+    for i0 in T.Parallel(*B.shape):
+        B[i0] = T.exp2(A[i0])
+
+
+@T.macro
+def combine_ukernel_mul_1dims_srr(A, B, C):
+    for i0 in T.Parallel(*C.shape):
+        C[i0] = A[i0] * B[i0]
+
+
+@T.macro
+def combine_ukernel_accumulate_1dims_rr(A, B):
     for i0 in T.Parallel(*B.shape):
         B[i0] += A[i0]
 
 
 @T.macro
-def combine_ukernel_accumulate_2dims_sr(A, B):
+def combine_ukernel_rescale_1dims_rr(S, ACC):
+    for i0 in T.Parallel(*ACC.shape):
+        ACC[i0] *= S[i0]
+
+
+@T.macro
+def combine_ukernel_mul_broadcast_0_2dims_srr(A, B, C):
+    for i0, i1 in T.Parallel(*C.shape):
+        C[i0, i1] = A[i0, i1] * B[i0]
+
+
+@T.macro
+def combine_ukernel_accumulate_2dims_rr(A, B):
     for i0, i1 in T.Parallel(*B.shape):
         B[i0, i1] += A[i0, i1]
+
+
+@T.macro
+def combine_ukernel_rescale_lead1_2dims_rr(S, ACC):
+    for i0, i1 in T.Parallel(*ACC.shape):
+        ACC[i0, i1] *= S[i0]
 
 
 @T.macro
@@ -366,21 +481,39 @@ def combine_ukernel_div_broadcast_0_dfloor_1eminus_30_2dims_rrg(A, B, C):
 
 
 @T.macro
-def combine_ukernel_log2_1dims_rg(A, B):
+def combine_ukernel_lse2_1dims_rrg(A, M, B):
     for i0 in T.Parallel(*B.shape):
-        B[i0] = T.log2(A[i0])
+        B[i0] = T.log2(A[i0]) + M[i0]
 
 
 @T.macro
 def combine_GraphNode_0_iter(
     PlaceHolder_ROWSUM: T.Tensor((4), "float32"),
+    PlaceHolder_MAX: T.Tensor((4), "float32"),
     PlaceHolder_VALUE: T.Tensor((4, 128), "float32"),
     t_rowsum_combine_0: T.Tensor((4), "float32"),
     t_value_combine_0: T.Tensor((4, 128), "float32"),
+    t_combine_max: T.Tensor((4), "float32"),
 ):
     PlaceHolder_ROWSUMM = T.alloc_shared((4,), "float32")
     T.copy(PlaceHolder_ROWSUM, PlaceHolder_ROWSUMM)
-    combine_ukernel_accumulate_1dims_sr(PlaceHolder_ROWSUMM, t_rowsum_combine_0)
+    PlaceHolder_MAXX = T.alloc_fragment((4,), "float32")
+    T.copy(PlaceHolder_MAX, PlaceHolder_MAXX)
+    t_combine_max_prev = T.alloc_fragment((4,), "float32")
+    combine_ukernel_copy_1dims_rr(t_combine_max, t_combine_max_prev)
+    combine_ukernel_accumulate_max_1dims_rr(PlaceHolder_MAXX, t_combine_max)
+    t_combine_shift = T.alloc_fragment((4,), "float32")
+    combine_ukernel_sub_1dims_rrr(PlaceHolder_MAXX, t_combine_max, t_combine_shift)
+    t_combine_weight = T.alloc_fragment((4,), "float32")
+    combine_ukernel_exp2_1dims_rr(t_combine_shift, t_combine_weight)
+    t_rowsum_weighted_0 = T.alloc_fragment((4,), "float32")
+    combine_ukernel_mul_1dims_srr(PlaceHolder_ROWSUMM, t_combine_weight, t_rowsum_weighted_0)
+    t_combine_max_step = T.alloc_fragment((4,), "float32")
+    combine_ukernel_sub_1dims_rrr(t_combine_max_prev, t_combine_max, t_combine_max_step)
+    t_combine_alpha = T.alloc_fragment((4,), "float32")
+    combine_ukernel_exp2_1dims_rr(t_combine_max_step, t_combine_alpha)
+    combine_ukernel_rescale_1dims_rr(t_combine_alpha, t_rowsum_combine_0)
+    combine_ukernel_accumulate_1dims_rr(t_rowsum_weighted_0, t_rowsum_combine_0)
     PlaceHolder_VALUEE = T.alloc_shared(
         (
             4,
@@ -389,26 +522,41 @@ def combine_GraphNode_0_iter(
         "float32",
     )
     T.copy(PlaceHolder_VALUE, PlaceHolder_VALUEE)
-    combine_ukernel_accumulate_2dims_sr(PlaceHolder_VALUEE, t_value_combine_0)
+    t_value_weighted_0 = T.alloc_fragment(
+        (
+            4,
+            128,
+        ),
+        "float32",
+    )
+    combine_ukernel_mul_broadcast_0_2dims_srr(
+        PlaceHolder_VALUEE, t_combine_weight, t_value_weighted_0
+    )
+    combine_ukernel_rescale_lead1_2dims_rr(t_combine_alpha, t_value_combine_0)
+    combine_ukernel_accumulate_2dims_rr(t_value_weighted_0, t_value_combine_0)
 
 
 @T.macro
 def combine_GraphNode_0(
     PlaceHolder_ROWSUM: T.Tensor((8, 4), "float32"),
+    PlaceHolder_MAX: T.Tensor((8, 4), "float32"),
     PlaceHolder_VALUE: T.Tensor((8, 4, 128), "float32"),
     t_rowsum_combine_0: T.Tensor((4), "float32"),
     t_value_combine_0: T.Tensor((4, 128), "float32"),
+    t_combine_max: T.Tensor((4), "float32"),
 ):
     for i0 in T.serial(8):
         combine_GraphNode_0_iter(
             PlaceHolder_ROWSUM=_S(
                 PlaceHolder_ROWSUM[1 * i0 : 1 * i0 + 1, 0 : 0 + 4], squeeze_dim=[0]
             ),
+            PlaceHolder_MAX=_S(PlaceHolder_MAX[1 * i0 : 1 * i0 + 1, 0 : 0 + 4], squeeze_dim=[0]),
             PlaceHolder_VALUE=_S(
                 PlaceHolder_VALUE[1 * i0 : 1 * i0 + 1, 0 : 0 + 4, 0 : 0 + 128], squeeze_dim=[0]
             ),
             t_rowsum_combine_0=t_rowsum_combine_0,
             t_value_combine_0=t_value_combine_0,
+            t_combine_max=t_combine_max,
         )
 
 
@@ -416,6 +564,7 @@ def combine_GraphNode_0(
 def combine_main_kernel_iter(
     PlaceHolder_ROWSUM: T.Tensor((8, 4), "float32"),
     PlaceHolder_VALUE: T.Tensor((8, 4, 128), "float32"),
+    PlaceHolder_MAX: T.Tensor((8, 4), "float32"),
     OutputNode_0: T.Tensor((4, 128), "bfloat16"),
     OutputNode_1: T.Tensor((4), "float32"),
 ):
@@ -429,13 +578,20 @@ def combine_main_kernel_iter(
         "float32",
     )
     T.clear(t_value_combine_0)
+    t_combine_max = T.alloc_fragment((4,), "float32")
+    T.fill(t_combine_max, -3.4028234663852886e38)
     combine_GraphNode_0(
-        PlaceHolder_ROWSUM, PlaceHolder_VALUE, t_rowsum_combine_0, t_value_combine_0
+        PlaceHolder_ROWSUM,
+        PlaceHolder_MAX,
+        PlaceHolder_VALUE,
+        t_rowsum_combine_0,
+        t_value_combine_0,
+        t_combine_max,
     )
     combine_ukernel_div_broadcast_0_dfloor_1eminus_30_2dims_rrg(
         t_value_combine_0, t_rowsum_combine_0, OutputNode_0
     )
-    combine_ukernel_log2_1dims_rg(t_rowsum_combine_0, OutputNode_1)
+    combine_ukernel_lse2_1dims_rrg(t_rowsum_combine_0, t_combine_max, OutputNode_1)
 
 
 @T.prim_func
@@ -450,6 +606,8 @@ def main_kernel(
     Partial_ROWSUM_combine: T.Tensor((8, batch, 32), "float32"),
     Partial_VALUE_split: T.Tensor((8, batch, 32, 128), "float32"),
     Partial_VALUE_combine: T.Tensor((8, batch, 32, 128), "float32"),
+    Partial_MAX_split: T.Tensor((8, batch, 32), "float32"),
+    Partial_MAX_combine: T.Tensor((8, batch, 32), "float32"),
     OutputNode_0: T.Tensor((batch, 32, 128), "bfloat16"),
     OutputNode_1: T.Tensor((batch, 32), "float32"),
 ):
@@ -472,6 +630,9 @@ def main_kernel(
             OutputNode_1=_S(
                 Partial_VALUE_split[i2 : i2 + 1, i0 : i0 + 1, 4 * i1 : 4 * i1 + 4, 0 : 0 + 128],
                 squeeze_dim=[0, 1],
+            ),
+            OutputNode_2=_S(
+                Partial_MAX_split[i2 : i2 + 1, i0 : i0 + 1, 4 * i1 : 4 * i1 + 4], squeeze_dim=[0, 1]
             ),
             q_row0=i0,
             q_head0=i1 * 4,
@@ -518,6 +679,9 @@ def main_kernel(
             PlaceHolder_VALUE=_S(
                 Partial_VALUE_combine[0 : 0 + 8, i0 : i0 + 1, 4 * i1 : 4 * i1 + 4, 0 : 0 + 128],
                 squeeze_dim=[1],
+            ),
+            PlaceHolder_MAX=_S(
+                Partial_MAX_combine[0 : 0 + 8, i0 : i0 + 1, 4 * i1 : 4 * i1 + 4], squeeze_dim=[1]
             ),
             OutputNode_0=_S(
                 OutputNode_0[i0 : i0 + 1, 4 * i1 : 4 * i1 + 4, 0 : 0 + 128], squeeze_dim=[0]

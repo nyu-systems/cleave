@@ -231,3 +231,36 @@ def test_validation_log_records_passes_and_failures(tmp_path, monkeypatch):
     monkeypatch.delenv("CLEAVE_VALIDATION_LOG")
     compare_outputs([reference], [reference], tol)
     assert len(log.read_text().splitlines()) == 3
+
+
+def test_the_validation_log_takes_the_label_it_is_given(tmp_path, monkeypatch):
+    """A record is filed under ``CLEAVE_VALIDATION_CONTEXT`` and nothing else. The library
+    read pytest's own ``PYTEST_CURRENT_TEST`` when no label was set: a variable of the test
+    runner, in product code. The tests label their comparisons themselves
+    (``tests/conftest.py``), and the measuring tool reads the operator off that label."""
+    import os
+
+    from tests._measure_tolerances import load, node_of
+
+    x = torch.ones(2, 4)
+    log = tmp_path / "validation" / "tests__default.jsonl"
+    monkeypatch.setenv("CLEAVE_VALIDATION_LOG", str(log))
+    # the conftest fixture labelled this test with its node id
+    mine = os.environ["CLEAVE_VALIDATION_CONTEXT"]
+    assert mine.endswith("test_compare_outputs.py::test_the_validation_log_takes_the_label_it_is_given")
+    compare_outputs([x], [x], Tolerance(rtol=1e-3))
+    # without a label there is none, whatever the runner's variable says
+    monkeypatch.delenv("CLEAVE_VALIDATION_CONTEXT")
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "tests/x.py::test_y (call)")
+    compare_outputs([x], [x], Tolerance(rtol=1e-3))
+    labelled, bare = [json.loads(line) for line in log.read_text().splitlines()]
+    assert labelled["context"] == mine and bare["context"] == ""
+
+    # the tool files a labelled record under its test's operator, with or without the phase
+    assert node_of("tests/a.py::test_b[x (y)]") == "tests/a.py::test_b[x (y)]"
+    assert node_of("tests/a.py::test_b[x (y)] (call)") == "tests/a.py::test_b[x (y)]"
+    e2e = "tests/pipeline_api/test_e2e.py::test_compile_end_to_end"
+    log.write_text("".join(json.dumps({**labelled, "context": context}) + "\n"
+                           for context in (e2e, e2e + " (call)")))
+    table = load(tmp_path)
+    assert set(table) == {"test:matmul"} and len(table["test:matmul"][0]) == 2

@@ -12,26 +12,52 @@ unset) it runs
 
   demos     ``demo/<name>.py --preset fast --no-cache ...``, one GPU each;
   dynamic   ``python -m demo.dynamic <operator> --topk 4 --filter-before-topk``, one GPU each
-            (every candidate on every captured workload);
+            (every candidate on every captured workload and on every adversarial one: the
+            softmax of every paged layer is exact, so an operator validates on both);
   tests     the suites that validate kernels, one xdist worker per GPU. They are an ordinary
             pytest run and fail where a declared tolerance is exceeded -- that is a finding,
             the measurement itself is in the log either way.
 
 The table has one row per operator and output: a histogram of the measured row-relative
 errors, the largest error of the candidates that are clearly valid, and the tolerance that
-follows from it by the rule in ``recommend``. Declare that value (``demo/<name>.py``,
+follows from it by the rule in ``recommend``. An output with a boundary role (the float32
+max, role ``"shift"``, a split partial of an exact softmax returns) has a row of its own,
+under its role, whatever place it has among a kernel's outputs; the other outputs are
+numbered among themselves. That is the operator's error on its normal
+inputs. Where its softmax is exact (a dense program with an exp that reads ``x - max(x)``,
+every dynamic operator) its kernels also run on adversarial softmax inputs, at the same
+bound, and those comparisons are counted without feeding it (``ADVERSARIAL_CASE``).
+Declare that value (``demo/<name>.py``,
 ``cleave.dynamic.registry``, ``tests/_tolerances.py``); never one chosen to make a kernel pass.
 
 ``--pin`` writes the measurement to ``tests/measured_errors.json``.
 ``tests/test_tolerance_declarations.py`` and ``tests/demo/test_demos.py`` hold every
 declaration to what the rule gives for that file, so after re-measuring the failing tests
-list exactly the declarations to change.
+list exactly the declarations to change. One that the new measurement would loosen is not
+raised by whoever re-measures: it keeps its value, goes into ``HELD`` of
+``tests/test_tolerance_declarations.py`` with its numbers, and is reported for a decision.
+
+A measurement of a part (``--only``, ``--names``) pins the operators it measured in full
+and leaves the others as they are pinned: a demo's operator is fed by that demo's runs, a
+test operator by the GPU tests (always the whole list), a dynamic operator by its
+``demo.dynamic`` run and by the GPU tests. The directory records what was run
+(``ran.json``), so ``--report DIR --pin`` pins the same operators later, and a directory
+that does not say, or that ran fewer than the three seeds, pins nothing. An operator no
+kernel validated at keeps its entry too, and is named (``rowsum_div_graph`` was one while
+pytest.ini deselected its tests: it was measured once by hand; no operator is one today);
+a pin without a declaration fails the declaration tests.
+
+    python -m tests._measure_tolerances --gpus 0,1,2,3 --out DIR --only tests --pin
+    python -m tests._measure_tolerances --gpus 0,1,2,3 --out DIR --only demos \
+        --names mha_decode,gqa_decode --pin
 """
 
 from __future__ import annotations
 
 import argparse
+import ast
 import concurrent.futures
+import importlib
 import json
 import math
 import os
@@ -45,14 +71,19 @@ from pathlib import Path
 
 from cleave.runtime.validate import Tolerance
 from tests._tolerances import CEILING, FP32_CEILING  # no operator may declare a looser bound
+from tests._tolerances import TOLERANCES
 
 ROOT = Path(__file__).resolve().parents[1]
 MEASURED = ROOT / "tests" / "measured_errors.json"  # what the declarations are pinned to
+RAN = "ran.json"  # in a measurement directory: what the measurement ran
+SEEDS = ("default", "1", "2")  # what a pinned measurement covers
+KINDS = ("demos", "dynamic", "tests")
 SAFETY = 4.0  # declared tolerance >= SAFETY x the largest valid error
 # ... except for bf16. It has 8 significand bits, so one ulp is 7.8e-3 of the row max, and
-# that is what a valid kernel measures (7.8e-3 .. 9.4e-3). 4x it is the ceiling itself, which
-# for any row whose max is above 0.25 is looser than the elementwise 0.01 + 0.01|ref| the
-# paged operators were held to before. 2x gives 2e-2, i.e. 2.56 ulps.
+# that is what a valid kernel measures (7.8e-3 .. 9.4e-3). 4x it is the ceiling itself. 2x
+# gives 2e-2, i.e. 2.56 ulps. (Against an elementwise 0.01 + 0.01|ref| that is tighter for
+# a row whose max is below 0.5 and looser from 0.5 on its near-zero entries and from 1.0
+# at its largest: cleave.dynamic.registry._tolerance.)
 COARSE_SAFETY = {"bfloat16": 2.0}
 WRONG = 1e-1
 ULP = {"float16": 2.0**-10, "bfloat16": 2.0**-7, "float32": 2.0**-23}
@@ -76,10 +107,24 @@ def valid_limit(dtype: str) -> float:
 
 # demo -> the runs that cover its plans (fast settings; lora and qknorm keep the fast
 # preset's topk because few of their tilings survive, mla_decode needs its whole tiling
-# pool: its first valid tiling ranks far below the top 32, and mha_backward's top 8 tilings
-# all fail to compile).
+# pool: its first valid tiling ranks far below the top 32; mha_backward runs the fast preset
+# as it is).
+# The attention demos declare their tolerance by boundary role, because ``cl.softmax`` is
+# exact and a split partial of it returns its max (role "shift"). The decode demos split by
+# default; the MHA / GQA / MQA prefill demos get a second run with the split their
+# docstrings name, so that the "shift" bound they declare is measured like any other.
+# (qknorm, mla_prefill and mla_decode run unsplit and declare one tolerance: no pair is
+# built from the loop state of qknorm, whose queries are normalized on the way to it from
+# no split input; the references of mla_prefill's split pairs would take about 190 GB; and
+# mla_decode asks for no split.)
+#
+# Disk: a run writes the references of its graphs under <out>/cache/runtime while it lasts,
+# one file per graph with every input case. For a program whose softmax is exact that is
+# seven cases; a split run of a prefill or decode demo at S_Q = 4096 takes about 20 GB.
+# ``--gpus`` bounds how many runs are alive at once.
 FAST = ["--preset", "fast", "--topk", "8"]
 SPLIT = ["--topk", "8", "--warmup", "4", "--iters", "100"]
+SPLIT_KV = ["--split", "SKV"]
 DEMOS = {
     "matmul": [FAST, FAST + ["--split", "K:4,8"]],
     "matmul_matmul": [FAST, ["--preset", "split", *SPLIT]],
@@ -88,13 +133,12 @@ DEMOS = {
     "swiglu": [FAST],
     "rmsnorm_matmul": [FAST, ["--preset", "split-k", *SPLIT]],
     "qknorm": [["--preset", "fast"]],
-    "mha_decode": [FAST],
-    "mha_decode_exact": [["--preset", "fast", "--topk", "16"]],
+    "mha_decode": [["--preset", "fast", "--topk", "16"]],
     "gqa_decode": [FAST],
     "mqa_decode": [FAST],
-    "mha_prefill": [FAST],
-    "gqa_prefill": [FAST],
-    "mqa_prefill": [FAST],
+    "mha_prefill": [FAST, FAST + SPLIT_KV + ["--max-ops", "13"]],
+    "gqa_prefill": [FAST, FAST + SPLIT_KV],
+    "mqa_prefill": [FAST, FAST + SPLIT_KV + ["--max-ops", "13"]],
     "mla_decode": [["--preset", "fast", "--topk", "1000"]],
     "mla_prefill": [FAST],
     "mha_backward": [["--preset", "fast"]],
@@ -103,9 +147,13 @@ DEMOS = {
 GPU_TESTS = [
     "tests/schedule/end2end", "tests/graph/apply_tiling", "tests/graph/handwritten",
     "tests/reference", "tests/runtime/test_run_candidates.py", "tests/pipeline_api/test_e2e.py",
+    "tests/pipeline_api/test_split_attention.py",
+    "tests/pipeline_api/test_exact_split_attention.py",
+    "tests/pipeline_api/test_exact_split_rows.py",
     "tests/frontend/test_exact_softmax.py", "tests/frontend_dynamic/test_paged_pipeline.py",
     "tests/pipeline_api/test_declared_validation.py", "tests/runtime/test_inter_outputs.py",
-    "tests/pipeline_api/test_per_output_gpu.py",
+    "tests/pipeline_api/test_per_output_gpu.py", "tests/lower/test_attention_bwd_gpu.py",
+    "tests/pipeline_api/test_carried_sum_gpu.py",
 ]
 
 
@@ -137,7 +185,68 @@ def recommend(largest_valid: float, dtype: str) -> float:
 # never measured: the lse error is proportional to |lse| (2 .. 25 on the captured workloads,
 # hundreds at x100 logits, where one fp32 ulp alone is 3e-5), so an absolute bound sized on
 # one logit scale is wrong on every other. The measured part of the bound is its rtol.
+#
+# The rtol is measured where it is what bounds the output. A comparison in which every
+# entry is within the floor is inside ``rtol * rowmax + ATOL_FLOOR`` whatever the rtol, so
+# it says nothing about the rtol: its row-relative error is the floor's share of a small
+# row, not an error that grows with the row. Measured on gqa_paged_decode_h32_kv8_d128_ps1
+# with logits that only fall along the keys (the lse of a row is then close to 0): errors
+# of 3e-7 .. 4e-7 are 5e-7 .. 7e-7 of a row max of 0.6, which as an rtol input would ask
+# for 5e-6, while the declared 1e-6 * rowmax + 1e-6 holds those rows with 3x to spare.
+# Such a comparison is counted and held to the declared bound like any other; it does not
+# feed ``largest valid`` (``feeds_rtol``). One entry over the floor and it feeds in full.
 ATOL_FLOOR = step125(SAFETY * ULP["float32"] / math.log(2))  # 1e-6
+
+
+def feeds_rtol(absolute: bool, abs_error: float) -> bool:
+    """Whether a valid comparison's row-relative error is an input to the output's rtol."""
+    return not (absolute and abs_error <= ATOL_FLOOR)
+
+
+# A dense program's tolerance is declared from its error on the normal inputs. Once its
+# softmax is exact its kernels are also validated on the adversarial softmax inputs
+# (``cleave.runtime.inputs.ADVERSARIAL``), at that same bound: those comparisons are counted
+# and held to the declaration like any other, and they are no input to it. A bound is never
+# loosened for an adversarial case; a kernel that needs more than the bound there fails.
+# (Measured on this operator family: a row dominated by its last keys is off by up to two
+# fp16 ulps of its max, 1.2e-3 .. 1.9e-3, against 9.8e-4 .. 1.2e-3 on normal inputs; as an
+# input that would turn every declared 5e-3 into 1e-2.)
+# Such a comparison is logged with the case in its ``what`` ("increasing inputs") and is
+# given this kind in the table, passed or not (a non-finite one stays non-finite: nothing
+# was measured). One that is over the bound is a finding, and the table says so.
+#
+# A dynamic operator's tolerance is declared from its error on its normal inputs: its
+# captured workloads and the hand-made requests that leave the inputs as generated. Its
+# softmax is exact, so its kernels are also validated on adversarial softmax inputs -- the
+# registry's adversarial workloads and the hand-made requests that transform the inputs --
+# at that same bound: those comparisons are counted and held to the declaration like any
+# other, and they are no input to it. A bound is never loosened for an adversarial case; a
+# kernel that needs more than the bound there fails.
+# (Measured on these operators: the lse of logits x100 or of a 128-unit ramp along the keys
+# is off by 4.1e-7 .. 6.9e-7 of the row max for the GQA layers and by 5.0e-6 for the MLA
+# prefill, where the float32 reference itself is 3.2e-6 from what the inputs allow; on
+# normal inputs the same kernels measure 2.3e-7 .. 5.7e-7 and 1.5e-6. As inputs the first
+# figures would turn six of the nine declared bounds into the next 1-2-5 step.)
+# Such a comparison is logged with its workload in ``what``, and the workload's key ends
+# in ``@<case>`` (``wl_16_1070_1020@large_logits``, ``tile_edges@decreasing``). It is given
+# this kind in the table, passed or not (a non-finite one stays non-finite: nothing was
+# measured). One that is over the bound is a finding, and the table says so.
+ADVERSARIAL_CASE = "adversarial"
+
+
+def _adversarial_whats() -> frozenset:
+    from cleave.runtime.inputs import ADVERSARIAL
+
+    return frozenset(f"{name} inputs" for name in ADVERSARIAL)
+
+
+def is_adversarial(context: str, what: str) -> bool:
+    """Whether a logged comparison ran on adversarial softmax inputs: a dynamic operator on
+    an adversarial workload (by its key), a dense program on one of its adversarial cases
+    (by name)."""
+    if context.startswith("dynamic:"):
+        return "@" in what
+    return what in _adversarial_whats()
 
 
 def expected_tolerances(outputs) -> list:
@@ -153,6 +262,7 @@ def expected_tolerances(outputs) -> list:
 def expected_tolerance(outputs) -> Tolerance:
     """The single ``Tolerance`` an operator declares for all its outputs: the loosest of what
     the rule gives each (a dense program's plans do not all have the same outputs)."""
+    assert not any(o.get("role") for o in outputs), "declare this operator by role"
     rtols = [t.rtol for t in expected_tolerances(outputs) if t is not None]
     assert rtols and not any(o["absolute"] for o in outputs), outputs
     return Tolerance(rtol=max(rtols))
@@ -167,6 +277,19 @@ def expected_declaration(declared, outputs):
     per_output = expected_tolerances(outputs)
     assert None not in per_output, outputs
     return tuple(per_output)
+
+
+def expected_tolerances_by_role(outputs) -> dict:
+    """What an operator with an output that has a boundary role declares: one ``Tolerance``
+    per role. ``""`` is the loosest of what the rule gives the outputs without a role, as
+    for any other operator; each role's is what the rule gives the outputs of that role."""
+    by_role = {}
+    for o in outputs:
+        by_role.setdefault(o.get("role", ""), []).append(o)
+    assert set(by_role) > {""}, outputs
+    return {role: expected_tolerance([{k: v for k, v in o.items() if k != "role"}
+                                      for o in entries])
+            for role, entries in by_role.items()}
 
 
 # ----------------------------------------------------------------------------- running
@@ -228,16 +351,145 @@ def measure(out: Path, gpus, seeds, only, names=None):
             _run("", "tests", seed,
                  [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *GPU_TESTS],
                  out, {"CLEAVE_GPU_POOL": ",".join(gpus)})
+    (out / RAN).write_text(json.dumps(
+        {"seeds": list(seeds), "only": sorted(only), "names": names}) + "\n")
+
+
+def measured_in_full(ran):
+    """``operator -> bool``: whether a measurement that ran ``ran`` (the ``ran.json`` of its
+    directory) ran everything that feeds that operator's entry."""
+    only, names = set(ran["only"]), ran["names"]
+
+    def in_full(operator: str) -> bool:
+        kind, _, name = operator.partition(":")
+        named = names is None or name in names
+        if kind == "demo":
+            return "demos" in only and named
+        if kind == "test":  # the GPU tests run as one list, whatever --names says
+            return "tests" in only
+        # a dynamic operator: its demo.dynamic run, and the GPU tests that validate it
+        return {"dynamic", "tests"} <= only and named
+
+    return in_full
+
+
+def pin(out: Path, measured: dict) -> dict:
+    """Pin ``measured`` (``measured_errors`` of the measurement in ``out``) in ``MEASURED``;
+    the pinned file's content.
+
+    Only what was measured in full is pinned: the operators every feeder of which the
+    measurement ran (``measured_in_full``), over the three seeds. Such an operator's entry
+    is replaced; every other operator keeps the entry it has, and so does one that was
+    run in full without a single kernel validating at it (its tests are deselected, or
+    gone: it is named, and a pin that no declaration answers fails the declaration tests).
+    """
+    record = out / RAN
+    if not record.exists():
+        raise SystemExit(f"{out} does not say what was run (no {RAN}): it pins nothing. "
+                         "Measure again with --out.")
+    ran = json.loads(record.read_text())
+    if sorted(ran["seeds"]) != sorted(SEEDS):
+        raise SystemExit(f"{out} ran the seeds {ran['seeds']}; a pinned measurement covers "
+                         f"{list(SEEDS)}")
+    in_full = measured_in_full(ran)
+    pinned = json.loads(MEASURED.read_text()) if MEASURED.exists() else {}
+    fresh = {operator: entry for operator, entry in measured.items() if in_full(operator)}
+    partial = sorted(set(measured) - set(fresh))
+    silent = sorted(operator for operator in pinned if in_full(operator) and operator not in fresh)
+    content = {**pinned, **fresh}
+    MEASURED.write_text(json.dumps(content, indent=1, sort_keys=True) + "\n")
+    print(f"pinned {len(fresh)} operator(s) measured in full; {len(content) - len(fresh)} "
+          "keep their entry"
+          + (f"; measured in part and not pinned: {', '.join(partial)}" if partial else "")
+          + (f"; run in full, no kernel validated, entry kept: {', '.join(silent)}"
+             if silent else ""), file=sys.stderr)
+    return content
 
 
 # ----------------------------------------------------------------------------- reporting
+def _single_row_builder(param):
+    from tests.graph.apply_tiling.test_unit_extents import SINGLE_ROW
+
+    return SINGLE_ROW[param][0].__name__
+
+
+def _misaligned_slice_builder(param):
+    from tests.graph.apply_tiling.test_pipelined_slices import MISALIGNED
+
+    return MISALIGNED[param][0][0].__name__
+
+
+# Tiling test files that validate at more than one operator: test -> the graph builder it
+# passes to ``tolerance_for`` (a name, or a function of the test's parameter id). Every
+# other file under tests/graph/apply_tiling and tests/reference imports its one builder on
+# a line of its own, or names the operator in each test that validates
+# (``tolerance_for(<builder>)``, ``tolerance_for("<program>")``): ``builder_of``.
+SEVERAL_BUILDERS = {
+    "tests/graph/apply_tiling/test_reduction_axes.py": {
+        "test_unlooped_sum_over_a_front_named_axis_validates":
+            "batched_matmul_splitk_combine_graph",
+        "test_unlooped_sum_over_a_loops_accumulator_validates": "matmul_rowsum_graph",
+    },
+    "tests/graph/apply_tiling/test_unit_extents.py": {
+        "test_a_loop_over_a_single_row_block_validates": _single_row_builder,
+        "test_a_block_that_computes_one_element_validates": "rowsum_graph",
+    },
+    "tests/graph/apply_tiling/test_rmsnorm_matmul_split_combine.py": {
+        "test_apply_tiling_rmsnorm_matmul_split_combine": "rmsnorm_matmul_split_combine_graph",
+    },
+    "tests/graph/apply_tiling/test_pipelined_slices.py": {
+        "test_gpu_the_plain_loop_validates": _misaligned_slice_builder,
+    },
+}
+
+
 def _test_operators():
     """pytest node id (without the phase) -> the operator whose tolerance it validates at."""
     from tests.graph.handwritten._cases import CASES as handwritten
     from tests.schedule.end2end.test_end2end import CASES as end2end
 
-    def builder_of(path):
-        return re.search(r"^from tests\._graphs import (\w+)$", (ROOT / path).read_text(), re.M)[1]
+    def builder_of(path, test, param):
+        """The operator a test of ``tests/graph/apply_tiling`` or ``tests/reference``
+        validates at, or None.
+
+        A file listed in ``SEVERAL_BUILDERS`` validates at several builders and says there
+        which one each of its tests passes to ``tolerance_for``; a test of such a file that
+        is not listed is an error, not a guess. A file that imports one builder from
+        ``tests._graphs`` on a line of its own validates that operator. Any other says which
+        in the test itself: by naming it, ``tolerance_for(<builder>)`` or
+        ``tolerance_for("<program>")``, or by looking the builder up in a table of the
+        module under the test's parameter (``{id: (builder, ...)}`` or ``{id: ((builder,
+        dims), ...)}``). Such a file used to end the report with a ``TypeError`` as soon as
+        one of its tests had validated a kernel.
+        """
+        name = test.partition("[")[0]
+        if path in SEVERAL_BUILDERS:
+            tests = SEVERAL_BUILDERS[path]
+            assert name in tests, (
+                f"{path}::{name} logs a validation, and its file validates at several "
+                f"operators: say which one in SEVERAL_BUILDERS")
+            builder = tests[name]
+            return builder if isinstance(builder, str) else builder(param)
+        text = (ROOT / path).read_text()
+        single = re.search(r"^from tests\._graphs import (\w+)$", text, re.M)
+        if single:
+            return single[1]
+        body = next((ast.get_source_segment(text, fn) for fn in ast.parse(text).body
+                     if isinstance(fn, ast.FunctionDef) and fn.name == name), "")
+        named = set(re.findall(r"tolerance_for\(\"?(\w+)\"?\)", body))
+        declared = named & set(TOLERANCES)
+        if len(declared) == 1:
+            return declared.pop()
+        module = importlib.import_module(path.removesuffix(".py").replace("/", "."))
+        for table in vars(module).values():
+            if not isinstance(table, dict) or param not in table:
+                continue
+            entry = table[param]
+            while isinstance(entry, tuple) and entry:
+                entry = entry[0]
+            if getattr(entry, "__name__", None) in TOLERANCES:
+                return entry.__name__
+        return None
 
     def operator(node):
         path, _, test = node.partition("::")
@@ -248,19 +500,36 @@ def _test_operators():
             case = handwritten[param]
             return f"dynamic:{param}" if case.out_idx is not None else case.source.__name__
         if path in ("tests/graph/handwritten/test_empty_request.py",
-                    "tests/graph/handwritten/test_splitkv_decode.py"):
-            return f"dynamic:{param or 'gqa_paged_decode_h32_kv8_d128_ps1'}"
+                    "tests/graph/handwritten/test_splitkv_decode.py",
+                    "tests/graph/handwritten/test_paged_exact_softmax.py"):
+            # a second parameter (the combine step of a split pair) leads the id: "2-<name>"
+            name = re.sub(r"^\d+-", "", param or "")
+            return f"dynamic:{name or 'gqa_paged_decode_h32_kv8_d128_ps1'}"
         if path.endswith("test_gqa_paged_decode_h32_kv8_d128_ps1.py"):
             return "dynamic:gqa_paged_decode_h32_kv8_d128_ps1"
         if path == "tests/frontend_dynamic/test_paged_pipeline.py":
             return f"dynamic:gqa_paged_decode_h32_kv8_d128_ps{param}"
         if path.startswith(("tests/graph/apply_tiling/", "tests/reference/")):
-            return builder_of(path)
+            return builder_of(path, test, param) or node
         if path == "tests/runtime/test_run_candidates.py":
             return "matmul_graph"
         if path == "tests/pipeline_api/test_e2e.py":
             return "matmul"
+        if path == "tests/pipeline_api/test_split_attention.py":
+            return "attention"
+        if path == "tests/pipeline_api/test_exact_split_attention.py":
+            return "exact_split_attention"
+        if path == "tests/pipeline_api/test_exact_split_rows.py":
+            return "exact_split_rows"
+        if path == "tests/pipeline_api/test_carried_sum_gpu.py":
+            return "sum_shifted"
         if path == "tests/frontend/test_exact_softmax.py":
+            if "middle_axis" in test:
+                return "softmax_mid"
+            if "next_to_an_exp" in test:
+                return "softmax_plus_exp"
+            if "two_softmaxes" in test:
+                return "dual_softmax"
             return "softmax" if "standalone" in test else "exact_attention"
         if path == "tests/pipeline_api/test_declared_validation.py":
             return "lse_attention"
@@ -268,13 +537,33 @@ def _test_operators():
             return "inter_pair"
         if path == "tests/pipeline_api/test_per_output_gpu.py":
             return "per_output_pair"
+        if path == "tests/lower/test_attention_bwd_gpu.py":
+            return "attention_bwd"
+        if path == "tests/schedule/end2end/test_absorbed_reduction.py":
+            return "absorbed_reduction"
         return node
 
     return operator
 
 
+def node_of(context: str) -> str:
+    """The pytest node id a test's comparison was logged under. ``tests/conftest.py``
+    labels every test's comparisons with its node id; a log written before it did carries
+    the runner's own variable, the node id followed by the phase (``" (call)"``)."""
+    for phase in (" (setup)", " (call)", " (teardown)"):
+        if context.endswith(phase):
+            return context[: -len(phase)]
+    return context
+
+
 def load(out: Path) -> dict:
-    """operator -> output index -> list of (dtype, absolute part?, rel, abs, kind, seed)."""
+    """operator -> output -> list of (dtype, absolute part?, rel, abs, kind, seed, sum?).
+
+    An output is its place among the outputs of its kernel that have no boundary role, or
+    the role of one that has: a split partial's ``"shift"`` is one output of the operator,
+    wherever the kernel returns it, and the sums next to it are numbered as in a partial
+    without it. ``sum?`` marks those sums: the outputs without a role of a kernel that
+    returns one with a role (``rows`` says what dtype they are judged in)."""
     operator_of = _test_operators()
     table = defaultdict(lambda: defaultdict(list))
     for path in sorted((out / "validation").glob("*.jsonl")):
@@ -283,21 +572,64 @@ def load(out: Path) -> dict:
             record = json.loads(line)
             context = record["context"]
             if not context.startswith(("demo:", "dynamic:")):
-                node = context.rpartition(" (")[0]
+                node = node_of(context)
                 if not node.startswith("tests/") or "test_compare_outputs" in node \
                         or node.startswith("tests/test_runtime_tolerance.py") \
                         or "threaded_into_workers" in node \
-                        or "test_noise_where_an_input_is_declared" in node:
-                    continue  # comparator unit tests and deliberate failures
+                        or "test_noise_where_an_input_is_declared" in node \
+                        or "test_without_the_running_max" in node \
+                        or "test_gpu_unstabilized_" in node:
+                    # comparator unit tests and deliberate failures (the last two run
+                    # kernels without the exact softmax: an operator's kernel as it was
+                    # before, and a dense program's tilings around a plain exp)
+                    continue
                 context = "test:" + operator_of(node)
                 context = context.replace("test:dynamic:", "dynamic:")
-            for i, o in enumerate(record["outputs"]):
+            # a dense program on one of its adversarial softmax cases, or a dynamic
+            # operator on one of its adversarial softmax workloads
+            hard = is_adversarial(context, record.get("what", ""))
+            place = 0
+            partial = any(o.get("role") for o in record["outputs"])
+            for o in record["outputs"]:
                 # Every output is judged by its row-relative error, whatever bound it was
                 # validated at when this was logged; "absolute" only records that the
                 # operator declares an absolute part as well (ATOL_FLOOR).
-                table[context][i].append(
-                    (o["dtype"], o["atol"] > 0, o["rel"], o["abs"], o["kind"], seed))
+                kind = ADVERSARIAL_CASE if hard and o["kind"] != "non_finite" else o["kind"]
+                key = o.get("role") or place
+                place += not o.get("role")
+                table[context][key].append(
+                    (o["dtype"], o["atol"] > 0, o["rel"], o["abs"], kind, seed,
+                     partial and not o.get("role")))
     return table
+
+
+def judged_dtypes(outputs: dict) -> dict:
+    """output -> ``(dtype it is judged in, dtypes its kernels return it in)`` for the
+    outputs of one operator (``load``).
+
+    An output is judged in the dtype its kernels return it in, with one exception: the
+    sums a split partial of an exact softmax returns next to its shift. They cross the cut
+    in float32, so that a sum over a whole split cannot overflow the program's dtype, but
+    they are computed from operands in that dtype (the weights of the value matmul are
+    tensor-core operands), so their error is the program dtype's, hundreds of float32 ulps.
+    They are judged in the program's dtype: the dtype of the operator's outputs that no
+    partial returns (its combines, its solo kernels, the chained pair). The float32 shift
+    next to them has a role and a float32 bound of its own.
+    """
+    program = {entry[0] for key, entries in outputs.items() if not isinstance(key, str)
+               for entry in entries if not entry[6]}
+    judged = {}
+    for key, entries in outputs.items():
+        stored = sorted({entry[0] for entry in entries})
+        own = sorted({entry[0] for entry in entries if not entry[6]})
+        if isinstance(key, str) or own or len(program) != 1:
+            # a role, an output some kernel returns outside a partial, or an operator with
+            # nothing but partials: judged as it is returned
+            dtype = (own or stored)[0]
+        else:
+            (dtype,) = program
+        judged[key] = (dtype, stored)
+    return judged
 
 
 _DECADES = [(f"<1e-{k}", 10.0**-k) for k in (6, 5, 4, 3, 2, 1)]
@@ -316,24 +648,40 @@ def _bucket(value, kind):
 
 def rows(table):
     for context in sorted(table, key=lambda c: (c.split(":")[0] != "demo", c)):
-        for i, entries in sorted(table[context].items()):
-            dtype = entries[0][0]
+        judged = judged_dtypes(table[context])
+        # numbered outputs first, then the ones under a role
+        for i, entries in sorted(table[context].items(),
+                                 key=lambda item: (isinstance(item[0], str), item[0])):
+            dtype, stored = judged[i]
             absolute = any(e[1] for e in entries)
             counts = defaultdict(int)
-            for _, _, rel, _, kind, _ in entries:
+            for _, _, rel, _, kind, _, _ in entries:
                 counts[_bucket(rel, kind)] += 1
-            measured = [(rel, abs_) for _, _, rel, abs_, kind, _ in entries
+            measured = [(rel, abs_, kind) for _, _, rel, abs_, kind, _, _ in entries
                         if rel is not None and kind != "non_finite"]
             limit = valid_limit(dtype)
+            # Adversarial comparisons the rtol has to cover: like any other, one within the
+            # floor alone is inside the bound whatever the rtol.
+            hard = [rel if feeds_rtol(absolute, abs_) else 0.0
+                    for rel, abs_, kind in measured if kind == ADVERSARIAL_CASE]
+            measured = [(rel, abs_) for rel, abs_, kind in measured if kind != ADVERSARIAL_CASE]
             valid = [(rel, abs_) for rel, abs_ in measured if rel <= limit]
-            largest = max((rel for rel, _ in valid), default=None)
+            feeding = [rel for rel, abs_ in valid if feeds_rtol(absolute, abs_)]
+            # No valid comparison at all: nothing was measured. Valid ones that the floor
+            # covers entirely: nothing the rtol has to cover, which is an error of 0.
+            largest = max(feeding, default=0.0 if valid else None)
             yield {
                 "operator": context, "output": i, "dtype": dtype, "absolute": absolute,
+                # the dtypes it is returned in, where that is not only the one it is judged in
+                "stored": stored if stored != [dtype] else None,
                 "seeds": sorted({e[5] for e in entries}), "n": len(entries),
                 "histogram": {b: counts[b] for b in BUCKETS if counts[b]},
                 "largest_valid": largest,
                 "largest_valid_abs": max((abs_ for _, abs_ in valid), default=None),
                 "ambiguous": sorted(rel for rel, _ in measured if limit < rel < WRONG),
+                "within_floor": len(valid) - len(feeding),
+                # an operator's passes on adversarial inputs: counted, no input to rtol
+                "adversarial": len(hard), "largest_adversarial": max(hard, default=None),
                 "rtol": None if largest is None else recommend(largest, dtype),
                 "atol": ATOL_FLOOR if absolute else 0.0,
             }
@@ -341,13 +689,23 @@ def rows(table):
 
 def measured_errors(table) -> dict:
     """operator -> per output ``{dtype, rel, abs, absolute, seeds, validated}``: the largest
-    clearly-valid error of each output, which is all the rule needs (``MEASURED``)."""
+    clearly-valid error of each output, which is all the rule needs (``MEASURED``). The
+    numbered outputs come first, in order; an output under a boundary role follows, with
+    its ``role``. ``dtype`` is the one the output is judged in (``judged_dtypes``); where
+    some kernel returns it in another, ``stored`` lists the dtypes it is returned in.
+
+    ``rel`` is taken over the comparisons that feed the rtol (``feeds_rtol``, and for a
+    dense program or a dynamic operator its normal inputs only: ``ADVERSARIAL_CASE``); ``abs``
+    over the valid comparisons on normal inputs and ``validated`` over all of them."""
     out = defaultdict(list)
     for r in rows(table):
-        assert r["output"] == len(out[r["operator"]]), r
+        role = r["output"] if isinstance(r["output"], str) else None
+        assert role or r["output"] == len(out[r["operator"]]), r
         out[r["operator"]].append({
             "dtype": r["dtype"], "rel": r["largest_valid"], "abs": r["largest_valid_abs"],
             "absolute": r["absolute"], "seeds": len(r["seeds"]), "validated": r["n"],
+            **({"role": role} if role else {}),
+            **({"stored": r["stored"]} if r["stored"] else {}),
         })
     return dict(out)
 
@@ -364,9 +722,19 @@ def markdown(table) -> str:
         largest_abs = "-" if r["largest_valid_abs"] is None else f"{r['largest_valid_abs']:.2e}"
         tol = "-" if r["rtol"] is None else f"rtol={r['rtol']:g}" + (
             f", atol={r['atol']:g}" if r["atol"] else "")
+        if r["within_floor"]:
+            tol += f" ({r['within_floor']} within the floor alone)"
+        if r["adversarial"]:
+            over = r["rtol"] is None or r["largest_adversarial"] > r["rtol"]
+            tol += (f" ({r['adversarial']} on adversarial inputs, largest "
+                    f"{r['largest_adversarial']:.2e}: "
+                    + ("OVER THE BOUND, a finding" if over else "held to the bound, no input to it")
+                    + ")")
         if r["ambiguous"]:
             tol += f" (AMBIGUOUS: {len(r['ambiguous'])} in ({valid_limit(r['dtype']):g}, " \
                    f"{WRONG:g}), max {r['ambiguous'][-1]:.2e})"
+        if r["stored"]:
+            tol += f" (returned as {', '.join(r['stored'])}, judged as {r['dtype']})"
         lines.append(f"| {r['operator']} | {r['output']} | {r['dtype']} | {len(r['seeds'])} | "
                      f"{r['n']} | {hist} | {largest} | {largest_abs} | {tol} |")
     return "\n".join(lines)
@@ -383,22 +751,25 @@ def main(argv=None):
     ap.add_argument("--names", default=None,
                     help="comma-separated demos / dynamic operators to restrict the runs to")
     ap.add_argument("--pin", action="store_true",
-                    help=f"also write the measurement to {MEASURED.relative_to(ROOT)}, which "
+                    help=f"also pin what was measured in full in tests/{MEASURED.name}, which "
                          "the declaration tests hold every declared tolerance to")
     args = ap.parse_args(argv)
     out = args.report or args.out
     if out is None:
         ap.error("give --out DIR to measure or --report DIR")
     if args.report is None:
-        measure(out, args.gpus.split(","), args.seeds.split(","), args.only.split(","),
+        only = args.only.split(",")
+        if not set(only) <= set(KINDS):
+            ap.error(f"--only takes {', '.join(KINDS)}, got {args.only!r}")
+        measure(out, args.gpus.split(","), args.seeds.split(","), only,
                 args.names.split(",") if args.names else None)
     table = load(out)
     text = markdown(table)
     (out / "tolerances.md").write_text(text + "\n")
-    pinned = json.dumps(measured_errors(table), indent=1, sort_keys=True) + "\n"
-    (out / MEASURED.name).write_text(pinned)
+    measured = measured_errors(table)
+    (out / MEASURED.name).write_text(json.dumps(measured, indent=1, sort_keys=True) + "\n")
     if args.pin:
-        MEASURED.write_text(pinned)
+        pin(out, measured)
     print(text)
 
 

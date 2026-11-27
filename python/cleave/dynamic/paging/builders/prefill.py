@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from ....ir.graph import Graph, GraphNode
-from ....ir.ops import ConstFill, MaskedDiv, MaskedLog2, RangeGather
+from ....ir.ops import ConstFill, MaskedDiv, MaskedLse2, RangeGather
 from ....ir.ops.gather import BUFFER_BOUND
 from ....ir.graph_utils import gather_all_nodes, lock_graph
 from ..stages import (
     LOG2E,
-    _exp,
+    _accumulators,
+    _declare_rolling,
     _gqa_body,
     _index_input,
     _name_inputs,
@@ -39,15 +40,18 @@ def _build_paged_prefill_causal(spec, dense) -> Graph:
     # --- the loop tier ---------------------------------------------------------------
     gather_k, gather_v = _paged_gathers(spec, dense, "kv_head")
     # `diag` is the tile's own end-aligned causal bound; `row_group` is what makes a row
-    # index mean a token rather than a head slot.
-    score_mma, exp, rowsum, value_mma = _gqa_body(
-        spec, dense, bm, lambda: _exp(dense, bm, causal=True, row_group=group)
+    # index mean a token rather than a head slot. Both go to the score and to the exp: a
+    # row whose causal window ends before this tile has every score at the masked value,
+    # so its running max does not move and its P is 0.
+    score_mma, exp, rowsum, value_mma, rolling = _gqa_body(
+        spec, dense, bm, causal=True, row_group=group
     )
     ph_k, ph_v, ph_idx = _wire_gathers(gather_k, gather_v, score_mma, value_mma)
     ph_q = score_mma.inputs[0].src_node
     _name_inputs(spec, ph_q, ph_k, ph_v, ph_idx)
 
     inner = Graph(nodes=gather_all_nodes(rowsum, value_mma))
+    _declare_rolling(inner, rolling, rowsum, value_mma)
     inner.extent = 1
     inner.loop_kind = "serial"
     inner.loop_trip = f"T.ceildiv(valid_len, {bn})"
@@ -82,8 +86,7 @@ def _build_paged_prefill_causal(spec, dense) -> Graph:
     lock_graph(inner)
 
     loop_node = GraphNode(name="GraphNode_0", graph=inner)
-    rowsum_id = inner.accum_nodes.index(rowsum)
-    value_id = inner.accum_nodes.index(value_mma)
+    accumulators = _accumulators(loop_node, rowsum, value_mma, rolling)
     inner_q = inner.binding[ph_q.name]
     inner_idx = inner.binding[ph_idx.name]
 
@@ -107,16 +110,15 @@ def _build_paged_prefill_causal(spec, dense) -> Graph:
     # --- the epilogue ----------------------------------------------------------------
     # `n_rows` is how many of the tile's tokens the request actually has; the last tile of
     # a request is partial far more often than not, so both stores are row-predicated.
-    div, log2, outputs = _normalise(
+    div, lse, outputs = _normalise(
         loop_node,
-        (value_mma, value_id),
-        (rowsum, rowsum_id),
+        *accumulators,
         (bm, head_dim),
         dense.accum_dtype,
         dense.out_dtype,
         spec.emit_lse,
         div_cls=MaskedDiv,
-        log2_cls=MaskedLog2,
+        lse_cls=MaskedLse2,
         scalar_args=("n_rows",),
         row_group=group,
     )
@@ -183,9 +185,10 @@ def _build_paged_prefill_causal(spec, dense) -> Graph:
     main.prologue = _worklist_scan(ph_qo, btok, indptr_dim)
     main.block_guard = lambda i, h: "_wl[0] >= 0"
     # With an empty causal window the KV loop runs zero trips, so the accumulators stay
-    # zero and the epilogue's floored divide yields exactly the 0 and -inf the fills
-    # write -- the two branches agree by construction. Taking the fill instead skips
-    # clearing the accumulator, gathering Q, and the divide.
+    # zero and the max at its finite start: the epilogue's floored divide and its
+    # log2(0) + max yield exactly the 0 and -inf the fills write -- the two branches agree
+    # by construction. Taking the fill instead skips clearing the accumulators, gathering
+    # Q, and the divide.
     main.work_guard = lambda i, h: f"{wl.live} > 0"
     main.else_nodes = list(fills)
     lock_graph(main)
@@ -213,8 +216,9 @@ def _build_paged_prefill_causal(spec, dense) -> Graph:
             exp=exp,
             rowsum=rowsum,
             value_mma=value_mma,
+            rolling=rolling,
             div=div,
-            log2=log2,
+            lse=lse,
             outputs=outputs,
             fills=fills,
         ),

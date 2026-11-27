@@ -23,6 +23,7 @@ from ..core.errors import (
     NonFiniteOutput,
     OutputMismatch,
     SmemExceeded,
+    SpecError,
     ValidationError,
     WorkerCrash,
 )
@@ -31,12 +32,20 @@ from .compile import (
     CompilerPassOptions,
     _compile,
     _load_main_kernel_from_code,
-    build_candidate_code,
+    build_candidate,
     check_code,
 )
-from .gpu import _create_parallel_env, _gpu_exec_guard
-from .reference import graph_out_indices, make_inputs, order_inputs_for_kernel
-from .validate import BenchOptions, benchmark_compiled_kernel, publish_reference
+from .gpu import _create_parallel_env, _gpu_exec_guard, device_lock_state
+from .reference import (
+    graph_out_indices,
+    make_inputs,
+    order_inputs_for_kernel,
+    output_order,
+    declared_output_places,
+    output_roles,
+    with_hand_off,
+)
+from .validate import BenchOptions, benchmark_compiled_kernel, publish_reference, tolerances_of
 from .workers import WorkerPool
 
 
@@ -88,11 +97,17 @@ class CandidateResult:
     error: CleaveError | None = None
     code: str | None = None
     cuda_src: str | None = None
+    # Mean time of one launch. For a kernel that stores an output transposed (a split
+    # partial) it includes the copy that hands the outputs over in the logical layout
+    # (cleave.runtime.reference.with_hand_off): no caller gets them without it.
     latency_ms: float | None = None
     label: str = ""
     # cleave.runtime.validate.MeasuredError per output, when the comparison ran to the end:
     # for every ok candidate, and for one that failed as an OutputMismatch.
     measured: tuple | None = None
+    # How the kernel stores each output: ``(axes, pad)`` per output, in the order it returns
+    # them (cleave.runtime.reference.to_stored / to_logical), when the build recorded it.
+    stored_layouts: tuple | None = None
 
     @property
     def ok(self) -> bool:
@@ -143,6 +158,25 @@ def _parent_error(error_cls, label, what, exc):
     return error
 
 
+def declared_bounds(tolerance, graph):
+    """``(declaration, roles)``: the declaration ``tolerance`` as it applies to the outputs
+    of a candidate of ``graph``, and their boundary roles when one of them has a role. (The
+    roles are only known for a candidate that comes with its lowered graph.)
+
+    A sequence is one bound per output of the program, in the program's order. A kernel
+    returns its outputs in the order its graph lists them, which need not be that order
+    (``reference.declared_output_places``), so the sequence is handed on in the kernel's.
+    """
+    known = tolerance is not None and getattr(graph, "nodes", None) is not None
+    roles = output_roles(graph) if known else None
+    declared = tolerances_of(tolerance, roles)
+    if known and isinstance(tolerance, (list, tuple)):
+        places = declared_output_places(graph)
+        if places is not None and len(places) == len(tolerance):
+            declared = tuple(tolerance[k] for k in places)
+    return declared, roles if roles and any(roles) else None
+
+
 def run_candidates(
     candidates,
     dtype,
@@ -162,15 +196,19 @@ def run_candidates(
     Compile/validate (and ``benchmark`` timing) run on up to ``max_parallel`` persistent
     workers; codegen stays in the parent (TileDicts can't be pickled). Injectable stages:
     ``build_fn`` (parent), ``check_fn`` (worker, picklable), ``reference_fn``, ``pool``.
+    ``build_fn`` returns the source, or ``(source, stored layouts)`` like the default
+    ``build_candidate``; the layouts go to ``check_fn`` and onto the result.
 
-    ``tolerance`` is the operator's declared bound (a ``Tolerance`` or one per output),
-    handed to ``check_fn``; the default ``check_code`` fails a candidate without one.
+    ``tolerance`` is the operator's declared bound (a ``Tolerance``, one per output, or
+    one per boundary role: ``validate.tolerances_of``). ``check_fn`` is handed what it comes
+    to for the candidate's own outputs; the default ``check_code`` fails a candidate
+    without a bound, and so does a declaration that leaves one of its outputs without.
     """
     if not candidates:
         return []
     if build_fn is None:
         options = compiler_pass_options or CompilerPassOptions()
-        build_fn = functools.partial(build_candidate_code, options=options)
+        build_fn = functools.partial(build_candidate, options=options)
     check_fn = check_fn or check_code
     reference_fn = reference_fn or publish_reference
 
@@ -219,17 +257,68 @@ def run_candidates(
     owns_pool = pool is None
     if owns_pool:
         pool = WorkerPool()
-    graph_refs = {}  # id(flat_graph) -> (reference_cache_dir, out_idx, io_bytes)
+    # id(flat_graph) -> (reference_cache_dir, out_idx, io_bytes), or what building it raised
+    graph_refs = {}
 
-    def reference_for(cand):
-        graph = cand.flat_graph
-        key = id(graph)
-        if key not in graph_refs:
+    def publish_references():
+        """Build the reference of every flat graph, before the first worker starts.
+
+        A reference is built on the GPU, under the lock the workers validate under
+        (``_gpu_exec_guard``). Built at the first candidate of its graph instead, the
+        parent would wait for that lock in the middle of the run -- and a worker whose
+        kernel never returns holds it for good. The parent is the one that times a
+        candidate out, so it would wait with it forever.
+
+        A graph whose outputs the declared tolerance does not cover has no reference built:
+        none of its candidates reaches a worker (each fails for the missing bound, in
+        ``launch_until_full``). This is for a caller that hands candidates over itself.
+        ``pipeline.build`` never gets here with such a graph: it refuses the declaration
+        before it starts (``_check_tolerance_fits``), so no program compiled through the
+        pipeline had a reference built for nothing.
+        """
+        for cand in candidates:
+            key = id(cand.flat_graph)
+            if key in graph_refs:
+                continue
+            try:
+                declared_for(cand)
+            except SpecError:
+                graph_refs[key] = (None, None, 0)  # nothing of it is used: no worker gets it
+                continue
             cache_dir = os.path.join(reference_root, f"g{len(graph_refs)}")
             os.makedirs(cache_dir, exist_ok=True)
-            g_out_idx, g_io_bytes = reference_fn(cache_dir, graph, dtype)
-            graph_refs[key] = (cache_dir, g_out_idx, g_io_bytes)
-        return graph_refs[key]
+            try:
+                g_out_idx, g_io_bytes = reference_fn(cache_dir, cand.flat_graph, dtype)
+            except Exception as exc:  # noqa: BLE001 - reported by each candidate of the graph
+                graph_refs[key] = exc
+            else:
+                graph_refs[key] = (cache_dir, g_out_idx, g_io_bytes)
+
+    def reference_for(cand):
+        reference = graph_refs[id(cand.flat_graph)]
+        if isinstance(reference, Exception):
+            raise reference
+        return reference
+
+    def widest_reference():
+        """The largest input + output footprint among the graphs that have a reference:
+        what the run's parallelism is sized for.
+
+        A worker loads the inputs and the reference of its candidate's graph onto the
+        device, and the graphs of one run differ (a split partial returns ``splits`` times
+        the program's output, and its combine reads that), so the cap has to hold for the
+        largest. A graph without a reference sends nothing to a worker and has no say:
+        one whose reference could not be built (its candidates report why), one no bound
+        covers. The first candidate's graph does not speak for all of them: with no
+        bound its footprint would be 0 and the cap off for the whole run, and with a
+        reference that failed the run itself would end on that error, every candidate
+        unreported.
+        """
+        return max((ref[2] for ref in graph_refs.values() if not isinstance(ref, Exception)),
+                   default=0)
+
+    def declared_for(cand):
+        return declared_bounds(tolerance, cand.flat_graph)
 
     def finish(job, result, pbar):
         results[job["idx"] - 1] = result
@@ -240,7 +329,7 @@ def run_candidates(
             job,
             CandidateResult(
                 job["candidate"], "failed", stage, error, code=code, label=job["label"],
-                measured=measured,
+                measured=measured, stored_layouts=job.get("stored_layouts"),
             ),
             pbar,
         )
@@ -260,15 +349,23 @@ def run_candidates(
                 fail(job, "codegen", _parent_error(CleaveError, label, "reference", exc), pbar)
                 continue
             try:
-                code_str = build_fn(cand)
+                built = build_fn(cand)
             except Exception as exc:
                 fail(job, "codegen", _parent_error(CodegenError, label, "codegen", exc), pbar)
+                continue
+            code_str, stored_layouts = built if isinstance(built, tuple) else (built, None)
+            job["stored_layouts"] = stored_layouts
+            try:
+                declared, roles = declared_for(cand)
+            except SpecError as exc:
+                error = _parent_error(ValidationError, label, "tolerance", exc)
+                fail(job, "validate", error, pbar, code_str)
                 continue
 
             task = {
                 "check_fn": check_fn, "code_str": code_str, "out_idx": cand_out_idx,
-                "reference_cache_dir": cand_ref_dir, "tolerance": tolerance,
-                "benchmark": benchmark,
+                "reference_cache_dir": cand_ref_dir, "tolerance": declared,
+                "benchmark": benchmark, "stored_layouts": stored_layouts, "roles": roles,
             }
             worker = None
             try:
@@ -291,13 +388,39 @@ def run_candidates(
                 CandidateResult(
                     job["candidate"], "ok", None, None, job["code_str"],
                     result["cuda_src"], result.get("latency_ms"), job["label"],
-                    result.get("measured"),
+                    result.get("measured"), job.get("stored_layouts"),
                 ),
                 pbar,
             )
         else:
             stage, error = _restore_compile_error(result, job["label"])
             fail(job, stage, error, pbar, job["code_str"], result.get("measured"))
+
+    waits_charged_at = [time.monotonic()]
+
+    def uncharge_waits(now):
+        """Take the time a worker waited for the device, behind another worker of this run,
+        off its candidate's clock.
+
+        Workers validate and time one at a time, under the device lock. A kernel that never
+        returns holds that lock until its worker is timed out, and every candidate launched
+        next to it waits behind it for exactly as long: their time was up in the same pass,
+        though none of them had had the device. One spinning kernel so failed every candidate
+        in flight, and all of them in a run of no more than ``max_parallel`` (the fast preset
+        of demo/swiglu.py: "8 kernels: 0 compiled, 8 failed [8x CandidateTimeout]", after
+        its first kernel had validated). The timeout therefore counts what a candidate does,
+        not what it waits for: the holder is always a candidate this run times out, so the
+        wait ends. A holder that is no worker of this run is another process on the device;
+        nothing here ends it, and waiting behind it is charged as before.
+        """
+        since, waits_charged_at[0] = waits_charged_at[0], now
+        holder, waiters = device_lock_state()
+        pids = {worker.process.pid: job for worker, job in active_jobs.items()}
+        if holder not in pids:
+            return
+        for pid in waiters & set(pids):
+            job = pids[pid]
+            job["started_at"] = min(now, job["started_at"] + (now - since))
 
     def collect(pbar):
         # A worker's result is read before its death is noticed, so a worker that
@@ -323,12 +446,12 @@ def run_candidates(
             fail(job, "crash", error, pbar, job["code_str"])
 
     try:
-        _, _, io_bytes = reference_for(candidates[0])
-        max_parallel = _effective_compile_and_run_parallelism(max_parallel, io_bytes)
+        publish_references()
+        max_parallel = _effective_compile_and_run_parallelism(max_parallel, widest_reference())
 
         with tqdm(total=total_candidates) as pbar:
             launch_until_full(pbar)
-            last_heartbeat_at = time.monotonic()
+            last_heartbeat_at = waits_charged_at[0] = time.monotonic()
 
             while active_jobs:
                 now = time.monotonic()
@@ -350,6 +473,7 @@ def run_candidates(
 
                 now = time.monotonic()
                 if timeout_secs is not None:
+                    uncharge_waits(now)
                     for worker, job in list(active_jobs.items()):
                         elapsed = now - job["started_at"]
                         if elapsed < timeout_secs:
@@ -413,14 +537,15 @@ class _SerialBench:
             self.graph_inputs[key] = (inputs_by_name, graph_out_indices(graph))
         return self.graph_inputs[key]
 
-    def latency_ms(self, graph, code_str):
+    def latency_ms(self, graph, code_str, stored_layouts=None):
         import torch
 
         inputs_by_name, out_idx = self._inputs_for(graph)
         kernel = _compile(_load_main_kernel_from_code(code_str), out_idx)
+        logical_shapes = [node.get_shape(0) for node in output_order(graph)]
         try:
             return benchmark_compiled_kernel(
-                kernel,
+                with_hand_off(kernel, stored_layouts, logical_shapes),  # as the workers time it
                 order_inputs_for_kernel(inputs_by_name, kernel),
                 warmup_iters=self.warmup,
                 profile_iters=self.iters,
@@ -458,7 +583,8 @@ def benchmark_results(results, dtype, warmup=16, iters=1000, *,
                 continue
             try:
                 with _gpu_exec_guard():
-                    latency = bench.latency_ms(result.cand.flat_graph, result.code)
+                    latency = bench.latency_ms(result.cand.flat_graph, result.code,
+                                               result.stored_layouts)
             except Exception as exc:  # noqa: BLE001 - reported per candidate
                 error = _parent_error(BenchmarkError, result.label, "benchmark", exc)
                 timed.append(replace(result, status="failed", stage="bench", error=error))

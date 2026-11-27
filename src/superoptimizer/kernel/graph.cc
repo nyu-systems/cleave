@@ -118,6 +118,20 @@ Graph *Graph::create_symbolic_graph(
     }
     merge_dims(input_op->output_tensors[0], decl.result());
   }
+  // Every dim of an input gets a symbol below, also one that no rule tied to
+  // another dim (the reduced dim of an input that only a reduction reads).
+  // After the rules, so a graph whose input dims all have a group already is
+  // grouped and numbered exactly as without this loop.
+  for (auto const &op : operators) {
+    if (op->op_type != cleave_superoptimizer::type::KN_INPUT_OP) {
+      continue;
+    }
+    for (auto const &tensor : op->output_tensors) {
+      for (int i = 0; i < tensor.num_dims; i++) {
+        grouper.group_alone(DimensionID{tensor.guid, i}, tensor.dim[i]);
+      }
+    }
+  }
 
   // Step 2: Symbolization pass - assign distinct symbols to groups
   SymbolicGraphConfig config;
